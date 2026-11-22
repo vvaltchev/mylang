@@ -76,7 +76,11 @@ const BuiltinDoc builtin_docs[] = {
   "The bare type name of x as a string (\"int\", \"array\", \"dict\", ...).",
   "Compare typestr(x), the full structural type, and kindstr(x), the kind." },
 { "defined", "convert", "defined(x)",
-  "True if x is a defined symbol (not an undefined identifier).", nullptr },
+  "True if the name x is DECLARED anywhere in an enclosing scope.",
+  "True throughout the name's scope, the part ABOVE the declaration "
+  "included - a declaration's name exists from scope entry, only its VALUE "
+  "binds later. Ask isbound(x) for that half. The argument is unevaluated, "
+  "so in a script defined() can only be CALLED, never used as a value." },
 { "clone", "convert", "clone(x)",
   "A shallow (one-level) copy; nested const objects stay shared/read-only.",
   nullptr },
@@ -93,7 +97,8 @@ const BuiltinDoc builtin_docs[] = {
   "A compile-time type QUERY (the arg is unevaluated): folds to a string "
   "literal of x's static type. Replaces the old typeof()." },
 { "kindstr", "reflect", "kindstr(x)",
-  "Just x's kind as a string (\"array\", \"int\", \"struct\", ...).",
+  "Just x's kind as a string (\"array\", \"int\", \"struct\", \"class\", "
+  "...).",
   "Like typestr but the bare kind; also a compile-time fold." },
 { "globals", "reflect", "globals()",
   "Sorted names bound in the global scope (vars/funcs/structs), excluding "
@@ -109,6 +114,13 @@ const BuiltinDoc builtin_docs[] = {
 { "specializations", "reflect", "specializations(f)",
   "The <name>$N / <name>$sN template-instance & specialization clones derived "
   "from f.", nullptr },
+{ "refcount", "reflect", "refcount(symbol)  [dev-only]",
+  "The number of handles sharing the reference symbol holds (1 for a scalar) "
+  "- DEV-ONLY, a test instrument.",
+  "DEV-ONLY (the REPL and the test harness; a script call is a compile-time "
+  "error). Reads the slot in place like intptr(), so the count is exact: a "
+  "leaked reference - one a call protocol forgot to release - is otherwise "
+  "invisible to a program, since a plain alias never copies." },
 { "show", "reflect", "show(x)  [dev-only]",
   "Render x's FINAL optimized AST back into synthetic MyLang code (DEV-ONLY).",
   "DEV-ONLY: it decompiles the AST, so it is reserved to the REPL and the test "
@@ -126,6 +138,16 @@ const BuiltinDoc builtin_docs[] = {
 { "intptr", "reflect", "intptr(x)",
   "The internal shared-object pointer of x as an int (tests of aliasing).",
   nullptr },
+{ "isbound", "reflect", "isbound(x)",
+  "True if x's DECLARATION has run yet (the other half of defined()).",
+  "False inside the temporal dead zone - between scope entry and the "
+  "declaration statement - and false for a name that exists nowhere, so "
+  "isbound(x) alone is the feature test. Lexical kinds (param, capture, "
+  "builtin, local) answer at compile time; a GLOBAL read from a function "
+  "body is a genuine runtime query. The argument must be an identifier "
+  "(`none` and `len` qualify, `3` and \"x\" do not) and is never evaluated. "
+  "It also GUARDS: inside if (isbound(x)) { ... }, x may be used even if it "
+  "is declared nowhere." },
 { "isconst", "reflect", "isconst(x)",
   "True if x is effectively const (literal, const, const-expr, or auto-const).",
   nullptr },
@@ -170,10 +192,11 @@ const BuiltinDoc builtin_docs[] = {
   "Sort a in place descending (or by cmp).", nullptr },
 { "reverse", "array", "reverse(a)",
   "Reverse a in place.", nullptr },
-{ "sum", "array", "sum(a, [reduce])",
-  "Sum the elements of a, or fold them with reduce(acc, x).",
+{ "sum", "array", "sum(a, [key])",
+  "Sum the elements of a (or key(x) for each element x).",
   "An all-int array sums in a tight unboxed loop; sum of an array<bool> counts "
-  "the trues." },
+  "the trues. An empty numeric sum is 0 / 0.0; an empty non-numeric one "
+  "raises InvalidArgumentEx." },
 { "map", "array", "map(f, c)",
   "A new array applying f to each element of an array/dict.", nullptr },
 { "filter", "array", "filter(f, c)",
@@ -188,10 +211,6 @@ const BuiltinDoc builtin_docs[] = {
   "Insert x at index/key i in array/dict c.", nullptr },
 { "erase", "array", "erase(c, i)",
   "Erase the element at index/key i from array/dict c.", nullptr },
-{ "dynarray", "array", "dynarray(a)",
-  "A fresh general (polymorphic, array<dyn>) copy of a - the manual promotion.",
-  "There is no automatic runtime promotion; storage is fixed at creation. "
-  "clone()/deepclone() preserve the layout." },
 
 /* --- dict --- */
 { "dict", "dict", "dict(pairs) | dict(default)",
@@ -246,9 +265,9 @@ const BuiltinDoc builtin_docs[] = {
 /* --- math --- */
 { "abs", "math", "abs(x)", "Absolute value (int or float).", nullptr },
 { "min", "math", "min(a) | min(x, y, ...)",
-  "Minimum of an array or of the arguments.", nullptr },
+  "Minimum of an array (non-empty) or of the arguments.", nullptr },
 { "max", "math", "max(a) | max(x, y, ...)",
-  "Maximum of an array or of the arguments.", nullptr },
+  "Maximum of an array (non-empty) or of the arguments.", nullptr },
 { "pow", "math", "pow(x, y)", "x raised to the power y.", nullptr },
 { "sqrt", "math", "sqrt(x)", "Square root.", nullptr },
 { "cbrt", "math", "cbrt(x)", "Cube root.", nullptr },
@@ -296,15 +315,17 @@ const BuiltinDoc builtin_docs[] = {
 
 /* --- random --- */
 { "rand", "random", "rand(lo, hi)",
-  "A random int in [lo, hi] inclusive (none if lo > hi).", nullptr },
+  "A random int in [lo, hi] inclusive (raises if lo > hi).", nullptr },
 { "randf", "random", "randf(lo, hi)",
-  "A random float in [lo, hi] inclusive (none if lo > hi).", nullptr },
+  "A random float in [lo, hi] (raises if lo > hi or not finite).",
+  nullptr },
 
 /* --- io --- */
 { "print", "io", "print(...)",
   "Print the arguments space-separated, then a newline.", nullptr },
 { "readln", "io", "readln()",
-  "Read one line from stdin (without the trailing newline).", nullptr },
+  "Read one line from stdin (without the trailing newline); none at "
+  "the end of input.", nullptr },
 { "writeln", "io", "writeln(s, [file])",
   "Write s + a newline to stdout, or to file.", nullptr },
 { "write", "io", "write(s, [file])",
@@ -504,30 +525,34 @@ const LangFeature lang_features[] = {
 /* ---- arrays ---- */
 { "arraylit", "arrays", "Array literals & access",
   "var a = [1, 2, 3];    a[0]    a[1:3]    len(a)    a += [4];",
-  "Arrays are 0-indexed, growable, and have value semantics (copy-on-write). "
-  "Indexing reads/writes an element; slicing yields an independent (lazily "
-  "copied) sub-array." },
+  "Arrays are 0-indexed and growable, and assignment SHARES them (a second "
+  "name for the same array; clone() copies). Indexing reads/writes an "
+  "element; slicing yields a new (lazily copied) sub-array." },
 { "slices", "arrays", "Slices (copy-on-write)",
   "var s = a[1:3];",
-  "A slice is a cheap VIEW until written: reading it shares the parent's "
-  "storage, and a write clones first so logically-distinct arrays never bleed "
-  "into each other. intptr(x) reveals when two values share storage." },
+  "A slice is a new array, separate from the one it was taken from - and, "
+  "like any array, shared once you have it: assigning or passing it does not "
+  "copy it again (Python's rule). Internally it is a cheap VIEW until "
+  "written: a write through any name holding it copies the window once, for "
+  "all of them. intptr(x) reveals when two values share storage." },
 { "flatstorage", "arrays", "Flat (unboxed) arrays",
-  "array_storage(a)    dynarray(a)",
+  "array_storage(a)    cast<array<dyn>>(a)",
   "A homogeneous array<int>/<float>/<bool> (and array<PodStruct>) is stored "
   "UNBOXED - far less memory and much faster bulk ops. The representation is "
   "decided once from the proven static type and never converted; declare `dyn` "
-  "or use dynarray() for a polymorphic array. See :help flatarrays / "
-  ":trace arrays." },
+  "or cast (cast<array<dyn>>(a), :help cast) for a polymorphic array. See "
+  ":help flatarrays / :trace arrays." },
 
 /* ---- dicts ---- */
 { "dictlit", "dicts", "Dictionaries",
   "var d = {\"k\": 1};    d[\"k\"]    d.k    get(d, k)    get!(d, k)\n"
   "var dd = dict(0);   // a default dict",
-  "Keys may be any hashable scalar. A missing-key READ throws KeyNotFoundEx "
+  "Keys may be any hashable value. A missing-key READ throws KeyNotFoundEx "
   "(the read is non-opt) unless the dict has a default (dict(default_value)); "
   "a plain-assignment to a missing key inserts it. get(d,k) is the nullable "
-  "lookup (opt V), get!(d,k) is value-or-throw." },
+  "lookup (opt V), get!(d,k) is value-or-throw. A literal is built like "
+  "successive stores: a key written twice keeps the LAST value, at the "
+  "place of its first occurrence." },
 
 /* ---- strings ---- */
 { "strtype", "strings", "Strings",
@@ -541,23 +566,37 @@ const LangFeature lang_features[] = {
   "struct Point { int x; int y; const ORIGIN = 0; }\n"
   "var p = Point(3, 4);    p.x    Point.ORIGIN",
   "A user value type with explicitly-typed fields and optional const members. "
-  "Construction is a call (Point(...)); fields are accessed with `.`. Structs "
-  "have COW value semantics. An all-scalar struct is POD (a native C byte "
-  "layout - see layout()); a ref/opt field makes it boxed. A self-reference "
-  "must be `opt` (dyn? next) to break the cycle - that is how you write a "
-  "list/tree." },
+  "Construction is a call (Point(...)); fields are accessed with `.`. A struct "
+  "is a VALUE: every copy (an assignment, an argument, an element read) is "
+  "independent, and `==` compares the fields. An all-scalar struct is POD (a "
+  "native C byte layout - see layout()); a ref/opt field makes it boxed. A "
+  "self-reference must be nullable (dyn? next) to break the cycle; for a "
+  "linked structure use a class (:help class)." },
+{ "classdecl", "structs", "class",
+  "class Node { int v; opt Node next; }\n"
+  "var a = Node(1, none);    var b = a;    b.v = 2;    // a.v is 2",
+  "A struct with REFERENCE semantics: a copy shares the one object, a write "
+  "through any holder is seen by all, `==` and hash() go by IDENTITY (two "
+  "instances with equal fields differ; an instance is a dict key by "
+  "identity). A field of the class's own type must be `opt`. `const c = "
+  "C(...)` makes the whole object read-only through every alias "
+  "(CannotChangeConstEx). A pure function cannot construct one - each "
+  "construction is a new object." },
 
 /* ---- exceptions ---- */
 { "trycatch", "exceptions", "Exceptions",
   "struct MyError { str msg; }\ntry { throw MyError(\"boom\"); }\n"
   "catch (MyError as e) { print(e.msg); }\nfinally { ... }    rethrow;",
-  "try/catch/finally with catch clauses matched by exception NAME. A user "
-  "exception is a struct instance: `throw MyError(...)` is caught by "
-  "`catch (MyError)` (the struct type), and `catch (MyError as e)` binds the "
-  "instance so `e.field` reads its data. Built-in runtime errors "
-  "(DivisionByZeroEx, TypeErrorEx, OutOfBoundsEx, KeyNotFoundEx, ...) are "
-  "catchable too. COMPILE-time errors (type/syntax) are NOT catchable. "
-  "`rethrow` re-throws the in-flight exception from a catch." },
+  "try/catch/finally. A user exception is a struct instance: `throw "
+  "MyError(...)` is caught by `catch (MyError)` - by the struct ITSELF, "
+  "the one the name means where the clause is written, so two structs "
+  "named alike are two types - and `catch (MyError as e)` binds the "
+  "instance, typed MyError, so `e.field` reads its data. Built-in runtime "
+  "errors (DivisionByZeroEx, TypeErrorEx, OutOfBoundsEx, KeyNotFoundEx, "
+  "...) are caught by their name. `catch { }` catches anything, and "
+  "`catch (dyn as e)` also binds what it caught. COMPILE-time errors "
+  "(type/syntax) are NOT catchable. `rethrow` re-throws the in-flight "
+  "exception from a catch." },
 
 /* ---- types ---- */
 { "inference", "types", "Static type inference",
@@ -578,6 +617,22 @@ const LangFeature lang_features[] = {
   "else it is a compile error at the declaration - so a non-opt parameter is "
   "PROVEN never none and the body needs no check. Inside a proven branch "
   "(if (x != none) ..., a guard clause) a nullable reads as non-opt." },
+{ "cast", "types", "Casts",
+  "cast<float>(n)    cast<int>(\"42\")    cast<bool>(\"yes\")\n"
+  "cast<array<float>>(xs)    cast<dict<str, int?>>(d)    cast<dyn>(v)",
+  "cast<T>(x) converts x to EXACTLY the type T, at run time. Scalars: bool, "
+  "int, float and str convert both ways (int(), float() and str()'s rules; "
+  "a number becomes a bool only from 0 / 1, a string from true / yes / on / "
+  "enabled or false / no / off / disabled, case ignored). T? lets none "
+  "through; cast<dyn?> keeps the value as it is, cast<dyn> refuses none. A "
+  "container cast builds a NEW container of type T, converting every "
+  "element (a nested one already of its target type is shared); a dict "
+  "keeps its order and default, and two keys that convert to one key are "
+  "refused. A struct, class or box must already be that type and comes "
+  "back copied. A value the conversion cannot take is an InvalidValueEx, "
+  "one of the wrong kind a TypeErrorEx; a cast no value of its argument's "
+  "type can survive is a compile error. T must be complete - not a bare "
+  "array or dict." },
 { "templates", "types", "Function templates",
   "func f(x) { var t = x + 1; return t; }    f(1); f(\"s\");",
   "A named function with an un-annotated, non-dyn, non-opt parameter is a "
@@ -761,7 +816,7 @@ const char *builtin_kind_note(const BuiltinDoc &d)
         !std::strcmp(d.name, "array") || !std::strcmp(d.name, "append") ||
         !std::strcmp(d.name, "push") || !std::strcmp(d.name, "pop") ||
         !std::strcmp(d.name, "insert") || !std::strcmp(d.name, "erase") ||
-        !std::strcmp(d.name, "dynarray") || !std::strcmp(d.name, "deepclone"))
+        !std::strcmp(d.name, "deepclone"))
         return "runtime (never const-folded)";
     return "const (folds with const arguments)";
 }
@@ -815,7 +870,7 @@ void render_language_index(std::ostream &o, bool color)
     const Pal p = palette(color);
     if (lang_db_empty()) {
         o << "Language reference is being assembled "
-          << p.dim << "(see plans/repl-introspection.md)" << p.rst << "\n";
+          << p.dim << "(see plans/archived/repl-introspection.md)" << p.rst << "\n";
         return;
     }
     o << "Language features by category "

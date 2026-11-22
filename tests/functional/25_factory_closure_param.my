@@ -1,0 +1,152 @@
+# #115: a closure RETURNED FROM A FACTORY gets its parameter typed from
+# the call sites of the variable it was bound to.
+#
+# `callee_funcinfo` cannot resolve `add` - it is a var, not a named
+# function or an inline lambda - so `x` used to finalize to `dyn` and
+# the whole closure body ran boxed (an unpinned ctx chain, a 32-byte
+# capture read, two runtime type checks). The finfo set on the Func
+# static type carries the answer: the lambda's type flows into the
+# factory's `ret`, out of the call, and into the variable's symbol.
+#
+# ⛔ THE ORACLE IS `typestr(x)` INSIDE THE BODY. A better-typed program
+# computes the same answers, so an engine differential is blind to this
+# by construction (CLAUDE.md, *Testing an AST TRANSFORM*) - the inferred
+# type itself has to be asserted. And it must be the PARAMETER's type:
+# a first version asked `typestr(add(k))`, the call RESULT, which was
+# already concrete before this change and so proved nothing. Watched:
+# the pre-#115 binary prints `dyn` on every line below.
+#
+# ⛔ ONE FACTORY PER CASE, ON PURPOSE. All the closures a factory
+# returns share ONE FuncInfo, so every call site of every one of them
+# JOINS into the same parameter - a single float call site anywhere
+# re-types the closure everywhere. A first version shared one factory
+# and case (3) silently re-typed cases (1) and (2).
+
+# (1) the parameter is typed, and the value is unchanged
+func make_adder(n) {
+  var base = n * 10;
+  return func [base] (x) { return typestr(x) + ":" + str(base + x); };
+}
+func one_site(int k) {
+  var add = make_adder(3);
+  return add(k);
+}
+print("one    ", one_site(runtime(4)));
+
+# (2) the 63_closures shape: a fresh closure per loop iteration
+func make_sum(n) {
+  var sbase = n * 10;
+  return func [sbase] (x) { return typestr(x) + ":" + str(sbase + x); };
+}
+var last = "";
+for (var i = 0; i < 4; i++) {
+  var a2 = make_sum(i);
+  last = a2(i);
+}
+print("loop   ", last);
+
+# (3) ⛔ TWO CALL SITES THAT DISAGREE *JOIN*, exactly as they do for a
+#     DIRECTLY-bound capturing lambda. This case used to DECLINE to
+#     `dyn` and print `dyn:21 dyn:22.500000`, because a UNIFORMITY
+#     check refused to contribute anything unless every site of a
+#     closure agreed. That check is deleted (maintainer's call,
+#     2026-08-28) and the two spellings of a capturing closure now
+#     behave identically:
+#
+#       var wbase = 20;                                    # DIRECT
+#       var f = func [wbase] (x) { return typestr(x); };
+#       print(f(1) + " " + f(2.5));   -> float float
+#
+#     - which is what this now prints too. `join(int, float)` is
+#     float, so `f(1)` coerces; an int/str pair is the join CONFLICT
+#     that the direct spelling already raised.
+#
+#     ⛔ WATCHED: restoring the uniformity check turns this line back
+#     into `widen  dyn:21 dyn:22.500000` - it is the ONE corpus line
+#     the deletion moves, which is why it is asserted here.
+func make_w(n) {
+  var wbase = n * 10;
+  return func [wbase] (x) { return typestr(x) + ":" + str(wbase + x); };
+}
+func widen(int k) {
+  var f = make_w(k);
+  return f(1) + " " + f(2.5);
+}
+print("widen  ", widen(runtime(2)));
+
+# (3b) the SAME shape written as a directly-bound capturing lambda -
+#      the spelling case (3) must agree with. Kept adjacent so the two
+#      cannot silently drift apart again.
+var dbase = 20;
+var dfn = func [dbase] (x) { return typestr(x) + ":" + str(dbase + x); };
+print("direct ", dfn(1) + " " + dfn(2.5));
+
+# (4) DECLINE - and this is the case that once made a UNIFORMITY rule
+#     necessary, and is now the reason it could be deleted. The old
+#     finfo set UNDER-COLLECTED: two same-shaped closures in an array
+#     presented a ONE-element set at every call site, so both sites
+#     below attributed to the same survivor, joining them gave that one
+#     FuncInfo both `int` and `str`, and a program with no conflict in
+#     it was REFUSED. The callee-set analysis reports these sites as
+#     TWO-candidate sets, so they are disqualified and no join happens.
+#     The decline is the same; the reason for it is now the true one.
+func mk_a(n) => func [n] (x) { return str(n) + str(x); };
+func mk_b(n) => func [n] (x) { return str(n) + str(x); };
+func two_closures(int k) {
+  var p = [mk_a(1), mk_b(2)];
+  var f = p[k % 2];
+  var g = p[(k + 1) % 2];
+  return f(7) + g("s");
+}
+print("pair   ", two_closures(runtime(3)));
+
+# (5) ⛔ COMPLETENESS. Two same-shaped closures in an array, ONE call
+#     site (so no per-callee agreement rule could ever have caught it)
+#     and an index that selects the FIRST. `join`'s `static_type_equal` shortcut used to
+#     drop one side's candidate set whenever two functions shared a
+#     signature, so the callee named ONE function and this printed
+#     `a:int15` - a type the call site cannot guarantee, since `p[k]`
+#     may be either closure. Fixed in join; it declines now.
+func mk_ca(n) => func [n] (x) { return "a:" + typestr(x) + str(n + x); };
+func mk_cb(n) => func [n] (x) { return "b:" + typestr(x) + str(n + x); };
+func pick_first(int k) {
+  var p = [mk_ca(10), mk_cb(20)];
+  var f = p[k];
+  return f(5);
+}
+print("merge  ", pick_first(runtime(0)));
+
+# (6) reached ONLY through a container element
+func make_c(n) {
+  var cbase = n * 100;
+  return func [cbase] (x) { return typestr(x) + ":" + str(cbase + x); };
+}
+func through_array(int k) {
+  var fs = [make_c(k)];
+  return fs[0](7);
+}
+print("array  ", through_array(runtime(1)));
+
+# (7) ⛔ THE MULTI-SITE HOLE, which #115 shipped with and #116
+#     increment 2 closed. A closure reached BOTH by a site that names
+#     it alone AND by a site that may reach it or another: only the
+#     first was ever counted, so `only_a(7)` typed the parameter `int`
+#     and the check pass then REFUSED the program on a signature the
+#     rule had invented -
+#
+#       TypeMismatchEx: argument 1 has type 'str' but the parameter
+#       is 'int'
+#
+#     - while the IDENTICAL program with no size-1 site compiled and
+#     printed `A:dyn B:dyn`. A callee is usable only when EVERY site
+#     whose set contains it names it ALONE. Watched: reverting the
+#     `disqualified` set makes this file fail to compile at all.
+func mk_h1(n) => func [n] (x) { return "1:" + typestr(x) + str(n); };
+func mk_h2(n) => func [n] (x) { return "2:" + typestr(x) + str(n); };
+func multisite(int k) {
+  var only_1 = mk_h1(1);          # names exactly one closure
+  var pair = [mk_h1(2), mk_h2(3)];   # ...the SAME FuncInfo as only_1
+  var either = pair[k];           # may be either
+  return only_1(7) + " " + either("s");
+}
+print("multi  ", multisite(runtime(0)));

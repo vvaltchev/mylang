@@ -1,0 +1,49 @@
+# INT-ENGINES: default
+#
+# INT test (#107 P2): the speed-only JIT decisions no output can show -
+# B1 in plans/intrusive-tests.md. `forward`: lever A handed a value to its
+# consumer in a register (the shift's temp, alive one instruction).
+# `guard_elided`: C4d dropped a proven struct's member guard, and C5
+# dropped the release test of a store into a slot that held a reference
+# earlier (main's temps, reused for `av` and for the float chain - the
+# shape jit_release_c5 pins; which temp is codegen's choice, so only the
+# kind and the function are asserted). Default engine: JIT decisions.
+
+struct P { int x; int y; }
+func mix(int n) {
+    var a = 12345;
+    for (var i = 0; i < n; i++) { var t = a >> 3; a = a ^ t; a = a + i; }
+    return a;
+}
+func pts(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var p = P(i, i * 2);
+        s += p.x + p.y;
+    }
+    return s;
+}
+var av = ["3"];
+var n = int(av[0]) * 3;
+var total = 0.0;
+for (var i = 1; i < n + 1; i++) {
+    var x = i * 1.0;
+    total += 1.0 / x + x * 0.5 - x / (x + 1.0);
+}
+var m = mix(int(runtime(100)));
+var q = pts(int(runtime(100)));
+print(m, q, int(total * 1000.0));
+assert(m == 24762 && q == 14850 && int(total * 1000.0) == 18257);
+
+var fw = int_events("forward");
+var ge = int_events("guard_elided");
+foreach (e in fw) print(e);
+foreach (e in ge) print(e);
+func has(arr, needle) {
+    foreach (e in arr)
+        if (find(e, needle) != none) return true;
+    return false;
+}
+assert(has(fw, "func=\"mix\" var=\"t\""));
+assert(has(ge, "kind=\"member\" func=\"pts\" var=\"p\""));
+assert(has(ge, "kind=\"store\" func=\"main\""));

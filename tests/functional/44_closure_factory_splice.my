@@ -1,0 +1,72 @@
+# #97 closure inlining, increment 3: a closure FACTORY's body is spliced
+# into its caller - main included - so the caller runs the factory's
+# make.closure itself, its captures read from the spliced slots (shifted
+# by the splice base). Every shape must print what the calls printed:
+#  - a counter factory (a mutable capture) and an adder factory, the
+#    closures called right after (their guards are then proven);
+#  - a factory capturing its PARAMETER directly, alone and beside a
+#    local (a parameter inside a wider span keeps its bind: the closure
+#    reads it as part of the span, which a one-slot rename cannot move);
+#  - two captures with an uncaptured local between them (a span with a
+#    gap);
+#  - a factory spliced into a FUNCTION body, not main;
+#  - a factory whose closure captures a CAPTURE - declines (it would read
+#    the caller's captures);
+#  - a factory called with an argument it divides by, caught by the
+#    caller's try (a try region keeps its own call a call).
+# MYLANG_JIT_COLD=guard runs every inline cache's miss arm.
+func mc(start) {
+    var count = start;
+    return func [count] () { count++; return count; };
+}
+func ma(n) { var base = n * 10; return func [base] (x) { return base + x; }; }
+func mp(n) { return func [n] (int x) { return n * 100 + x; }; }
+func mq(n) {
+    var w = n + 1;
+    return func [n, w] (int x) { return n * 1000 + w + x; };
+}
+func mg(a) {
+    var p = a * 2;
+    var q = a + 1;
+    var z = q * 3;
+    return func [p, z] (int x) { return p + z + x; };
+}
+func outer(int k) {
+    return func [k] () { return func [k] (int x) { return k + x; }; };
+}
+func md(d) { var b = 100 / d; return func [b] (int x) { return b + x; }; }
+
+func run(int k) {
+    var c = mg(k);
+    var d = mp(k);
+    var r = c(1) + d(2);
+    return r;
+}
+
+func safe(int k) {
+    try {
+        var e = md(k);
+        return e(1);
+    } catch (DivisionByZeroEx) {
+        return -1;
+    }
+    return 0;
+}
+
+var s = 0;
+var t = 0;
+for (var i = 0; i < 30; i++) {
+    var c = mc(i);
+    s = s + c() + c();
+    var add = ma(i);
+    s = s + add(i);
+    var f = mp(i);
+    var g = mg(i);
+    var q = mq(i);
+    s = s + f(i) + g(i) + q(i) + run(i);
+    var mk = outer(i);
+    var h = mk();
+    s = s + h(i);
+    t = t + safe(i - 3);
+}
+print(s, t);

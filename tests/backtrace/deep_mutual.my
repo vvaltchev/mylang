@@ -1,0 +1,27 @@
+# a MUTUAL recursion deep enough to cross the sync depth cap (the
+# SWITCH path; 32 without the native stack), whose calls sit in inlined
+# regions of a chunk that ALSO holds another inlined callee (`pre`): a
+# pc lookup on a collapsed run names the wrong one
+func ev(int n, int k) {
+    if (n == 0) return 10 / (k - 1);
+    var a = pre(n);
+    return a + wod(n, k);
+}
+func od(int n, int k) {
+    if (n == 0) return 20 / (k - 1);
+    var a = pre(n);
+    return a + wev(n, k);
+}
+func pre(int n) => n * 3;
+func wod(int n, int k) => od(n - 1, k) + 1;
+func wev(int n, int k) => ev(n - 1, k) + 1;
+func drive(int d) {
+    var s = 0;
+    for (var i = 0; i < 4; i++) {
+        var k = 0;
+        if (i == 3) k = runtime(1);
+        s = s + ev(d, k);
+    }
+    return s;
+}
+print(drive(runtime(220)));

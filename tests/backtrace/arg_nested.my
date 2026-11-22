@@ -1,0 +1,11 @@
+# THE ARGUMENT RULE: an argument error at a call that itself sits in an
+# INLINED body renders the enclosing inlinee's frame (outer) and not the
+# callee's (inner) - the argument is evaluated in outer
+func inner(x) => x * 2;
+func outer(y) => inner(10 / y) + 1;
+func drive(int m) {
+    var s = 0;
+    for (var i = 0; i < m; i++) s = s + outer(m - 1 - i);
+    return s;
+}
+print(drive(runtime(4)));

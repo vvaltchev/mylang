@@ -1,15 +1,18 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "eval.h"
+#include "parser.h"   /* pt_typed_written, pt_typed_value */
 #include "errors.h"
 #include "syntax.h"
 #include "lexer.h"
 #include "backtrace.h"
 #include "bitops.h"
+#include "cyclewalk.h"   /* the cycle guard: deep copies reproduce a cycle */
 #include "vm.h"   /* Phase 4: run a function body via the bytecode VM */
 
 #include <cmath>
 #include <chrono>
+#include <optional>
 
 using std::pair;
 using std::vector;
@@ -90,7 +93,11 @@ EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx,
     , gfuncs(parent ? parent->gfuncs : nullptr)
     , captures(parent ? parent->captures : nullptr)
     , flow((parent && !func_ctx) ? parent->flow : &flow_state)
+    , root(parent ? parent->root : this)     /* #114 */
 {
+    if (const_ctx)
+        scope_alive = std::make_shared<bool>(true);
+
     /* Load builtins into the map ONLY for a context that resolves names through
      * the map: the const-evaluator (const_builtins) and the REPL (both). A
      * SCRIPT runtime root loads NOTHING - the resolver slotted every name (incl.
@@ -103,6 +110,21 @@ EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx,
             symbols.insert(builtins.begin(), builtins.end());
         }
     }
+}
+
+EvalContext::~EvalContext()
+{
+    if (scope_alive)
+        *scope_alive = false;
+    /* A compile-time function run (const-eval) keeps a cycle it leaves in
+     * a local until exit (const_eval_keep_cycles) - and a local of a BLOCK
+     * it ran lives here, in a scope that dies before that scan: the
+     * function is unresolved at parse time, so its locals are map entries
+     * of the body's block contexts, and such a cycle leaked. A script's
+     * run-time map is empty, so this costs it one test. */
+    if (!symbols.empty() && !const_ctx && in_const_eval())
+        for (const auto &kv : symbols)
+            cyc_keep_if_cyclic(kv.second.get());
 }
 
 LValue *EvalContext::lookup(const Identifier *id)
@@ -150,19 +172,19 @@ void EvalContext::emplace(const Identifier *id, const EvalValue &val, bool is_co
 void EvalContext::emplace(const Identifier *id, EvalValue &&val, bool is_const)
 {
     ML_CHECK(in_const_eval() || repl_mode);
-    symbols.emplace(id->uid, LValue(move(val), is_const));
+    symbols.emplace(id->uid, LValue(std::move(val), is_const));
 }
 
 void EvalContext::emplace(const std::string_view &id, EvalValue &&val, bool is_const)
 {
     ML_CHECK(in_const_eval() || repl_mode);
-    symbols.emplace(UniqueId::get(id), LValue(move(val), is_const));
+    symbols.emplace(UniqueId::get(id), LValue(std::move(val), is_const));
 }
 
 void EvalContext::emplace(const UniqueId *uid, EvalValue &&val, bool is_const)
 {
     ML_CHECK(in_const_eval() || repl_mode);
-    symbols.emplace(uid, LValue(move(val), is_const));
+    symbols.emplace(uid, LValue(std::move(val), is_const));
 }
 
 void EvalContext::collect_symbols(
@@ -207,7 +229,8 @@ EvalValue Construct::eval(EvalContext *ctx, bool rec) const
 }
 
 LiteralStr::LiteralStr(const std::string_view &v)
-    : value(v.empty() ? empty_str : EvalValue(SharedStr(unescape_str(v))))
+    : Literal(ConstructType::lit_str)
+    , value(v.empty() ? empty_str : EvalValue(SharedStr(unescape_str(v))))
 { }
 
 /*
@@ -308,7 +331,12 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
         if (ctx->gfuncs->defined[sym.slot])
             return EvalValue(&ctx->gfuncs->slots[sym.slot]);
 
-        return UndefinedId{get_str()};
+        /* TDZ, runtime half (#131): the name IS declared - it has a global
+         * slot - but its declaration has not run yet. That is UNBOUND, not
+         * undefined, and it is a catchable RuntimeException. */
+        throw UnboundSymbolEx(
+            intern_msg("'" + std::string(get_str()) + "' is not bound yet"),
+            start, end);
     }
 
     if (sym.kind == SymKind::capture && ctx->captures) {
@@ -336,6 +364,17 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
         return EvalValue(&builtin_slot(sym.slot));
     }
 
+    if (builtin_only) {
+        /* before the resolver gives it the builtin table's slot: the
+         * parser's constant evaluation of a const bound to a builtin (#94),
+         * in a pure function whose parameter may have the builtin's name -
+         * the builtin, not that binding. Not a const builtin (`box`): the
+         * lookup below, which a const scope cannot answer either. */
+        const auto it = EvalContext::const_builtins.find(uid);
+        if (it != EvalContext::const_builtins.end())
+            return it->second.get();
+    }
+
     while (ctx) {
 
         LValue *lval = ctx->lookup(this);
@@ -358,27 +397,39 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
  * unresolved name. Keep the two in lockstep - the FuncObject ctor's capture
  * snapshot must read a captured name EXACTLY as an Identifier read would.
  */
-EvalValue read_sym(EvalContext *ctx, SymKind kind, int slot,
-                   const UniqueId *uid)
+/*
+ * #114: see the declaration. The SAME dispatch as read_sym, handing
+ * back the slot instead of an EvalValue wrapping it; null where
+ * read_sym would have answered `UndefinedId`.
+ *
+ * ⛔ THE TWO MUST AGREE, and the shape that keeps them agreeing is
+ * that read_sym is written IN TERMS OF THIS ONE below - there is one
+ * dispatch, not two copies free to drift. The unbound-global throw
+ * lives here, so both callers get it.
+ */
+LValue *read_sym_lv(EvalContext *ctx, SymKind kind, int slot,
+                    const UniqueId *uid)
 {
     if (kind == SymKind::local && ctx->frame)
-        return EvalValue(&ctx->frame->at(slot));
+        return &ctx->frame->at(slot);
 
     if (kind == SymKind::global && ctx->gfuncs) {
         if (ctx->gfuncs->defined[slot])
-            return EvalValue(&ctx->gfuncs->slots[slot]);
+            return &ctx->gfuncs->slots[slot];
 
-        return UndefinedId{uid->val};
+        /* See Identifier::do_eval: declared (it has a slot) but not bound. */
+        throw UnboundSymbolEx(
+            intern_msg("'" + std::string(uid->val) + "' is not bound yet"));
     }
 
     if (kind == SymKind::capture && ctx->captures)
-        return EvalValue(&(*ctx->captures)[slot]);
+        return &(*ctx->captures)[slot];
 
     if (kind == SymKind::builtin) {
         if (ctx && ctx->const_ctx && !builtin_is_const(slot))
-            return UndefinedId{uid->val};
+            return nullptr;              /* read_sym: UndefinedId */
 
-        return EvalValue(&builtin_slot(slot));
+        return &builtin_slot(slot);
     }
 
     while (ctx) {
@@ -386,10 +437,19 @@ EvalValue read_sym(EvalContext *ctx, SymKind kind, int slot,
         LValue *lval = ctx->lookup(uid);
 
         if (lval)
-            return EvalValue(lval);
+            return lval;
 
         ctx = ctx->parent;
     }
+
+    return nullptr;                      /* read_sym: UndefinedId */
+}
+
+EvalValue read_sym(EvalContext *ctx, SymKind kind, int slot,
+                   const UniqueId *uid)
+{
+    if (LValue *lv = read_sym_lv(ctx, kind, slot, uid))
+        return EvalValue(lv);
 
     return UndefinedId{uid->val};
 }
@@ -397,10 +457,9 @@ EvalValue read_sym(EvalContext *ctx, SymKind kind, int slot,
 /*
  * return / break / continue no longer use C++ exceptions: they set the
  * EvalContext's FlowState (see eval.h) and unwind via ordinary returns.
- * rethrow is genuinely exceptional (it re-throws a real exception object from
- * inside a catch block) and stays an exception.
+ * rethrow is genuinely exceptional: it raises the handled exception again
+ * (FlowState::handling) as a real RuntimeException, at the `rethrow`.
  */
-struct RethrowEx { Loc start; Loc end; };
 
 static inline EvalValue
 do_func_return(EvalValue &&tmp, Construct *retExpr)
@@ -416,7 +475,31 @@ do_func_return(EvalValue &&tmp, Construct *retExpr)
     return RValue(tmp);
 }
 
-static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt);
+static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt,
+                                     int site_arg = -1);
+
+/*
+ * A function run at COMPILE time (const-eval) may build a value that
+ * contains itself. Nothing it built reaches the program as it is - a
+ * constant is a frozen copy, a folded `var` a fresh copy per evaluation -
+ * so whatever cycle it returns, or leaves in its own locals, is dropped by
+ * the compiler, where no program can break it. Keep each such value until
+ * the program ends (cyclewalk.h, cyc_keep_until_exit), which frees it. Only
+ * a value from which a cycle can be reached is kept.
+ */
+static void const_eval_keep_cycles(const EvalContext &args_ctx,
+                                   const Frame *frame,
+                                   const EvalValue &result)
+{
+    cyc_keep_if_cyclic(result);
+    std::vector<std::pair<const UniqueId *, const LValue *>> syms;
+    args_ctx.collect_symbols(syms);
+    for (const auto &s : syms)
+        cyc_keep_if_cyclic(s.second->get());
+    if (frame)
+        for (int i = 0; i < frame->size; i++)
+            cyc_keep_if_cyclic(frame->slots[i].get());
+}
 
 /*
  * Bind one parameter. When `frame` is set (the function was resolved), the
@@ -428,6 +511,42 @@ static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt);
  *
  * The param is a FuncDescriptor::ParamDesc - the descriptor's parse-time
  * snapshot of the param Identifier - so binding reads no AST node.
+ *
+ * `site_arg` (RULE 2, 2026-09-20): the index of the CALL-SITE ARGUMENT this
+ * bind consumes, for the coercion's throw to carry (Exception::bind_arg) -
+ * only the two call-site overloads (argument expressions, the VM's arg run)
+ * pass it; a builtin CALLBACK's bind passes -1, because its parameter index
+ * names no argument of the builtin call the caret will land on (watched:
+ * `sort(a, func(int x, int y) ...)` over a dyn string carets sort's whole
+ * argument list in every engine, and must keep doing so).
+ */
+/* RULE 1: binding none to a parameter not declared `opt` (eval.h) */
+TypeErrorEx none_bind_error(const UniqueId *param, int site_arg)
+{
+    std::string m = "parameter '";
+    m += param->val;
+    m += "' is not 'opt' and cannot be none";
+    TypeErrorEx ex(intern_msg(m));
+    ex.bind_arg = site_arg;
+    return ex;
+}
+
+void throw_none_bind(const UniqueId *param, int site_arg)
+{
+    throw none_bind_error(param, site_arg);
+}
+
+/*
+ * A parameter's binding is never const at run time: a `const` parameter
+ * is one the body may not REASSIGN, which the resolver refuses at compile
+ * time, and the value it holds is the caller's (an array a `const a` is
+ * bound to is the caller's mutable array, as in the VM, whose binds know
+ * no const). Bound const, the tree-walker's in-place builtins refused it -
+ * `append(a, 9)` raised CannotChangeConstEx and `sort(a)` sorted a copy,
+ * where the VM changed the caller's array (RULE 2) - and a builtin
+ * callback evaluated at compile time could not reassign its own
+ * parameters, which it may at run time. (What a deeper `const` should
+ * protect is plans/immutable-views.md.)
  */
 static inline void
 bind_param(EvalContext *args_ctx,
@@ -435,15 +554,29 @@ bind_param(EvalContext *args_ctx,
            int idx,
            const FuncDescriptor::ParamDesc &param,
            EvalValue val,
-           bool is_const)
+           int site_arg,
+           bool check_fit)
 {
+    /* RULE 1: a non-opt parameter never holds none - refused here, at the
+     * bind, before any coercion (the VM's bind_fault walks the same
+     * order). An omitted trailing parameter is `opt` by construction. */
+    if (!param.opt && val.is<NoneVal>())
+        throw_none_bind(param.name, site_arg);
     if (param.decl_type == DeclType::f || param.decl_type == DeclType::i)
-        val = coerce_to_decl_type(val, param.decl_type);
+        val = coerce_to_decl_type(val, param.decl_type, site_arg);
+    /* #49: a value the static check let through (a dyn) misfits a typed
+     * parameter - checked where the call may carry one (`check_fit`:
+     * CallExpr::check_args at a call site; every callback bind) */
+    else if (check_fit && param.fit && !val.is<NoneVal>()) {
+        FitMisfit m;
+        if (!value_enters(val, *param.fit, m))
+            throw param_fit_error(param.name, *param.fit, m, site_arg);
+    }
 
     if (frame) {
-        frame->at(idx) = LValue(move(val), is_const);
+        frame->at(idx) = LValue(std::move(val), false);
     } else {
-        args_ctx->emplace(param.name, move(val), is_const);
+        args_ctx->emplace(param.name, std::move(val), false);
     }
 }
 
@@ -463,25 +596,41 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
                     Frame *frame,
-                    size_t min_args)   /* precomputed: FuncDescriptor::min_args */
+                    size_t min_args,   /* precomputed: FuncDescriptor::min_args */
+                    bool check_fit)
 {
+    /*
+     * RULE 2: EVERY argument is evaluated, left to right, before the arity
+     * check and before any bind - the order the VM's call ops have (the
+     * argument run is staged before the call op runs). This loop used to
+     * check the arity first and evaluate each argument just before ITS
+     * bind, so a later argument's side effect was skipped when an arity
+     * error or an earlier bind refused - a difference only the tree-walker
+     * had. The values live in a small inline buffer: no allocation for a
+     * call of up to 8 arguments.
+     */
+    const size_t nargs = args.size();
+    EvalValue small[8];
+    std::vector<EvalValue> big;
+    EvalValue *vals = small;
+    if (nargs > 8) {
+        big.resize(nargs);
+        vals = big.data();
+    }
+    for (size_t i = 0; i < nargs; i++)
+        vals[i] = RValue(args[i]->eval(ctx));
+
     const size_t nparams = funcParams.size();
-    if (args.size() > nparams || args.size() < min_args)
+    if (nargs > nparams || nargs < min_args)
         throw InvalidNumberOfArgsEx();
 
     for (size_t i = 0; i < nparams; i++) {
-        /*
-         * A param's binding is const iff it was declared `const` - NOT merely
-         * because we are const-evaluating. This lets a (pure) function reassign
-         * its own by-value parameters during const-eval, while a `const` param
-         * stays immutable everywhere.
-         */
         bind_param(
             args_ctx, frame, static_cast<int>(i),
             funcParams[i],
-            i < args.size() ? RValue(args[i]->eval(ctx)) : EvalValue(),
-            funcParams[i].cnst
-        );
+            i < nargs ? std::move(vals[i]) : EvalValue(),
+            static_cast<int>(i),             /* a call-site bind */
+            check_fit);
     }
 }
 
@@ -491,7 +640,8 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
                     Frame *frame,
-                    size_t min_args)
+                    size_t min_args,
+                    bool check_fit)
 {
     const size_t nparams = funcParams.size();
     if (args.size() > nparams || args.size() < min_args)
@@ -501,8 +651,9 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
         bind_param(
             args_ctx, frame, static_cast<int>(i),
             funcParams[i],
-            i < args.size() ? args[i] : EvalValue(), ctx->const_ctx
-        );
+            i < args.size() ? args[i] : EvalValue(),
+            /*site_arg=*/-1,                 /* a callback's bind */
+            check_fit);
     }
 }
 
@@ -525,7 +676,8 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
                     Frame *frame,
-                    size_t min_args)
+                    size_t min_args,
+                    bool check_fit)
 {
     const size_t nparams = funcParams.size();
     if (args.size() > nparams || args.size() < min_args)
@@ -535,11 +687,13 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
         if (i < args.size())
             bind_param(args_ctx, frame, static_cast<int>(i),
                        funcParams[i],
-                       args[i], ctx->const_ctx);
+                       args[i],
+                       static_cast<int>(i),     /* a call-site bind */
+                       check_fit);
         else
             bind_param(args_ctx, frame, static_cast<int>(i),
                        funcParams[i],
-                       EvalValue(), ctx->const_ctx);
+                       EvalValue(), /*site_arg=*/-1, check_fit);
     }
 }
 
@@ -549,7 +703,8 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
                     Frame *frame,
-                    size_t min_args)
+                    size_t min_args,
+                    bool check_fit)
 {
     const size_t nparams = funcParams.size();
     if (nparams < 1 || min_args > 1)
@@ -557,8 +712,9 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
 
     for (size_t i = 0; i < nparams; i++)
         bind_param(args_ctx, frame, static_cast<int>(i),
-                       funcParams[i],
-                   i == 0 ? arg : EvalValue(), ctx->const_ctx);
+                   funcParams[i],
+                   i == 0 ? arg : EvalValue(),
+                   /*site_arg=*/-1, check_fit);  /* a callback's bind */
 }
 
 
@@ -568,7 +724,8 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
                     Frame *frame,
-                    size_t min_args)
+                    size_t min_args,
+                    bool check_fit)
 {
     const size_t nparams = funcParams.size();
     if (nparams < 2 || min_args > 2)
@@ -576,9 +733,9 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
 
     for (size_t i = 0; i < nparams; i++)
         bind_param(args_ctx, frame, static_cast<int>(i),
-                       funcParams[i],
+                   funcParams[i],
                    i == 0 ? args.first : i == 1 ? args.second : EvalValue(),
-                   ctx->const_ctx);
+                   /*site_arg=*/-1, check_fit);  /* a callback's bind */
 }
 
 /*
@@ -608,7 +765,7 @@ vm_capture_frame(Exception &e, FuncObject &obj, const Chunk *call_ck,
         /* profile #3: the LAZY frame - no strings at capture time (the
          * descriptor outlives the render: AST/VmProgram-owned, and both are
          * declared OUTSIDE the driver's try; format_backtrace stringifies). */
-        e.backtrace.emplace_back(obj.func, cs);
+        e.push_frame(obj.func, cs);
     } else {
         /* A COMPILE-TIME fold (AutoConst / the inliner's refold) may run a
          * THROWAWAY clone whose descriptor dies with the fold, while the
@@ -621,7 +778,7 @@ vm_capture_frame(Exception &e, FuncObject &obj, const Chunk *call_ck,
         ps.reserve(d->params.size());
         for (const auto &p : d->params)
             ps.push_back(string(p.name->val));
-        e.backtrace.emplace_back(
+        e.push_frame(
             !d->display_name.empty()
                 ? d->display_name
                 : d->name ? string(d->name->val) : "<lambda>",
@@ -648,6 +805,95 @@ vm_capture_frame(Exception &e, FuncObject &obj, const Chunk *call_ck,
  * every other caller (a builtin callback, the tree-walker) leaves it false, so
  * the signal is converted back to a C++ throw here for them.
  */
+/* inference's template rule (declare_funcdecl): a NAMED function with an
+ * un-annotated, non-dyn, non-opt parameter */
+static bool pt_is_template(const FuncDeclStmt *fd)
+{
+    if (!fd->id || !fd->params)
+        return false;
+    for (const auto &p : fd->params->elems)
+        if (!p->opt_mod && !p->dyn_mod && p->decl_type == DeclType::none)
+            return true;
+    return false;
+}
+
+/* a call the PARSER makes itself - not one inside a function's body,
+ * which runs as that function runs */
+static bool pt_parser_level(const EvalContext *ctx)
+{
+    for (const EvalContext *c = ctx; c; c = c->parent)
+        if (c->func_ctx)
+            return false;
+    return true;
+}
+
+/*
+ * Question 5: a user function run at PARSE time runs a copy of itself
+ * type-inferred as the program types it (parser.cpp) - unless it is such a
+ * copy already. The switch is on the parser's const root alone
+ * (EvalContext::parse_typed), so the call is a const-eval one and the
+ * function has its tree. A call the parser makes (`pt_call`) runs as
+ * written (pt_typed_written); one a running function makes runs by value
+ * (pt_typed_value), where a TEMPLATE runs untyped, as the program runs one
+ * it reaches through a value. The values are read where the bind put them,
+ * every parameter (an omitted trailing `opt` one is bound to none). True:
+ * `r` is the typed copy's result.
+ */
+static bool pt_try_typed(EvalContext *ctx, FuncObject &obj,
+                         const CallExpr *pt_call, Frame *bindframe,
+                         EvalContext &args_ctx, Loc call_site, EvalValue &r)
+{
+    /* every caller passes its context: a guard */
+    if (!ctx)                           /* INT-COV-EXEMPT: see above */
+        return false;
+    if (!ctx->root->parse_typed || obj.func->parse_typed)
+        return false;
+    if (pt_call)
+        return pt_typed_written(ctx, pt_call, r);
+    if (!obj.func->decl)        /* INT-COV-EXEMPT: parse time has a tree */
+        return false;
+    if (pt_is_template(obj.func->decl))
+        return false;
+    const size_t n = obj.func->params.size();
+    std::vector<EvalValue> vals;
+    vals.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+        if (bindframe)
+            vals.push_back(bindframe->at(static_cast<int_type>(i)).get());
+        else
+            vals.push_back(args_ctx.lookup(obj.func->params[i].name)->get());
+    }
+    return pt_typed_value(obj, vals, call_site, r);
+}
+
+/* An escaping user exception's payload, rendered while the definitions
+ * it names are alive - to the text the driver prints for it */
+static void freeze_exception_payload(ExceptionObject &e)
+{
+    const EvalValue &d = e.get_data();
+    if (!d.is<NoneVal>() && !d.is<SharedStr>())
+        e.set_data(EvalValue(SharedStr(d.get_type()->to_string(d))));
+}
+
+/* ...and the payloads of the exceptions it was raised while handling
+ * (question 12), which the report prints too. A chain node is a clone
+ * only this chain and its clones hold, so freezing it in place is safe. */
+void freeze_exception_chain(RuntimeException &e)
+{
+    for (RuntimeException *c = &e; c; c = c->context.get())
+        if (c->is_exception_object())
+            freeze_exception_payload(*static_cast<ExceptionObject *>(c));
+}
+
+/* Is `ctx` inside a function invocation (its body, or a block of it)? */
+static bool ctx_in_function(const EvalContext *ctx)
+{
+    for (const EvalContext *c = ctx; c; c = c->parent)
+        if (c->func_ctx)
+            return true;
+    return false;
+}
+
 template <class ArgsVecT>
 static EvalValue
 do_func_call(EvalContext *ctx,
@@ -657,10 +903,34 @@ do_func_call(EvalContext *ctx,
              const InlineCtx *call_site_inl = nullptr,
              const Chunk *call_ck = nullptr,
              size_t call_pc = 0,
-             bool as_signal = false)
+             bool as_signal = false,
+             bool check_fit = true,
+             const CallExpr *pt_call = nullptr)
 {
-    /* func_ctx == true gives this call its own FlowState (see eval.h) */
-    EvalContext args_ctx(&obj.capture_ctx, false, true);
+    /* func_ctx == true gives this call its own FlowState (see eval.h).
+     * The parent is the closure's captured ROOT (G2): the empty link context
+     * that used to sit between them passed root's fields through unchanged -
+     * see FuncObject::capture_root. */
+    /*
+     * A closure loaded from a .myv pool has NO root of its own (it was built
+     * before any EvalContext existed - see FuncObject::capture_root). It is
+     * capture-free, so its body reads only globals and builtins, and those
+     * live in the CALLER's root: substituting it keeps the body's lookups
+     * defined instead of handing it a parent-less context whose `gfuncs` is
+     * null. Never taken for a closure the running program created.
+     */
+    EvalContext *croot = obj.capture_root;
+
+    if (!croot && ctx)
+        croot = get_root_ctx(ctx);
+
+    /* #38 B: a const-eval call of a function created in a const scope sees
+     * that scope (lexically), not only the root - FuncObject::const_scope */
+    if (obj.const_scope && ctx && ctx->in_const_eval()
+            && obj.const_scope_alive && *obj.const_scope_alive)
+        croot = obj.const_scope;
+
+    EvalContext args_ctx(croot, false, true);
 
     /*
      * A SymKind::capture reference in the body reads this closure's
@@ -737,12 +1007,24 @@ do_func_call(EvalContext *ctx,
         bindframe = &frame;
     }
 
-    if (!obj.func->params.empty()) {
-        do_func_bind_params(
-            obj.func->params, args, ctx, &args_ctx,
-            bindframe,
-            static_cast<size_t>(obj.func->min_args)
-        );
+    /* EVERY call binds, a parameter-less one included: the bind is what
+     * checks the argument count, and a function with no parameters
+     * called with one (a dyn call, a builtin's callback) used to skip
+     * it here and run - the VM refuses that call (RULE 2) */
+    do_func_bind_params(
+        obj.func->params, args, ctx, &args_ctx,
+        bindframe,
+        static_cast<size_t>(obj.func->min_args),
+        check_fit
+    );
+
+    /* question 5: a parse-time call runs a typed copy (its frame is the
+     * copy's) */
+    {
+        EvalValue r;
+        if (pt_try_typed(ctx, obj, pt_call, bindframe, args_ctx,
+                         call_site, r))
+            return r;
     }
 
     try {
@@ -756,7 +1038,10 @@ do_func_call(EvalContext *ctx,
         Construct *eb;
         if (!vm_ck && obj.func->decl
                 && (eb = func_expr_body(obj.func->decl)) != nullptr) {
-            return do_func_return(eb->eval(&args_ctx), eb);
+            EvalValue r = do_func_return(eb->eval(&args_ctx), eb);
+            if (croot && croot->in_const_eval())
+                const_eval_keep_cycles(args_ctx, bindframe, r);
+            return r;
         }
 
         /*
@@ -771,7 +1056,21 @@ do_func_call(EvalContext *ctx,
         } else {
             /* Tree-walk the body. After the -vm AST teardown every callable
              * function has a chunk and decl is null - reaching here without
-             * one is a compiler bug, not a fallback. */
+             * one is a compiler bug, not a fallback.
+             *
+             * #122 TIER 2: unless the bytecode came off a DISK, where it is
+             * not a compiler bug but hostile input - a descriptor whose
+             * has-chunk bit was cleared. The loader refuses that shape
+             * (serialize.cpp, tier 1) whenever the is-template-base bit
+             * still disagrees with it; a mutation that clears BOTH is
+             * self-consistent and reaches here, so this is the residue.
+             * It must NOT be the ML_CHECK below and nothing else: that one
+             * is gated on ASSERTS, and the build with the most to lose - an
+             * optimized release running a shipped image - is exactly the
+             * build that compiles it out and dereferences the null. */
+            ML_UNTRUSTED_CHECK(obj.func->decl,
+                               "a called function has neither a chunk nor a "
+                               "body");
             ML_CHECK_MSG(obj.func->decl,
                          "call to a chunk-less function after AST teardown");
             obj.func->decl->body->eval(&args_ctx);
@@ -780,8 +1079,26 @@ do_func_call(EvalContext *ctx,
     } catch (Exception &e) {
         /* The tree-walker / expression-body path (a real C++ throw). Record
          * this frame + any inlined-call virtual frames, then re-throw. */
+        const bool cev = ctx && ctx->in_const_eval();
         vm_capture_frame(e, obj, call_ck, call_pc, call_site, call_site_inl,
-                         ctx && ctx->in_const_eval());
+                         cev);
+        /*
+         * An exception LEAVING A CONSTANT EVALUATION - this call was made
+         * by the compiler itself (the parser, AutoConst), not by a
+         * function it is running - is a compile error no script `try` can
+         * handle, and all that is left to do with a thrown struct is to
+         * print it. It is rendered HERE: the nodes the compiler holds die
+         * as the exception unwinds - a function literal in a parse
+         * function's local, a statement a fold took out of its block - and
+         * one of them may own the struct's definition, which the report
+         * then read freed (`var x = (pure func() { struct E { int n; }
+         * throw E(1); })();`, a heap-use-after-free in every engine).
+         * A call a running function made is not frozen: a `try` of that
+         * function may still catch the struct and read its fields.
+         */
+        if (cev && !ctx_in_function(ctx))
+            if (auto *re = dynamic_cast<RuntimeException *>(&e))
+                freeze_exception_chain(*re);
         throw;
     }
 
@@ -797,7 +1114,7 @@ do_func_call(EvalContext *ctx,
         vm_capture_frame(*g_vm_exc_pending, obj, call_ck, call_pc, call_site,
                          call_site_inl);
         if (!as_signal) {
-            std::unique_ptr<RuntimeException> ex = move(g_vm_exc_pending);
+            std::unique_ptr<RuntimeException> ex = std::move(g_vm_exc_pending);
             ex->rethrow();
         }
         return none;                 /* signal in flight; caller checks it */
@@ -805,8 +1122,12 @@ do_func_call(EvalContext *ctx,
 
     FlowState &fs = *args_ctx.flow;
 
+    if (croot && croot->in_const_eval())
+        const_eval_keep_cycles(args_ctx, bindframe,
+                               fs.type == FlowState::ret ? fs.value : none);
+
     if (fs.type == FlowState::ret)
-        return move(fs.value);
+        return std::move(fs.value);
 
     return none;
 }
@@ -815,11 +1136,17 @@ EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
                     const vector<EvalValue> &args)
 {
-    EvalValue r;
-    if (vm_try_invoke(ctx, obj, args.data(), args.size(), r))
-        return r;
-
     return do_func_call(ctx, obj, args);
+}
+
+/* Question 5: the typed copy of a function a parse-time call runs
+ * (pt_typed_value, parser.cpp), with the call's own site for its frame */
+EvalValue pt_invoke(EvalContext *ctx,
+                    FuncObject &obj,
+                    const vector<EvalValue> &args,
+                    Loc call_site)
+{
+    return do_func_call(ctx, obj, args, call_site);
 }
 
 /* The VM's native-call entry (CallV): the args are already evaluated into a
@@ -832,17 +1159,27 @@ EvalValue vm_call_func(EvalContext *ctx,
                        size_t n,
                        const Chunk *ck, size_t pc)
 {
-    return do_func_call(ctx, obj, VmArgs{argslots, n}, Loc(), nullptr, ck, pc,
-                        /*as_signal=*/true);
+    try {
+        /* the bind's fit check (#49) is CheckNoneArgsV's, in front of the
+         * call op where the call may need one: not repeated here */
+        return do_func_call(ctx, obj, VmArgs{argslots, n}, Loc(), nullptr,
+                            ck, pc, /*as_signal=*/true, /*check_fit=*/false);
+    } catch (Exception &e) {
+        /* the bind runs BEFORE do_func_call's try, so its throw escapes
+         * loc-less: the argument list's caret, as the tree-walker's
+         * CallExpr::do_eval stamps it (an interpreted op passes its chunk;
+         * the JIT's boundary path passes none and stamps in its own
+         * conveyance) */
+        if (ck)
+            vm_stamp_setup_caret(e, *ck, pc);
+        throw;
+    }
 }
 
 EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
                     const EvalValue &arg)
 {
-    EvalValue r;
-    if (vm_try_invoke(ctx, obj, &arg, 1, r))
-        return r;
     return do_func_call(ctx, obj, arg);
 }
 
@@ -850,10 +1187,6 @@ EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
                     const pair<EvalValue, EvalValue> &args)
 {
-    EvalValue r;
-    const EvalValue argv[2] = { args.first, args.second };
-    if (vm_try_invoke(ctx, obj, argv, 2, r))
-        return r;
     return do_func_call(ctx, obj, args);
 }
 
@@ -885,7 +1218,7 @@ pure_cache_call(EvalContext *ctx, FuncObject &obj,
                 const vector<EvalValue> &vals, Loc call_site,
                 const InlineCtx *inl,
                 const Chunk *ck = nullptr, size_t pc = 0,
-                bool as_signal = false)
+                bool as_signal = false, bool check_fit = true)
 {
     PureCache &cache = ctx->frame->ensure_pure_cache();
     PureCacheKey key{ obj.func, vals };
@@ -894,7 +1227,7 @@ pure_cache_call(EvalContext *ctx, FuncObject &obj,
         return it->second;
 
     EvalValue r = do_func_call(ctx, obj, vals, call_site, inl, ck, pc,
-                               as_signal);
+                               as_signal, check_fit);
     /* Inc v2: a signaled (cross-frame unwinding) call must NOT be cached - its
      * result is a sentinel. Only reachable with as_signal (a VM caller); the
      * tree-walker's cached_call passes false, so do_func_call C++-throws and
@@ -902,24 +1235,26 @@ pure_cache_call(EvalContext *ctx, FuncObject &obj,
     if (g_vm_exc_pending)
         return r;
     if (r.get_type()->t < Type::t_str)
-        cache.emplace(move(key), r);
+        cache.emplace(std::move(key), r);
     return r;
 }
 
 static EvalValue
 cached_call(EvalContext *ctx, FuncObject &obj,
             const vector<unique_ptr<Construct>> &args,
-            Loc call_site, const InlineCtx *inl)
+            Loc call_site, const InlineCtx *inl, bool check_fit)
 {
     if (!ctx->frame || !g_pure_cache_enabled)
-        return do_func_call(ctx, obj, args, call_site, inl);
+        return do_func_call(ctx, obj, args, call_site, inl, nullptr, 0,
+                            false, check_fit);
 
     vector<EvalValue> vals;
     vals.reserve(args.size());
     for (const auto &a : args)
         vals.push_back(RValue(a->eval(ctx)));
 
-    return pure_cache_call(ctx, obj, vals, call_site, inl);
+    return pure_cache_call(ctx, obj, vals, call_site, inl, nullptr, 0,
+                           false, check_fit);
 }
 
 /* The VM's CachedCallV: cached_call but the args are already evaluated into the
@@ -930,7 +1265,8 @@ vm_cached_call(EvalContext *ctx, FuncObject &obj,
 {
     if (!ctx->frame || !g_pure_cache_enabled)
         return do_func_call(ctx, obj, VmArgs{argslots, n},
-                            Loc(), nullptr, ck, pc, /*as_signal=*/true);
+                            Loc(), nullptr, ck, pc, /*as_signal=*/true,
+                            /*check_fit=*/false);  /* CheckNoneArgsV's */
 
     vector<EvalValue> vals;
     vals.reserve(n);
@@ -938,10 +1274,12 @@ vm_cached_call(EvalContext *ctx, FuncObject &obj,
         vals.push_back(argslots[i].get());
 
     return pure_cache_call(ctx, obj, vals, Loc(), nullptr, ck, pc,
-                           /*as_signal=*/true);
+                           /*as_signal=*/true, /*check_fit=*/false);
 }
 
-static void stamp_operand_loc(const Construct *c, Exception &e);
+static void stamp_operand_loc(const Construct *c, Exception &e,
+                              const Construct *parent = nullptr);
+static bool is_lvalue_rooted(const Construct *c);
 
 /*
  * Build a struct instance from a (positional, already-desugared) argument list.
@@ -951,12 +1289,61 @@ static void stamp_operand_loc(const Construct *c, Exception &e);
  * the arguments against the field types (for a statically-known callee), so
  * this is the construction, not the validation.
  */
+/* The BoxObj element kind of a declared box element type ('i', 'f', 'b',
+ * 's'), or 0 for a struct (or no) element */
+char box_kind_of(DeclType k)
+{
+    switch (k) {
+    case DeclType::i: return 'i';
+    case DeclType::f: return 'f';
+    case DeclType::b: return 'b';
+    case DeclType::s: return 's';
+    default:          return 0;
+    }
+}
+
+/* Does `v` hold a box of the declared `box<T>` (`a`, its kind box; null
+ * for no element type)? A run-time check for a value a `dyn` laundered. */
+bool box_fits_annot(const EvalValue &v, const TypeAnnot *a)
+{
+    const TypeAnnot *e = a ? a->elem.get() : nullptr;
+    if (v.is<intrusive_ptr<BoxObj>>())
+        return !e || box_kind_of(e->kind) ==
+                     v.get_ref<intrusive_ptr<BoxObj>>()->kind;
+    if (!v.is<intrusive_ptr<StructObject>>())
+        return false;
+    const StructObject &o = *v.get_ref<intrusive_ptr<StructObject>>();
+    return o.boxed && (!e || (e->kind == DeclType::strct
+                              && (!e->strct || e->strct == o.def)));
+}
+
 /* Coerce + runtime-validate one field value. The inferencer already checks a
  * statically-known construction, but this guards a `dyn`-laundered value and
  * makes a parse-time (const) construction type-safe (so it can fold).
- * Non-static: the VM's vm_struct_ctor (vm.cpp) pre-coerces with it (H1). */
+ * Non-static: the VM's vm_struct_ctor (vm.cpp) pre-coerces with it (H1).
+ * `check_fit` (#49): a container or box field's declared element types are
+ * checked too (value_fits) - asked where the construction may carry a
+ * misfit (CallExpr::fit_args, BoxedCtor::fit) and by the generic ctor. */
+static void
+field_fit_check(const FieldDef &fd, const EvalValue &v, Loc s, Loc e)
+{
+    FitMisfit m;
+    ML_CHECK(fd.annot);
+    if (value_enters(v, *fd.annot, m))
+        return;
+    FitSpec spec;
+    spec.annot = fd.annot;
+    spec.place = FitSpec::Place::field;
+    spec.name = fd.name;
+    TypeErrorEx ex = fit_error(spec, m);
+    ex.loc_start = s;
+    ex.loc_end = e;
+    throw ex;
+}
+
 EvalValue
-coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e)
+coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e,
+                    bool check_fit)
 {
     if (v.is<NoneVal>()) {
         if (fd.is_opt)
@@ -985,17 +1372,36 @@ coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e)
                 return v;
             break;
         case FieldKind::f_array:
-            if (v.is<SharedArrayObj>())
+            if (v.is<SharedArrayObj>()) {
+                if (check_fit)
+                    field_fit_check(fd, v, s, e);
                 return v;
+            }
             break;
         case FieldKind::f_dict:
-            if (v.is<intrusive_ptr<DictObject>>())
+            if (v.is<intrusive_ptr<DictObject>>()) {
+                if (check_fit)
+                    field_fit_check(fd, v, s, e);
                 return v;
+            }
             break;
         case FieldKind::f_struct:
-            if (v.is<intrusive_ptr<StructObject>>() &&
-                v.get<intrusive_ptr<StructObject>>()->def->name == fd.struct_ty)
+            /* the declared struct, by identity where the def is known; a
+             * box<P> is a reference, never a P value (#49) */
+            if (v.is<intrusive_ptr<StructObject>>()) {
+                const StructObject &o =
+                    *v.get_ref<intrusive_ptr<StructObject>>();
+                if (!o.boxed && (fd.struct_def ? o.def == fd.struct_def
+                                               : o.def->name == fd.struct_ty))
+                    return v;
+            }
+            break;
+        case FieldKind::f_box:
+            if (box_fits_annot(v, fd.annot.get())) {
+                if (check_fit)
+                    field_fit_check(fd, v, s, e);
                 return v;
+            }
             break;
     }
 
@@ -1004,7 +1410,7 @@ coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e)
 }
 
 /*
- * Native composite types for reflection (see plans/reflection.md). Built once
+ * Native composite types for reflection (see plans/archived/reflection.md). Built once
  * (lazy static, program-lifetime), boxed (they have str/array fields), slots in
  * declaration order. `StructLayout`'s `fields` carries a TypeAnnot of
  * `array<StructField>` so the inferencer types `layout(S).fields[0]` as a
@@ -1043,7 +1449,7 @@ const StructTypeDef *native_struct_layout_def()
             FieldDef f;
             f.name = UniqueId::get(n);
             f.kind = k;
-            f.annot = move(annot);
+            f.annot = std::move(annot);
             f.slot = static_cast<int>(d->fields.size());
             d->fields.push_back(f);
         };
@@ -1100,29 +1506,10 @@ const StructTypeDef *native_struct_type_def()
     return def;
 }
 
-/* Construct a POD struct from already-evaluated field VALUES (the VM's
- * StructCtorV, whose field args were compiled into a register run). Mirrors
- * construct_struct's POD path but takes values, not an ExprList to eval. The
- * codegen emits StructCtorV only when nargs == nfields and every arg is a typed
- * scalar the inferencer proved assignable, so coerce_struct_field cannot throw
- * here; a defensive throw is caught + given the construction's loc by the VM
- * handler (empty locs below). */
-intrusive_ptr<StructObject>
-construct_struct_from_values(StructTypeDef *def,
-                            const EvalValue *vals, size_t n)
-{
-    auto obj = make_intrusive<StructObject>(def);
-    for (size_t i = 0; i < n; i++) {
-        EvalValue v = coerce_struct_field(def->fields[i], vals[i],
-                                          Loc(), Loc());
-        obj->pod_set(static_cast<int>(i), v);
-    }
-    return intrusive_ptr<StructObject>(obj);
-}
-
 intrusive_ptr<StructObject>
 construct_struct_boxed_from_values(StructTypeDef *def, const EvalValue *vals,
-                                  size_t nargs, const ArgLoc *locs)
+                                  size_t nargs, const ArgLoc *locs,
+                                  bool check_fit)
 {
     const size_t nfields = def->fields.size();
     auto obj = make_intrusive<StructObject>(def);
@@ -1151,7 +1538,8 @@ construct_struct_boxed_from_values(StructTypeDef *def, const EvalValue *vals,
         const Loc e = (i < nargs && locs) ? locs[i].end : Loc();
         /* an omitted trailing opt field binds to none */
         EvalValue v = i < nargs ? vals[i] : EvalValue();
-        obj->fields.emplace_back(coerce_struct_field(fd, move(v), s, e), false);
+        obj->fields.emplace_back(
+            coerce_struct_field(fd, std::move(v), s, e, check_fit), false);
     }
     return intrusive_ptr<StructObject>(obj);
 }
@@ -1178,7 +1566,8 @@ EvalValue vm_make_struct_array(StructTypeDef *def, size_t n,
 }
 
 static EvalValue
-construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
+construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args,
+                 bool check_fit)
 {
     const size_t nfields = def->fields.size();
     const size_t nargs = args->elems.size();
@@ -1216,7 +1605,8 @@ construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
         /* an omitted trailing opt field binds to none */
         EvalValue v = i < nargs ? RValue(args->elems[i]->eval(ctx))
                                 : EvalValue();
-        obj->fields.emplace_back(coerce_struct_field(fd, move(v), s, e), false);
+        obj->fields.emplace_back(
+            coerce_struct_field(fd, std::move(v), s, e, check_fit), false);
     }
 
     return intrusive_ptr<StructObject>(obj);
@@ -1264,8 +1654,10 @@ EvalValue construct_struct_v(StructTypeDef *def, const ArgLocs *al,
         const Loc e = i < nargs ? al->arg(i)->end : al->end;
         /* an omitted trailing opt field binds to none */
         EvalValue v = i < nargs ? RValue(args[i]) : EvalValue();
-        obj->fields.emplace_back(coerce_struct_field(fd, move(v), s, e),
-                                 false);
+        /* a dyn callee: nothing was checked at compile time (#49) */
+        obj->fields.emplace_back(
+            coerce_struct_field(fd, std::move(v), s, e, /*check_fit=*/true),
+            false);
     }
 
     return EvalValue(intrusive_ptr<StructObject>(obj));
@@ -1298,6 +1690,381 @@ void pod_store_field(const FieldDef &f, char *base, const EvalValue &v)
     }
 }
 
+static inline void
+apply_compound_op(EvalValue &acc, const EvalValue &rhs, Op op);
+
+/* A POD field's value from raw struct bytes - StructObject::pod_get's read,
+ * for bytes no StructObject owns (a POD place). */
+static EvalValue pod_load_field(const FieldDef &f, const char *base)
+{
+    const char *p = base + f.offset;
+    if (f.kind == FieldKind::f_bool)
+        return EvalValue(static_cast<unsigned char>(*p) != 0);
+    if (f.kind == FieldKind::f_int) {
+        int_type v;
+        std::memcpy(&v, p, sizeof v);
+        return EvalValue(v);
+    }
+    if (f.kind == FieldKind::f_float) {
+        float_type v;
+        std::memcpy(&v, p, sizeof v);
+        return EvalValue(v);
+    }
+    /* else an inline POD struct: a POD field is nothing else */
+    StructTypeDef *nd = const_cast<StructTypeDef *>(f.struct_def);
+    auto obj = make_intrusive<StructObject>(nd);
+    std::memcpy(obj->bytes.data(), p, nd->size);
+    return intrusive_ptr<StructObject>(obj);
+}
+
+/* STRUCT VALUE SEMANTICS (eval.h) */
+StructObject &struct_own(LValue *&holder)
+{
+    {
+        /* a CLASS instance (or a boxed struct) is a reference: every
+         * holder writes the one object, whoever else holds it - and a
+         * constant's is read-only through every alias, so the write is
+         * refused, as a mutating builtin on a constant array is */
+        StructObject &o =
+            *holder->get().get_ref<intrusive_ptr<StructObject>>();
+        if (o.is_ref()) {
+            if (o.is_readonly())
+                throw CannotChangeConstEx();
+            return o;
+        }
+    }
+    if (holder->is_borrowed()) {
+        /* the caller's slot holds the counted reference: a write here
+         * would change the caller's struct, whatever the count says */
+        intrusive_ptr<StructObject> c = make_intrusive<StructObject>(
+            *holder->get().get_ref<intrusive_ptr<StructObject>>());
+        c->clear_readonly();
+        StructObject &r = *c;
+        holder->frame_release();                /* abandons the borrow */
+        holder->put(EvalValue(std::move(c)));
+        return r;
+    }
+    holder = holder->write_target();
+    intrusive_ptr<StructObject> &p =
+        holder->getval<intrusive_ptr<StructObject>>();
+    if (p.use_count() == 1 && !p->is_readonly())
+        return *p;
+    /* shallow: the fields are copied, a nested struct shares its object
+     * until a write owns it too, an array or a dict stays shared - they
+     * are references - and keeps its own read-only flag */
+    intrusive_ptr<StructObject> c = make_intrusive<StructObject>(*p);
+    c->clear_readonly();
+    p = std::move(c);
+    return *p;
+}
+
+void struct_own_if(LValue *&holder)
+{
+    if (holder->is<intrusive_ptr<StructObject>>())
+        struct_own(holder);
+}
+
+/* BOXES (eval.h) */
+
+static const char *box_kind_name(char k)
+{
+    switch (k) {
+    case 'i': return "int";
+    case 'f': return "float";
+    case 'b': return "bool";
+    default:  return "str";
+    }
+}
+
+/* the name a run-time value gives an error message about a box */
+static std::string box_value_name(const EvalValue &v)
+{
+    if (v.is<intrusive_ptr<StructObject>>()) {
+        const StructObject &o = *v.get_ref<intrusive_ptr<StructObject>>();
+        if (o.boxed)
+            return std::string("box<") + o.def->name->val + ">";
+        return o.def->name->val;
+    }
+    if (v.is<intrusive_ptr<BoxObj>>())
+        return std::string("box<") +
+               box_kind_name(v.get_ref<intrusive_ptr<BoxObj>>()->kind) + ">";
+    return runtime_type_name(v);
+}
+
+/* "a str", "an int", "none" - a value named in a box error message */
+static std::string box_value_phrase(const EvalValue &v)
+{
+    if (v.is<NoneVal>())
+        return "none";
+    const std::string n = box_value_name(v);
+    const bool vowel = !n.empty()
+        && std::string("aeiouAEIOU").find(n[0]) != std::string::npos;
+    return (vowel ? "an " : "a ") + n;
+}
+
+[[noreturn]] static void box_not_a_box(const EvalValue &v)
+{
+    throw TypeErrorEx(intern_msg("'*' needs a box, not " +
+                                 box_value_phrase(v)));
+}
+
+EvalValue box_make(const EvalValue &v)
+{
+    switch (v.get_type()->t) {
+    case Type::t_int:
+        return EvalValue(make_intrusive<BoxObj>(v, 'i'));
+    case Type::t_float:
+        return EvalValue(make_intrusive<BoxObj>(v, 'f'));
+    case Type::t_bool:
+        return EvalValue(make_intrusive<BoxObj>(v, 'b'));
+    case Type::t_str:
+        return EvalValue(make_intrusive<BoxObj>(v, 's'));
+    case Type::t_none:
+        throw TypeErrorEx("box() of none: box the value it holds");
+    case Type::t_struct: {
+        const StructObject &o = *v.get_ref<intrusive_ptr<StructObject>>();
+        if (o.is_ref())
+            return v;                   /* a class instance or a box */
+        auto b = make_intrusive<StructObject>(o,
+                                              StructObject::value_copy_t());
+        b->boxed = true;
+        b->ident = class_ident_next();
+        return EvalValue(std::move(b));
+    }
+    default:
+        return v;                       /* a reference passes through */
+    }
+}
+
+EvalValue box_load(const EvalValue &b)
+{
+    if (b.is<intrusive_ptr<BoxObj>>())
+        return b.get_ref<intrusive_ptr<BoxObj>>()->v;
+    if (b.is<intrusive_ptr<StructObject>>()) {
+        const StructObject &o = *b.get_ref<intrusive_ptr<StructObject>>();
+        if (o.boxed)
+            return EvalValue(make_intrusive<StructObject>(
+                o, StructObject::value_copy_t()));
+    }
+    box_not_a_box(b);
+}
+
+EvalValue box_load_want(const EvalValue &b, int want,
+                        const StructTypeDef *def)
+{
+    if (want == 0)
+        return box_load(b);
+    static const char kinds[] = { 0, 'i', 'f', 'b', 's' };
+    bool ok;
+    if (b.is<intrusive_ptr<BoxObj>>())
+        ok = want < 5 && b.get_ref<intrusive_ptr<BoxObj>>()->kind
+                         == kinds[want];
+    else if (b.is<intrusive_ptr<StructObject>>()) {
+        const StructObject &o = *b.get_ref<intrusive_ptr<StructObject>>();
+        ok = want == 5 && o.boxed && o.def == def;
+    } else {
+        box_not_a_box(b);
+    }
+    if (!ok) {
+        const std::string expect = want == 5
+            ? std::string(def->name->val) : box_kind_name(kinds[want]);
+        throw TypeErrorEx(intern_msg("'*' expected a box<" + expect +
+                                     ">, got " + box_value_phrase(b)));
+    }
+    return box_load(b);
+}
+
+void box_store(const EvalValue &b, const EvalValue &v)
+{
+    if (b.is<intrusive_ptr<BoxObj>>()) {
+        BoxObj &o = *b.get_ref<intrusive_ptr<BoxObj>>();
+        if (o.readonly)
+            throw CannotChangeConstEx();
+        switch (o.kind) {
+        case 'i':
+            if (v.is<int_type>() || v.is<bool>()) {
+                o.v = coerce_to_decl_type(v, DeclType::i);
+                return;
+            }
+            break;
+        case 'f':
+            if (v.is<float_type>() || v.is<int_type>() || v.is<bool>()) {
+                o.v = coerce_to_decl_type(v, DeclType::f);
+                return;
+            }
+            break;
+        case 'b':
+            if (v.is<bool>()) {
+                o.v = v;
+                return;
+            }
+            break;
+        default:
+            if (v.is<SharedStr>()) {
+                o.v = v;
+                return;
+            }
+            break;
+        }
+        throw TypeErrorEx(intern_msg(std::string("a box<") +
+            box_kind_name(o.kind) + "> cannot hold " +
+            box_value_phrase(v)));
+    }
+    if (b.is<intrusive_ptr<StructObject>>()) {
+        StructObject &o = *b.get_ref<intrusive_ptr<StructObject>>();
+        if (o.boxed) {
+            if (o.readonly)
+                throw CannotChangeConstEx();
+            if (v.is<intrusive_ptr<StructObject>>()) {
+                const StructObject &src =
+                    *v.get_ref<intrusive_ptr<StructObject>>();
+                if (src.def == o.def && !src.is_ref()) {
+                    if (&src != &o) {
+                        o.fields = src.fields;
+                        o.bytes = src.bytes;
+                    }
+                    return;
+                }
+            }
+            throw TypeErrorEx(intern_msg(std::string("a box<") +
+                o.def->name->val + "> cannot hold " +
+                box_value_phrase(v)));
+        }
+    }
+    box_not_a_box(b);
+}
+
+/*
+ * POD PLACES (eval.h). The walk only ever enters bytes it will STORE into,
+ * so the flat array is detached on the way in (a slice made standalone, an
+ * alias's slices cloned), exactly as flat_store_core detaches it for a
+ * whole-element store; a rooted POD instance is entered only after its
+ * holder OWNS it (struct_own), so the bytes are its alone.
+ */
+bool pod_place_elem(LValue *blv, const EvalValue &key, PodPlace &out)
+{
+    if (!blv->is<SharedArrayObj>())
+        return false;
+    SharedArrayObj &arr = blv->getval<SharedArrayObj>();
+    if (arr.skind() != SharedArrayObj::Storage::structs ||
+        blv->is_const_var() || arr.is_readonly())
+        return false;
+
+    /* TypeArr::subscript's checks, in its order, loc-less */
+    if (!key.is<int_type>())
+        throw TypeErrorEx("Expected integer as subscript");
+    int_type idx = key.get<int_type>();
+    ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
+    if (idx < 0)
+        idx += arr.size();
+    if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+        throw OutOfBoundsEx();
+
+    if (arr.is_slice())
+        arr.materialize_slice();
+    else if (arr.use_count() > 1)
+        arr.clone_aliased_slices(arr.offset() + idx);
+    arr.invalidate_hash();
+
+    auto &sv = arr.flat_structs();
+    out.bytes = sv.buf.data() + (arr.offset() + idx) * sv.stride;
+    out.def = sv.def;
+    return true;
+}
+
+bool pod_place_step(PodPlace &p, const UniqueId *memUid)
+{
+    const int slot = p.def->slot_of(memUid);
+    if (slot < 0)
+        return false;
+    /* a POD struct's struct field is an inline POD struct (compute_layout) */
+    const FieldDef &f = p.def->fields[static_cast<size_t>(slot)];
+    if (f.kind != FieldKind::f_struct)
+        return false;
+    p.bytes += f.offset;
+    p.def = f.struct_def;
+    return true;
+}
+
+bool pod_place_rooted_field(LValue *blv, const UniqueId *memUid,
+                            PodPlace &out)
+{
+    if (!blv->is<intrusive_ptr<StructObject>>())
+        return false;
+    StructObject &obj = *blv->getval<intrusive_ptr<StructObject>>().get();
+    /* read-only: not yet the slot's own (struct_own comes first) */
+    if (!obj.is_pod() || obj.is_readonly())
+        return false;
+    PodPlace p;
+    p.bytes = obj.bytes.data();
+    p.def = obj.def;
+    if (!pod_place_step(p, memUid))
+        return false;
+    out = p;
+    return true;
+}
+
+bool pod_place_ref(const EvalValue &v, PodPlace &out)
+{
+    if (!v.is<intrusive_ptr<StructObject>>())
+        return false;
+    StructObject &o =
+        const_cast<StructObject &>(*v.get_ref<intrusive_ptr<StructObject>>());
+    if (!o.is_ref() || !o.is_pod())
+        return false;
+    if (o.is_readonly())
+        throw CannotChangeConstEx();
+    out.bytes = o.bytes.data();
+    out.def = o.def;
+    return true;
+}
+
+EvalValue pod_place_value(const PodPlace &p)
+{
+    StructTypeDef *nd = const_cast<StructTypeDef *>(p.def);
+    auto obj = make_intrusive<StructObject>(nd);
+    std::memcpy(obj->bytes.data(), p.bytes, nd->size);
+    return intrusive_ptr<StructObject>(obj);
+}
+
+EvalValue pod_place_store(const PodPlace &p, int slot, Op op,
+                          const EvalValue &rval, Loc ms, Loc me,
+                          EvalValue *old_out)
+{
+    const FieldDef &f = p.def->fields[static_cast<size_t>(slot)];
+    const EvalValue r = RValue(rval);
+    EvalValue newval;
+    if (op == Op::assign) {
+        newval = r;
+    } else {
+        newval = pod_load_field(f, p.bytes);
+        if (old_out)
+            *old_out = newval;
+        apply_compound_op(newval, r, op);
+    }
+    /* coerce + runtime-validate to the field's type (member_store's rule) */
+    newval = coerce_struct_field(f, std::move(newval), ms, me);
+    pod_store_field(f, p.bytes, newval);
+    return newval;
+}
+
+EvalValue pod_place_incdec(const PodPlace &p, int slot, bool is_inc,
+                           bool is_prefix, Loc ms, Loc me,
+                           Loc id_start, Loc id_end)
+{
+    const FieldDef &f = p.def->fields[static_cast<size_t>(slot)];
+    const EvalValue old = pod_load_field(f, p.bytes);
+    if (!old.is<int_type>() && !old.is<float_type>())
+        throw TypeErrorEx("'++'/'--' requires an int or float",
+                          id_start, id_end);
+    EvalValue nv = old;
+    apply_compound_op(nv, EvalValue(static_cast<int_type>(1)),
+                      is_inc ? Op::addeq : Op::subeq);
+    nv = coerce_struct_field(f, std::move(nv), ms, me);
+    pod_store_field(f, p.bytes, nv);
+    return is_prefix ? nv : old;
+}
+
 /*
  * The build-hot fast path behind `append(arr, Point(...))`: when appending a
  * struct constructor call to a flat POD-struct array of that exact type,
@@ -1316,7 +2083,7 @@ bool try_construct_into_struct_array(EvalContext *ctx, SharedArrayObj &arr,
 bool try_construct_into_struct_array(EvalContext *ctx, SharedArrayObj &arr,
                                      Construct *arg)
 {
-    auto *cc = dynamic_cast<CallExpr *>(arg);
+    auto *cc = node_cast<CallExpr>(arg);
     if (!cc || !cc->args)
         return false;
 
@@ -1370,7 +2137,7 @@ bool try_construct_into_struct_array(EvalContext *ctx, SharedArrayObj &arr,
 EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
                             Loc a0s, Loc a0e, const StructTypeDef *cdef,
                             const ArgLoc *flocs, const EvalValue *vals,
-                            size_t n)
+                            size_t n, bool checked)
 {
     if (!target)
         throw NotLValueEx(a0s, a0e);
@@ -1383,7 +2150,7 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
     if (arr.is_readonly())
         throw CannotChangeConstEx(a0s, a0e);
     if (arr.is_slice())
-        arr.clone_internal_vec();
+        arr.materialize_slice();
 
     StructTypeDef *def = const_cast<StructTypeDef *>(cdef);
     ML_CHECK(def && def->is_pod() && n == def->fields.size());
@@ -1418,13 +2185,22 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
             flocs[i].start, flocs[i].end));
     const EvalValue elem(intrusive_ptr<StructObject>{obj});
 
+    /* Q2: an append through `dyn` (EmplaceSite::ct_store): the value fits
+     * the array's own type - loc-less, the whole argument list's caret
+     * (the op's loc entry), as the tree-walker's builtin_append stamps */
+    if (checked)
+        ct_fit_value(target->get(), elem);
+
     if (arr.skind() == SharedArrayObj::Storage::structs &&
         arr.flat_structs().def == def) {
         auto &sv = arr.flat_structs();
         const size_t at = sv.buf.size();
         sv.buf.resize(at + sv.stride);
         std::memcpy(sv.buf.data() + at, obj->bytes.data(), sv.stride);
-    } else if (arr.skind() == SharedArrayObj::Storage::general) {
+    } else if (arr.skind() == SharedArrayObj::Storage::general ||
+               arr.skind() == SharedArrayObj::Storage::strs ||
+               arr.skind() == SharedArrayObj::Storage::objs) {
+        /* a strs or objs array promotes (get_vec), as append's core does */
         arr.get_vec().emplace_back(elem, ctx->const_ctx);
     } else {
         throw TypeErrorEx("Cannot append a struct to this array",
@@ -1467,9 +2243,19 @@ EvalValue dispatch_builtin_values(EvalContext *ctx, const Builtin &b,
     case Builtin::Kind::lvalue: {
         /* The lvalue adapters' exact behavior: arg0's LValue* if it IS one
          * (else null -> the builtin throws NotLValueEx / its arity error),
-         * the rest RValued by value. */
-        LValue *target = (n && args[0].is<LValue *>())
-                             ? args[0].get<LValue *>() : nullptr;
+         * the rest RValued by value. An UNDEFINED name (the REPL's open
+         * world) is the name's error at the argument, as the direct
+         * adapter reports it (lv_builtin_target, types.cpp). */
+        if (n && args[0].is<UndefinedId>())
+            throw UndefinedVariableEx(args[0].get<UndefinedId>().id,
+                                      al->args ? al->args[0].start : al->start,
+                                      al->args ? al->args[0].end : al->end);
+        LValue tmp;
+        LValue *target = n
+            ? builtin_lv_target(b, args[0].is<LValue *>()
+                                       ? args[0].get<LValue *>() : nullptr,
+                                args[0], tmp)
+            : nullptr;
         const size_t n_rest = n ? n - 1 : 0;
         EvalValue stackbuf[8];
         std::vector<EvalValue> heapbuf;
@@ -1496,8 +2282,10 @@ EvalValue dispatch_builtin_values(EvalContext *ctx, const Builtin &b,
             throw TypeErrorEx("Expected function",
                               al->arg(0)->start, al->arg(0)->end);
         const EvalValue c = RValue(args[1]);
+        /* an indirect call has no destination hint: a general result */
         return vm_map_filter(ctx, f, c, b.kind == Builtin::Kind::filter,
-                             al->arg(1)->start, al->arg(1)->end);
+                             al->arg(1)->start, al->arg(1)->end,
+                             al->arg(1)->start, 0);
     }
 
     case Builtin::Kind::lazy:
@@ -1514,6 +2302,43 @@ EvalValue dispatch_builtin_values(EvalContext *ctx, const Builtin &b,
 }
 
 /*
+ * THE CALL'S SETUP CARET (RULE 2, 2026-09-20). A loc-less exception out of
+ * a call's SETUP - an arity throw, a bind coercion, the window push - is
+ * stamped here, by the call site, since the throw itself knows no source
+ * position. Two spans, chosen by what failed:
+ *  - a BIND COERCION (`func f(int k)` handed a `dyn` float) carets the
+ *    FAILING ARGUMENT's own expression - the bind recorded its index in
+ *    Exception::bind_arg (bind_param's `site_arg`);
+ *  - anything else (an arity error is about the LIST; the window push is
+ *    about no argument) carets the whole argument list.
+ * Shared by CallExpr::do_eval's dispatch (dispatch_call_value's catch) and
+ * the DEVIRTUALIZED nodes (DirectCallExpr/CachedCallExpr), which must
+ * reproduce it exactly: before they did, `fi(x)` marked the whole call
+ * from a named function and the argument list from a closure. The VM's
+ * twin is vm_stamp_setup_caret (base_locs + arg_locs), the generic
+ * dyn-callee op's is vm_stamp_args_caret (its CallSite), and the JIT's
+ * conveyance stamps it in emitted code (emit_exc_stamp's args form). An
+ * out-of-range index (a stale value from an unrelated bind) takes the
+ * list span - a caret is never invented from it.
+ */
+static inline void stamp_args_loc(Exception &e, const ExprList *args)
+{
+    if (e.loc_start)
+        return;
+    const int i = e.bind_arg;
+    if (i >= 0 && static_cast<size_t>(i) < args->elems.size()
+            && args->elems[static_cast<size_t>(i)]->start) {
+        /* (an argument with no span of its own - a const-folded literal -
+         * takes the list's, exactly as codegen records it for the VM) */
+        e.loc_start = args->elems[static_cast<size_t>(i)]->start;
+        e.loc_end = args->elems[static_cast<size_t>(i)]->end;
+        return;
+    }
+    e.loc_start = args->start;
+    e.loc_end = args->end;
+}
+
+/*
  * Shared call DISPATCH: `callable` is the ALREADY-evaluated callee value, `node`
  * the CallExpr (for its args + carets). A Builtin runs its ExprList ABI -
  * EXCEPT an INDIRECT (vm_dyn_callee) call of a non-lazy builtin, which is
@@ -1525,6 +2350,39 @@ EvalValue dispatch_builtin_values(EvalContext *ctx, const Builtin &b,
  * AND the VM's generic value-call op (CallValueGenericV: &chunk, pc,
  * as_signal=true) so the two engines dispatch byte-identically.
  */
+/*
+ * #32: arg0 of an INDIRECT call to an in-place (lvalue) builtin, by
+ * reference: an access chain rooted at a variable that steps into a
+ * member is walked as a STORE base (store_base_value - each struct it
+ * enters owned), so the builtin works on this variable's struct and not
+ * on one a copy still shares, as the direct call's adapter does and the
+ * VM's arg0 descriptors do; anything else is read as before (a value
+ * stays a value - the builtin's "not an lvalue"). An optional member is
+ * not a step a store walk has.
+ */
+static EvalValue indirect_lv_arg0(EvalContext *ctx, const Construct *e,
+                                  LValue &hold)
+{
+    bool member = false;
+    const Construct *r = e;
+    for (;;) {
+        if (ctag(r) == ConstructType::member) {
+            auto *m = static_cast<const MemberExpr *>(r);
+            if (m->optional)
+                return e->eval(ctx);
+            member = true;
+            r = m->what.get();
+        } else if (ctag(r) == ConstructType::subscript) {
+            r = static_cast<const Subscript *>(r)->what.get();
+        } else {
+            break;
+        }
+    }
+    if (!member || ctag(r) != ConstructType::id)
+        return e->eval(ctx);
+    return store_base_value(ctx, e, hold);
+}
+
 EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
                               const CallExpr *node, const Chunk *ck,
                               size_t pc, bool as_signal)
@@ -1566,8 +2424,12 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
                     argv = vheap.data();
                     locs = lheap.data();
                 }
+                LValue hold0;   /* indirect_lv_arg0's (a variable root:
+                                 * never filled) */
                 for (size_t i = 0; i < n; i++) {
-                    argv[i] = ael->elems[i]->eval(ctx);
+                    argv[i] = i == 0 && b.kind == Builtin::Kind::lvalue
+                        ? indirect_lv_arg0(ctx, ael->elems[0].get(), hold0)
+                        : ael->elems[i]->eval(ctx);
                     locs[i] = ArgLoc{ael->elems[i]->start,
                                      ael->elems[i]->end};
                 }
@@ -1577,38 +2439,82 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
                 al.args = locs;
                 al.nargs = n;
                 al.arr_hint = ael->arr_hint;
+                al.ctype = ael->ctype;
+                al.ct_store = ael->ct_store;
                 return dispatch_builtin_values(ctx, b, &al, argv, n);
+            }
+            /* question 5: a builtin the PARSER calls with a function in its
+             * arguments runs as written, so it calls the function as the
+             * program's inference types it - a callback's parameter takes
+             * the container's element type, not each value's own */
+            if (ctx->root->parse_typed && !ctx->root->pt_copy
+                && b.kind != Builtin::Kind::lazy
+                && b.kind != Builtin::Kind::node && pt_parser_level(ctx)
+                && pt_args_name_function(ctx, node->args.get())) {
+                EvalValue r;
+                if (pt_typed_written(ctx, node, r))
+                    return r;
             }
             return b.func(ctx, node->args.get());
         }
 
         if (callable.is<intrusive_ptr<FuncObject>>()) {
+            /* question 5: a call the PARSER makes, as written - not one
+             * at a typed copy's own top level (do_func_call) */
+            const CallExpr *pt_call = ctx->root->parse_typed
+                    && !ctx->root->pt_copy && pt_parser_level(ctx)
+                ? node : nullptr;
             return do_func_call(
                 ctx,
                 *callable.get<intrusive_ptr<FuncObject>>().get(),
                 node->args->elems,
                 node->start,     /* call site = the CallExpr's location */
                 node->inline_ctx,/* virtual frames if this call is inlined */
-                ck, pc, as_signal
+                ck, pc, as_signal,
+                node->check_args(),
+                pt_call
             );
         }
 
         /* Calling a struct type descriptor constructs an instance. By this
-         * point a named call has been desugared to positional. */
-        if (callable.is<StructTypeDef *>())
-            return construct_struct(ctx, callable.get<StructTypeDef *>(),
-                                    node->args.get());
+         * point a named call has been desugared to positional. A CLASS
+         * instance is made at compile time only by a `const` declaration
+         * (CallExpr::in_const_decl): a pure function that constructs one
+         * named after it is refused here, when the call is evaluated, and
+         * one named before it by the parser. */
+        if (callable.is<StructTypeDef *>()) {
+            StructTypeDef *def = callable.get<StructTypeDef *>();
+            if (def->is_class && ctx && ctx->in_const_eval()
+                && !node->in_const_decl)
+                throw SyntaxErrorEx(node->start,
+                    "a pure function cannot construct a class instance "
+                    "(each construction is a new object)");
+            return construct_struct(ctx, def, node->args.get(),
+                                    node->fit_args);
+        }
 
     } catch (Exception &e) {
-
-        if (!e.loc_start) {
-            e.loc_start = node->args->start;
-            e.loc_end = node->args->end;
-        }
+        stamp_args_loc(e, node->args.get());     /* RULE 2: see above */
         throw;
     }
 
     throw NotCallableEx(node->what->start, node->what->end);
+}
+
+/*
+ * A redirected lambda-template call reads its VARIABLE before the call
+ * (Identifier::bind_guard): one not bound yet raises UnboundSymbolEx at
+ * the callee, as the call through the variable does under -nti. In a
+ * const-eval context the global is not visible, so the read fails there
+ * and AutoConst / the inliner's refold leave the call for run time.
+ */
+static void eval_bind_guard(EvalContext *ctx, const Construct *what)
+{
+    if (ctag(what) != ConstructType::id)
+        return;
+    if (const Identifier *g = static_cast<const Identifier *>(what)
+            ->live_guard())
+        (void)RValue(g->eval(ctx));
 }
 
 EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
@@ -1625,6 +2531,7 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 
     /* Point an undefined-callee error at the callee, not the whole call. */
     try {
+        eval_bind_guard(ctx, what.get());
         callable_storage = RValue(what->eval(ctx));
     } catch (Exception &e) {
         stamp_operand_loc(what.get(), e);
@@ -1649,16 +2556,25 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
  */
 EvalValue DirectCallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
+    eval_bind_guard(ctx, what.get());
     if (ctx->gfuncs && ctx->gfuncs->defined[direct_func_slot]) {
         const EvalValue &fv = ctx->gfuncs->slots[direct_func_slot].get();
-        if (fv.is<intrusive_ptr<FuncObject>>())
-            return do_func_call(
-                ctx,
-                *fv.get<intrusive_ptr<FuncObject>>().get(),
-                args->elems,
-                start,
-                inline_ctx
-            );
+        if (fv.is<intrusive_ptr<FuncObject>>()) {
+            try {
+                return do_func_call(
+                    ctx,
+                    *fv.get<intrusive_ptr<FuncObject>>().get(),
+                    args->elems,
+                    start,
+                    inline_ctx,
+                    nullptr, 0, false,
+                    check_args()
+                );
+            } catch (Exception &e) {
+                stamp_args_loc(e, args.get());
+                throw;
+            }
+        }
     }
     return CallExpr::do_eval(ctx, rec);
 }
@@ -1674,16 +2590,24 @@ EvalValue DirectCallExpr::do_eval(EvalContext *ctx, bool rec) const
  */
 EvalValue CachedCallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
+    eval_bind_guard(ctx, what.get());
     if (ctx->gfuncs && ctx->gfuncs->defined[direct_func_slot]) {
         const EvalValue &fv = ctx->gfuncs->slots[direct_func_slot].get();
-        if (fv.is<intrusive_ptr<FuncObject>>())
-            return cached_call(
-                ctx,
-                *fv.get<intrusive_ptr<FuncObject>>().get(),
-                args->elems,
-                start,
-                inline_ctx
-            );
+        if (fv.is<intrusive_ptr<FuncObject>>()) {
+            try {
+                return cached_call(
+                    ctx,
+                    *fv.get<intrusive_ptr<FuncObject>>().get(),
+                    args->elems,
+                    start,
+                    inline_ctx,
+                    check_args()
+                );
+            } catch (Exception &e) {
+                stamp_args_loc(e, args.get());   /* RULE 2: see above */
+                throw;
+            }
+        }
     }
     return CallExpr::do_eval(ctx, rec);
 }
@@ -1751,6 +2675,36 @@ EvalValue InlinedCallExpr::do_eval(EvalContext *ctx, bool rec) const
  * node re-eval on the VM side. The only context it needs is `is_const` (whether
  * the elements' LValues are read-only, i.e. we are in a const-eval context).
  */
+EvalValue flat_hint_value(const EvalValue &v, ArrHint hint)
+{
+    switch (hint) {
+    case ArrHint::flat_i:
+        if (v.is<int_type>())
+            return v;
+        if (v.is<bool>())
+            return EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
+        break;
+    case ArrHint::flat_f:
+        if (v.is<float_type>())
+            return v;
+        if (v.is<int_type>())
+            return EvalValue(static_cast<float_type>(v.get<int_type>()));
+        if (v.is<bool>())
+            return EvalValue(static_cast<float_type>(v.get<bool>() ? 1 : 0));
+        break;
+    case ArrHint::flat_b:
+        if (v.is<bool>())
+            return v;
+        break;
+    default:
+        return v;
+    }
+    /* the message the flat arrays raise for a dyn-laundered misfit */
+    throw TypeErrorEx(
+        "Cannot store a value of a different type in a flat (typed) array; "
+        "declare the array dyn for a polymorphic array");
+}
+
 EvalValue build_array_from_values(const EvalValue *vals, size_t n,
                                   ArrHint hint,
                                   const StructTypeDef *hint_struct,
@@ -1772,11 +2726,74 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
             return SharedArrayObj(SharedArrayObj::fvec_type{});
         if (hint == ArrHint::flat_b)
             return SharedArrayObj(SharedArrayObj::bvec_type{});
+        if (hint == ArrHint::flat_c)
+            return SharedArrayObj(SharedArrayObj::ovec_type{});
         /* A general empty `[]` must be a FRESH MUTABLE array, not the shared
          * read-only empty_arr singleton (like the flat hints above) - else a
          * later append() COW-clones instead of mutating in place (a function
          * appending to a passed-in `[]` wouldn't grow the caller). */
         return SharedArrayObj(SharedArrayObj::vec_type{});
+    }
+
+    /*
+     * An array<C> of a class C (flat_c): the flat CLASS storage, when every
+     * element is a class instance or none - type-driven, so a value that is
+     * not (the destination is `dyn` somewhere) leaves it general below.
+     */
+    if (hint == ArrHint::flat_c) {
+        bool all = true;
+        for (size_t i = 0; i < n && all; i++)
+            all = is_obj_elem(vals[i]);
+        if (all) {
+            SharedArrayObj::ovec_type ov;
+            ov.v.reserve(n);
+            for (size_t i = 0; i < n; i++)
+                ov.push(obj_elem_ptr(vals[i]));
+            return SharedArrayObj(std::move(ov));
+        }
+    }
+
+    /*
+     * A destination proven array<int> / <float> / <bool> (the flat hints):
+     * the elements widen to its element type (bool -> int, int / bool ->
+     * float) and the array is born flat - a literal with a `dyn` element
+     * holding a bool or an int stayed a GENERAL array holding them, a bool
+     * in an array<int>. A literal is built by an op that never fails, so
+     * an element that does not fit at all (a dyn string) still builds
+     * general below.
+     */
+    if (hint == ArrHint::flat_i || hint == ArrHint::flat_f
+            || hint == ArrHint::flat_b) {
+        bool fit = true;
+        for (size_t i = 0; i < n && fit; i++) {
+            const EvalValue &v = vals[i];
+            fit = hint == ArrHint::flat_b ? v.is<bool>()
+                : hint == ArrHint::flat_i ? v.is<int_type>() || v.is<bool>()
+                : v.is<float_type>() || v.is<int_type>() || v.is<bool>();
+        }
+        if (fit) {
+            if (hint == ArrHint::flat_i) {
+                SharedArrayObj::ivec_type iv;
+                iv.reserve(n);
+                for (size_t i = 0; i < n; i++)
+                    iv.push_back(
+                        flat_hint_value(vals[i], hint).get<int_type>());
+                return SharedArrayObj(std::move(iv));
+            }
+            if (hint == ArrHint::flat_f) {
+                SharedArrayObj::fvec_type fv;
+                fv.reserve(n);
+                for (size_t i = 0; i < n; i++)
+                    fv.push_back(
+                        flat_hint_value(vals[i], hint).get<float_type>());
+                return SharedArrayObj(std::move(fv));
+            }
+            SharedArrayObj::bvec_type bv;
+            bv.reserve(n);
+            for (size_t i = 0; i < n; i++)
+                bv.push_back(vals[i].get<bool>() ? 1 : 0);
+            return SharedArrayObj(std::move(bv));
+        }
     }
 
     /*
@@ -1791,15 +2808,23 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
     SharedArrayObj::fvec_type fvec;
     SharedArrayObj::bvec_type bvec;
     SharedArrayObj::vec_type  gvec;
+    /* mode 6: class references (the flat CLASS storage) */
+    SharedArrayObj::ovec_type ovec;
     /* mode 5: a flat array of same-type POD structs (their bytes packed) */
     std::vector<char> svecbuf;
     StructTypeDef *sdef = nullptr;
     int sstride = 0;
 
+    /* a POD struct VALUE: a box<P> has P's def and P's bytes, but it is a
+     * reference - packed into the bytes it would stop being one (a store
+     * through the array's element no longer reached the box, 2026-11-14) */
     auto is_pod_struct_of = [](const EvalValue &v, StructTypeDef *d) -> bool {
-        return v.is<intrusive_ptr<StructObject>>() &&
-               v.get<intrusive_ptr<StructObject>>()->is_pod() &&
-               (d == nullptr || v.get<intrusive_ptr<StructObject>>()->def == d);
+        if (!v.is<intrusive_ptr<StructObject>>())
+            return false;
+        /* get_ref, not get: the handle is only read, and each copy's
+         * release is branches no run takes */
+        const StructObject &o = *v.get_ref<intrusive_ptr<StructObject>>();
+        return o.is_pod() && !o.is_ref() && (d == nullptr || o.def == d);
     };
     auto append_struct_bytes = [&](const EvalValue &v) {
         const StructObject &o = *v.get<intrusive_ptr<StructObject>>().get();
@@ -1808,12 +2833,13 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
         std::memcpy(svecbuf.data() + at, o.bytes.data(), sstride);
     };
     /*
-     * 0 = empty, 1 = ints, 2 = floats, 4 = bools, 3 = general. Type-driven: a
+     * 0 = empty, 1 = ints, 2 = floats, 4 = bools, 5 = POD structs, 6 = class
+     * references, 3 = general. Type-driven: a
      * literal bound to a dynamically-typed destination (arr_hint general, set by
      * the inferencer) is built general from the start, so a later mixed write to
-     * it never has to promote. (The flat_i/flat_f/flat_b hints need no special
-     * case - the value-driven scan already produces flat for an all-one-kind
-     * literal, which is exactly when those hints are set.)
+     * it never has to promote. (The flat_i/flat_f/flat_b hints were served
+     * above whenever every element fits; reaching here with one, an
+     * element does not fit - a `dyn` misfit, built general.)
      */
     int mode = hint == ArrHint::general ? 3 : 0;
     if (mode == 3)
@@ -1830,7 +2856,10 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
         else if (mode == 4)
             for (unsigned char x : bvec)
                 gvec.emplace_back(EvalValue(static_cast<bool>(x)), is_const);
-        else if (mode == 5) {
+        else if (mode == 6) {
+            for (size_t i = 0; i < ovec.size(); i++)
+                gvec.emplace_back(obj_elem_value(ovec[i]), is_const);
+        } else if (mode == 5) {
             const size_t cnt = sstride ? svecbuf.size() / sstride : 0;
             for (size_t i = 0; i < cnt; i++) {
                 auto o = make_intrusive<StructObject>(sdef);
@@ -1844,6 +2873,7 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
         fvec.clear();
         bvec.clear();
         svecbuf.clear();
+        ovec = SharedArrayObj::ovec_type();
         mode = 3;
     };
 
@@ -1858,6 +2888,13 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
                 mode = 2; fvec.push_back(v.get<float_type>());
             } else if (v.is<bool>()) {
                 mode = 4; bvec.push_back(v.get<bool>() ? 1 : 0);
+            } else if (is_class_instance(v)) {
+                /* class instances: their references, value-driven like
+                 * the POD structs below (a constant's literal is built
+                 * before inference, so no hint can reach it) */
+                mode = 6;
+                ovec.v.reserve(n);
+                ovec.push(obj_elem_ptr(v));
             } else if (is_pod_struct_of(v, nullptr)) {
                 mode = 5;
                 sdef = v.get<intrusive_ptr<StructObject>>()->def;
@@ -1876,6 +2913,8 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
             bvec.push_back(v.get<bool>() ? 1 : 0);
         } else if (mode == 5 && is_pod_struct_of(v, sdef)) {
             append_struct_bytes(v);
+        } else if (mode == 6 && is_obj_elem(v)) {
+            ovec.push(obj_elem_ptr(v));
         } else {
             if (mode != 3)
                 spill_to_general();
@@ -1883,13 +2922,168 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
         }
     }
 
-    if (mode == 1) return SharedArrayObj(move(ivec));
-    if (mode == 2) return SharedArrayObj(move(fvec));
-    if (mode == 4) return SharedArrayObj(move(bvec));
+    if (mode == 1) return SharedArrayObj(std::move(ivec));
+    if (mode == 2) return SharedArrayObj(std::move(fvec));
+    if (mode == 4) return SharedArrayObj(std::move(bvec));
     if (mode == 5)
         return SharedArrayObj(
-            SharedArrayObj::svec_type(move(svecbuf), sdef, sstride));
-    return SharedArrayObj(move(gvec));
+            SharedArrayObj::svec_type(std::move(svecbuf), sdef, sstride));
+    if (mode == 6)
+        return SharedArrayObj(std::move(ovec));
+    return SharedArrayObj(std::move(gvec));
+}
+
+/* A numeric WIDENING (a subscript's key, a store's value): int/bool ->
+ * float, bool -> int; every other value (none included) as it is. */
+EvalValue literal_widen(EvalValue v, DeclType dt)
+{
+    if (dt == DeclType::f) {
+        if (v.is<int_type>())
+            return EvalValue(static_cast<float_type>(v.get<int_type>()));
+        if (v.is<bool>())
+            return EvalValue(static_cast<float_type>(v.get<bool>() ? 1 : 0));
+    } else if (dt == DeclType::i && v.is<bool>()) {
+        return EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
+    }
+    return v;
+}
+
+/* A container LITERAL's element widening (LiteralArray::elem_coerce,
+ * LiteralDict::key_coerce / val_coerce): the widening above, CHECKED - a
+ * `dyn` element that is not a number refuses, as a typed store does
+ * (coerce_to_decl_type). Rule 1 (plans/strict-container-types.md): a
+ * literal built for an array<int> place may hold a `dyn` element, and the
+ * literal refuses it while it is built, before anything is stored. The VM
+ * applies the same rule with CoerceNumV on the element's run slot. At
+ * compile time (`at_compile`, a literal the parser folds) no element is a
+ * `dyn`, so a misfit is a type error inference reports: it passes here. */
+static EvalValue literal_elem_widen(EvalValue v, DeclType dt,
+                                    bool at_compile)
+{
+    /* (a literal's stamp is an int or a float one: annot_num,
+     * stamp_literal_coerce) */
+    if (at_compile)
+        return literal_widen(std::move(v), dt);
+    return coerce_to_decl_type(v, dt, -1);
+}
+
+/* a fully CONSTANT literal's values, widened by their own join
+ * (const_values_widen, below arr_elem_boxed) */
+static void const_values_widen(EvalValue *vals, size_t n, size_t stride,
+                               bool is_const);
+
+/*
+ * The walk behind stamp_ctype / stamp_ctype_top / ctype_restamp. `mode`:
+ * 0 the top container only (a literal: what it holds was typed where IT
+ * was made, or is not its to type); 1 along the annotation, stopping at a
+ * `dyn` element (a builtin's result, a baked value: the fresh containers
+ * its static type names - one under a `dyn` element stays untyped, as a
+ * literal nested there is in -nc's tree, stamp_literal_coerce: only `dyn`
+ * reaches it, and it keeps the storage its own values gave it).
+ */
+bool ctype_names(const TypeAnnot *t) noexcept
+{
+    return t && (t->kind == DeclType::arr
+                 ? t->elem != nullptr
+                 : t->kind == DeclType::dict && t->key != nullptr);
+}
+
+static void stamp_ctype_rec(const EvalValue &v, const TypeAnnot *t,
+                            int mode) noexcept
+{
+    if (!t)
+        return;
+    const auto sub = [&](const EvalValue &e, const TypeAnnot *et) {
+        if (ctype_names(et))
+            stamp_ctype_rec(e, annot_nonopt(et), mode);
+    };
+    if (v.is<SharedArrayObj>()) {
+        const SharedArrayObj &a = v.get_ref<SharedArrayObj>();
+        if (a.ctype() || a.is_readonly() || a.slice
+                || t->kind != DeclType::arr)
+            return;
+        const_cast<SharedArrayObj &>(a).set_ctype(t);
+        /* only general storage can hold a container */
+        if (mode == 0 || a.skind() != SharedArrayObj::Storage::general)
+            return;
+        const ArrayConstView &view = a.get_view();
+        for (size_type i = 0; i < view.size(); i++)
+            sub(view[i].get(), t->elem.get());
+        return;
+    }
+    if (v.is<intrusive_ptr<DictObject>>()) {
+        DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
+        if (d.ctype() || d.is_readonly() || t->kind != DeclType::dict)
+            return;
+        d.set_ctype(t);
+        if (mode == 0)
+            return;
+        for (const auto &kv : d.get_ref())
+            sub(kv.second.get(), t->val.get());
+        if (d.get_has_default())
+            sub(d.get_default(), t->val.get());
+    }
+}
+
+void stamp_ctype(const EvalValue &v, const TypeAnnot *t) noexcept
+{
+    stamp_ctype_rec(v, t, 1);
+}
+
+void stamp_ctype_top(const EvalValue &v, const TypeAnnot *t) noexcept
+{
+    stamp_ctype_rec(v, t, 0);
+}
+
+/* the type an array or a dict carries (ctype_restamp's argument is one) */
+static const TypeAnnot *ctype_get(const EvalValue &v)
+{
+    if (v.is<SharedArrayObj>())
+        return v.get_ref<SharedArrayObj>().ctype();
+    return v.get_ref<intrusive_ptr<DictObject>>()->ctype();
+}
+
+/* a fresh copy's mutable containers made untyped again (ctype_restamp) */
+static void ctype_clear(const EvalValue &v)
+{
+    if (v.is<SharedArrayObj>()) {
+        const SharedArrayObj &a = v.get_ref<SharedArrayObj>();
+        /* a fresh copy shares only read-only containers, slices
+         * included, so a mutable one is no slice */
+        if (a.is_readonly() || !a.ctype())
+            return;
+        ML_CHECK(!a.slice);
+        const_cast<SharedArrayObj &>(a).set_ctype(nullptr);
+        if (a.skind() != SharedArrayObj::Storage::general)
+            return;
+        const ArrayConstView &view = a.get_view();
+        for (size_type i = 0; i < view.size(); i++)
+            ctype_clear(view[i].get());
+        return;
+    }
+    if (v.is<intrusive_ptr<DictObject>>()) {
+        DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
+        if (d.is_readonly() || !d.ctype())
+            return;
+        d.set_ctype(nullptr);
+        for (const auto &kv : d.get_ref())
+            ctype_clear(kv.second.get());
+    }
+}
+
+EvalValue ctype_restamp(const EvalValue &v, const TypeAnnot *t)
+{
+    const TypeAnnot *cur = ctype_get(v);
+    if (cur == t)
+        return v;
+    if (!cur) {
+        stamp_ctype_rec(v, t, 1);
+        return v;
+    }
+    EvalValue c = make_mutable_clone(v);
+    ctype_clear(c);
+    stamp_ctype_rec(c, t, 1);
+    return c;
 }
 
 EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
@@ -1899,19 +3093,42 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
      * the same builder the VM's MakeArrayV op calls with register values. */
     const size_t n = elems.size();
 
+    /* widened by the inferencer's stamp, or - a fully CONSTANT literal
+     * built by the const evaluator, before any stamp exists - by the join
+     * of its own values (const_values_widen) */
+    const auto widen = [&](EvalValue *buf) {
+        if (elem_coerce != DeclType::none) {
+            for (size_t i = 0; i < n; i++)
+                buf[i] = literal_elem_widen(std::move(buf[i]), elem_coerce,
+                                            ctx->in_const_eval());
+        } else if (is_const && !unpacked && !annotated
+                   && ctx->in_const_eval()) {
+            /* only the PARSE-TIME build: at run time an unstamped literal
+             * means no inference ran (-nti), so no typed reader trusts
+             * a type, and the VM builds it unwidened too */
+            const_values_widen(buf, n, 1, ctx->const_ctx);
+        }
+    };
     if (n <= 16) {
         EvalValue buf[16];
         for (size_t i = 0; i < n; i++)
             buf[i] = RValue(elems[i]->eval(ctx));
-        return build_array_from_values(buf, n, arr_hint, arr_hint_struct,
-                                       ctx->const_ctx);
+        widen(buf);
+        EvalValue r = build_array_from_values(buf, n, arr_hint,
+                                              arr_hint_struct,
+                                              ctx->const_ctx);
+        stamp_ctype_top(r, ctype);
+        return r;
     }
 
     std::vector<EvalValue> buf(n);
     for (size_t i = 0; i < n; i++)
         buf[i] = RValue(elems[i]->eval(ctx));
-    return build_array_from_values(buf.data(), n, arr_hint, arr_hint_struct,
-                                   ctx->const_ctx);
+    widen(buf.data());
+    EvalValue r = build_array_from_values(buf.data(), n, arr_hint,
+                                          arr_hint_struct, ctx->const_ctx);
+    stamp_ctype_top(r, ctype);
+    return r;
 }
 
 /*
@@ -1931,9 +3148,17 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
  *     backs deepclone().
  * Scalars and strings are returned as-is. An empty array collapses to the
  * shared empty_arr singleton, matching LiteralArray.
+ *
+ * The copy keeps the source's SHAPE (question 10, Python's deepcopy):
+ * `st` holds every container copied so far with its copy, so one met
+ * again - shared at two places, or on a cycle while its copy is still
+ * being filled - is linked to that copy, never copied twice (cyclewalk.h,
+ * CycCopyStack). A read-only sub-object that is shared rather than copied
+ * cannot lead back here: a frozen value holds only frozen ones. A dict
+ * copy is built in its source's order, which is its order (#50).
  */
 static EvalValue
-clone_to_mutable(const EvalValue &v, bool through_readonly)
+clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
 {
     if (v.is<SharedArrayObj>()) {
 
@@ -1941,6 +3166,22 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
 
         if (arr.is_readonly() && !through_readonly)
             return v;   /* share the const sub-object, don't copy it */
+
+        /* question 10: an array met again is the copy already made for it
+         * (or being made: a cycle), whatever its storage */
+        CycKey k;
+        const bool keyed = cyc_copy_key(arr, k);
+        if (keyed)
+            if (const EvalValue *c = st.link(k))
+                return *c;
+        /* Q2: a copy is an array of the source's type */
+        const TypeAnnot *ct = arr.ctype();
+        auto made = [&](EvalValue res) {
+            res.get<SharedArrayObj>().set_ctype(ct);
+            if (keyed)
+                st.remember(k, res);
+            return res;
+        };
 
         /* An empty array must NOT collapse to the shared read-only empty_arr
          * singleton here: this is a MUTABLE clone (make_mutable_clone /
@@ -1959,26 +3200,26 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
          */
         if (arr.skind() == SharedArrayObj::Storage::ints) {
             const auto &iv = arr.flat_ints();
-            return SharedArrayObj(SharedArrayObj::ivec_type(
+            return made(SharedArrayObj(SharedArrayObj::ivec_type(
                 iv.cbegin() + arr.offset(),
                 iv.cbegin() + arr.offset() + arr.size()
-            ));
+            )));
         }
 
         if (arr.skind() == SharedArrayObj::Storage::floats) {
             const auto &fv = arr.flat_floats();
-            return SharedArrayObj(SharedArrayObj::fvec_type(
+            return made(SharedArrayObj(SharedArrayObj::fvec_type(
                 fv.cbegin() + arr.offset(),
                 fv.cbegin() + arr.offset() + arr.size()
-            ));
+            )));
         }
 
         if (arr.skind() == SharedArrayObj::Storage::bools) {
             const auto &bv = arr.flat_bools();
-            return SharedArrayObj(SharedArrayObj::bvec_type(
+            return made(SharedArrayObj(SharedArrayObj::bvec_type(
                 bv.cbegin() + arr.offset(),
                 bv.cbegin() + arr.offset() + arr.size()
-            ));
+            )));
         }
 
         /* Flat POD-struct array: a byte copy keeps it flat (POD bytes hold no
@@ -1989,80 +3230,152 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
                 sv.buf.cbegin() + arr.offset() * sv.stride,
                 sv.buf.cbegin() + (arr.offset() + arr.size()) * sv.stride
             );
-            return SharedArrayObj(
-                SharedArrayObj::svec_type(move(nb), sv.def, sv.stride));
+            return made(SharedArrayObj(
+                SharedArrayObj::svec_type(std::move(nb), sv.def, sv.stride)));
         }
 
         /* Flat STRING array: strings are immutable, so a handle copy IS a
          * full mutable-top copy - stays flat. */
         if (arr.skind() == SharedArrayObj::Storage::strs) {
             const auto &tv = arr.flat_strs();
-            return SharedArrayObj(SharedArrayObj::tvec_type(
+            return made(SharedArrayObj(SharedArrayObj::tvec_type(
                 tv.cbegin() + arr.offset(),
                 tv.cbegin() + arr.offset() + arr.size()
-            ));
+            )));
+        }
+
+        /* Flat CLASS array: each element as the general path below treats
+         * it (a clone of a class instance is a class instance, so the
+         * copy stays flat). The copy exists before its elements, so an
+         * element leading back to the array links it. */
+        if (arr.skind() == SharedArrayObj::Storage::objs) {
+            const auto &ov = arr.flat_objs();
+            EvalValue res = SharedArrayObj(SharedArrayObj::ovec_type());
+            res.get<SharedArrayObj>().set_ctype(ct);
+            SharedArrayObj::ovec_type &nv =
+                res.get<SharedArrayObj>().flat_objs();
+            nv.v.reserve(arr.size());
+            std::optional<CycCopyGuard> g;
+            if (keyed)
+                g.emplace(st, k, res);
+            for (size_type i = 0; i < arr.size(); i++) {
+                const EvalValue c = clone_to_mutable(
+                    obj_elem_value(ov[arr.offset() + i]), through_readonly,
+                    st);
+                ML_CHECK(is_obj_elem(c));
+                nv.push(obj_elem_ptr(c));
+            }
+            return res;
         }
 
         const ArrayConstView &view = arr.get_view();
 
-        SharedArrayObj::vec_type vec;
+        /* the copy exists before its elements, so a back edge can link it */
+        EvalValue res = SharedArrayObj(SharedArrayObj::vec_type());
+        res.get<SharedArrayObj>().set_ctype(ct);
+        SharedArrayObj::vec_type &vec = res.get<SharedArrayObj>().get_vec();
         vec.reserve(view.size());
+        std::optional<CycCopyGuard> g;
+        if (keyed)
+            g.emplace(st, k, res);
 
         for (unsigned i = 0; i < view.size(); i++) {
             vec.emplace_back(
-                clone_to_mutable(view[i].get(), through_readonly), false
+                clone_to_mutable(view[i].get(), through_readonly, st),
+                false
             );
         }
 
-        return SharedArrayObj(move(vec));
+        /* the construction-time length, as building from a full vector set
+         * it (a non-slice reads size() from the vector anyway) */
+        res.get<SharedArrayObj>().len = static_cast<size_type>(vec.size());
+        return res;
     }
 
     if (v.is<intrusive_ptr<DictObject>>()) {
 
-        const auto &obj = v.get<intrusive_ptr<DictObject>>();
+        const auto &obj = v.get_ref<intrusive_ptr<DictObject>>();
 
         if (obj->is_readonly() && !through_readonly)
             return v;   /* share the const sub-object, don't copy it */
 
-        DictObject::inner_type data;
+        const CycKey k = cyc_key_obj(obj.get());
+        if (const EvalValue *c = st.link(k))
+            return *c;
+
+        auto out = make_intrusive<DictObject>();
+        out->set_ctype(obj->ctype());       /* Q2: the source's type */
+        EvalValue res = intrusive_ptr<DictObject>(out);
+        CycCopyGuard g(st, k, res);
 
         for (const auto &p : obj->get_ref()) {
-            data.emplace(
-                p.first,
+            out->build_emplace(
+                EvalValue(p.first),
                 LValue(
-                    clone_to_mutable(p.second.get(), through_readonly),
+                    clone_to_mutable(p.second.get(), through_readonly, st),
                     false
                 )
             );
         }
 
-        auto out = make_intrusive<DictObject>(move(data));
         if (obj->get_has_default())   /* preserve the default-dict default */
             out->set_default(
-                clone_to_mutable(obj->get_default(), through_readonly));
-        return intrusive_ptr<DictObject>(out);
+                clone_to_mutable(obj->get_default(), through_readonly, st));
+        return res;
+    }
+
+    if (v.is<intrusive_ptr<BoxObj>>()) {
+        /* a box of a scalar / str: a NEW box (a new identity) holding the
+         * same value - which needs no copy of its own */
+        const BoxObj &b = *v.get_ref<intrusive_ptr<BoxObj>>();
+        if (b.readonly && !through_readonly)
+            return v;
+        const CycKey k = cyc_key_obj(&b);
+        if (const EvalValue *c = st.link(k))
+            return *c;          /* one box, met again: its one copy */
+        auto out = make_intrusive<BoxObj>(b);
+        out->readonly = false;
+        EvalValue res(std::move(out));
+        st.remember(k, res);
+        return res;
     }
 
     if (v.is<intrusive_ptr<StructObject>>()) {
 
-        const auto &obj = v.get<intrusive_ptr<StructObject>>();
+        const auto &obj = v.get_ref<intrusive_ptr<StructObject>>();
 
         if (obj->is_readonly() && !through_readonly)
             return v;   /* share the const sub-object, don't copy it */
+
+        /* met again (a class instance or a box<P> held twice): its one
+         * copy */
+        const CycKey k = cyc_key_obj(obj.get());
+        if (const EvalValue *c = st.link(k))
+            return *c;
 
         /* POD: a byte copy is a full mutable copy (no nested references). */
         if (obj->is_pod()) {
             auto out = make_intrusive<StructObject>(*obj);   /* copies bytes */
             out->clear_readonly();
-            return intrusive_ptr<StructObject>(out);
+            EvalValue res = intrusive_ptr<StructObject>(out);
+            st.remember(k, res);
+            return res;
         }
 
         auto out = make_intrusive<StructObject>(obj->def);
+        if (obj->boxed) {               /* a box<P>: a new box */
+            out->boxed = true;
+            out->ident = class_ident_next();
+        }
+        EvalValue res = intrusive_ptr<StructObject>(out);
+        CycCopyGuard g(st, k, res);
+
         out->fields.reserve(obj->fields.size());
         for (const auto &f : obj->fields)
             out->fields.emplace_back(
-                clone_to_mutable(f.get(), through_readonly), false);
-        return intrusive_ptr<StructObject>(out);
+                clone_to_mutable(f.get(), through_readonly, st),
+                false);
+        return res;
     }
 
     return v;
@@ -2070,12 +3383,14 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
 
 EvalValue make_mutable_clone(const EvalValue &v)
 {
-    return clone_to_mutable(v, false);
+    CycCopyStack st;
+    return clone_to_mutable(v, false, st);
 }
 
 EvalValue make_deep_mutable_clone(const EvalValue &v)
 {
-    return clone_to_mutable(v, true);
+    CycCopyStack st;
+    return clone_to_mutable(v, true, st);
 }
 
 /*
@@ -2088,13 +3403,34 @@ EvalValue make_deep_mutable_clone(const EvalValue &v)
  * strings are returned as-is (already immutable). An empty array gets its own
  * read-only object (not the shared empty_arr singleton, which must stay
  * mutable).
+ *
+ * A value that contains itself is frozen into a FROZEN CYCLE (cyclewalk.h,
+ * as clone_to_mutable does): each container is flagged read-only once its
+ * own copy is complete, so by the time the whole copy returns, every
+ * container in it - the back-linked ones included - is read-only.
  */
-EvalValue
-make_const_clone(const EvalValue &v)
+static EvalValue
+make_const_clone_rec(const EvalValue &v, bool key, CycCopyStack &st)
 {
     if (v.is<SharedArrayObj>()) {
 
         const SharedArrayObj &src = v.get<SharedArrayObj>();
+
+        /* question 10: an array met again is its one copy (or being made:
+         * a cycle), whatever its storage, as in a deep copy */
+        CycKey k;
+        const bool keyed = cyc_copy_key(src, k);
+        if (keyed)
+            if (const EvalValue *c = st.link(k))
+                return *c;
+        /* Q2: a copy is an array of the source's type */
+        const TypeAnnot *ct = src.ctype();
+        auto made = [&](EvalValue res) {
+            res.get<SharedArrayObj>().set_ctype(ct);
+            if (keyed)
+                st.remember(k, res);
+            return res;
+        };
 
         /*
          * Flat homogeneous array: bake a flat read-only copy, keeping the
@@ -2108,9 +3444,9 @@ make_const_clone(const EvalValue &v)
                 iv.cbegin() + src.offset(),
                 iv.cbegin() + src.offset() + src.size()
             );
-            SharedArrayObj arr(move(nv));
+            SharedArrayObj arr(std::move(nv));
             arr.set_readonly();
-            return arr;
+            return made(arr);
         }
 
         if (src.skind() == SharedArrayObj::Storage::floats) {
@@ -2119,9 +3455,9 @@ make_const_clone(const EvalValue &v)
                 fv.cbegin() + src.offset(),
                 fv.cbegin() + src.offset() + src.size()
             );
-            SharedArrayObj arr(move(nv));
+            SharedArrayObj arr(std::move(nv));
             arr.set_readonly();
-            return arr;
+            return made(arr);
         }
 
         if (src.skind() == SharedArrayObj::Storage::bools) {
@@ -2130,9 +3466,9 @@ make_const_clone(const EvalValue &v)
                 bv.cbegin() + src.offset(),
                 bv.cbegin() + src.offset() + src.size()
             );
-            SharedArrayObj arr(move(nv));
+            SharedArrayObj arr(std::move(nv));
             arr.set_readonly();
-            return arr;
+            return made(arr);
         }
 
         /* Flat POD-struct array: a deep read-only byte copy (POD bytes hold no
@@ -2144,9 +3480,9 @@ make_const_clone(const EvalValue &v)
                 sv.buf.cbegin() + (src.offset() + src.size()) * sv.stride
             );
             SharedArrayObj arr(
-                SharedArrayObj::svec_type(move(nb), sv.def, sv.stride));
+                SharedArrayObj::svec_type(std::move(nb), sv.def, sv.stride));
             arr.set_readonly();
-            return arr;
+            return made(arr);
         }
 
         /* Flat STRING array: strings are immutable - nothing to recurse
@@ -2158,44 +3494,110 @@ make_const_clone(const EvalValue &v)
                 tv.cbegin() + src.offset() + src.size()
             ));
             arr.set_readonly();
-            return arr;
+            return made(arr);
+        }
+
+        /* Flat CLASS array: the same references (a class instance keeps
+         * its identity - frozen in place for a constant, below), read-only */
+        if (src.skind() == SharedArrayObj::Storage::objs) {
+            const auto &ov = src.flat_objs();
+            EvalValue res = SharedArrayObj(SharedArrayObj::ovec_type());
+            SharedArrayObj &arr = res.get<SharedArrayObj>();
+            arr.set_ctype(ct);
+            SharedArrayObj::ovec_type &nv = arr.flat_objs();
+            nv.v.reserve(src.size());
+            {
+                std::optional<CycCopyGuard> g;
+                if (keyed)
+                    g.emplace(st, k, res);
+                for (size_type i = 0; i < src.size(); i++) {
+                    const EvalValue c = make_const_clone_rec(
+                        obj_elem_value(ov[src.offset() + i]), key, st);
+                    ML_CHECK(is_obj_elem(c));
+                    nv.push(obj_elem_ptr(c));
+                }
+            }
+            arr.set_readonly();
+            return res;
         }
 
         const ArrayConstView &view = src.get_view();
 
-        SharedArrayObj::vec_type vec;
+        EvalValue res = SharedArrayObj(SharedArrayObj::vec_type());
+        SharedArrayObj &arr = res.get<SharedArrayObj>();
+        arr.set_ctype(ct);
+        SharedArrayObj::vec_type &vec = arr.get_vec();
         vec.reserve(view.size());
 
-        for (unsigned i = 0; i < view.size(); i++)
-            vec.emplace_back(make_const_clone(view[i].get()), false);
+        {
+            std::optional<CycCopyGuard> g;
+            if (keyed)
+                g.emplace(st, k, res);
+            for (unsigned i = 0; i < view.size(); i++)
+                vec.emplace_back(make_const_clone_rec(view[i].get(), key, st),
+                                 false);
+        }
 
-        SharedArrayObj arr(move(vec));
+        arr.len = static_cast<size_type>(vec.size());
         arr.set_readonly();
-        return arr;
+        return res;
     }
 
     if (v.is<intrusive_ptr<DictObject>>()) {
 
         const DictObject &src_obj = *v.get<intrusive_ptr<DictObject>>().get();
-        DictObject::inner_type data;
 
-        for (const auto &p : src_obj.get_ref()) {
-            data.emplace(
-                p.first,
-                LValue(make_const_clone(p.second.get()), false)
-            );
+        const CycKey k = cyc_key_obj(&src_obj);
+        if (const EvalValue *c = st.link(k))
+            return *c;
+
+        auto obj = make_intrusive<DictObject>();
+        obj->set_ctype(src_obj.ctype());    /* Q2: the source's type */
+        EvalValue res = intrusive_ptr<DictObject>(obj);
+
+        {
+            CycCopyGuard g(st, k, res);
+
+            for (const auto &p : src_obj.get_ref()) {
+                obj->build_emplace(
+                    EvalValue(p.first),
+                    LValue(make_const_clone_rec(p.second.get(), key, st),
+                           false)
+                );
+            }
+
+            if (src_obj.get_has_default())   /* preserve the default */
+                obj->set_default(
+                    make_const_clone_rec(src_obj.get_default(), key, st));
         }
 
-        auto obj = make_intrusive<DictObject>(move(data));
-        if (src_obj.get_has_default())   /* preserve the default-dict default */
-            obj->set_default(make_const_clone(src_obj.get_default()));
         obj->set_readonly();
-        return intrusive_ptr<DictObject>(obj);
+        return res;
     }
 
     if (v.is<intrusive_ptr<StructObject>>()) {
 
         const StructObject &src = *v.get<intrusive_ptr<StructObject>>().get();
+
+        /*
+         * A CLASS instance keeps its identity: it is never copied here. As
+         * (part of) a dict KEY it is not frozen either - its hash is its
+         * identity, which no field write changes, and freezing it would
+         * make the program's own object read-only. As a CONSTANT it is
+         * frozen IN PLACE: a constant's class objects are made by its
+         * declaration at compile time (a class construction is never
+         * folded anywhere else), so nothing else holds them yet - and
+         * freezing in place keeps two references to one of them one object.
+         */
+        if (src.is_ref()) {
+            if (key || src.is_readonly())
+                return v;
+            StructObject &o = const_cast<StructObject &>(src);
+            o.set_readonly();
+            for (auto &f : o.fields)
+                f.put(make_const_clone_rec(f.get(), false, st));
+            return v;
+        }
 
         /* POD: bytes hold no references, so a byte copy is a deep copy. */
         if (src.is_pod()) {
@@ -2204,53 +3606,170 @@ make_const_clone(const EvalValue &v)
             return intrusive_ptr<StructObject>(obj);
         }
 
+        const CycKey k = cyc_key_obj(&src);
+        if (const EvalValue *c = st.link(k))
+            return *c;
+
         auto obj = make_intrusive<StructObject>(src.def);
-        obj->fields.reserve(src.fields.size());
-        for (const auto &f : src.fields)
-            obj->fields.emplace_back(make_const_clone(f.get()), false);
+        EvalValue res = intrusive_ptr<StructObject>(obj);
+
+        {
+            CycCopyGuard g(st, k, res);
+            obj->fields.reserve(src.fields.size());
+            for (const auto &f : src.fields)
+                obj->fields.emplace_back(
+                    make_const_clone_rec(f.get(), key, st), false);
+        }
+
         obj->set_readonly();
-        return intrusive_ptr<StructObject>(obj);
+        return res;
     }
 
     return v;
 }
 
-/*
- * Build a fresh, mutable GENERAL array from a flat (unboxed int/float) array,
- * reading its scalar elements directly (no promotion of the source). Used to
- * materialize a folded array literal whose destination is dynamically typed
- * (arr_hint general): the array is born general so a later mixed write to it
- * never has to promote. Only a flat source reaches here - an already-general
- * baked value is handled by make_mutable_clone, which keeps it general.
- */
-static EvalValue
-make_general_array_clone(const SharedArrayObj &src)
+EvalValue
+make_const_clone(const EvalValue &v, bool key)
 {
-    const size_type m = src.size();
-    SharedArrayObj::vec_type gv;
-    gv.reserve(m);
+    CycCopyStack st;
+    EvalValue r = make_const_clone_rec(v, key, st);
 
-    if (src.skind() == SharedArrayObj::Storage::ints) {
-        const auto &iv = src.flat_ints();
-        for (size_type i = 0; i < m; i++)
-            gv.emplace_back(EvalValue(iv[src.offset() + i]), false);
-    } else if (src.skind() == SharedArrayObj::Storage::floats) {
-        const auto &fv = src.flat_floats();
-        for (size_type i = 0; i < m; i++)
-            gv.emplace_back(EvalValue(fv[src.offset() + i]), false);
-    } else if (src.skind() == SharedArrayObj::Storage::strs) {
-        const auto &tv = src.flat_strs();
-        for (size_type i = 0; i < m; i++)
-            gv.emplace_back(EvalValue(SharedStr(tv[src.offset() + i])),
-                            false);
-    } else {
-        const auto &bv = src.flat_bools();
-        for (size_type i = 0; i < m; i++)
-            gv.emplace_back(EvalValue(static_cast<bool>(bv[src.offset() + i])),
-                            false);
+    /* A FROZEN CYCLE cannot be broken by the program (every container in
+     * it is read-only), so it would live forever: keep it until the program
+     * ends, which frees it (cyc_keep_until_exit). */
+    if (st.closed)
+        cyc_keep_until_exit(r);
+    return r;
+}
+
+/* The values cyc_keep_until_exit keeps (cyclewalk.h) - counted handles. */
+static std::vector<EvalValue> &cyc_kept()
+{
+    static std::vector<EvalValue> kept;
+    return kept;
+}
+
+void cyc_keep_until_exit(const EvalValue &v)
+{
+    /* the vector is constructed BEFORE the handler is registered, so the
+     * handler runs before the vector's destructor (atexit's ordering) */
+    std::vector<EvalValue> &kept = cyc_kept();
+    static bool registered = false;
+    if (!registered) {
+        registered = true;
+        std::atexit(cyc_release_kept);
+    }
+    kept.push_back(v);
+}
+
+/*
+ * The walk of cyc_release_kept, which runs AFTER main returns - when a
+ * VmProgram or an AST has already freed the struct defs its values point
+ * to. So it reads no def (cyc_key and cyc_any_child do, through
+ * is_pod/is_ref: a heap-use-after-free at exit for any frozen cycle that
+ * reached a struct): a struct object is visited by its address and its
+ * children are its `fields` (a POD struct's are empty), an array by its
+ * storage (general or flat class), a dict by its object.
+ */
+static bool exit_key(const EvalValue &v, CycKey &k)
+{
+    switch (v.get_type()->t) {
+    case Type::t_arr: {
+        const SharedArrayObj &a = v.get_ref<SharedArrayObj>();
+        if (a.skind() != SharedArrayObj::Storage::general
+                && a.skind() != SharedArrayObj::Storage::objs)
+            return false;
+        k.obj = a.storage_id();
+        k.off = a.offset();
+        k.len = a.size();
+        return true;
+    }
+    case Type::t_dict:
+        k = cyc_key_obj(v.get_ref<intrusive_ptr<DictObject>>().get());
+        return true;
+    case Type::t_struct:
+        k = cyc_key_obj(v.get_ref<intrusive_ptr<StructObject>>().get());
+        return true;
+    default:
+        return false;
+    }
+}
+
+template <class F>
+static void exit_children(const EvalValue &v, F f)
+{
+    switch (v.get_type()->t) {
+    case Type::t_arr: {
+        const SharedArrayObj &a = v.get_ref<SharedArrayObj>();
+        if (a.skind() == SharedArrayObj::Storage::objs) {
+            const auto &ov = a.flat_objs();
+            for (size_type i = 0; i < a.size(); i++)
+                if (StructObject *p = ov[a.offset() + i])
+                    f(obj_elem_value(p));
+        } else if (a.skind() == SharedArrayObj::Storage::general) {
+            const ArrayConstView view = a.get_view();
+            for (size_type i = 0; i < view.size(); i++)
+                f(view[i].get());
+        }
+        return;
+    }
+    case Type::t_dict: {
+        const DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
+        for (const auto &kv : d.get_ref()) {
+            f(kv.first);
+            f(kv.second.get());
+        }
+        if (d.get_has_default())
+            f(d.get_default());
+        return;
+    }
+    case Type::t_struct:
+        for (const LValue &fl :
+                 v.get_ref<intrusive_ptr<StructObject>>()->fields)
+            f(fl.get());
+        return;
+    default:
+        return;
+    }
+}
+
+void cyc_release_kept()
+{
+    std::vector<EvalValue> work;
+    work.swap(cyc_kept());
+
+    /* Every container reachable from a kept value, each held by a counted
+     * handle while the others are emptied - so emptying one frees none of
+     * the rest under the loop. */
+    std::vector<EvalValue> all;
+    std::unordered_set<CycKey, CycKeyHash> seen;
+
+    while (!work.empty()) {
+        EvalValue v = std::move(work.back());
+        work.pop_back();
+        CycKey k;
+        if (!exit_key(v, k) || !seen.insert(k).second)
+            continue;
+        exit_children(v, [&](const EvalValue &c) { work.push_back(c); });
+        all.push_back(std::move(v));
     }
 
-    return SharedArrayObj(move(gv));
+    for (EvalValue &v : all) {
+        if (v.is<SharedArrayObj>()) {
+            SharedArrayObj &a = v.get<SharedArrayObj>();
+            if (a.skind() == SharedArrayObj::Storage::objs) {
+                /* in place: get_vec() would detach a slice's window */
+                auto &ov = a.flat_objs();
+                for (size_t i = 0; i < ov.size(); i++)
+                    ov.set(i, nullptr);
+            } else {
+                a.get_vec().clear();
+            }
+        } else if (v.is<intrusive_ptr<DictObject>>())
+            v.get<intrusive_ptr<DictObject>>()->release_at_exit();
+        else
+            v.get<intrusive_ptr<StructObject>>()->fields.clear();
+    }
 }
 
 /*
@@ -2279,20 +3798,261 @@ arr_elem_boxed(const SharedArrayObj &a, size_type i)
         }
         case SharedArrayObj::Storage::strs:
             return EvalValue(SharedStr(a.flat_strs()[a.offset() + i]));
+        case SharedArrayObj::Storage::objs:
+            return obj_elem_value(a.flat_objs()[a.offset() + i]);
         default:
             return a.get_view()[i].get();
+    }
+}
+
+/* The numeric SHAPE a constant value's static type has - the part of
+ * static_type_from_value (inferencer.cpp) the widening needs: the numeric
+ * join bool <= int <= float, through arrays' elements and dicts' values,
+ * `none` joining as nothing (it only makes a type opt), anything else
+ * `other` (the join is dyn, and nothing widens). A constant literal is
+ * built at parse time, before inference exists, so this is how its
+ * values reach the type the inferencer will then give it (#75). */
+namespace {
+struct NumShape {
+    enum Kind { bot, b, i, f, arr, dict, other } k = bot;
+    std::unique_ptr<NumShape> sub;       /* arr: element, dict: value */
+};
+
+void shape_join(NumShape &a, const NumShape &x)
+{
+    using K = NumShape::Kind;
+    if (x.k == K::bot || a.k == K::other)
+        return;
+    if (a.k == K::bot) {
+        a.k = x.k;
+        if (x.sub) {
+            a.sub = std::make_unique<NumShape>();
+            shape_join(*a.sub, *x.sub);
+        }
+        return;
+    }
+    const bool an = a.k == K::b || a.k == K::i || a.k == K::f;
+    const bool xn = x.k == K::b || x.k == K::i || x.k == K::f;
+    if (an && xn) {
+        a.k = std::max(a.k, x.k);
+    } else if (a.k == x.k && (a.k == K::arr || a.k == K::dict)) {
+        if (x.sub)
+            shape_join(*a.sub, *x.sub);
+    } else {
+        a.k = K::other;
+        a.sub.reset();
+    }
+}
+
+/* `st`: the containers this walk is inside (cyclewalk.h) - a constant may
+ * contain itself, and a back edge's shape is `other`, the dyn its static
+ * type gives it (static_type_from_value). */
+NumShape shape_of(const EvalValue &v, CycStack &st)
+{
+    NumShape s;
+    if (v.is<NoneVal>())
+        return s;
+    if (v.is<bool>()) { s.k = NumShape::b; return s; }
+    if (v.is<int_type>()) { s.k = NumShape::i; return s; }
+    if (v.is<float_type>()) { s.k = NumShape::f; return s; }
+    CycKey k;
+    const bool keyed = cyc_key(v, k);
+    if (keyed && st.contains(k)) {
+        s.k = NumShape::other;
+        return s;
+    }
+    CycGuard g(st, k, keyed);
+    if (v.is<SharedArrayObj>()) {
+        const auto &a = v.get_ref<SharedArrayObj>();
+        s.k = NumShape::arr;
+        s.sub = std::make_unique<NumShape>();
+        for (size_type i = 0; i < a.size(); i++)
+            shape_join(*s.sub, shape_of(arr_elem_boxed(a, i), st));
+        return s;
+    }
+    if (v.is<intrusive_ptr<DictObject>>()) {
+        s.k = NumShape::dict;
+        s.sub = std::make_unique<NumShape>();
+        for (const auto &kv : v.get_ref<intrusive_ptr<DictObject>>()
+                                   ->get_ref())
+            shape_join(*s.sub, shape_of(kv.second.get(), st));
+        return s;
+    }
+    s.k = NumShape::other;
+    return s;
+}
+
+/* `v` widened to shape `s`; `changed` says whether anything moved. A
+ * container is REBUILT, never edited: it may be a shared constant
+ * reached through a name (`const N = [[1, 2.5], A];` - A keeps its own
+ * type) */
+EvalValue shape_widen(const EvalValue &v, const NumShape &s, bool is_const,
+                      bool &changed)
+{
+    changed = false;
+    if (s.k == NumShape::f && (v.is<int_type>() || v.is<bool>())) {
+        changed = true;
+        return EvalValue(static_cast<float_type>(
+            v.is<bool>() ? (v.get<bool>() ? 1 : 0) : v.get<int_type>()));
+    }
+    if (s.k == NumShape::i && v.is<bool>()) {
+        changed = true;
+        return EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
+    }
+    if (s.k == NumShape::arr && v.is<SharedArrayObj>()) {
+        const auto &a = v.get_ref<SharedArrayObj>();
+        std::vector<EvalValue> buf(a.size());
+        bool any = false;
+        for (size_type i = 0; i < a.size(); i++) {
+            bool c;
+            buf[i] = shape_widen(arr_elem_boxed(a, i), *s.sub, is_const, c);
+            any |= c;
+        }
+        if (!any)
+            return v;
+        changed = true;
+        EvalValue r = build_array_from_values(buf.data(), buf.size(),
+                                              ArrHint::dflt, nullptr,
+                                              is_const);
+        if (a.is_readonly())
+            r = make_const_clone(r);
+        return r;
+    }
+    if (s.k == NumShape::dict && v.is<intrusive_ptr<DictObject>>()) {
+        const auto &d = *v.get_ref<intrusive_ptr<DictObject>>();
+        if (d.get_has_default())
+            return v;
+        std::vector<EvalValue> buf;
+        buf.reserve(2 * d.get_ref().size());
+        bool any = false;
+        for (const auto &kv : d.get_ref()) {
+            bool c;
+            buf.push_back(kv.first);
+            buf.push_back(shape_widen(kv.second.get(), *s.sub, is_const, c));
+            any |= c;
+        }
+        if (!any)
+            return v;
+        changed = true;
+        EvalValue r = build_dict_from_pairs(buf.data(), buf.size() / 2,
+                                            is_const);
+        if (d.is_readonly())
+            r = make_const_clone(r);
+        return r;
+    }
+    return v;
+}
+} // namespace
+
+/* widen_baked_value's walk; `st` the containers it is inside (a baked
+ * value may contain itself - a back edge is left as it is) */
+static EvalValue widen_baked_rec(const EvalValue &v, const WidenShape &w,
+                                 CycStack &st, bool &changed)
+{
+    changed = false;
+    if (w.k == 'f' && (v.is<int_type>() || v.is<bool>())) {
+        changed = true;
+        return EvalValue(static_cast<float_type>(
+            v.is<bool>() ? (v.get<bool>() ? 1 : 0) : v.get<int_type>()));
+    }
+    if (w.k == 'i' && v.is<bool>()) {
+        changed = true;
+        return EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
+    }
+    if ((w.k != 'a' || !v.is<SharedArrayObj>())
+        && (w.k != 'd' || !v.is<intrusive_ptr<DictObject>>()))
+        return v;
+    CycKey ck;
+    const bool keyed = cyc_key(v, ck);
+    if (keyed && st.contains(ck))
+        return v;
+    CycGuard g(st, ck, keyed);
+    if (w.k == 'a') {
+        const auto &a = v.get_ref<SharedArrayObj>();
+        std::vector<EvalValue> buf(a.size());
+        bool any = false;
+        for (size_type i = 0; i < a.size(); i++) {
+            bool c = false;
+            buf[i] = w.sub ? widen_baked_rec(arr_elem_boxed(a, i), *w.sub,
+                                             st, c)
+                           : arr_elem_boxed(a, i);
+            any |= c;
+        }
+        /* ...and the storage its type gives it: [1.5] for an
+         * array<float?> is GENERAL, so a later `none` element fits */
+        using K = SharedArrayObj::Storage;
+        const K want = w.hint == ArrHint::general ? K::general
+                     : w.hint == ArrHint::flat_i ? K::ints
+                     : w.hint == ArrHint::flat_f ? K::floats
+                     : w.hint == ArrHint::flat_b ? K::bools
+                     : w.hint == ArrHint::flat_s ? K::structs
+                     : w.hint == ArrHint::flat_c ? K::objs
+                                                 : a.skind();
+        if (!any && want == a.skind())
+            return v;
+        changed = true;
+        EvalValue r = build_array_from_values(buf.data(), buf.size(),
+                                              w.hint, w.hint_struct, false);
+        if (a.is_readonly())
+            r = make_const_clone(r);
+        return r;
+    }
+    const auto &d = *v.get_ref<intrusive_ptr<DictObject>>();
+    std::vector<EvalValue> buf;
+    buf.reserve(2 * d.get_ref().size());
+    bool any = false;
+    for (const auto &kv : d.get_ref()) {
+        bool ck2 = false, cv = false;
+        buf.push_back(w.key ? widen_baked_rec(kv.first, *w.key, st, ck2)
+                            : kv.first);
+        buf.push_back(w.sub ? widen_baked_rec(kv.second.get(), *w.sub, st, cv)
+                            : kv.second.get());
+        any |= ck2 || cv;
+    }
+    /* (no default to widen: a default dict is `dict(v)`'s value, which a
+     * written literal - the only value this widens - cannot hold) */
+    if (!any)
+        return v;
+    changed = true;
+    EvalValue r = build_dict_from_pairs(buf.data(), buf.size() / 2, false);
+    /* a constant's dict is built at its annotation's types by its bake
+     * (stamp_literal_annot runs before it), so none is widened here */
+    if (d.is_readonly())        /* INT-COV-EXEMPT: see above */
+        r = make_const_clone(r);    /* INT-COV-EXEMPT: see above */
+    return r;
+}
+
+EvalValue widen_baked_value(const EvalValue &v, const WidenShape &w)
+{
+    CycStack st;
+    bool changed;
+    return widen_baked_rec(v, w, st, changed);
+}
+
+static void const_values_widen(EvalValue *vals, size_t n, size_t stride,
+                               bool is_const)
+{
+    NumShape s;
+    CycStack st;
+    for (size_t i = 0; i < n; i++)
+        shape_join(s, shape_of(vals[i * stride], st));
+    if (s.k == NumShape::bot || s.k == NumShape::other)
+        return;
+    for (size_t i = 0; i < n; i++) {
+        bool c;
+        EvalValue w = shape_widen(vals[i * stride], s, is_const, c);
+        if (c)
+            vals[i * stride] = std::move(w);
     }
 }
 
 /*
  * The value a LiteralObj (a baked const array/dict/struct) materializes -
  * factored out of LiteralObj::do_eval so the VM's LoadLiteralObjV op reproduces
- * it BYTE-for-BYTE from a baked pool entry (value + immutable + arr_hint +
- * arr_hint_struct), AST-free (no LiteralObj node needed at run time).
+ * it BYTE-for-BYTE from a baked pool entry (value + immutable), AST-free (no
+ * LiteralObj node needed at run time).
  */
-EvalValue eval_literal_obj(const EvalValue &value, bool immutable,
-                           ArrHint arr_hint,
-                           const StructTypeDef *arr_hint_struct)
+EvalValue eval_literal_obj(const EvalValue &value, bool immutable)
 {
     /*
      * A const-decl target (immutable) shares the baked value directly: it was
@@ -2302,48 +4062,17 @@ EvalValue eval_literal_obj(const EvalValue &value, bool immutable,
      * other target (a `var` or a read-only consumer) gets a fresh mutable deep
      * copy, so writes work and re-entry never sees a prior mutation.
      *
-     * Type-driven: when the destination is dynamically typed (arr_hint general)
-     * but the baked array is flat (a homogeneous literal like [1,2,3] later
-     * widened to array<dyn> by a mixed write), materialize it general from the
-     * start so that write never promotes.
+     * The value is already in the storage its destination's type gives it:
+     * the passes that learn that type rebuild it (the parser's
+     * stamp_literal_annot, the inferencer's set_array_repr_hint and
+     * stamp_literal_repr - widen_baked_value), so nothing is converted here.
      */
-    if (!immutable && arr_hint == ArrHint::general && value.is<SharedArrayObj>()
-        && value.get<SharedArrayObj>().skind()
-               != SharedArrayObj::Storage::general)
-        return make_general_array_clone(value.get<SharedArrayObj>());
-
-    /* An empty baked array bound to an array<POD struct> destination starts
-     * flat (the const-fold erased the element type, so the hint restores it),
-     * so a built-up `var a = []; append(a, S(..))` stays unboxed. */
-    if (arr_hint == ArrHint::flat_s && arr_hint_struct &&
-        value.is<SharedArrayObj>() && value.get<SharedArrayObj>().size() == 0) {
-        StructTypeDef *def = const_cast<StructTypeDef *>(arr_hint_struct);
-        return SharedArrayObj(SharedArrayObj::svec_type({}, def, def->size));
-    }
-
-    /* The SCALAR twin (2026-07-18 profile #1): an empty baked `[]` whose
-     * destination is a known array<int>/<float>/<bool> - annotated OR
-     * inferred (`var a = []; push(a, i)` fixpoints to array<int>) - starts
-     * FLAT. The const-fold baked it before inference (element type
-     * unknowable), so only the hint can restore the representation; without
-     * this arm the entire grow-from-empty class ran on 48-byte general
-     * LValues (bench 13's shape). */
-    if (value.is<SharedArrayObj>()
-        && value.get<SharedArrayObj>().size() == 0) {
-        if (arr_hint == ArrHint::flat_i)
-            return SharedArrayObj(SharedArrayObj::ivec_type{});
-        if (arr_hint == ArrHint::flat_f)
-            return SharedArrayObj(SharedArrayObj::fvec_type{});
-        if (arr_hint == ArrHint::flat_b)
-            return SharedArrayObj(SharedArrayObj::bvec_type{});
-    }
-
     return immutable ? value : make_mutable_clone(value);
 }
 
 EvalValue LiteralObj::do_eval(EvalContext *ctx, bool rec) const
 {
-    return eval_literal_obj(value, immutable, arr_hint, arr_hint_struct);
+    return eval_literal_obj(value, immutable);
 }
 
 /*
@@ -2353,11 +4082,17 @@ EvalValue LiteralObj::do_eval(EvalContext *ctx, bool rec) const
  * application can throw (undefined variable, type mismatch, division by zero).
  */
 static void
-stamp_operand_loc(const Construct *c, Exception &e)
+stamp_operand_loc(const Construct *c, Exception &e,
+                  const Construct *parent)
 {
     if (!e.loc_start) {
-        e.loc_start = c->start;
-        e.loc_end = c->end;
+        Loc s = c->start, en = c->end;
+        /* #68: an error the PARENT's operation raises about an inlined
+         * call's value carets the call, as written there */
+        if (parent)
+            inline_operand_span(c->inline_call, s, en);
+        e.loc_start = s;
+        e.loc_end = en;
     }
 
     /*
@@ -2368,22 +4103,53 @@ stamp_operand_loc(const Construct *c, Exception &e)
      */
 }
 
-/* `acc OP= operand`, with operand-precise error locations. */
-static void
-num_binop_loc(EvalValue &acc, const Construct *operand, EvalContext *ctx,
-              NumBinOp op)
+/* #68: a division's errors caret its divisor as the division writes
+ * it - an inlined call's value at the call (inline_operand_span) */
+[[noreturn]] static void
+throw_operand_div0(const Construct *parent, const Construct *op)
 {
+    Loc s = op->start, e = op->end;
+    inline_operand_span(op->inline_call, s, e);
+    throw DivisionByZeroEx(s, e);
+}
+
+[[noreturn]] static void
+throw_operand_div_overflow(const Construct *parent, const Construct *op)
+{
+    Loc s = op->start, e = op->end;
+    inline_operand_span(op->inline_call, s, e);
+    throw InvalidValueEx("integer overflow in division", s, e);
+}
+
+/* `acc OP= operand`, with operand-precise error locations: an error
+ * evaluating the operand at its own span, one the operation raises
+ * about it at the operand as `parent` writes it (#68) */
+static void
+num_binop_loc(EvalValue &acc, const Construct *parent,
+              const Construct *operand, EvalContext *ctx, NumBinOp op,
+              bool sum = false)
+{
+    EvalValue v;
     try {
-        num_bin_op(acc, RValue(operand->eval(ctx)), op);
+        v = RValue(operand->eval(ctx));
     } catch (Exception &e) {
         stamp_operand_loc(operand, e);
+        throw;
+    }
+    try {
+        /* `sum`: acc is the copy an array `+` builds (ArrSumScope) */
+        const ArrSumScope g(sum ? acc : none);
+        num_bin_op(acc, v, op);
+    } catch (Exception &e) {
+        stamp_operand_loc(operand, e, parent);
         throw;
     }
 }
 
 /* Same, for the short-circuiting logical operators (&& and ||). */
 static void
-logop_loc(EvalValue &acc, const Construct *operand, EvalContext *ctx, Op op)
+logop_loc(EvalValue &acc, const Construct *operand, EvalContext *ctx,
+          Op op)
 {
     /*
      * `&&` / `||` operate on truthiness (the unchanged truthy rules:
@@ -2402,7 +4168,7 @@ logop_loc(EvalValue &acc, const Construct *operand, EvalContext *ctx, Op op)
 
 EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const
 {
-    assert(elems.size() >= 1 && elems[0].first == Op::invalid);
+    ML_CHECK(elems.size() >= 1 && elems[0].first == Op::invalid);
 
     if (elems.size() == 1)
         return elems[0].second->eval(ctx);
@@ -2418,7 +4184,7 @@ EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const
 
 EvalValue Expr02::do_eval(EvalContext *ctx, bool rec) const
 {
-    assert(elems.size() == 1 || elems.size() == 2);
+    ML_CHECK(elems.size() == 1 || elems.size() == 2);
     const auto &[op, e] = elems[0];
 
     if (op == Op::invalid)
@@ -2454,10 +4220,10 @@ EvalValue Expr02::do_eval(EvalContext *ctx, bool rec) const
                 throw InternalErrorEx();
         }
 
-        return move(val);
+        return std::move(val);
 
     } catch (Exception &ex) {
-        stamp_operand_loc(e.get(), ex);
+        stamp_operand_loc(e.get(), ex, this);
         throw;
     }
 }
@@ -2471,14 +4237,14 @@ EvalValue Expr05::do_eval(EvalContext *ctx, bool rec) const
         const auto &[op, e] = *it;
 
         switch (op) {
-            case Op::shl:  num_binop_loc(val, e.get(), ctx, &Type::shl);  break;
-            case Op::shr:  num_binop_loc(val, e.get(), ctx, &Type::shr);  break;
-            case Op::ushr: num_binop_loc(val, e.get(), ctx, &Type::ushr); break;
+            case Op::shl:  num_binop_loc(val, this, e.get(), ctx, &Type::shl);  break;
+            case Op::shr:  num_binop_loc(val, this, e.get(), ctx, &Type::shr);  break;
+            case Op::ushr: num_binop_loc(val, this, e.get(), ctx, &Type::ushr); break;
             default:       throw InternalErrorEx();
         }
     }
 
-    return move(val);
+    return std::move(val);
 }
 
 EvalValue Expr08::do_eval(EvalContext *ctx, bool rec) const
@@ -2492,10 +4258,10 @@ EvalValue Expr08::do_eval(EvalContext *ctx, bool rec) const
         if (op != Op::band)
             throw InternalErrorEx();
 
-        num_binop_loc(val, e.get(), ctx, &Type::band);
+        num_binop_loc(val, this, e.get(), ctx, &Type::band);
     }
 
-    return move(val);
+    return std::move(val);
 }
 
 EvalValue Expr09::do_eval(EvalContext *ctx, bool rec) const
@@ -2509,10 +4275,10 @@ EvalValue Expr09::do_eval(EvalContext *ctx, bool rec) const
         if (op != Op::bxor)
             throw InternalErrorEx();
 
-        num_binop_loc(val, e.get(), ctx, &Type::bxor);
+        num_binop_loc(val, this, e.get(), ctx, &Type::bxor);
     }
 
-    return move(val);
+    return std::move(val);
 }
 
 EvalValue Expr10::do_eval(EvalContext *ctx, bool rec) const
@@ -2526,10 +4292,10 @@ EvalValue Expr10::do_eval(EvalContext *ctx, bool rec) const
         if (op != Op::bor)
             throw InternalErrorEx();
 
-        num_binop_loc(val, e.get(), ctx, &Type::bor);
+        num_binop_loc(val, this, e.get(), ctx, &Type::bor);
     }
 
-    return move(val);
+    return std::move(val);
 }
 
 EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
@@ -2542,25 +4308,26 @@ EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::times:
-                num_binop_loc(val, e.get(), ctx, &Type::mul);
+                num_binop_loc(val, this, e.get(), ctx, &Type::mul);
                 break;
             case Op::div:
-                num_binop_loc(val, e.get(), ctx, &Type::div);
+                num_binop_loc(val, this, e.get(), ctx, &Type::div);
                 break;
             case Op::mod:
-                num_binop_loc(val, e.get(), ctx, &Type::mod);
+                num_binop_loc(val, this, e.get(), ctx, &Type::mod);
                 break;
             default:
                 throw InternalErrorEx();
         }
     }
 
-    return move(val);
+    return std::move(val);
 }
 
 EvalValue Expr04::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue &&val = eval_first_rvalue(ctx).clone();
+    ctype_sum_copy(val);       /* Q2: the sum's copy starts untyped */
 
     for (auto &&it = elems.begin() + 1; it != elems.end(); it++) {
 
@@ -2568,17 +4335,20 @@ EvalValue Expr04::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::plus:
-                num_binop_loc(val, e.get(), ctx, &Type::add);
+                num_binop_loc(val, this, e.get(), ctx, &Type::add, true);
                 break;
             case Op::minus:
-                num_binop_loc(val, e.get(), ctx, &Type::sub);
+                num_binop_loc(val, this, e.get(), ctx, &Type::sub);
                 break;
             default:
                 throw InternalErrorEx();
         }
     }
 
-    return move(val);
+    /* Q2: the sum takes its static type (the VM's StampTypeV) */
+    if (ctype)
+        stamp_ctype_top(val, ctype);
+    return std::move(val);
 }
 
 EvalValue Expr06::do_eval(EvalContext *ctx, bool rec) const
@@ -2591,16 +4361,16 @@ EvalValue Expr06::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::lt:
-                num_binop_loc(val, e.get(), ctx, &Type::lt);
+                num_binop_loc(val, this, e.get(), ctx, &Type::lt);
                 break;
             case Op::gt:
-                num_binop_loc(val, e.get(), ctx, &Type::gt);
+                num_binop_loc(val, this, e.get(), ctx, &Type::gt);
                 break;
             case Op::le:
-                num_binop_loc(val, e.get(), ctx, &Type::le);
+                num_binop_loc(val, this, e.get(), ctx, &Type::le);
                 break;
             case Op::ge:
-                num_binop_loc(val, e.get(), ctx, &Type::ge);
+                num_binop_loc(val, this, e.get(), ctx, &Type::ge);
                 break;
             default:
                 throw InternalErrorEx();
@@ -2621,10 +4391,10 @@ EvalValue Expr07::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::eq:
-                num_binop_loc(val, e.get(), ctx, &Type::eq);
+                num_binop_loc(val, this, e.get(), ctx, &Type::eq);
                 break;
             case Op::noteq:
-                num_binop_loc(val, e.get(), ctx, &Type::noteq);
+                num_binop_loc(val, this, e.get(), ctx, &Type::noteq);
                 break;
             default:
                 throw InternalErrorEx();
@@ -2645,6 +4415,12 @@ EvalValue Expr11::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::land:
+                /* SHORT-CIRCUIT (#138): a false accumulator DETERMINES the
+                 * result, so the right operand is not evaluated at all - its
+                 * side effects do not happen and its errors are not raised.
+                 * That is what makes `p != none && p.x > 0` a guard. */
+                if (!val.is_true())
+                    return EvalValue(false);
                 logop_loc(val, e.get(), ctx, op);
                 break;
             default:
@@ -2652,7 +4428,7 @@ EvalValue Expr11::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
-    return move(val);
+    return std::move(val);
 }
 
 EvalValue Expr12::do_eval(EvalContext *ctx, bool rec) const
@@ -2665,6 +4441,10 @@ EvalValue Expr12::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::lor:
+                /* SHORT-CIRCUIT (#138) - the `||` twin: a TRUE accumulator
+                 * determines the result. */
+                if (val.is_true())
+                    return EvalValue(true);
                 logop_loc(val, e.get(), ctx, op);
                 break;
             default:
@@ -2672,7 +4452,7 @@ EvalValue Expr12::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
-    return move(val);
+    return std::move(val);
 }
 
 /*
@@ -2703,33 +4483,56 @@ static inline int_type typed_cmp(Op op, T a, T b)
     }
 }
 
-int_type TypedScalarExpr::eval_int(EvalContext *ctx) const
+int_type TypedScalarExpr::eval_int_body(EvalContext *ctx) const
 {
     switch (cat) {
 
         case Cat::neg:
             if (kind == TypeHint::f)
                 return static_cast<int_type>(-elems[0].second->eval_float(ctx));
-            return -elems[0].second->eval_int(ctx);
+            {
+                const int_type v = elems[0].second->eval_int(ctx);
+                ML_INT_ONLY(int_vc_arith('n', v, 0);)
+                return -v;
+            }
 
         case Cat::lnot:
             return elems[0].second->eval_int(ctx) == 0 ? 1 : 0;
 
         case Cat::arith: {
             if (kind == TypeHint::f)
-                return static_cast<int_type>(eval_float(ctx));
+                return static_cast<int_type>(eval_float_body(ctx));
             int_type acc = elems[0].second->eval_int(ctx);
             for (size_t i = 1; i < elems.size(); i++) {
                 const int_type r = elems[i].second->eval_int(ctx);
                 switch (elems[i].first) {
-                    case Op::plus:  acc += r; break;
-                    case Op::minus: acc -= r; break;
-                    case Op::times: acc *= r; break;
+                    case Op::plus:
+                        ML_INT_ONLY(int_vc_arith('+', acc, r);)
+                        acc += r; break;
+                    case Op::minus:
+                        ML_INT_ONLY(int_vc_arith('-', acc, r);)
+                        acc -= r; break;
+                    case Op::times:
+                        ML_INT_ONLY(int_vc_arith('*', acc, r);)
+                        acc *= r; break;
+                    /* div0 carets the DIVISOR operand (#76) - the boxed
+                     * ladder's operand-precise convention, so the engines
+                     * agree regardless of which path lowered the chain */
                     case Op::div:
-                        if (r == 0) throw DivisionByZeroEx(start, end);
+                        ML_INT_ONLY(int_vc_divmod(false, acc, r);)
+                        if (r == 0)
+                            throw_operand_div0(this, elems[i].second.get());
+                        if (r == -1 && acc == INT_TYPE_MIN)
+                            throw_operand_div_overflow(
+                                this, elems[i].second.get());
                         acc /= r; break;
                     case Op::mod:
-                        if (r == 0) throw DivisionByZeroEx(start, end);
+                        ML_INT_ONLY(int_vc_divmod(true, acc, r);)
+                        if (r == 0)
+                            throw_operand_div0(this, elems[i].second.get());
+                        if (r == -1 && acc == INT_TYPE_MIN)
+                            throw_operand_div_overflow(
+                                this, elems[i].second.get());
                         acc %= r; break;
                     case Op::band: acc &= r; break;
                     case Op::bor:  acc |= r; break;
@@ -2744,18 +4547,35 @@ int_type TypedScalarExpr::eval_int(EvalContext *ctx) const
         }
 
         case Cat::cmp:
-            if (kind == TypeHint::f)
-                return typed_cmp<float_type>(elems[1].first,
-                                             elems[0].second->eval_float(ctx),
-                                             elems[1].second->eval_float(ctx));
-            return typed_cmp<int_type>(elems[1].first,
-                                       elems[0].second->eval_int(ctx),
-                                       elems[1].second->eval_int(ctx));
+            /* the operands LEFT TO RIGHT, explicitly: as two arguments of
+             * typed_cmp their order was unspecified, and a GCC build
+             * evaluated the RIGHT one first - `a() < b()` printed b before
+             * a in the tree-walker alone (RULE 2) */
+            if (kind == TypeHint::f) {
+                const float_type x = elems[0].second->eval_float(ctx);
+                const float_type y = elems[1].second->eval_float(ctx);
+                ML_INT_ONLY(int_vc_float_cmp(x, y);)
+                return typed_cmp<float_type>(elems[1].first, x, y);
+            } else {
+                const int_type x = elems[0].second->eval_int(ctx);
+                const int_type y = elems[1].second->eval_int(ctx);
+                return typed_cmp<int_type>(elems[1].first, x, y);
+            }
 
         case Cat::logical: {
             int_type acc = elems[0].second->eval_int(ctx);
             for (size_t i = 1; i < elems.size(); i++) {
-                /* both sides always evaluated (no short-circuit) */
+                /* SHORT-CIRCUIT (#138): stop at the operand that DETERMINES
+                 * the result - false for `&&`, true for `||` - so the rest is
+                 * never evaluated. The M8 form must agree with the boxed one
+                 * operand for operand, since which one a node gets is an
+                 * inference detail the program cannot see. */
+                if (elems[i].first == Op::land) {
+                    if (!acc)
+                        return 0;
+                } else if (acc) {
+                    return 1;
+                }
                 const int_type r = elems[i].second->eval_int(ctx);
                 acc = (elems[i].first == Op::land) ? (acc && r) : (acc || r);
             }
@@ -2766,26 +4586,52 @@ int_type TypedScalarExpr::eval_int(EvalContext *ctx) const
     return 0;
 }
 
-float_type TypedScalarExpr::eval_float(EvalContext *ctx) const
+float_type TypedScalarExpr::eval_float_body(EvalContext *ctx) const
 {
+    /* An INT node asked for a float (an operand of a float operator, a
+     * float comparison, a float destination) computes in int and
+     * converts the RESULT: its operators are int operators - `j / 2` is
+     * 3 whatever reads it, and `mx + 1` wraps. Reading its operands as
+     * floats instead turned `(j / 2) * 1.0` into 3.5. */
+    if (kind == TypeHint::i && (cat == Cat::arith || cat == Cat::neg))
+        return static_cast<float_type>(eval_int_body(ctx));
+
     switch (cat) {
 
-        case Cat::neg:
-            return -elems[0].second->eval_float(ctx);
+        case Cat::neg: {
+            const float_type v = elems[0].second->eval_float(ctx);
+            ML_INT_ONLY(int_vc_float_neg(v);)
+            return -v;
+        }
 
         case Cat::arith: {
             float_type acc = elems[0].second->eval_float(ctx);
             for (size_t i = 1; i < elems.size(); i++) {
                 const float_type r = elems[i].second->eval_float(ctx);
                 switch (elems[i].first) {
-                    case Op::plus:  acc += r; break;
-                    case Op::minus: acc -= r; break;
-                    case Op::times: acc *= r; break;
+                    case Op::plus:
+                        ML_INT_ONLY(int_vc_float_op(acc, r, acc + r);)
+                        acc += r; break;
+                    case Op::minus:
+                        ML_INT_ONLY(int_vc_float_op(acc, r, acc - r);)
+                        acc -= r; break;
+                    case Op::times:
+                        ML_INT_ONLY(int_vc_float_op(acc, r, acc * r);)
+                        acc *= r; break;
                     case Op::div:
-                        if (r == 0.0) throw DivisionByZeroEx(start, end);
+                        ML_INT_ONLY(int_vc_float_div0(false, r);
+                                    if (r != 0.0)
+                                        int_vc_float_op(acc, r, acc / r);)
+                        if (r == 0.0)
+                            throw_operand_div0(this, elems[i].second.get());
                         acc /= r; break;
                     case Op::mod:
-                        if (r == 0.0) throw DivisionByZeroEx(start, end);
+                        ML_INT_ONLY(int_vc_float_div0(true, r);
+                                    if (r != 0.0)
+                                        int_vc_float_op(acc, r,
+                                                        fmod(acc, r));)
+                        if (r == 0.0)
+                            throw_operand_div0(this, elems[i].second.get());
                         acc = fmod(acc, r); break;
                     default: throw InternalErrorEx();
                 }
@@ -2794,7 +4640,43 @@ float_type TypedScalarExpr::eval_float(EvalContext *ctx) const
         }
 
         default:   /* cmp / logical / lnot yield int */
-            return static_cast<float_type>(eval_int(ctx));
+            return static_cast<float_type>(eval_int_body(ctx));
+    }
+}
+
+/* Task #75: the typed evals bypass Construct::eval, so a node spliced from
+ * an inlined body must flush its own "inlined-at" chain when an exception
+ * unwinds through it - the innermost typed node on the unwind path wins
+ * (exactly Construct::eval's protocol, keyed off inline_origin_emitted).
+ * A chain-less node (the overwhelmingly common case) takes the direct
+ * call - no try scaffolding on its path. */
+int_type TypedScalarExpr::eval_int(EvalContext *ctx) const
+{
+    if (!inline_ctx)
+        return eval_int_body(ctx);
+    try {
+        return eval_int_body(ctx);
+    } catch (Exception &ex) {
+        if (!ex.inline_origin_emitted) {
+            flush_inline_frames(inline_ctx, ex);
+            ex.inline_origin_emitted = true;
+        }
+        throw;
+    }
+}
+
+float_type TypedScalarExpr::eval_float(EvalContext *ctx) const
+{
+    if (!inline_ctx)
+        return eval_float_body(ctx);
+    try {
+        return eval_float_body(ctx);
+    } catch (Exception &ex) {
+        if (!ex.inline_origin_emitted) {
+            flush_inline_frames(inline_ctx, ex);
+            ex.inline_origin_emitted = true;
+        }
+        throw;
     }
 }
 
@@ -2809,17 +4691,42 @@ EvalValue TypedScalarExpr::do_eval(EvalContext *ctx, bool rec) const
     return EvalValue(eval_int(ctx));
 }
 
-/* Apply a compound-assignment op (`+=`, `-=`, ...) to `acc` in place. */
+/* Apply a compound-assignment op (`+=`, `-=`, ...) to `acc` in place.
+ * A loc-less throw out of the operation is marked Exception::op_caret:
+ * it carets the WHOLE compound expression, not the lvalue (RULE 2 - the
+ * tree-walker's Expr14 is the first node to stamp it; a VM store op
+ * selects its op_locs entry on the flag, bytecode.h). */
+static inline void
+apply_compound_op_raw(EvalValue &acc, const EvalValue &rhs, Op op)
+{
+    switch (op) {
+        case Op::addeq:  num_bin_op(acc, rhs, &Type::add);  break;
+        case Op::subeq:  num_bin_op(acc, rhs, &Type::sub);  break;
+        case Op::muleq:  num_bin_op(acc, rhs, &Type::mul);  break;
+        case Op::diveq:  num_bin_op(acc, rhs, &Type::div);  break;
+        case Op::modeq:  num_bin_op(acc, rhs, &Type::mod);  break;
+        /* int-only (like the binary forms): a non-int operand reaches the
+         * base Type's virtual, which throws TypeErrorEx - num_bin_op's
+         * float promotion routes a float there, exactly as `x << 2.5`. */
+        case Op::shleq:  num_bin_op(acc, rhs, &Type::shl);  break;
+        case Op::shreq:  num_bin_op(acc, rhs, &Type::shr);  break;
+        case Op::ushreq: num_bin_op(acc, rhs, &Type::ushr); break;
+        case Op::bandeq: num_bin_op(acc, rhs, &Type::band); break;
+        case Op::boreq:  num_bin_op(acc, rhs, &Type::bor);  break;
+        case Op::bxoreq: num_bin_op(acc, rhs, &Type::bxor); break;
+        default:         throw InternalErrorEx();
+    }
+}
+
 static inline void
 apply_compound_op(EvalValue &acc, const EvalValue &rhs, Op op)
 {
-    switch (op) {
-        case Op::addeq: num_bin_op(acc, rhs, &Type::add); break;
-        case Op::subeq: num_bin_op(acc, rhs, &Type::sub); break;
-        case Op::muleq: num_bin_op(acc, rhs, &Type::mul); break;
-        case Op::diveq: num_bin_op(acc, rhs, &Type::div); break;
-        case Op::modeq: num_bin_op(acc, rhs, &Type::mod); break;
-        default:        throw InternalErrorEx();
+    try {
+        apply_compound_op_raw(acc, rhs, op);
+    } catch (Exception &e) {
+        if (!e.loc_start)
+            e.op_caret = 1;
+        throw;
     }
 }
 
@@ -2892,54 +4799,101 @@ as_resolved_capture(const Construct *lvalue)
 static inline EvalValue
 slot_rmw(LValue &lv, Op op, const EvalValue &rval)
 {
+    /*
+     * An ARRAY ELEMENT's write goes through put(), which detaches the array
+     * first (LValue::write_target) - and may leave `lv` stale, or freed,
+     * since a slice's element then lives in new storage. So the result is
+     * never read back from `lv` after a put, and the in-place int fast
+     * path is for a slot that is not an element: on a slice's element it
+     * skipped the detach, so `s[0] += 1` changed the array `s` was sliced
+     * from (the VM and the JIT, until 2026-10-08; the tree-walker's
+     * doAssign put the value).
+     */
     if (op == Op::assign) {
 
-        lv.put(RValue(rval));
-
-    } else {
-
-        const EvalValue r = RValue(rval);
-
-        if (lv.is<int_type>() && r.is<int_type>() &&
-            (op == Op::addeq || op == Op::subeq || op == Op::muleq)) {
-
-            int_type &v = lv.getval<int_type>();
-            const int_type n = r.get<int_type>();
-
-            if (op == Op::addeq)      v += n;
-            else if (op == Op::subeq) v -= n;
-            else                      v *= n;
-
-        } else {
-
-            EvalValue nv = lv.get();
-            apply_compound_op(nv, r, op);
-            lv.put(move(nv));
-        }
+        EvalValue v = RValue(rval);
+        lv.put(v);
+        return v;
     }
 
-    return lv.get();
+    const EvalValue r = RValue(rval);
+
+    if (!lv.container && lv.is<int_type>() && r.is<int_type>() &&
+        (op == Op::addeq || op == Op::subeq || op == Op::muleq)) {
+
+        int_type &v = lv.getval<int_type>();
+        const int_type n = r.get<int_type>();
+
+        if (op == Op::addeq)      v += n;
+        else if (op == Op::subeq) v -= n;
+        else                      v *= n;
+
+        return lv.get();
+    }
+
+    EvalValue nv = lv.get();
+    apply_compound_op(nv, r, op);
+    lv.put(nv);
+    return nv;
 }
 
 /*
- * Fast path for `a[i] = v` / `a[i] OP= v` when `a` is a flat (unboxed) int or
- * float array: write the scalar straight into the unboxed vector, with no
- * promotion to vector<LValue> and no element-LValue round-trip. Without this,
- * the first store into a flat array (e.g. filling an array(N, 0)) would promote
- * it and undo the whole specialization.
- *
- * Returns true (and sets `out` to the stored value) when it handled the store;
- * false to fall through to the general lvalue->eval() -> doAssign() path. To
- * keep the fall-through sound it commits to the flat path only after deciding
- * on the BASE alone (which must be a side-effect-free lvalue - an id or a
- * nested subscript/member chain like `a[0][0]`, so re-eval on the general path
- * is harmless); the index is evaluated once, inside. Handling nested bases is
- * essential: a flat array nested in a general one (e.g. `[[1,2],[3,4]]`) has no
- * element LValue, so `a[0][0] = v` can only be written here.
- *
- * A value that doesn't fit the flat kind (a string into an int array, only
- * reachable through `dyn`) promotes the array and stores generally - same
- * result as the un-specialized path, just slower for that one cold write.
+ * Q2: slot_rmw for a CHECKED store (Construct::ct_store, Instr::
+ * ct_checked) into an element or a dict value whose container's own type
+ * says `ea`: a compound's RESULT is checked (ct_fit) before it is put. A
+ * plain `=` was checked before the element was reached (ct_store_pre),
+ * so it is slot_rmw's. [s, e): a misfit's caret (Loc(): none).
+ */
+static EvalValue
+ct_rmw(LValue &lv, Op op, const EvalValue &rval, const TypeAnnot *ea,
+       bool dict, Loc s, Loc e)
+{
+    /* (a plain `=` has no `ea`: ct_store_pre checked it) */
+    if (!ea)
+        return slot_rmw(lv, op, rval);
+    ML_CHECK(op != Op::assign);
+    EvalValue nv = lv.get();
+    apply_compound_op(nv, RValue(rval), op);
+    nv = ct_fit(ea, std::move(nv), dict, s, e);
+    lv.put(nv);
+    return nv;
+}
+
+/*
+ * Q2: the start of a CHECKED store into container `c` (an array or a
+ * dict; anything else checks nothing). A plain `=`'s value is checked
+ * HERE, before the element is reached - a dict's auto-vivified key must
+ * not stay behind a refusal - and `v` becomes the value to store (an int
+ * into a float element converted). A compound's result can only be
+ * checked at the write: the element annotation is returned for ct_rmw /
+ * flat_store_core. [s, e): a misfit's caret.
+ */
+struct CtStore {
+    const TypeAnnot *ea = nullptr;   /* a compound's check, else null */
+    bool dict = false;
+};
+static CtStore
+ct_store_pre(const EvalValue &c, Op op, EvalValue &v, Loc s, Loc e)
+{
+    CtStore r;
+    const TypeAnnot *ea = ct_elem_annot(c);
+    if (!ea)
+        return r;
+    r.dict = c.is<intrusive_ptr<DictObject>>();
+    if (op == Op::assign)
+        v = ct_fit(ea, RValue(v), r.dict, s, e);
+    else
+        r.ea = ea;
+    return r;
+}
+
+/*
+ * True if evaluating `c` can have no side effect (an id, a literal, a
+ * subscript / member / arithmetic chain over those) - so evaluating it twice
+ * is unobservable. Its users read a base a second time for speed
+ * (member_pod_array_scalar), or tell the codegen a base may be read twice.
+ * A STORE does not ask it: an access chain's base is evaluated exactly once
+ * whatever it contains (access_store, below).
  */
 static bool
 no_side_effects(const Construct *c)
@@ -2953,15 +4907,15 @@ no_side_effects(const Construct *c)
         return no_side_effects(s->what.get()) &&
                no_side_effects(s->index.get());
     }
-    if (auto *m = dynamic_cast<const MemberExpr *>(c))
+    if (auto *m = node_cast<const MemberExpr>(c))
         return no_side_effects(m->what.get());
-    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
+    if (auto *mo = node_cast<const MultiOpConstruct>(c)) {
         for (const auto &pr : mo->elems)
             if (!no_side_effects(pr.second.get()))
                 return false;
         return true;          /* pure arithmetic/comparison index, e.g. i+1 */
     }
-    if (auto *t = dynamic_cast<const TypedScalarExpr *>(c)) {
+    if (auto *t = node_cast<const TypedScalarExpr>(c)) {
         for (const auto &pr : t->elems)
             if (!no_side_effects(pr.second.get()))
                 return false;
@@ -2979,42 +4933,58 @@ bool construct_no_side_effects(const Construct *c)
  * Flat-array element store CORE: `blv` holds a flat (non-general, non-const,
  * non-read-only) SharedArrayObj `arr`; store `rval` (op) at index `idx_v`. The
  * caller has already proven blv is a flat writable array. Shared by the AST
- * path (try_flat_subscript_store, base `a` from the AST) and the VM's NESTED
+ * path (subscript_store, base `a` from the AST) and the VM's NESTED
  * store (vm_nested_subscript_store, base `a[i]` an inner element LValue).
- * Returns true (and sets `out`) on a store; false ONLY for a compound op on a
- * flat struct array (structs have no `+=`), so the caller defers to the general
- * path. `sub_*` is the subscript's caret (OOB / type errors), `idx_*` the
- * index's (the "Expected integer" error).
+ * Returns true (and sets `out`) on a store; false when a flat string or
+ * class array PROMOTED to general for a value or an op it cannot hold, so
+ * the caller defers to the general path. `sub_*` is the subscript's caret
+ * (OOB / type errors - "Expected integer" too, as the general array's
+ * store and every read report it). A compound op stores the element it
+ * read in `*old_out` when given - the value a postfix `++` / `--` yields.
  */
 static bool
 flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
                 const EvalValue &rval, Op op, EvalValue &out,
-                Loc sub_start, Loc sub_end, Loc idx_start, Loc idx_end)
+                Loc sub_start, Loc sub_end, EvalValue *old_out = nullptr,
+                const TypeAnnot *ct = nullptr)
 {
     /*
      * Flat POD-struct array: `a[i] = <matching POD struct>` stores the value's
-     * bytes (a compound op defers; structs have no `+=`). A non-matching value
-     * is the dyn-launder case (errors like the scalar kinds).
+     * bytes. A compound op reads the element and applies the operator, as a
+     * general array of the same structs does - a struct has none, so it is
+     * that array's TypeErrorEx (README: storage never changes behaviour; it
+     * deferred to the general path, which has no LValue for a flat element
+     * and raised NotLValueEx). A non-matching value is the dyn-launder case
+     * (errors like the scalar kinds).
      */
     if (arr.skind() == SharedArrayObj::Storage::structs) {
 
-        if (op != Op::assign)
-            return false;
-
-        const EvalValue r = RValue(rval);
+        const EvalValue r0 = RValue(rval);
         const auto &sv0 = arr.flat_structs();
 
         if (!idx_v.is<int_type>())
             throw TypeErrorEx("Expected integer as subscript",
-                              idx_start, idx_end);
+                              sub_start, sub_end);
         int_type idx = idx_v.get<int_type>();
+        ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
         if (idx < 0)
             idx += arr.size();
         if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
             throw OutOfBoundsEx(sub_start, sub_end);
 
+        EvalValue r = r0;
+        if (op != Op::assign) {
+            r = arr_elem_boxed(arr, static_cast<size_type>(idx));
+            if (old_out)
+                *old_out = r;
+            apply_compound_op(r, r0, op);
+        }
+
+        /* a box<P> is not a P value (its def is P's): refused like any
+         * other type, never packed into the bytes */
         if (!r.is<intrusive_ptr<StructObject>>() ||
             !r.get<intrusive_ptr<StructObject>>()->is_pod() ||
+            r.get<intrusive_ptr<StructObject>>()->is_ref() ||
             r.get<intrusive_ptr<StructObject>>()->def != sv0.def)
             throw TypeErrorEx(
                 "Cannot store a value of a different type in a flat (typed) "
@@ -3022,7 +4992,7 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
                 sub_start, sub_end);
 
         if (arr.is_slice())
-            arr.clone_internal_vec();
+            arr.materialize_slice();
         else if (arr.use_count() > 1)
             arr.clone_aliased_slices(arr.offset() + idx);
 
@@ -3031,6 +5001,40 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
         std::memcpy(sv.buf.data() + (arr.offset() + idx) * sv.stride,
                     o.bytes.data(), sv.stride);
         out = r;
+        return true;
+    }
+
+    /*
+     * Flat CLASS array (plans/class-and-box.md step 2), the strs model: a
+     * plain store of a class instance or `none` keeps it flat; anything
+     * else (another value through a `dyn` alias, a compound op - which a
+     * class instance has none of) PROMOTES to general and defers.
+     */
+    if (arr.skind() == SharedArrayObj::Storage::objs) {
+
+        const EvalValue r0 = RValue(rval);
+        if (op != Op::assign || !is_obj_elem(r0)) {
+            arr.promote_objs_to_general();
+            return false;                 /* general path handles it */
+        }
+
+        if (!idx_v.is<int_type>())
+            throw TypeErrorEx("Expected integer as subscript",
+                              sub_start, sub_end);
+        int_type idx = idx_v.get<int_type>();
+        ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
+        if (idx < 0)
+            idx += arr.size();
+        if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+            throw OutOfBoundsEx(sub_start, sub_end);
+
+        if (arr.is_slice())
+            arr.materialize_slice();
+        else if (arr.use_count() > 1)
+            arr.clone_aliased_slices(arr.offset() + idx);
+
+        arr.flat_objs().set(arr.offset() + idx, obj_elem_ptr(r0));
+        out = r0;
         return true;
     }
 
@@ -3050,15 +5054,16 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
 
         if (!idx_v.is<int_type>())
             throw TypeErrorEx("Expected integer as subscript",
-                              idx_start, idx_end);
+                              sub_start, sub_end);
         int_type idx = idx_v.get<int_type>();
+        ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
         if (idx < 0)
             idx += arr.size();
         if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
             throw OutOfBoundsEx(sub_start, sub_end);
 
         if (arr.is_slice())
-            arr.clone_internal_vec();
+            arr.materialize_slice();
         else if (arr.use_count() > 1)
             arr.clone_aliased_slices(arr.offset() + idx);
 
@@ -3072,9 +5077,10 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
 
     if (!idx_v.is<int_type>())
         throw TypeErrorEx("Expected integer as subscript",
-                          idx_start, idx_end);
+                          sub_start, sub_end);
 
     int_type idx = idx_v.get<int_type>();
+    ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
     if (idx < 0)
         idx += arr.size();
     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
@@ -3089,14 +5095,31 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
         newval = r;
     } else {
         newval = arr_elem_boxed(arr, idx);   /* read current element, any kind */
+        if (old_out)
+            *old_out = newval;
         apply_compound_op(newval, r, op);
+        /* Q2: a checked compound's result fits the array's own type */
+        if (ct)
+            newval = ct_fit(ct, std::move(newval), false, sub_start, sub_end);
     }
 
+    /*
+     * #96: a BOOL value WIDENS into numeric storage (0/1 into ints,
+     * 0.0/1.0 into floats) - the promotion chain bool <= int <= float,
+     * the same widen coerce_to_decl_type and coerce_struct_field
+     * already do (arrays were the outlier; the static checker accepts
+     * the assignment, so refusing at runtime contradicted it - and the
+     * VM's typed StoreElemInt path, which pre-widens a bool literal to
+     * a 0/1 operand, DIVERGED from this refusal). The reverse direction
+     * (an int into a BOOL array) stays an error: that is a narrowing,
+     * which the language never does implicitly.
+     */
     const bool fits = kind_int
-        ? newval.is<int_type>()
+        ? (newval.is<int_type>() || newval.is<bool>())
         : kind_bool
             ? newval.is<bool>()
-            : (newval.is<float_type>() || newval.is<int_type>());
+            : (newval.is<float_type>() || newval.is<int_type>()
+               || newval.is<bool>());
 
     if (!fits) {
         /*
@@ -3114,25 +5137,29 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
     }
 
     /*
-     * COW, matching the general element-write semantics (get_value_for_put):
+     * COW, matching the general element write (LValue::write_target):
      * a slice clones itself; a non-slice that is aliased clones any live slices
      * so they don't observe the write, but writes in place otherwise (plain
      * handle aliases share the mutation - MyLang assignment aliases).
      */
     if (arr.is_slice())
-        arr.clone_internal_vec();            /* keep-flat; now standalone */
+        arr.materialize_slice();
     else if (arr.use_count() > 1)
         arr.clone_aliased_slices(at0);
 
     const size_type at = arr.offset() + idx;
     if (kind_int) {
-        arr.flat_ints()[at] = newval.get<int_type>();
+        arr.flat_ints()[at] = newval.is<bool>()
+            ? (newval.get<bool>() ? 1 : 0)
+            : newval.get<int_type>();
     } else if (kind_bool) {
         arr.flat_bools()[at] = newval.get<bool>() ? 1 : 0;
     } else {
         arr.flat_floats()[at] = newval.is<int_type>()
             ? static_cast<float_type>(newval.get<int_type>())
-            : newval.get<float_type>();
+            : newval.is<bool>()
+                ? (newval.get<bool>() ? 1.0 : 0.0)
+                : newval.get<float_type>();
     }
 
     arr.invalidate_hash();   /* an element write changes the array's hash */
@@ -3158,91 +5185,446 @@ flat_writable_array(LValue *blv, SharedArrayObj *&arr)
     return true;
 }
 
-static bool
-try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
-                         const EvalValue &rval, EvalValue &out)
+/* What Construct::eval does to an exception leaving node `n`: stamp its
+ * span when the exception carries none, and emit its inlined-at frames once.
+ * For code that runs a node's work without going through its eval. */
+static void stamp_like_eval(const Construct *n, Exception &e)
 {
-    if (!lvalue->is_subscript())
-        return false;
-
-    Subscript *sub = static_cast<Subscript *>(lvalue);
-
-    /* Base must be a side-effect-free lvalue - see the note above. */
-    if (!no_side_effects(sub->what.get()))
-        return false;
-
-    const EvalValue base_lv = sub->what->eval(ctx);
-    if (!base_lv.is<LValue *>())
-        return false;
-
-    SharedArrayObj *arr;
-    if (!flat_writable_array(base_lv.get<LValue *>(), arr))
-        return false;
-
-    /* Committed to the flat path now: evaluate the index exactly once. */
-    const EvalValue idx_v = RValue(sub->index->eval(ctx));
-    return flat_store_core(base_lv.get<LValue *>(), *arr, idx_v, rval, op, out,
-                           sub->start, sub->end,
-                           sub->index->start, sub->index->end);
+    if (!e.loc_start) {
+        e.loc_start = n->start;
+        e.loc_end = n->end;
+    }
+    if (n->inline_ctx && !e.inline_origin_emitted) {
+        flush_inline_frames(n->inline_ctx, e);
+        e.inline_origin_emitted = true;
+    }
 }
 
 /*
- * Fast path for `s.field = v` / `s.field OP= v` when `s` is a POD struct: a POD
- * field is bytes, not an LValue, so the general lvalue path can't target it -
- * write the (coerced/validated) scalar straight into the byte slot. Returns
- * false (and lets the general path run) for a boxed struct, a const/read-only
- * instance (so the right error fires), a non-field member, or a non-lvalue
- * base. No COW clone: a POD struct aliases like any value (a `var q = p` shares
- * it, and the write is shared - the same as the boxed path and arrays/dicts).
+ * A store through a value that is not a variable - a call's result, a
+ * literal, a ternary, a slice (`f()[0] = v`, `(c ? a : b).x += 1`) - goes
+ * into that value, as if it were first bound to a fresh variable:
+ * `f()[0] = v` is `{ var t = f(); t[0] = v; }`. `hold` is that variable,
+ * the caller's, alive for the whole store. A container is a reference, so
+ * the write lands in the object f() returned; a slice detaches the hold
+ * (copy on write) exactly as it would a variable; a string or a scalar
+ * meets the error a variable of it meets. Until 2026-10-06 the tree-walker
+ * stored through such a value into a dict only, raised NotLValueEx for an
+ * array or a struct, and the VM refused to compile it - while an inlined
+ * `f` turned the same store into one through a variable (RULE 2). The VM's
+ * twin is the codegen's hold_store_base.
  */
-static bool
-try_pod_struct_store(EvalContext *ctx, Construct *lvalue, Op op,
-                     const EvalValue &rval, EvalValue &out)
+static EvalValue hold_store_base(const EvalValue &base, LValue &hold)
 {
-    auto *mem = dynamic_cast<MemberExpr *>(lvalue);
-    if (!mem)
-        return false;
+    if (base.is<LValue *>() || base.is<UndefinedId>())
+        return base;
+    hold = LValue(base, false);
+    return EvalValue(&hold);
+}
 
-    if (!no_side_effects(mem->what.get()))
-        return false;
+/* The general tail of a store: the formed reference is an LValue to write,
+ * or the target is not a location. `*old_out`, when given, receives the
+ * value the store replaced (as do the stores below). */
+static EvalValue
+assign_through(EvalContext *ctx, const Construct *lvalue,
+               const EvalValue &lval, const EvalValue &rval, Op op,
+               EvalValue *old_out = nullptr, const CtStore &ct = CtStore())
+{
+    if (!lval.is<LValue *>())
+        throw NotLValueEx(lvalue->start, lvalue->end);
 
-    const EvalValue base_lv = mem->what->eval(ctx);
-    if (!base_lv.is<LValue *>())
-        return false;                 /* temporary base: general path errors */
+    /* The parser never evaluates an assignment during const evaluation. */
+    if (ctx->const_ctx)
+        throw InternalErrorEx();
 
-    LValue *blv = base_lv.get<LValue *>();
-    if (!blv->is<intrusive_ptr<StructObject>>())
-        return false;
+    LValue *lv = lval.get<LValue *>();
+    if (lv->is_const_var()) {
+        if (lv->is<Builtin>())
+            throw CannotRebindBuiltinEx(lvalue->start, lvalue->end);
+        throw CannotRebindConstEx(lvalue->start, lvalue->end);
+    }
+    if (old_out)
+        *old_out = lv->get();
+    if (ct.ea)
+        return ct_rmw(*lv, op, rval, ct.ea, ct.dict, lvalue->start,
+                      lvalue->end);
+    return doAssign(lval, rval, op);
+}
 
-    StructObject &obj = *blv->getval<intrusive_ptr<StructObject>>().get();
-    if (!obj.is_pod())
-        return false;                 /* boxed: general lvalue path handles */
+/*
+ * A store THROUGH an access chain - `x[k] = v` / `x[k] OP= v`, `x.f = v` /
+ * `x.f OP= v`, and `++` / `--` on a typed one (IncDecExpr routes `+= 1`
+ * here). The base and the key are evaluated EXACTLY ONCE, left to right,
+ * and the store goes to what they named:
+ *   - a flat (unboxed) array's element is written straight into the vector
+ *     (flat_store_core) - it has no LValue, so no general path can write
+ *     it; a value that does not fit the flat kind promotes or throws there;
+ *   - a POD struct's field is written into its bytes (it has no LValue
+ *     either), coerced to the field's type;
+ *   - anything else forms the element / member reference the way
+ *     Subscript::do_eval / MemberExpr::do_eval would (a plain `=` may
+ *     auto-vivify a dict key) and assigns through it.
+ * Until 2026-10-05 the first two were gated on a side-effect-free base -
+ * the general path then evaluated the whole lvalue a second time - so
+ * `a[f()][0] += 5` raised NotLValueEx in the tree-walker while the VM, which
+ * computes each key into a temp once, stored it (RULE 2).
+ */
+static EvalValue
+subscript_store(EvalContext *ctx, const Subscript *sub, Op op,
+                const EvalValue &rval, EvalValue *old_out = nullptr)
+{
+    EvalValue base, key;
+    LValue hold;
+    try {
+        base = store_base_value(ctx, sub->what.get(), hold);
+        if (base.is<UndefinedId>())
+            throw UndefinedVariableEx(base.get<UndefinedId>().id,
+                                      sub->what->start, sub->what->end);
+        key = literal_widen(RValue(sub->index->eval(ctx)), sub->key_coerce);
+    } catch (Exception &e) {
+        stamp_like_eval(sub, e);
+        throw;
+    }
+    /* #49: a store target's dict key that may misfit the declared key
+     * type - the key's caret, as the VM's CheckFitV */
+    if (sub->key_fit)
+        check_fit_loc(key, *sub->key_fit, sub->index->start,
+                      sub->index->end);
 
-    const int slot = obj.def->slot_of(mem->memUid);
-    if (slot < 0)
-        return false;                 /* a const member etc.: general path */
-
-    if (blv->is_const_var() || obj.is_readonly())
-        return false;                 /* const: defer for the right error/loc */
-
-    const EvalValue r = RValue(rval);
-
-    EvalValue newval;
-    if (op == Op::assign) {
-        newval = r;
-    } else {
-        newval = obj.pod_get(slot);
-        apply_compound_op(newval, r, op);
+    /* Q2: a store through `dyn` checks its value against the container's
+     * own type (the VM's ct_checked store ops) */
+    EvalValue checked;
+    const EvalValue *rvp = &rval;
+    CtStore ct;
+    if (sub->ct_store) {
+        checked = rval;
+        ct = ct_store_pre(RValue(base), op, checked, sub->start, sub->end);
+        rvp = &checked;
     }
 
-    /* coerce + runtime-validate to the field's scalar type (throws on mismatch,
-     * e.g. a dyn-laundered wrong type) */
-    newval = coerce_struct_field(obj.def->fields[slot], move(newval),
-                                 mem->start, mem->end);
-    obj.pod_set(slot, newval);
+    SharedArrayObj *arr;
+    if (!ctx->const_ctx && base.is<LValue *>()
+            && flat_writable_array(base.get<LValue *>(), arr)) {
+        EvalValue out;
+        if (flat_store_core(base.get<LValue *>(), *arr, key, *rvp, op, out,
+                            sub->start, sub->end, old_out, ct.ea))
+            return out;
+    }
 
-    out = newval;
+    EvalValue elv;
+    try {
+        Type *t = base.is<LValue *>()
+            ? base.get<LValue *>()->get().get_type()
+            : base.get_type();
+        elv = t->subscript(base, key, /*for_write=*/op == Op::assign);
+    } catch (Exception &e) {
+        stamp_like_eval(sub, e);
+        throw;
+    }
+    return assign_through(ctx, sub, elv, *rvp, op, old_out, ct);
+}
+
+/*
+ * The BASE of a store, evaluated ONCE, for writing: `x` in `x.f = v`,
+ * `x[k] = v`, `x.f++`, `append(x.f, v)`. A member step into a struct OWNS
+ * the struct first (struct_own): the store below writes into it, and a
+ * struct is a value - its other holders must not see the write. An access
+ * chain with no member step is evaluated as a read evaluates it. Where the
+ * struct a step enters lives in bytes no LValue covers - a flat struct
+ * array's element, an inline POD field - the walk continues INSIDE them
+ * (`place`, eval.h's POD places); a step the bytes cannot take (not an
+ * inline POD struct) reads the struct as a value from there on. Else
+ * `base` is the slot or the value the store's own access starts from.
+ */
+struct MemberTarget {
+    EvalValue base;
+    PodPlace place;
+};
+
+static bool chain_has_member(const Construct *e)
+{
+    for (;;) {
+        if (ctag(e) == ConstructType::member)
+            return true;
+        if (ctag(e) != ConstructType::subscript)
+            return false;
+        e = static_cast<const Subscript *>(e)->what.get();
+    }
+}
+
+/*
+ * May a store write through `base` - a slot (an LValue), or a CLASS
+ * instance read as a value (an element of a flat class array has no
+ * LValue)? A class instance is a reference wherever it came from, so its
+ * field is the shared object's - unless it is a constant's, which no
+ * alias may write (struct_own's rule). A field of any other VALUE is not
+ * a location: a store through a value holds it first.
+ */
+static bool store_rooted(const EvalValue &base)
+{
+    if (base.is<LValue *>())
+        return true;
+    if (!base.is<intrusive_ptr<StructObject>>())
+        return false;
+    const StructObject &o = *base.get_ref<intrusive_ptr<StructObject>>();
+    if (!o.is_ref())
+        return false;
+    if (o.is_readonly())
+        throw CannotChangeConstEx();
     return true;
+}
+
+/* One member step of a store walk (MemberExpr::do_eval's work, for_write
+ * false, the struct owned first). The caller stamps a throw. */
+static void member_store_step(MemberTarget &t, const MemberExpr *s)
+{
+    if (t.place.bytes) {
+        if (pod_place_step(t.place, s->memUid))
+            return;
+        t.base = pod_place_value(t.place);
+        t.place = PodPlace();
+    }
+    if (t.base.is<LValue *>()) {
+        LValue *h = t.base.get<LValue *>();
+        struct_own_if(h);
+        t.base = EvalValue(h);
+        if (pod_place_rooted_field(h, s->memUid, t.place))
+            return;
+    } else {
+        /* a box<P> of a POD struct read as a value: its inline POD field
+         * is a place in the shared object's bytes (t.base keeps it alive) */
+        PodPlace rp;
+        if (pod_place_ref(t.base, rp) && pod_place_step(rp, s->memUid)) {
+            t.place = rp;
+            return;
+        }
+    }
+    const bool rooted = store_rooted(t.base);
+    t.base = s->access(RValue(t.base), /*for_write=*/false, rooted);
+}
+
+static void store_walk(EvalContext *ctx, const Construct *e, LValue &hold,
+                       MemberTarget &t)
+{
+    if (ctag(e) == ConstructType::member) {
+        const MemberExpr *s = static_cast<const MemberExpr *>(e);
+        store_walk(ctx, s->what.get(), hold, t);
+        try {
+            member_store_step(t, s);
+        } catch (Exception &ex) {   /* INT-COV-EXEMPT: its type test fails */
+            stamp_like_eval(s, ex);
+            throw;
+        }
+        return;
+    }
+    if (ctag(e) == ConstructType::subscript) {
+        /* Subscript::do_eval's work, by hand: a writable flat struct
+         * array's element is entered in place, not read as a copy, and a
+         * member step in its base owns what it enters */
+        const Subscript *sub = static_cast<const Subscript *>(e);
+        if (chain_has_member(sub->what.get())) {
+            store_walk(ctx, sub->what.get(), hold, t);
+            if (t.place.bytes) {
+                t.base = pod_place_value(t.place);
+                t.place = PodPlace();
+            }
+        } else {
+            try {
+                t.base = hold_store_base(sub->what->eval(ctx), hold);
+            } catch (Exception &ex) {
+                stamp_like_eval(sub, ex);
+                throw;
+            }
+        }
+        try {
+            if (t.base.is<UndefinedId>())
+                throw UndefinedVariableEx(t.base.get<UndefinedId>().id,
+                                          sub->what->start, sub->what->end);
+            const EvalValue key = literal_widen(
+                RValue(sub->index->eval(ctx)), sub->key_coerce);
+            if (!t.base.is<LValue *>() ||
+                !pod_place_elem(t.base.get<LValue *>(), key, t.place)) {
+                Type *ty = t.base.is<LValue *>()
+                    ? t.base.get<LValue *>()->get().get_type()
+                    : t.base.get_type();
+                t.base = ty->subscript(t.base, key, /*for_write=*/false);
+            }
+        } catch (Exception &ex) {
+            stamp_like_eval(sub, ex);
+            throw;
+        }
+        return;
+    }
+    t.base = hold_store_base(e->eval(ctx), hold);
+}
+
+/* The base of a store `<e>.f` / `<e>[k]`: store_walk for a chain that
+ * steps into a member, else `e` evaluated as a read, a value held. */
+static MemberTarget store_base(EvalContext *ctx, const Construct *e,
+                               LValue &hold)
+{
+    MemberTarget t;
+    if (chain_has_member(e))
+        store_walk(ctx, e, hold, t);
+    else
+        t.base = hold_store_base(e->eval(ctx), hold);
+    return t;
+}
+
+/* The base of a member store `... .f = v`: store_walk over `mem->what`. */
+static MemberTarget member_target(EvalContext *ctx, const MemberExpr *mem,
+                                  LValue &hold)
+{
+    MemberTarget t;
+    store_walk(ctx, mem->what.get(), hold, t);
+    return t;
+}
+
+/* The value-or-slot form of a store base (store_base, its POD place read
+ * as a value): the base of `<e>[k] = v`, the target of a mutating builtin.
+ * Exported (eval.h) for the tree-walker's builtin adapters. */
+EvalValue store_base_value(EvalContext *ctx, const Construct *e, LValue &hold)
+{
+    MemberTarget t = store_base(ctx, e, hold);
+    if (t.place.bytes)
+        return pod_place_value(t.place);
+    return t.base;
+}
+
+/*
+ * A store into a field of a BOXED (non-POD) struct the caller owns
+ * (struct_own): the value is converted and checked exactly as a POD
+ * field's is (coerce_struct_field - an int into a `float` field is a
+ * float, a bool into an `int` one an int, a `dyn` misfit a TypeErrorEx
+ * at the member) - and as the constructor's is. It used to be a plain
+ * slot write, so `s.f = 2` held the int 2 in a float field (the VM's
+ * typed field reads hid it, `print(s)` showed it) and a dyn string
+ * landed in an int field: storage layout changed what a field holds.
+ * Shared by the tree-walker's member_store and the VM's vm_member_store.
+ */
+static EvalValue
+boxed_field_rmw(StructObject &own, int slot, Op op, const EvalValue &value,
+                Loc mstart, Loc mend, EvalValue *old_out = nullptr)
+{
+    LValue &lv = own.fields[static_cast<size_t>(slot)];
+    if (old_out)
+        *old_out = lv.get();
+    EvalValue nv;
+    if (op == Op::assign) {
+        nv = RValue(value);
+    } else {
+        nv = lv.get();
+        apply_compound_op(nv, RValue(value), op);
+    }
+    nv = coerce_struct_field(own.def->fields[static_cast<size_t>(slot)],
+                             std::move(nv), mstart, mend);
+    lv.put(nv);
+    return nv;
+}
+
+static EvalValue
+member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
+             const EvalValue &rval, EvalValue *old_out = nullptr)
+{
+    MemberTarget t;
+    LValue hold;
+    try {
+        t = member_target(ctx, mem, hold);
+    } catch (Exception &e) {
+        stamp_like_eval(mem, e);
+        throw;
+    }
+
+    /* the store itself stays outside that catch, as the POD path below:
+     * an operation's error (`p.x /= 0`) keeps the whole expression's caret */
+    if (t.place.bytes) {
+        const int slot = t.place.def->slot_of(mem->memUid);
+        if (slot >= 0)
+            return pod_place_store(t.place, slot, op, rval,
+                                   mem->start, mem->end, old_out);
+        t.base = pod_place_value(t.place);
+    }
+    EvalValue base = t.base;
+    /* A REFERENCE instance read as a value (an element of a flat reference
+     * array, a field) is still the one shared object: held here, it takes
+     * the slot path below - struct_own hands back the object itself, and a
+     * box<P> of a POD struct is stored into its bytes */
+    LValue ref_hold;
+    if (!base.is<LValue *>() && is_class_instance(base)) {
+        ref_hold = LValue(base, false);
+        base = EvalValue(&ref_hold);
+    }
+
+    /* A struct in a slot: OWNED first (struct_own - its other holders must
+     * not see the write), then a POD field is stored into its bytes. (A
+     * `const` parameter's struct is refused at compile time when its type
+     * is known; at run time the parameter is the call's copy, as in every
+     * engine.) */
+    const bool rooted = store_rooted(base);
+    if (base.is<LValue *>()) {
+        LValue *blv = base.get<LValue *>();
+        if (blv->is<intrusive_ptr<StructObject>>()) {
+            StructObject &obj = struct_own(blv);
+            base = EvalValue(blv);
+            const int slot = obj.is_pod()
+                ? obj.def->slot_of(mem->memUid) : -1;
+            if (slot >= 0) {
+                const EvalValue r = RValue(rval);
+                EvalValue newval;
+                if (op == Op::assign) {
+                    newval = r;
+                } else {
+                    newval = obj.pod_get(slot);
+                    if (old_out)
+                        *old_out = newval;
+                    apply_compound_op(newval, r, op);
+                }
+                /* coerce + runtime-validate to the field's scalar type
+                 * (throws on a mismatch, e.g. a dyn-laundered wrong
+                 * type) */
+                newval = coerce_struct_field(obj.def->fields[slot],
+                                             std::move(newval),
+                                             mem->start, mem->end);
+                obj.pod_set(slot, newval);
+                return newval;
+            }
+            /* a boxed struct's field: converted and checked the same way */
+            const int bslot = obj.is_pod()
+                ? -1 : obj.def->slot_of(mem->memUid);
+            if (bslot >= 0)
+                return boxed_field_rmw(obj, bslot, op, rval,
+                                       mem->start, mem->end, old_out);
+        }
+    }
+
+    /* Q2: `d.k = v` through `dyn` checks the value against the dict's
+     * own type (a struct's field is checked by its declaration, above) */
+    EvalValue checked;
+    const EvalValue *rvp = &rval;
+    CtStore ct;
+    if (mem->ct_store) {
+        checked = rval;
+        /* an undefined base (the REPL's open world) carets the member, as
+         * the access below does - a misfit carries its own */
+        try {
+            ct = ct_store_pre(RValue(base), op, checked, mem->start,
+                              mem->end);
+        } catch (Exception &e) {
+            stamp_like_eval(mem, e);
+            throw;
+        }
+        rvp = &checked;
+    }
+
+    EvalValue lval;
+    try {
+        lval = mem->access(RValue(base), /*for_write=*/op == Op::assign,
+                           rooted);
+    } catch (Exception &e) {
+        stamp_like_eval(mem, e);
+        throw;
+    }
+    return assign_through(ctx, mem, lval, *rvp, op, old_out, ct);
 }
 
 /*
@@ -3254,9 +5636,15 @@ try_pod_struct_store(EvalContext *ctx, Construct *lvalue, Op op,
  * non-widening values pass through unchanged; the inferencer has already
  * rejected anything not assignable to the declared type.
  */
-static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt)
+static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt,
+                                     int site_arg)
 {
     /*
+     * `site_arg` (RULE 2, 2026-09-20): the CALL-SITE argument index when
+     * this coercion binds a parameter for a call site, else -1 - the throw
+     * carries it (Exception::bind_arg) so the call's setup catch can caret
+     * that argument alone. An assignment's coercion passes nothing.
+     *
      * Coerce a value to a typed variable's/param's declared type. WIDENING is
      * implicit (int/bool -> float, bool -> int); NARROWING is NOT (a `float`
      * into an `int` THROWS, it never truncates) - use an explicit int(x) to
@@ -3273,18 +5661,22 @@ static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt)
             return EvalValue(static_cast<float_type>(v.get<int_type>()));
         if (v.is<bool>())
             return EvalValue(static_cast<float_type>(v.get<bool>() ? 1 : 0));
-        throw TypeErrorEx(
+        TypeErrorEx ex(
             "cannot store a non-numeric value in a 'float' variable "
             "(use float(...) to convert)");
+        ex.bind_arg = site_arg;
+        throw ex;
     }
     if (dt == DeclType::i) {
         if (v.is<int_type>() || v.is<NoneVal>())
             return v;
         if (v.is<bool>())
             return EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
-        throw TypeErrorEx(
+        TypeErrorEx ex(
             "cannot store a non-int value in an 'int' variable "
             "(a float doesn't narrow implicitly - use int(...) to convert)");
+        ex.bind_arg = site_arg;
+        throw ex;
     }
     return v;
 }
@@ -3292,9 +5684,54 @@ static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt)
 /* VM (CoerceNumV): the typed-store numeric coerce - the SAME
  * coerce_to_decl_type the tree-walker's op==assign path runs, so the widen /
  * pass-none / narrowing-throw behavior is byte-identical by construction. */
-EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float)
+EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float,
+                             int site_arg)
 {
-    return coerce_to_decl_type(v, is_float ? DeclType::f : DeclType::i);
+    return coerce_to_decl_type(v, is_float ? DeclType::f : DeclType::i,
+                               site_arg);
+}
+
+/*
+ * THE ONE place that turns a function's parameter list into its bind plan.
+ * Sets `fast_bind` (no parameter needs coercion, so a bind is a plain copy)
+ * and, when it does not hold, `bind_req` - the Type singleton each parameter
+ * requires for the copy to still be exact (see FuncDescriptor::bind_req).
+ *
+ * It exists as ONE function because the two are derived from the SAME read of
+ * `decl_type` and there are four callers (vm_bind_chunk, vm_precompile_all's
+ * pass A, the -vd dump's splice pass, and the .myv reader). The flag used to
+ * be recomputed inline at three of them; a fourth consumer that had to agree
+ * with it is exactly the shape CLAUDE.md's audit-table trap warns about.
+ */
+void compute_bind_flags(const FuncDescriptor *d)
+{
+    bool fast = true;
+    bool fit = false;
+
+    for (const auto &p : d->params) {
+        if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
+            fast = false;
+        if (p.fit)
+            fit = true;
+    }
+
+    d->fast_bind = fast;
+    d->fit_any = fit;
+    d->bind_req.clear();
+
+    if (fast)
+        return;                     /* nothing reads bind_req then */
+
+    d->bind_req.reserve(d->params.size());
+
+    for (const auto &p : d->params) {
+        const void *req = nullptr;
+        if (p.decl_type == DeclType::i)
+            req = EvalValue(static_cast<int_type>(0)).get_type();
+        else if (p.decl_type == DeclType::f)
+            req = EvalValue(static_cast<float_type>(0)).get_type();
+        d->bind_req.push_back(req);
+    }
 }
 
 /*
@@ -3310,72 +5747,213 @@ EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float)
  * read-only container) match the tree-walker byte-for-byte.
  */
 EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
-                             const EvalValue &value, Op op,
-                             Loc lstart, Loc lend)
+                             const EvalValue &value_in, Op op,
+                             Loc lstart, Loc lend, bool checked)
 {
+    /* Q2: a store through `dyn` (Instr::ct_checked) checks its value
+     * against the container's own type - a plain `=` here, a compound's
+     * result at the write */
+    EvalValue cv;
+    CtStore ct;
+    if (checked) {
+        cv = value_in;
+        ct = ct_store_pre(base_lv->get(), op, cv, lstart, lend);
+    }
+    const EvalValue &value = checked ? cv : value_in;
+
     /* A FLAT array element (int/float/bool/struct) has no boxed LValue - it's a
      * scalar/bytes in the flat vector - so the general subscript(for_write) path
      * below would wrongly raise NotLValueEx. Store straight into the flat buffer
      * via the shared flat_store_core (COW + type check + the dyn-launder error),
-     * exactly as the tree-walker's try_flat_subscript_store. This is what makes
+     * exactly as the tree-walker's subscript_store. This is what makes
      * StoreElemValue a UNIVERSAL store (any base: flat / general / dict), so the
      * codegen can emit it for a dyn/unproven base. flat_store_core returns false
-     * only for a compound op on a flat STRUCT array (defer to the general path,
-     * which raises the same error). */
+     * only when a flat string / class array promoted to general (defer to
+     * the general path, which then holds the element's LValue). */
     if (base_lv->is<SharedArrayObj>()) {
         SharedArrayObj *arr;
         if (flat_writable_array(base_lv, arr)) {
             EvalValue out;
             if (flat_store_core(base_lv, *arr, key, value, op, out,
-                                lstart, lend, lstart, lend))
+                                lstart, lend, nullptr, ct.ea))
                 return out;
         }
     }
 
     const bool for_write = (op == Op::assign);
-    EvalValue elv = base_lv->get().get_type()->subscript(
-        EvalValue(base_lv), key, for_write);
-    if (!elv.is<LValue *>())
-        throw NotLValueEx(lstart, lend);
-    return slot_rmw(*elv.get<LValue *>(), op, value);
-}
-
-/*
- * VM IncDecElemCheckedV: `c[k]++` / `c[k]--` on a DYN/unproven base. Mirrors
- * IncDecExpr::do_eval's dyn read-modify-write path: form the element LValue via
- * the runtime subscript(for_write=false) (a general array / dict has a boxed
- * element; a flat scalar element has none -> NotLValueEx, matching the tree-
- * walker), enforce int/float (inc-dec is int/float-ONLY - a string throws
- * rather than concatenating), then apply ±1. The value is discarded (a
- * statement). TWO distinct carets, exactly as the tree-walker: a subscript-
- * internal throw (KeyNotFound/OOB) gets the SUBSCRIPT loc (`sub_*`), while the
- * inc-dec's own checks (NotLValue/const/TypeError) get the INC-DEC loc (`id_*`).
- */
-void vm_incdec_elem(LValue *base_lv, const EvalValue &key, bool is_inc,
-                    Loc sub_start, Loc sub_end, Loc id_start, Loc id_end)
-{
     EvalValue elv;
     try {
         elv = base_lv->get().get_type()->subscript(
-            EvalValue(base_lv), key, /*for_write=*/false);
+            EvalValue(base_lv), key, for_write);
     } catch (Exception &e) {
-        /* A subscript-internal throw (KeyNotFound/OOB) is loc-less; stamp the
-         * SUBSCRIPT loc (the tree-walker's stamp_operand_loc on the lvalue). */
-        if (!e.loc_start) { e.loc_start = sub_start; e.loc_end = sub_end; }
+        /* reaching the element is the LVALUE's error (an OOB, a missing
+         * key): its caret, as Subscript::do_eval stamps it - when the
+         * caller has one (the JIT helpers pass none; their conveyance
+         * stamps the op's `locs` entry, which is the same span) */
+        if (!e.loc_start) {
+            e.loc_start = lstart;
+            e.loc_end = lend;
+        }
+        throw;
+    }
+    if (!elv.is<LValue *>())
+        throw NotLValueEx(lstart, lend);
+    return ct_rmw(*elv.get<LValue *>(), op, value, ct.ea, ct.dict,
+                  lstart, lend);
+}
+
+/*
+ * `++` / `--` on an ELEMENT or a MEMBER nothing proved the type of (a `dyn`
+ * base, or any base under -nti): the checked read-modify-write that every
+ * engine's dyn path shares - IncDecExpr::do_eval's, the VM's statement ops
+ * (vm_incdec_elem / vm_incdec_member) and vm_incdec_final's tier 3. Each
+ * sets `old` and returns the new value.
+ *
+ * A general array's element, a dict's value and a ROOTED boxed struct's
+ * field are LValues, changed in place. A FLAT array's element and a POD
+ * field are not: a rooted, writable one is read, checked and stored back
+ * through flat_store_core / vm_member_store - what `+= 1` does
+ * (subscript_store, member_store). Until 2026-10-05 every
+ * engine raised NotLValueEx there - for `d[0]++` on a dyn holding an int
+ * array, and for EVERY `a[i]++` on a flat array under -nti - while `+= 1`
+ * worked; the four copies of this logic agreed on the throw.
+ *
+ * Carets: an access error (out of bounds, a non-int index, a missing key or
+ * member) gets the access's (`a*`; "Expected dict object" the base's,
+ * `b*`); the inc-dec's own NotLValue / const / type error gets `id*`.
+ */
+static EvalValue
+dyn_incdec_finish(LValue *lv, bool is_inc, EvalValue &old,
+                  Loc id_start, Loc id_end)
+{
+    if (lv->is_const_var())
+        throw CannotChangeConstEx(id_start, id_end);
+    old = lv->get();
+    if (!old.is<int_type>() && !old.is<float_type>())
+        throw TypeErrorEx("'++'/'--' requires an int or float",
+                          id_start, id_end);
+    EvalValue nv = old;
+    apply_compound_op(nv, EvalValue(static_cast<int_type>(1)),
+                      is_inc ? Op::addeq : Op::subeq);
+    lv->put(nv);
+    return nv;
+}
+
+static EvalValue
+dyn_incdec_elem(const EvalValue &cur, const EvalValue &key, bool is_inc,
+                EvalValue &old, Loc astart, Loc aend,
+                Loc id_start, Loc id_end)
+{
+    SharedArrayObj *arr;
+
+    if (cur.is<LValue *>() && flat_writable_array(cur.get<LValue *>(), arr)) {
+
+        /* The checks a general array's subscript makes, in its order and
+         * with its caret - then the element's type, before any write. */
+        if (!key.is<int_type>())
+            throw TypeErrorEx("Expected integer as subscript", astart, aend);
+        int_type idx = key.get<int_type>();
+        if (idx < 0)
+            idx += arr->size();
+        if (idx < 0 || static_cast<size_t>(idx) >= arr->size())
+            throw OutOfBoundsEx(astart, aend);
+
+        old = arr_elem_boxed(*arr, static_cast<size_type>(idx));
+        if (!old.is<int_type>() && !old.is<float_type>())
+            throw TypeErrorEx("'++'/'--' requires an int or float",
+                              id_start, id_end);
+
+        /* an int or float element: an ints or floats array, which
+         * flat_store_core always stores */
+        EvalValue nv;
+        if (!flat_store_core(cur.get<LValue *>(), *arr, key,
+                             EvalValue(static_cast<int_type>(1)),
+                             is_inc ? Op::addeq : Op::subeq, nv,
+                             astart, aend))
+            throw InternalErrorEx();
+        return nv;
+    }
+
+    EvalValue elv;
+    try {
+        Type *ct = cur.is<LValue *>()
+            ? cur.get<LValue *>()->get().get_type()
+            : cur.get_type();
+        elv = ct->subscript(cur, key, /*for_write=*/false);
+    } catch (Exception &e) {
+        if (!e.loc_start) {
+            e.loc_start = astart;
+            e.loc_end = aend;
+        }
         throw;
     }
     if (!elv.is<LValue *>())
         throw NotLValueEx(id_start, id_end);
-    LValue *lv = elv.get<LValue *>();
-    if (lv->is_const_var())
-        throw CannotChangeConstEx(id_start, id_end);
-    EvalValue old = lv->get();
-    if (!old.is<int_type>() && !old.is<float_type>())
-        throw TypeErrorEx("'++'/'--' requires an int or float",
-                          id_start, id_end);
-    const EvalValue one{static_cast<int_type>(1)};
-    apply_compound_op(old, one, is_inc ? Op::addeq : Op::subeq);
-    lv->put(std::move(old));
+    return dyn_incdec_finish(elv.get<LValue *>(), is_inc, old,
+                             id_start, id_end);
+}
+
+static EvalValue
+dyn_incdec_member(const EvalValue &base, const EvalValue &memId,
+                  const UniqueId *memUid, bool is_inc, EvalValue &old,
+                  Loc astart, Loc aend, Loc bstart, Loc bend,
+                  Loc id_start, Loc id_end)
+{
+    EvalValue cur = base;
+    /* a reference instance read as a value: held, it is rooted
+     * (member_store) */
+    LValue ref_hold;
+    if (!cur.is<LValue *>() && is_class_instance(cur)) {
+        ref_hold = LValue(cur, false);
+        cur = EvalValue(&ref_hold);
+    }
+    const bool rooted = cur.is<LValue *>();
+    const EvalValue &cval = rooted ? cur.get<LValue *>()->get() : cur;
+
+    if (rooted && cval.is<intrusive_ptr<StructObject>>()) {
+        const StructObject &obj =
+            *cval.get_ref<intrusive_ptr<StructObject>>().get();
+        const int slot = obj.def->slot_of(memUid);
+        if (obj.is_pod() && slot >= 0) {
+            old = obj.pod_get(slot);
+            if (!old.is<int_type>() && !old.is<float_type>())
+                throw TypeErrorEx("'++'/'--' requires an int or float",
+                                  id_start, id_end);
+            /* the store owns the struct (struct_own) */
+            return vm_member_store(cur.get<LValue *>(), memUid,
+                                   is_inc ? Op::addeq : Op::subeq,
+                                   EvalValue(static_cast<int_type>(1)),
+                                   astart, aend, bstart, bend);
+        }
+    }
+
+    /* A field of a value's struct is a value, as MemberExpr reads it; a
+     * dict's value is an LValue either way. */
+    LValue *lv = vm_member_lvalue_ref(cur, memId, memUid,
+                                      /*for_write=*/false, astart, aend);
+    if (!lv) {
+        /* the read's own error first (no such member, not a struct or a
+         * dict), as the tree-walker's MemberExpr raises it */
+        const EvalValue &v =
+            cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
+        member_read_core(v, memId, memUid, false, astart, aend,
+                         bstart, bend);
+        throw NotLValueEx(id_start, id_end);
+    }
+    return dyn_incdec_finish(lv, is_inc, old, id_start, id_end);
+}
+
+/*
+ * VM IncDecElemCheckedV: `c[k]++` / `c[k]--` on a DYN/unproven base, as a
+ * statement (the value is discarded): dyn_incdec_elem. The subscript caret
+ * (`sub_*`) marks an access error, the inc-dec caret (`id_*`) its own.
+ */
+void vm_incdec_elem(LValue *base_lv, const EvalValue &key, bool is_inc,
+                    Loc sub_start, Loc sub_end, Loc id_start, Loc id_end)
+{
+    EvalValue old;
+    dyn_incdec_elem(EvalValue(base_lv), key, is_inc, old, sub_start, sub_end,
+                    id_start, id_end);
 }
 
 /*
@@ -3398,30 +5976,53 @@ void vm_incdec_elem(LValue *base_lv, const EvalValue &key, bool is_inc,
  * a readonly instance, a non-struct-non-dict base) - the caller turns that into
  * NotLValueEx. Shared by vm_incdec_member and vm_lvalue_chain_store.
  */
-LValue *vm_member_lvalue_ref(const EvalValue &dval, const EvalValue &memId,
+LValue *vm_member_lvalue_ref(EvalValue &cur, const EvalValue &memId,
                              const UniqueId *memUid, bool for_write,
                              Loc mstart, Loc mend)
 {
+    const EvalValue &dval =
+        cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
     if (dval.is<intrusive_ptr<StructObject>>()) {
-        const auto &obj = dval.get<intrusive_ptr<StructObject>>();
-        const int slot = obj->def->slot_of(memUid);
-        if (slot >= 0 && !obj->is_pod() && !obj->is_readonly())
-            return &obj->fields[slot];
-        return nullptr;
+        /* a struct's field is a location only in a writable slot's
+         * struct - owned before the field is handed out - or in a CLASS
+         * instance, a reference wherever it was read from (an element of
+         * a flat class array has no LValue; store_rooted's rule) */
+        if (!cur.is<LValue *>()) {
+            const StructObject &o =
+                *dval.get_ref<intrusive_ptr<StructObject>>().get();
+            if (!o.is_ref())
+                return nullptr;
+            if (o.is_readonly())
+                throw CannotChangeConstEx(mstart, mend);
+            const int slot = o.def->slot_of(memUid);
+            /* a POD box's field is in its bytes: no LValue (the callers
+             * hold a reference first, or enter it as a place) */
+            if (slot < 0 || o.is_pod())
+                return nullptr;
+            return &const_cast<StructObject &>(o).fields[slot];
+        }
+        LValue *h = cur.get<LValue *>();
+        const StructObject &obj =
+            *dval.get_ref<intrusive_ptr<StructObject>>().get();
+        const int slot = obj.def->slot_of(memUid);
+        if (slot < 0 || obj.is_pod())
+            return nullptr;
+        StructObject &own = struct_own(h);
+        cur = EvalValue(h);
+        return &own.fields[slot];
     }
     if (dval.is<intrusive_ptr<DictObject>>()) {
         const auto &obj = dval.get<intrusive_ptr<DictObject>>();
         if (!obj->is_readonly()) {
-            DictObject::inner_type &data = obj->get_ref();
-            const auto &it = data.find(memId);
-            if (it != data.end())
+            const DictObject::mut_iterator it = obj->find_mut(memId);
+            if (it != obj->mut_end())
                 return &it->second;
-            if (obj->get_has_default())
-                return &(*data.emplace(memId,
-                    LValue(obj->get_default(), false)).first).second;
+            if (obj->get_has_default())      /* a new key (Cursor) */
+                return obj->insert_new(ct_fit_key(*obj, EvalValue(memId)),
+                                       LValue(obj->get_default(), false));
             if (for_write)
-                return &(*data.emplace(memId,
-                    LValue(none, false)).first).second;
+                return obj->insert_new(ct_fit_key(*obj, EvalValue(memId)),
+                                       LValue(none, false));
             throw KeyNotFoundEx(mstart, mend);
         }
     }
@@ -3430,23 +6031,14 @@ LValue *vm_member_lvalue_ref(const EvalValue &dval, const EvalValue &memId,
 
 void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
                       const UniqueId *memUid, bool is_inc,
-                      Loc mstart, Loc mend, Loc id_start, Loc id_end)
+                      Loc mstart, Loc mend, Loc bstart, Loc bend,
+                      Loc id_start, Loc id_end)
 {
-    /* inc-dec is a READ-modify-write, so for_write=false (no auto-vivify), and
-     * a POD field / readonly / missing key with no default is not an lvalue. */
-    LValue *lv = vm_member_lvalue_ref(base_lv->get(), memId, memUid,
-                                      /*for_write=*/false, mstart, mend);
-    if (!lv)
-        throw NotLValueEx(id_start, id_end);
-    if (lv->is_const_var())
-        throw CannotChangeConstEx(id_start, id_end);
-    EvalValue old = lv->get();
-    if (!old.is<int_type>() && !old.is<float_type>())
-        throw TypeErrorEx("'++'/'--' requires an int or float",
-                          id_start, id_end);
-    const EvalValue one{static_cast<int_type>(1)};
-    apply_compound_op(old, one, is_inc ? Op::addeq : Op::subeq);
-    lv->put(std::move(old));
+    /* "Expected dict object" marks the base, as the tree-walker's member
+     * read does (the site pool carries its caret since myv v28). */
+    EvalValue old;
+    dyn_incdec_member(EvalValue(base_lv), memId, memUid, is_inc, old,
+                      mstart, mend, bstart, bend, id_start, id_end);
 }
 
 /*
@@ -3455,37 +6047,50 @@ void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
  * plain VALUE (the chain-walk convention: a value-walked chain reproduces the
  * tree-walker's rvalue-ness, so the final ref of an rvalue base is an rvalue).
  *
- * Tier 2 (a proven int/float lvalue) == handle_single_expr14(`±= 1`) then
- * old = new ∓ 1 (apply_compound_op - so a dyn-laundered non-numeric derives
- * or throws EXACTLY as the tree-walker's derive does):
- *   - final SUBSCRIPT: the flat path (flat_store_core) ONLY when the codegen
- *     proved the base AST side-effect-free (`allow_flat` - try_flat's gate);
- *     else the general subscript(for_write=false) lvalue + slot_rmw (a flat
- *     element read through an impure base is an RVALUE -> NotLValueEx at the
- *     LVALUE caret, the tree-walker's doAssign error).
- *   - final MEMBER: the POD byte store (vm_member_store) ONLY under
- *     `allow_pod` (try_pod's gate) for a struct base; else the general member
- *     lvalue (vm_member_lvalue_ref; a POD/readonly field is a VALUE read -
- *     run member_read_core for its non-container TypeError, then NotLValueEx).
+ * Tier 2 (a proven int/float lvalue) == handle_single_expr14(`±= 1`)
+ * (subscript_store / member_store), each store reporting the value it
+ * replaced, which postfix returns (it was derived as new ∓ 1 until
+ * 2026-10-05: wrong for a float, (0.1 + 1) - 1 != 0.1, and for -0.0). The
+ * walk already evaluated every key once, so the final step takes the same
+ * stores:
+ *   - final SUBSCRIPT: a rooted flat array's element through flat_store_core,
+ *     else the general subscript(for_write=false) lvalue + slot_rmw (a value
+ *     base's element is an RVALUE -> NotLValueEx at the LVALUE caret);
+ *   - final MEMBER: a rooted POD struct's field through vm_member_store, else
+ *     the general member lvalue (vm_member_lvalue_ref; a readonly field or a
+ *     value base's is a VALUE read - member_read_core for its non-container
+ *     TypeError, then NotLValueEx).
+ * Until 2026-10-05 the flat and POD stores were gated on a side-effect-free
+ * base AST (`allow_flat` / `allow_pod`, codegen-proven) to mirror the
+ * tree-walker's old gate - so `var u = a[f()][0]++` raised NotLValueEx.
  *
- * Tier 3 (dyn / un-hinted) == the dyn read-modify-write: form the final ref
- * READ-style, then NotLValue / const / non-int-float TypeError at the INC-DEC
- * caret (`id_*`), ±1, return old (postfix) / new (prefix).
+ * Tier 3 (dyn / un-hinted) == dyn_incdec_elem / dyn_incdec_member, the
+ * tree-walker's own: an access error at the access caret (`b*` is a member
+ * step's BASE caret, for "Expected dict object"), NotLValue / const /
+ * non-int-float at the INC-DEC caret (`id_*`); returns old (postfix) / new
+ * (prefix). `k*` (the index's caret) is read by nothing since a flat
+ * store's "Expected integer" took the subscript's caret, as every other
+ * store and read has; the image still carries it.
  */
 EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
                           const EvalValue &memId, const UniqueId *memUid,
                           const EvalValue &key,
                           bool tier2, bool is_inc, bool is_prefix,
-                          bool allow_flat, bool allow_pod,
                           Loc lstart, Loc lend, Loc kstart, Loc kend,
-                          Loc id_start, Loc id_end)
+                          Loc bstart, Loc bend, Loc id_start, Loc id_end)
 {
     const Op cop = is_inc ? Op::addeq : Op::subeq;
     const EvalValue one{static_cast<int_type>(1)};
+    /* a reference instance read as a value: held, it is rooted */
+    LValue ref_hold;
+    if (is_member && !cur.is<LValue *>() && is_class_instance(cur)) {
+        ref_hold = LValue(cur, false);
+        cur = EvalValue(&ref_hold);
+    }
 
     if (tier2) {
 
-        EvalValue nv;
+        EvalValue nv, old;
         bool have_nv = false;
 
         if (is_member) {
@@ -3493,12 +6098,17 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
             const EvalValue &cval =
                 cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
 
-            if (allow_pod && cur.is<LValue *>() &&
+            if (cur.is<LValue *>() &&
                 cval.is<intrusive_ptr<StructObject>>() &&
                 cval.get<intrusive_ptr<StructObject>>()->is_pod()) {
 
-                /* try_pod_struct_store's case: a rooted POD struct with a
-                 * side-effect-free base - byte-store the field. */
+                /* member_store's case: a rooted POD struct - byte-store the
+                 * field (a missing member throws in vm_member_store). */
+                const StructObject &obj =
+                    *cval.get_ref<intrusive_ptr<StructObject>>().get();
+                const int slot = obj.def->slot_of(memUid);
+                if (slot >= 0)
+                    old = obj.pod_get(slot);
                 nv = vm_member_store(cur.get<LValue *>(), memUid, cop, one,
                                      lstart, lend, lstart, lend);
                 have_nv = true;
@@ -3506,29 +6116,32 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
             } else {
 
                 /* The general path: the member lvalue (boxed field / dict
-                 * value); a VALUE read (POD via impure base, readonly, or a
+                 * value); a VALUE read (readonly, a value base, or a
                  * non-container base's TypeError) fails NotLValue at the
-                 * LVALUE caret, exactly as the tree-walker's doAssign. */
-                LValue *lv = vm_member_lvalue_ref(cval, memId, memUid,
+                 * LVALUE caret, exactly as the tree-walker's member_store. */
+                LValue *lv = vm_member_lvalue_ref(cur, memId, memUid,
                                                   /*for_write=*/false,
                                                   lstart, lend);
                 if (!lv) {
-                    member_read_core(cval, memId, memUid, false,
+                    const EvalValue &v = cur.is<LValue *>()
+                        ? cur.get<LValue *>()->get() : cur;
+                    member_read_core(v, memId, memUid, false,
                                      lstart, lend, lstart, lend);
                     throw NotLValueEx(lstart, lend);
                 }
+                old = lv->get();
                 nv = slot_rmw(*lv, cop, one);
                 have_nv = true;
             }
 
         } else {
 
-            if (allow_flat && cur.is<LValue *>()) {
+            if (cur.is<LValue *>()) {
                 SharedArrayObj *arr;
                 if (flat_writable_array(cur.get<LValue *>(), arr)) {
                     EvalValue out;
                     if (flat_store_core(cur.get<LValue *>(), *arr, key, one,
-                                        cop, out, lstart, lend, kstart, kend)) {
+                                        cop, out, lstart, lend, &old)) {
                         nv = out;
                         have_nv = true;
                     }
@@ -3551,69 +6164,32 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
                 }
                 if (!elv.is<LValue *>())
                     throw NotLValueEx(lstart, lend);
+                old = elv.get<LValue *>()->get();
                 nv = slot_rmw(*elv.get<LValue *>(), cop, one);
                 have_nv = true;
             }
         }
 
-        if (is_prefix)
-            return nv;
-
-        EvalValue old = nv;     /* old = new -/+ 1 (no operand re-read) */
-        apply_compound_op(old, one, is_inc ? Op::subeq : Op::addeq);
-        return old;
+        return is_prefix ? nv : old;
     }
 
-    /* Tier 3 (dyn): the checked read-modify-write. */
-    LValue *lv;
-
-    if (is_member) {
-        const EvalValue &cval =
-            cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
-        lv = vm_member_lvalue_ref(cval, memId, memUid, /*for_write=*/false,
-                                  lstart, lend);
-        if (!lv) {
-            member_read_core(cval, memId, memUid, false,
-                             lstart, lend, lstart, lend);
-            throw NotLValueEx(id_start, id_end);
-        }
-    } else {
-        EvalValue elv;
-        try {
-            Type *ct = cur.is<LValue *>()
-                ? cur.get<LValue *>()->get().get_type()
-                : cur.get_type();
-            elv = ct->subscript(cur, key, /*for_write=*/false);
-        } catch (Exception &e) {
-            if (!e.loc_start) { e.loc_start = lstart; e.loc_end = lend; }
-            throw;
-        }
-        if (!elv.is<LValue *>())
-            throw NotLValueEx(id_start, id_end);
-        lv = elv.get<LValue *>();
-    }
-
-    if (lv->is<Builtin>())
-        throw CannotRebindBuiltinEx();
-    if (lv->is_const_var())
-        throw CannotChangeConstEx(id_start, id_end);
-
-    EvalValue old = lv->get();
-    if (!old.is<int_type>() && !old.is<float_type>())
-        throw TypeErrorEx("'++'/'--' requires an int or float",
+    /* Tier 3 (dyn): the checked read-modify-write every engine shares. */
+    EvalValue old;
+    const EvalValue nv = is_member
+        ? dyn_incdec_member(cur, memId, memUid, is_inc, old, lstart, lend,
+                            bstart, bend, id_start, id_end)
+        : dyn_incdec_elem(cur, key, is_inc, old, lstart, lend,
                           id_start, id_end);
-    EvalValue nv = old;
-    apply_compound_op(nv, one, cop);
-    lv->put(move(nv));
-    return is_prefix ? lv->get() : old;
+    return is_prefix ? nv : old;
 }
 
 /*
  * VM StoreMemberV: native `s.member = v` / `s.member OP= v` for a STRUCT base (a
- * dict member store goes through DictStore). Mirrors try_pod_struct_store (a POD
- * field: coerce + byte store) + the boxed-field lvalue store the tree-walker's
- * handle_single_expr14 does, but AST-free: `base_lv` from a slot, the member's
- * uid + carets from the member-key pool. Returns the stored value. A const /
+ * dict member store goes through DictStore). Mirrors the tree-walker's
+ * member_store (a POD field: coerce + byte store; a boxed field: coerce +
+ * the field's LValue, boxed_field_rmw), but AST-free: `base_lv` from a
+ * slot, the member's uid + carets from the member-key pool. Returns the
+ * stored value. A const /
  * read-only struct throws NotLValueEx (the tree-walker's general-path error).
  */
 /* The boxed field LValue* of `base.member` for a MUTATING builtin arg0
@@ -3623,7 +6199,7 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
  * vm_member_store's boxed branch. */
 LValue *vm_member_lvalue(LValue *base_lv, const UniqueId *memUid,
                          const Loc &mstart, const Loc &mend,
-                         const Loc &bstart, const Loc &bend)
+                         const Loc &bstart, const Loc &bend, LValue &hold)
 {
     const EvalValue &dval = base_lv->get();
     if (!dval.is<intrusive_ptr<StructObject>>())
@@ -3635,47 +6211,62 @@ LValue *vm_member_lvalue(LValue *base_lv, const UniqueId *memUid,
             intern_msg("Struct '" + string(obj.def->name->val) +
                        "' has no member '" + string(memUid->val) + "'"),
             mstart, mend);
-    if (base_lv->is_const_var() || obj.is_readonly() || obj.is_pod())
-        throw NotLValueEx(mstart, mend);
-    return &obj.fields[slot];
+    /* a POD struct's field: not a location - the member read gives a
+     * VALUE, and the builtin works on it held, as the tree-walker's
+     * (lv_builtin_target) */
+    if (obj.is_pod()) {
+        hold = LValue(obj.is_pod() ? obj.pod_get(slot) : obj.fields[slot].get(),
+                      false);
+        return &hold;
+    }
+    /* the builtin may change the field (a slice detached, a value put):
+     * the struct is the slot's own first (struct_own) */
+    return &struct_own(base_lv).fields[slot];
 }
 
 EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,
                           const EvalValue &value,
                           const Loc &mstart, const Loc &mend,
-                          const Loc &bstart, const Loc &bend)
+                          const Loc &bstart, const Loc &bend,
+                          const StructTypeDef *bake_def, int bake_slot)
 {
     const EvalValue &dval = base_lv->get();
     if (!dval.is<intrusive_ptr<StructObject>>())
         throw TypeErrorEx("Expected struct object", bstart, bend);
 
-    StructObject &obj = *dval.get<intrusive_ptr<StructObject>>().get();
-    const int slot = obj.def->slot_of(memUid);
+    StructObject &obj = *dval.get_ref<intrusive_ptr<StructObject>>().get();
+    /* the compile-baked field slot (behind the def-identity check) skips
+     * the slot_of name scan - the 64_struct_create fix */
+    const int slot = obj.def == bake_def && bake_slot >= 0
+        ? bake_slot : obj.def->slot_of(memUid);
     if (slot < 0)
         throw TypeErrorEx(
             intern_msg("Struct '" + string(obj.def->name->val) +
                        "' has no member '" + string(memUid->val) + "'"),
             mstart, mend);
 
-    if (base_lv->is_const_var() || obj.is_readonly())
-        throw NotLValueEx(mstart, mend);
+    /* the struct is the slot's own before the write (struct_own): a copy
+     * of it elsewhere - another variable, an element, a parameter's
+     * caller - must not see the write */
+    StructObject &own = struct_own(base_lv);
 
-    if (obj.is_pod()) {
+    if (own.is_pod()) {
         const EvalValue r = RValue(value);
         EvalValue newval;
         if (op == Op::assign) {
             newval = r;
         } else {
-            newval = obj.pod_get(slot);
+            newval = own.pod_get(slot);
             apply_compound_op(newval, r, op);
         }
-        newval = coerce_struct_field(obj.def->fields[slot], std::move(newval),
+        newval = coerce_struct_field(own.def->fields[slot], std::move(newval),
                                      mstart, mend);
-        obj.pod_set(slot, newval);
+        own.pod_set(slot, newval);
         return newval;
     }
 
-    return slot_rmw(obj.fields[slot], op, value);   /* boxed field lvalue */
+    /* a boxed field: converted and checked as a POD one (boxed_field_rmw) */
+    return boxed_field_rmw(own, slot, op, value, mstart, mend);
 }
 
 /*
@@ -3691,8 +6282,9 @@ EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,
  */
 EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
                                     const EvalValue &key2,
-                                    const EvalValue &value, Op op,
-                                    const std::pair<Loc, Loc> *locs)
+                                    const EvalValue &value_in, Op op,
+                                    const std::pair<Loc, Loc> *locs,
+                                    bool checked)
 {
     /* `locs[0]` = the INNER subscript caret, `locs[1]` = the OUTER's - read ONLY
      * on the throw path (a pointer keeps the hot store cheap). The INNER read
@@ -3708,6 +6300,17 @@ EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
         throw;
     }
 
+    /* Q2: a store through `dyn` checks against the INNER container's
+     * own type (vm_subscript_store) */
+    EvalValue cv;
+    CtStore ct;
+    if (checked) {
+        cv = value_in;
+        ct = ct_store_pre(RValue(inner), op, cv, locs[1].first,
+                          locs[1].second);
+    }
+    const EvalValue &value = checked ? cv : value_in;
+
     /* A FLAT inner array (`[[1,2],[3,4]]`: general outer, flat int inners) has
      * no element LValue - store the scalar straight into its buffer, exactly
      * like the single-level flat store (COW-correct). */
@@ -3717,10 +6320,9 @@ EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
             EvalValue fout;
             if (flat_store_core(inner.get<LValue *>(), *arr, key2, value, op,
                                 fout, locs[1].first, locs[1].second,
-                                locs[1].first, locs[1].second))
+                                nullptr, ct.ea))
                 return fout;
-            /* a compound op on a flat struct array: defer to the general path
-             * below, which raises the same error as the tree-walker. */
+            /* a string / class array promoted: the general path below */
         }
     }
 
@@ -3734,10 +6336,16 @@ EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
         EvalValue elv = t->subscript(inner, key2, for_write);
         if (!elv.is<LValue *>())
             throw NotLValueEx(locs[1].first, locs[1].second);
-        return slot_rmw(*elv.get<LValue *>(), op, value);
+        return ct_rmw(*elv.get<LValue *>(), op, value, ct.ea, ct.dict,
+                      locs[1].first, locs[1].second);
     } catch (Exception &e) {
-        if (!e.loc_start) { e.loc_start = locs[1].first;
-                            e.loc_end = locs[1].second; }
+        /* an OPERATION error (op_caret) is not the outer subscript's: it
+         * stays loc-less for the op's op_locs caret (the handler's /
+         * the JIT conveyance's stamp) */
+        if (!e.loc_start && !e.op_caret) {
+            e.loc_start = locs[1].first;
+            e.loc_end = locs[1].second;
+        }
         throw;
     }
 }
@@ -3754,8 +6362,10 @@ EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
  * tree-walker.
  */
 EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
-                                   size_t nkeys, const EvalValue &value, Op op,
-                                   const std::pair<Loc, Loc> *steplocs)
+                                   size_t nkeys, const EvalValue &value_in,
+                                   Op op,
+                                   const std::pair<Loc, Loc> *steplocs,
+                                   bool checked)
 {
     EvalValue cur = EvalValue(base);   /* wraps the current container LValue* */
     /* Each INTERMEDIATE read throws with ITS subscript node's loc (byte-
@@ -3763,9 +6373,20 @@ EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
      * KeyNotFound is stamped here. The FINAL store's throws are loc-less and the
      * CALLER stamps them the outer/side-table loc (== the outermost subscript
      * = steplocs[nkeys-1]). */
+    /*
+     * An intermediate step may yield a VALUE rather than an element LValue -
+     * a READ-ONLY container (a const, reached through a parameter) hands out
+     * rvalues, and so does a flat element. The walk CONTINUES on the value,
+     * exactly like the tree-walker's chained Subscript::do_eval: a read-only
+     * inner is only refused at the FINAL store (NotLValueEx at the whole
+     * lvalue), and a scalar raises its own TypeErrorEx at the step that
+     * indexes it. Refusing at the step (as this did) carets `p[1]` where the
+     * tree-walker carets `p[1][0][0]` - a RULE 2 break (#38).
+     */
     for (size_t k = 0; k + 1 < nkeys; k++) {
         const Loc ks = steplocs[k].first, ke = steplocs[k].second;
-        Type *t = cur.get<LValue *>()->get().get_type();
+        Type *t = cur.is<LValue *>()
+            ? cur.get<LValue *>()->get().get_type() : cur.get_type();
         EvalValue next;
         try {
             next = t->subscript(cur, keys[k], /*for_write=*/false);
@@ -3773,44 +6394,115 @@ EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
             if (!e.loc_start) { e.loc_start = ks; e.loc_end = ke; }
             throw;
         }
-        if (!next.is<LValue *>())         /* a flat scalar can't be indexed */
-            throw NotLValueEx(ks, ke);
         cur = std::move(next);
     }
 
     const Loc fs = steplocs[nkeys - 1].first, fe = steplocs[nkeys - 1].second;
-    LValue *inner = cur.get<LValue *>();
+    /* Q2: checked against the innermost container's own type */
+    EvalValue cv;
+    CtStore ct;
+    if (checked) {
+        cv = value_in;
+        ct = ct_store_pre(RValue(cur), op, cv, fs, fe);
+    }
+    const EvalValue &value = checked ? cv : value_in;
+    LValue *inner = cur.is<LValue *>() ? cur.get<LValue *>() : nullptr;
     SharedArrayObj *arr;
-    if (flat_writable_array(inner, arr)) {
+    if (inner && flat_writable_array(inner, arr)) {
         EvalValue fout;
         if (flat_store_core(inner, *arr, keys[nkeys - 1], value, op,
-                            fout, fs, fe, fs, fe))
+                            fout, fs, fe, nullptr, ct.ea))
             return fout;
     }
     /* The FINAL store's throws (subscript OOB/KeyNotFound, slot_rmw type) are
      * loc-less; stamp them the OUTERMOST subscript's caret. */
     try {
-        Type *t = inner->get().get_type();
+        Type *t = inner ? inner->get().get_type() : cur.get_type();
         const bool for_write = (op == Op::assign);
         EvalValue elv = t->subscript(cur, keys[nkeys - 1], for_write);
         if (!elv.is<LValue *>())
             throw NotLValueEx(fs, fe);
-        return slot_rmw(*elv.get<LValue *>(), op, value);
+        return ct_rmw(*elv.get<LValue *>(), op, value, ct.ea, ct.dict,
+                      fs, fe);
     } catch (Exception &e) {
-        if (!e.loc_start) { e.loc_start = fs; e.loc_end = fe; }
+        /* an OPERATION error keeps no step caret: see the nested store */
+        if (!e.loc_start && !e.op_caret) {
+            e.loc_start = fs;
+            e.loc_end = fe;
+        }
         throw;
     }
 }
 
-/* Read scalar field #fidx of element `idx` of a flat array<PodStruct> straight
- * from the bytes (the VM's LoadStructFieldInt/Float, the struct-foreach direct
- * read). `arrv` is the array value; the codegen proved it flat-struct + `idx`
- * in range (the counted loop), so no checks. A bool field reads as 0/1. */
+/* Field #fidx of element `idx` of a GENERAL array whose elements are POD
+ * structs (a promoted array<PodStruct>): the boxed StructObject's field, in
+ * its own kind (int / float / bool -> 0/1). An element that is not a struct,
+ * or a field index it does not have, can only come from a corrupt image and
+ * reads 0 - the defined value of the untrusted tier (#142). */
+template <class T>
+static T general_struct_field(const SharedArrayObj &arr, size_type idx,
+                              int_type fidx)
+{
+    const EvalValue &ev = arr.get_vec()[arr.offset() + idx].get();
+    if (!ev.is<intrusive_ptr<StructObject>>())
+        return static_cast<T>(0);
+    const StructObject &so = *ev.get_ref<intrusive_ptr<StructObject>>();
+    if (!so.def || fidx < 0
+        || static_cast<size_t>(fidx) >= so.def->fields.size()
+        || !so.def->is_pod())
+        return static_cast<T>(0);
+    const FieldKind k = so.def->fields[fidx].kind;
+    if (k != FieldKind::f_int && k != FieldKind::f_float
+        && k != FieldKind::f_bool)
+        return static_cast<T>(0);
+    const EvalValue fv = so.pod_get(static_cast<int>(fidx));
+    if (fv.is<float_type>())
+        return static_cast<T>(fv.get<float_type>());
+    if (fv.is<int_type>())
+        return static_cast<T>(fv.get<int_type>());
+    return static_cast<T>(fv.get_type()->is_true(fv) ? 1 : 0);   /* bool */
+}
+
+/* Read scalar field #fidx of element `idx` of an array<PodStruct> (the VM's
+ * LoadStructFieldInt/Float, the struct-foreach direct read). `arrv` is the
+ * array value; the codegen proved `idx` in range (the counted loop over an
+ * inert body). A bool field reads as 0/1.
+ *
+ * ⛔ The codegen did NOT prove the STORAGE flat - only the static type
+ * array<P>, and a flat struct array AUTO-PROMOTES to general storage on a
+ * cold op (insert/sort/map, via get_vec()) anywhere BEFORE the loop. This
+ * read used to return 0 for every element of such an array (a silent wrong
+ * answer, found by the #54 -nc audit: an un-folded `var pts = []` was built
+ * general). A general array is read the boxed way, as G4's subscript form
+ * below always did. */
 int_type vm_struct_field_int(const EvalValue &arrv, int_type idx,
                     int_type fidx)
 {
+    /*
+     * #137 tier 2 + #142: `fidx` is an INSTRUCTION operand and the def is
+     * whatever the slot holds at RUN time, so verify_chunk can bound it by
+     * nothing tighter than the widest struct in the program - a narrow
+     * struct read with a wide one's field index arrives here in range for
+     * tier 1 and out of range for this vector.
+     *
+     * It must not THROW to say so: jit_load_struct_field and
+     * jit_struct_field_add_int are `noexcept` with no catch, so an
+     * exception here is std::terminate. A defined value it is - the same
+     * bargain the rest of the untrusted tier makes.
+     */
+    if (!arrv.is<SharedArrayObj>())
+        return 0;
     const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
+    if (idx < 0 || static_cast<size_type>(idx) >= arr.size())
+        return 0;
+    if (arr.skind() == SharedArrayObj::Storage::general)
+        return general_struct_field<int_type>(
+            arr, static_cast<size_type>(idx), fidx);
+    if (arr.skind() != SharedArrayObj::Storage::structs)
+        return 0;
     const auto &sv = arr.flat_structs();
+    if (fidx < 0 || static_cast<size_t>(fidx) >= sv.def->fields.size())
+        return 0;
     const FieldDef &f = sv.def->fields[fidx];
     const char *p =
         sv.buf.data() + (arr.offset() + idx) * sv.stride + f.offset;
@@ -3824,14 +6516,119 @@ int_type vm_struct_field_int(const EvalValue &arrv, int_type idx,
 float_type vm_struct_field_float(const EvalValue &arrv, int_type idx,
                       int_type fidx)
 {
+    /*
+     * #137 tier 2 + #142: `fidx` is an INSTRUCTION operand and the def is
+     * whatever the slot holds at RUN time, so verify_chunk can bound it by
+     * nothing tighter than the widest struct in the program - a narrow
+     * struct read with a wide one's field index arrives here in range for
+     * tier 1 and out of range for this vector.
+     *
+     * It must not THROW to say so: jit_load_struct_field and
+     * jit_struct_field_add_int are `noexcept` with no catch, so an
+     * exception here is std::terminate. A defined value it is - the same
+     * bargain the rest of the untrusted tier makes.
+     */
+    if (!arrv.is<SharedArrayObj>())
+        return 0.0;
     const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
+    if (idx < 0 || static_cast<size_type>(idx) >= arr.size())
+        return 0.0;
+    if (arr.skind() == SharedArrayObj::Storage::general)   /* see above */
+        return general_struct_field<float_type>(
+            arr, static_cast<size_type>(idx), fidx);
+    if (arr.skind() != SharedArrayObj::Storage::structs)
+        return 0.0;
     const auto &sv = arr.flat_structs();
+    if (fidx < 0 || static_cast<size_t>(fidx) >= sv.def->fields.size())
+        return 0.0;
     const FieldDef &f = sv.def->fields[fidx];
     const char *p =
         sv.buf.data() + (arr.offset() + idx) * sv.stride + f.offset;
     float_type v;
     std::memcpy(&v, p, sizeof v);
     return v;
+}
+
+/*
+ * G4: the CHECKED `a[i].f` scalar read - the SUBSCRIPT form of
+ * LoadStructFieldInt/Float.
+ *
+ * The foreach form above is unchecked because its gate proved both facts it
+ * needs: flat-struct storage, and an in-range loop counter. A SUBSCRIPT base
+ * proves NEITHER - a flat array<PodStruct> AUTO-PROMOTES to general storage
+ * on any cold op (insert/sort/map, via get_vec()), and the index is
+ * arbitrary - so this does the negative-index wrap and the bounds check
+ * itself and serves BOTH storages.
+ *
+ * The element is a POD struct either way (the codegen gate requires it), so
+ * the general arm reads the same FIELD INDEX out of the boxed StructObject.
+ * OutOfBoundsEx is thrown LOC-LESS: the interpreter stamps it from the loc
+ * side table and the JIT re-raises it through EnterNative, so both engines
+ * report the op's own caret (the SUBSCRIPT's span - see task #125).
+ */
+template <class T>
+static T vm_struct_elem_field(const EvalValue &arrv, int_type idx,
+                              int_type fidx)
+{
+    const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
+
+    if (idx < 0)
+        idx += static_cast<int_type>(arr.size());
+    if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+        throw OutOfBoundsEx();
+
+    if (arr.skind() == SharedArrayObj::Storage::structs) {
+        const auto &sv = arr.flat_structs();
+        /* #137 tier 2 - see the twin in vm_struct_field_int above. The
+         * OutOfBoundsEx raised earlier is a LANGUAGE error and stays a
+         * throw (its caller conveys it); a bad field index is CORRUPTION
+         * and takes the defined value instead. */
+        if (fidx < 0 || static_cast<size_t>(fidx) >= sv.def->fields.size())
+            return static_cast<T>(0);
+        const FieldDef &f = sv.def->fields[fidx];
+        const char *p = sv.buf.data()
+            + (arr.offset() + static_cast<size_type>(idx)) * sv.stride
+            + f.offset;
+        if (f.kind == FieldKind::f_bool)
+            return static_cast<T>(static_cast<unsigned char>(*p) != 0 ? 1 : 0);
+        if (f.kind == FieldKind::f_float) {
+            float_type v;
+            std::memcpy(&v, p, sizeof v);
+            return static_cast<T>(v);
+        }
+        int_type v;
+        std::memcpy(&v, p, sizeof v);
+        return static_cast<T>(v);
+    }
+
+    /* PROMOTED (or built) general: a boxed StructObject per element. The
+     * same FIELD INDEX applies - the element is a POD struct either way -
+     * and pod_get hands back the field's own kind, so one arm per kind
+     * covers int / float / bool for BOTH the int and float readers (an
+     * int field feeding a float read is try_member_scalar's promoting
+     * form). */
+    const EvalValue &ev =
+        arr.get_vec()[arr.offset() + static_cast<size_type>(idx)].get();
+    const EvalValue fv =
+        ev.get_ref<intrusive_ptr<StructObject>>()->pod_get(
+            static_cast<int>(fidx));
+    if (fv.is<float_type>())
+        return static_cast<T>(fv.get<float_type>());
+    if (fv.is<int_type>())
+        return static_cast<T>(fv.get<int_type>());
+    return static_cast<T>(fv.get_type()->is_true(fv) ? 1 : 0);   /* bool */
+}
+
+int_type vm_struct_elem_field_int(const EvalValue &arrv, int_type idx,
+                                  int_type fidx)
+{
+    return vm_struct_elem_field<int_type>(arrv, idx, fidx);
+}
+
+float_type vm_struct_elem_field_float(const EvalValue &arrv, int_type idx,
+                                      int_type fidx)
+{
+    return vm_struct_elem_field<float_type>(arrv, idx, fidx);
 }
 
 /* Materialize element `idx` of a flat array<PodStruct> as a FRESH StructObject
@@ -3842,19 +6639,137 @@ float_type vm_struct_field_float(const EvalValue &arrv, int_type idx,
 EvalValue vm_struct_elem(const EvalValue &arrv, int_type idx)
 {
     const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
-    const auto &sv = arr.flat_structs();
+    /* #53: the index is bounded by the length at the loop's START, and the
+     * body may have shrunk the array (the foreach's defined OutOfBoundsEx,
+     * loc-less - the op's caret is stamped by the raise) or PROMOTED it to
+     * general storage (a cold op on a struct array; the element is then
+     * read the general way, as the tree-walker does). */
+    if (idx < 0 || static_cast<size_type>(idx) >= arr.size())
+        throw OutOfBoundsEx();
+    if (arr.skind() == SharedArrayObj::Storage::general)
+        return arr_elem_boxed(arr, static_cast<size_type>(idx));
+    const auto &sv = arr.flat_structs();   /* any other kind: an image's */
     auto obj = make_intrusive<StructObject>(sv.def);
     std::memcpy(obj->bytes.data(),
                 sv.buf.data() + (arr.offset() + idx) * sv.stride, sv.stride);
     return EvalValue(intrusive_ptr<StructObject>(obj));
 }
 
+/* #110: the whole-`p` foreach bind INTO the loop variable's slot. The
+ * tree-walker reuses one StructObject across iterations (Foreach's
+ * `reuse`); here the slot itself is the holder: when it still holds the
+ * previous iteration's object and NOTHING ELSE references it - use_count
+ * 1, i.e. the body neither stored, captured, appended nor aliased it -
+ * the element's bytes are copied over it in place, and no object is
+ * allocated or freed. Anything else (a captured element, a different
+ * def, a read-only value the body assigned, a general array) takes the
+ * fresh-object path, so a captured element keeps its value. */
+void vm_struct_elem_into(LValue &dst, const EvalValue &arrv, int_type idx)
+{
+    const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
+    if (idx >= 0 && static_cast<size_type>(idx) < arr.size()
+        && arr.skind() == SharedArrayObj::Storage::structs
+        && dst.get().is<intrusive_ptr<StructObject>>()) {
+        const auto &sv = arr.flat_structs();
+        const intrusive_ptr<StructObject> &o =
+            dst.get().get_ref<intrusive_ptr<StructObject>>();
+        /* (no `boxed` test, unlike the constructors' reuse: the loop
+         * variable is typed P, so no program can leave a box<P> in it) */
+        if (o.use_count() == 1 && o->def == sv.def && !o->readonly
+            && o->bytes.size() == static_cast<size_t>(sv.stride)) {
+            std::memcpy(o->bytes.data(),
+                        sv.buf.data() + (arr.offset() + idx) * sv.stride,
+                        sv.stride);
+            return;
+        }
+    }
+    dst.put(vm_struct_elem(arrv, idx));
+}
+
+/*
+ * `cast<T>(x)`: cast_value, its refusal carrying the argument's caret. A
+ * constant evaluation (the parser's fold) refuses a string's float out of
+ * range, as float(s) does.
+ */
+EvalValue CastExpr::do_eval(EvalContext *ctx, bool rec) const
+{
+    /* an error reading the argument (a REPL name no input declared)
+     * carets the argument, as a call's does */
+    EvalValue v;
+    try {
+        v = RValue(elem->eval(ctx));
+    } catch (Exception &e) {    /* INT-COV-EXEMPT: its type test fails */
+        stamp_operand_loc(elem.get(), e);
+        throw;
+    }
+    return cast_value_loc(v, *to, ctx->in_const_eval(), elem->start,
+                          elem->end);
+}
+
+/*
+ * `*b`: the value the box holds (box_load). A box<P> reads a COPY of its
+ * struct, a value. The caret of a misuse (not a box, none) is the `*b`.
+ */
+EvalValue DerefExpr::do_eval(EvalContext *ctx, bool rec) const
+{
+    const EvalValue b = RValue(elem->eval(ctx));
+    return box_load_want(b, want, want_def);
+}
+
+/*
+ * `*b = v` / `*b OP= v` (and `++` / `--` through IncDecExpr's typed path):
+ * the rvalue was evaluated first (Expr14::do_eval), then the box once; a
+ * compound reads the box, applies the operator - its error carets the
+ * whole expression, as every compound store's does - and stores back. The
+ * value is the box's value after the store (widened to its element kind).
+ */
+static EvalValue
+deref_store(EvalContext *ctx, const DerefExpr *d, Op op,
+            const EvalValue &rval, EvalValue *old_out = nullptr)
+{
+    EvalValue box;
+    try {
+        box = RValue(d->elem->eval(ctx));
+    } catch (Exception &e) {
+        stamp_like_eval(d, e);
+        throw;
+    }
+    EvalValue v;
+    if (op == Op::assign) {
+        v = RValue(rval);
+    } else {
+        try {
+            v = box_load_want(box, d->want, d->want_def);
+        } catch (Exception &e) {
+            stamp_like_eval(d, e);
+            throw;
+        }
+        if (old_out)
+            *old_out = v;
+        apply_compound_op(v, RValue(rval), op);
+    }
+    try {
+        box_store(box, v);
+        return box_load(box);
+    } catch (Exception &e) {
+        stamp_like_eval(d, e);
+        throw;
+    }
+}
+
+/*
+ * One assignment to `lvalue`. `old_out`, when given (a compound store only:
+ * IncDecExpr's typed `±= 1`), receives the value the store replaced - read
+ * at the store itself, so postfix `++` / `--` yields it exactly (deriving it
+ * as new -/+ 1 was wrong for a float: (0.1 + 1) - 1 is not 0.1).
+ */
 static EvalValue
 handle_single_expr14(EvalContext *ctx,
                      bool inDecl,
                      Op op,
                      Construct *lvalue,
-                     const EvalValue &rval_in)
+                     const EvalValue &rval_in,
+                     EvalValue *old_out = nullptr)
 {
     /*
      * For a plain `=` to an explicitly-typed scalar variable, coerce a widening
@@ -3900,9 +6815,9 @@ handle_single_expr14(EvalContext *ctx,
         if (const Identifier *id = as_resolved_global(lvalue)) {
 
             if (GlobalFuncTable *gf = ctx->gfuncs) {
-                gf->slots[id->sym.slot] =
-                    LValue(RValue(rval), ctx->const_ctx || lvalue->is_const);
-                gf->defined[id->sym.slot] = 1;
+                gf->define(id->sym.slot,
+                           LValue(RValue(rval),
+                                  ctx->const_ctx || lvalue->is_const));
                 return rval;
             }
         }
@@ -3925,8 +6840,11 @@ handle_single_expr14(EvalContext *ctx,
 
                 LValue &lv = f->slots[id->sym.slot];
 
-                if (!lv.is_const_var())
+                if (!lv.is_const_var()) {
+                    if (old_out)
+                        *old_out = lv.get();
                     return slot_rmw(lv, op, rval);
+                }
             }
         }
 
@@ -3944,8 +6862,11 @@ handle_single_expr14(EvalContext *ctx,
 
                 LValue &lv = gf->slots[id->sym.slot];
 
-                if (!lv.is_const_var())
+                if (!lv.is_const_var()) {
+                    if (old_out)
+                        *old_out = lv.get();
                     return slot_rmw(lv, op, rval);
+                }
             }
         }
 
@@ -3961,28 +6882,28 @@ handle_single_expr14(EvalContext *ctx,
 
                 LValue &lv = (*ctx->captures)[id->sym.slot];
 
-                if (!lv.is_const_var())
+                if (!lv.is_const_var()) {
+                    if (old_out)
+                        *old_out = lv.get();
                     return slot_rmw(lv, op, rval);
+                }
             }
         }
 
-        /*
-         * Fast path: `a[i] = v` / `a[i] OP= v` into a flat (unboxed) int/float
-         * array - write the scalar straight into the flat vector, no promotion.
-         */
-        EvalValue flat_out;
-        if (try_flat_subscript_store(ctx, lvalue, op, rval, flat_out))
-            return flat_out;
     }
 
-    /*
-     * Fast path: `s.field = v` / `s.field OP= v` into a POD struct - store the
-     * scalar straight into the struct's byte slot (a POD field has no LValue).
-     */
-    {
-        EvalValue pod_out;
-        if (try_pod_struct_store(ctx, lvalue, op, rval, pod_out))
-            return pod_out;
+    /* A store through an access chain: its base and key once, then the
+     * flat / POD / general store (subscript_store, member_store). */
+    if (!inDecl) {
+        if (ctag(lvalue) == ConstructType::deref)
+            return deref_store(ctx, static_cast<DerefExpr *>(lvalue), op,
+                               rval, old_out);
+        if (lvalue->is_subscript())
+            return subscript_store(ctx, static_cast<Subscript *>(lvalue),
+                                   op, rval, old_out);
+        if (ctag(lvalue) == ConstructType::member)
+            return member_store(ctx, static_cast<MemberExpr *>(lvalue),
+                                op, rval, old_out);
     }
 
     /*
@@ -4057,6 +6978,8 @@ handle_single_expr14(EvalContext *ctx,
             );
 
         } else {
+            if (old_out)
+                *old_out = lval.get<LValue *>()->get();
             return doAssign(lval, rval, op);
         }
 
@@ -4089,7 +7012,7 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
              * inferencer proved is a non-null int (th == i) - e.g. a POD struct
              * field `p.x`. The latter reads UNBOXED via eval_int() (no
              * pod_get/EvalValue), which is what makes `sx += p.x` over a flat
-             * struct array a true unboxed reduction (plans/structs.md phase 8).
+             * struct array a true unboxed reduction (plans/archived/structs.md phase 8).
              */
             const bool rhs_int =
                 rvalue->is_lit_int() || rvalue->th == TypeHint::i;
@@ -4131,6 +7054,15 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
         stamp_operand_loc(rvalue.get(), e);
         throw;
     }
+    /* converted CHECKED, the whole assignment's caret on a value that does
+     * not fit - the VM's CoerceNumV (a statically typed rvalue always fits;
+     * a parse-time stamp of a pure body may meet one that does not) */
+    if (rv_coerce != DeclType::none)
+        rval_storage = coerce_to_decl_type(rval_storage, rv_coerce);
+    /* #49: checked against the place's declared type where it may misfit
+     * - the value's caret, as the VM's CheckFitV */
+    if (rv_fit)
+        check_fit_loc(rval_storage, *rv_fit, rvalue->start, rvalue->end);
     const EvalValue &rval = rval_storage;
     IdList *idlist = nullptr;
 
@@ -4141,11 +7073,15 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
         if (!rval.is<SharedArrayObj>()) {
 
-            for (const auto &e: idlist->elems) {
-                if (e->is_id()
-                    && static_cast<Identifier *>(e.get())->is_underscore())
+            for (size_t i = 0; i < idlist->elems.size(); i++) {
+                Identifier *t = idlist->elems[i].get();
+                if (t->is_underscore())
                     continue;   /* `_` placeholder: skip */
-                handle_single_expr14(ctx, inDecl, op, e.get(), rval);
+                /* #49: what the target receives, checked before its
+                 * store - the value's caret, as the VM's CheckFitV */
+                if (const auto &f = idlist->fit_of(i))
+                    check_fit_loc(rval, *f, rvalue->start, rvalue->end);
+                handle_single_expr14(ctx, inDecl, op, t, rval);
             }
 
         } else {
@@ -4170,18 +7106,14 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
             for (size_type i = 0; i < idlist->elems.size(); i++) {
 
-                if (idlist->elems[i]->is_id()
-                    && static_cast<Identifier *>(idlist->elems[i].get())
-                           ->is_underscore())
+                if (idlist->elems[i]->is_underscore())
                     continue;   /* `_` placeholder: skip this array slot */
 
-                handle_single_expr14(
-                    ctx,
-                    inDecl,
-                    op,
-                    idlist->elems[i].get(),
-                    arr_elem_boxed(arr, i)
-                );
+                const EvalValue elem = arr_elem_boxed(arr, i);
+                if (const auto &f = idlist->fit_of(i))
+                    check_fit_loc(elem, *f, rvalue->start, rvalue->end);
+                handle_single_expr14(ctx, inDecl, op,
+                                     idlist->elems[i].get(), elem);
             }
         }
 
@@ -4189,7 +7121,21 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
     } else {
 
-        return handle_single_expr14(ctx, inDecl, op, lvalue.get(), rval);
+        EvalValue r = handle_single_expr14(ctx, inDecl, op, lvalue.get(),
+                                           rval);
+        /* A plain store's VALUE into an element or a field is the rvalue
+         * converted to the target's STATIC type (val_widen; a dict's
+         * rv_coerce already widened `rval`) - not whatever conversion the
+         * container ran at run time, which a dyn target cannot predict
+         * statically: `var z = (dp.x = true)` with a dyn `dp` is the bool
+         * the inferencer typed, though the int field stored 1. A `dyn`
+         * rvalue converts CHECKED, as a typed variable receiving one does
+         * - the VM's CoerceNumV; a statically typed one always fits. */
+        if (op == Op::assign && !inDecl
+                && (lvalue->is_subscript()
+                    || ctag(lvalue.get()) == ConstructType::member))
+            return coerce_to_decl_type(rval, val_widen);
+        return r;
     }
 }
 
@@ -4201,8 +7147,8 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
  *    incl. flat-array elements and POD struct fields, which have no LValue):
  *    route the mutation through handle_single_expr14 (`operand += 1`), which
  *    reuses every store fast path (slot, flat array, COW, struct). It returns
- *    the NEW value; postfix derives `old = new -/+ 1` (the delta is exactly 1),
- *    so we never re-read the operand;
+ *    the NEW value and reports the value the store replaced, which postfix
+ *    returns (deriving it as new -/+ 1 was wrong for a float);
  *
  *  - a `dyn` / un-hinted operand (always LValue-backed - a dyn value is never
  *    flat): read-modify-write through the LValue so the int/float requirement
@@ -4211,20 +7157,34 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
  * The inferencer rejects a non-lvalue / const / non-numeric operand at compile
  * time; the runtime checks are the `dyn` safety net.
  */
+/* A value-selecting expression (`c ? a : b`, `a ?? b`) whose arms join
+ * to a numeric type WIDENS the arm it picked to that type (task #75):
+ * `c ? 1 : 2.5` is a float, and the VM's typed paths read it as one - the
+ * raw int was the divergence. th == i without th_bool is an int (a bool
+ * arm widens); a th_bool node is a real bool and keeps its arms. */
+static EvalValue select_widen(const Construct *self, EvalValue v)
+{
+    if (self->th == TypeHint::f)
+        return literal_widen(std::move(v), DeclType::f);
+    if (self->th == TypeHint::i && !self->th_bool)
+        return literal_widen(std::move(v), DeclType::i);
+    return v;
+}
+
 EvalValue TernaryExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     const EvalValue c = RValue(condExpr->eval(ctx));
     if (c.get_type()->is_true(c))
-        return RValue(thenExpr->eval(ctx));
-    return RValue(elseExpr->eval(ctx));
+        return select_widen(this, RValue(thenExpr->eval(ctx)));
+    return select_widen(this, RValue(elseExpr->eval(ctx)));
 }
 
 EvalValue CoalesceExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue l = RValue(lhs->eval(ctx));
     if (l.is<NoneVal>())
-        return RValue(rhs->eval(ctx));
-    return l;
+        return select_widen(this, RValue(rhs->eval(ctx)));
+    return select_widen(this, std::move(l));
 }
 
 EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
@@ -4266,18 +7226,100 @@ EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
 
     if (th == TypeHint::i || th == TypeHint::f) {
 
+        /* The store reports the value it replaced: postfix yields exactly
+         * that (a float's old cannot be derived from new - (0.1 + 1) - 1
+         * is not 0.1, nor -1 + 1 the -0.0 it was). */
+        EvalValue old;
         const EvalValue nv =
-            handle_single_expr14(ctx, false, cop, lvalue.get(), one);
-
-        if (is_prefix)
-            return nv;
-
-        EvalValue old = nv;     /* old = new -/+ 1 (no operand re-read) */
-        apply_compound_op(old, one, is_inc ? Op::subeq : Op::addeq);
-        return old;
+            handle_single_expr14(ctx, false, cop, lvalue.get(), one, &old);
+        return is_prefix ? nv : old;
     }
 
-    /* dyn / un-hinted: read-modify-write through the LValue. */
+    /*
+     * dyn / un-hinted. An element or a member is the read-modify-write the
+     * VM's dyn paths share (dyn_incdec_elem / dyn_incdec_member), with the
+     * base and the key evaluated once, in the order Subscript / MemberExpr
+     * evaluate them. A variable is an LValue.
+     */
+    if (lvalue->is_subscript()) {
+        const Subscript *sub = static_cast<const Subscript *>(lvalue.get());
+        EvalValue cur, key;
+        LValue hold;
+        try {
+            cur = store_base_value(ctx, sub->what.get(), hold);
+            if (cur.is<UndefinedId>())
+                throw UndefinedVariableEx(cur.get<UndefinedId>().id,
+                                          sub->what->start, sub->what->end);
+            key = literal_widen(RValue(sub->index->eval(ctx)),
+                                sub->key_coerce);
+        } catch (Exception &e) {
+            stamp_operand_loc(lvalue.get(), e);
+            throw;
+        }
+        EvalValue old;
+        const EvalValue nv = dyn_incdec_elem(cur, key, is_inc, old,
+                                             sub->start, sub->end,
+                                             start, end);
+        return is_prefix ? nv : old;
+    }
+
+    if (ctag(lvalue.get()) == ConstructType::deref) {
+        /* `(*b)++` on a dyn box: the box once, its value checked */
+        const DerefExpr *d = static_cast<const DerefExpr *>(lvalue.get());
+        EvalValue box, old;
+        try {
+            box = RValue(d->elem->eval(ctx));
+            old = box_load_want(box, d->want, d->want_def);
+        } catch (Exception &e) {
+            stamp_like_eval(d, e);
+            throw;
+        }
+        if (!old.is<int_type>() && !old.is<float_type>())
+            throw TypeErrorEx("'++'/'--' requires an int or float",
+                              start, end);
+        EvalValue nv = old;
+        apply_compound_op(nv, one, cop);
+        try {
+            box_store(box, nv);
+        } catch (Exception &e) {
+            stamp_like_eval(d, e);
+            throw;
+        }
+        return is_prefix ? nv : old;
+    }
+
+    if (ctag(lvalue.get()) == ConstructType::member &&
+        !static_cast<const MemberExpr *>(lvalue.get())->optional) {
+        const MemberExpr *m = static_cast<const MemberExpr *>(lvalue.get());
+        MemberTarget t;
+        LValue hold;
+        try {
+            t = member_target(ctx, m, hold);
+            if (!t.place.bytes && t.base.is<UndefinedId>())
+                throw UndefinedVariableEx(t.base.get<UndefinedId>().id,
+                                          m->start, m->end);
+        } catch (Exception &e) {
+            stamp_operand_loc(lvalue.get(), e);
+            throw;
+        }
+        /* a field in bytes no LValue covers (a flat struct array's element,
+         * an inline POD field): the read-modify-write in place */
+        if (t.place.bytes) {
+            const int slot = t.place.def->slot_of(m->memUid);
+            if (slot >= 0)
+                return pod_place_incdec(t.place, slot, is_inc, is_prefix,
+                                        m->start, m->end, start, end);
+            t.base = pod_place_value(t.place);
+        }
+        EvalValue cur = t.base;
+        EvalValue old;
+        const EvalValue nv = dyn_incdec_member(cur, m->memId, m->memUid,
+                                               is_inc, old, m->start, m->end,
+                                               m->what->start, m->what->end,
+                                               start, end);
+        return is_prefix ? nv : old;
+    }
+
     EvalValue lref;
     try {
         lref = lvalue->eval(ctx);
@@ -4294,7 +7336,9 @@ EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
 
     LValue *lv = lref.get<LValue *>();
 
-    if (lv->is<Builtin>())
+    /* the builtin's own name; a variable HOLDING a builtin is a type error
+     * below, as in the VM */
+    if (lv->is<Builtin>() && lv->is_const_var())
         throw CannotRebindBuiltinEx();
 
     if (lv->is_const_var())
@@ -4307,9 +7351,9 @@ EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
 
     EvalValue nv = old;
     apply_compound_op(nv, one, cop);
-    lv->put(move(nv));
+    lv->put(nv);
 
-    return is_prefix ? lv->get() : old;
+    return is_prefix ? nv : old;
 }
 
 EvalValue IfStmt::do_eval(EvalContext *ctx, bool rec) const
@@ -4343,14 +7387,26 @@ EvalValue ContinueStmt::do_eval(EvalContext *ctx, bool rec) const
 EvalValue ReturnStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     /* RValue() throws UndefinedVariableEx (with this stmt's loc) if needed */
-    ctx->flow->value = elem ? RValue(elem->eval(ctx)) : none;
+    ctx->flow->value = elem
+        ? literal_widen(RValue(elem->eval(ctx)), ret_coerce) : none;
     ctx->flow->type = FlowState::ret;
     return none;
 }
 
 EvalValue RethrowStmt::do_eval(EvalContext *ctx, bool rec) const
 {
-    throw RethrowEx{start, end};
+    /* the parser accepts `rethrow` only inside a catch body of this same
+     * function, and do_catch sets `handling` for as long as one runs */
+    const RuntimeException *ex = ctx->flow->handling;
+    ML_CHECK(ex);
+    /* a COPY carries the rethrow site's caret: the handled exception stays
+     * as it was caught, for a later rethrow and for the chain (question 12)
+     * - the VM keeps it parked the same way */
+    std::unique_ptr<RuntimeException> c(ex->clone());
+    c->loc_start = start;
+    c->loc_end = end;
+    c->rethrow();
+    return none; /* Make compilers unaware of [[noreturn]] happy */
 }
 
 EvalValue ThrowStmt::do_eval(EvalContext *ctx, bool rec) const
@@ -4366,7 +7422,8 @@ EvalValue ThrowStmt::do_eval(EvalContext *ctx, bool rec) const
     if (e.is<intrusive_ptr<StructObject>>()) {
         throw ExceptionObject(
             string(e.get<intrusive_ptr<StructObject>>()->def->name->val),
-            e
+            e,
+            e.get<intrusive_ptr<StructObject>>()->def->name
         );
     }
 
@@ -4384,6 +7441,47 @@ EvalValue ThrowStmt::do_eval(EvalContext *ctx, bool rec) const
     );
 }
 
+/*
+ * Is this statement a NAMED func/struct declaration - one that must be BOUND
+ * at scope entry rather than when the statement is reached (#134)?
+ *
+ * Sound because such a declaration cannot depend on the enclosing frame: the
+ * grammar REJECTS a capture list on a named func (`func f[a](x)` is a
+ * SyntaxError - captures are for closure EXPRESSIONS only), and a named
+ * func's body is parented to `capture_root`, the program root, so it cannot
+ * read an enclosing local either (verified: it reports "Undefined variable").
+ * A struct is simpler still - its descriptor is computed at parse time.
+ *
+ * So creating the FuncObject / binding the descriptor at scope entry instead
+ * of at the statement is UNOBSERVABLE, and it is what makes a call to a
+ * function declared BELOW the call work - mutual recursion, "helpers at the
+ * bottom", a struct constructed above its `struct` line.
+ *
+ * A LAMBDA is deliberately NOT included: `var f = func(x) {...}` is an
+ * `Expr14` var declaration, not a FuncDeclStmt statement, so it keeps its
+ * declaration-point binding and its temporal dead zone - its capture
+ * snapshot must happen exactly where it is written.
+ */
+static bool is_hoistable_decl(const Construct *c)
+{
+    if (const auto *fd = node_cast<const FuncDeclStmt>(c))
+        return fd->id != nullptr;
+    if (const auto *sd = node_cast<const StructDeclStmt>(c))
+        return sd->id != nullptr;
+    return false;
+}
+
+/* Bind this block's named func/struct declarations before any statement runs
+ * (see is_hoistable_decl). Re-run on every ENTRY, so a decl in a loop body is
+ * still re-bound per iteration exactly as it was when the statement did it. */
+static void bind_hoistable_decls(const std::vector<unique_ptr<Construct>> &el,
+                                 EvalContext *ctx)
+{
+    for (const auto &e : el)
+        if (is_hoistable_decl(e.get()))
+            e->eval(ctx);
+}
+
 EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
 {
     /*
@@ -4397,7 +7495,12 @@ EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
      */
     if (scope_free && ctx) {
 
+        bind_hoistable_decls(elems, ctx);
+
         for (const auto &e : elems) {
+
+            if (is_hoistable_decl(e.get()))
+                continue;               /* already bound above */
 
             EvalValue &&tmp = e->eval(ctx);
 
@@ -4422,6 +7525,11 @@ EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
      * program (this do_eval spans it).
      */
     unique_ptr<Frame> root_frame;
+
+    /* the program starts: number its class instances from the base every
+     * engine uses (g_class_ident - vm_run does the same) */
+    if (!ctx)
+        class_ident_reset(CLASS_IDENT_RUN_BASE);
 
     if (!ctx && slot_count) {
         root_frame = make_unique<Frame>();
@@ -4449,7 +7557,12 @@ EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
      * is never observed.
      */
 
+    bind_hoistable_decls(elems, &curr);
+
     for (const auto &e: elems) {
+
+        if (is_hoistable_decl(e.get()))
+            continue;                   /* already bound above */
 
         EvalValue &&tmp = e->eval(&curr);
 
@@ -4504,9 +7617,8 @@ EvalValue StructDeclStmt::do_eval(EvalContext *ctx, bool rec) const
          * O(1) slot, no map) - like a top-level function. Script-only (the REPL
          * keeps structs in the redefinable map; gfuncs is null there). */
         if (id->sym.kind == SymKind::global && ctx->gfuncs) {
-            GlobalFuncTable *gf = ctx->gfuncs;
-            gf->slots[id->sym.slot] = LValue(move(desc), true /* const */);
-            gf->defined[id->sym.slot] = 1;
+            ctx->gfuncs->define(id->sym.slot,
+                                LValue(std::move(desc), true /* const */));
             return none;
         }
 
@@ -4516,7 +7628,7 @@ EvalValue StructDeclStmt::do_eval(EvalContext *ctx, bool rec) const
             ctx->erase(id.get());
         }
 
-        ctx->emplace(id.get(), move(desc), true /* const */);
+        ctx->emplace(id.get(), std::move(desc), true /* const */);
         return none;
     }
 
@@ -4539,9 +7651,8 @@ EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
          * in the map, so this path is script-only).
          */
         if (id->sym.kind == SymKind::global && ctx->gfuncs) {
-            GlobalFuncTable *gf = ctx->gfuncs;
-            gf->slots[id->sym.slot] = LValue(move(func), ctx->const_ctx);
-            gf->defined[id->sym.slot] = 1;
+            ctx->gfuncs->define(id->sym.slot,
+                                LValue(std::move(func), ctx->const_ctx));
             return none;
         }
 
@@ -4553,10 +7664,14 @@ EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
             ctx->erase(id.get());
         }
 
+        /* An explicit `pure func`'s name is a compile-time binding, like a
+         * struct's: in the REPL (whose names stay in this map) `a = 3` is a
+         * CannotRebindConstEx, as the resolver makes it in a script.
+         * Redefining the function is still allowed (erased above). */
         ctx->emplace(
             id.get(),
-            move(func),
-            ctx->const_ctx
+            std::move(func),
+            ctx->const_ctx || desc->explicit_pure
         );
 
         return none;
@@ -4588,7 +7703,9 @@ EvalValue Subscript::do_eval(EvalContext *ctx, bool rec) const
         );
     }
 
-    return t->subscript(lval, RValue(index->eval(ctx)), for_write);
+    return t->subscript(lval,
+                        literal_widen(RValue(index->eval(ctx)), key_coerce),
+                        for_write);
 }
 
 /*
@@ -4612,6 +7729,7 @@ int_type Subscript::eval_int(EvalContext *ctx) const
     if (base.is<SharedArrayObj>()) {
         const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
         int_type idx = index->eval_int(ctx);
+        ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
         if (idx < 0)
             idx += arr.size();
         if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
@@ -4621,7 +7739,9 @@ int_type Subscript::eval_int(EvalContext *ctx) const
             return arr.flat_ints()[at];     /* unboxed: no promotion */
         if (arr.skind() == SharedArrayObj::Storage::bools)
             return arr.flat_bools()[at] ? 1 : 0;   /* bool elem -> int 0/1 */
-        return arr.get_vec()[at].getval<int_type>();
+        /* a misfit is a TypeErrorEx at THIS subscript, as its OOB is
+         * (reads_as_int) */
+        return typed_read_int(arr.get_vec()[at].get(), start, end);
     }
     /* typed dict read `d[k]` (present key): look the value up directly instead
      * of Construct::eval_int, which would re-evaluate `what` (the dict). */
@@ -4629,9 +7749,7 @@ int_type Subscript::eval_int(EvalContext *ctx) const
         const EvalValue key = RValue(index->eval(ctx));
         if (const EvalValue *v = dict_present_value(
                 base.get_ref<intrusive_ptr<DictObject>>(), key)) {
-            if (v->is<bool>())
-                return v->get<bool>() ? 1 : 0;
-            return v->get<int_type>();
+            return typed_read_int(*v, start, end);
         }
     }
     return Construct::eval_int(ctx);   /* missing key / non-dict: do_eval */
@@ -4646,6 +7764,7 @@ float_type Subscript::eval_float(EvalContext *ctx) const
     if (base.is<SharedArrayObj>()) {
         const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
         int_type idx = index->eval_int(ctx);
+        ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
         if (idx < 0)
             idx += arr.size();
         if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
@@ -4657,20 +7776,13 @@ float_type Subscript::eval_float(EvalContext *ctx) const
             return static_cast<float_type>(arr.flat_ints()[at]);
         if (arr.skind() == SharedArrayObj::Storage::bools)
             return arr.flat_bools()[at] ? 1.0 : 0.0;
-        const LValue &el = arr.get_vec()[at];
-        if (el.is<int_type>())
-            return static_cast<float_type>(el.getval<int_type>());
-        return el.getval<float_type>();
+        return typed_read_float(arr.get_vec()[at].get(), start, end);
     }
     if (base.is<intrusive_ptr<DictObject>>()) {
         const EvalValue key = RValue(index->eval(ctx));
         if (const EvalValue *v = dict_present_value(
                 base.get_ref<intrusive_ptr<DictObject>>(), key)) {
-            if (v->is<int_type>())
-                return static_cast<float_type>(v->get<int_type>());
-            if (v->is<bool>())
-                return v->get<bool>() ? 1.0 : 0.0;
-            return v->get<float_type>();
+            return typed_read_float(*v, start, end);
         }
     }
     return Construct::eval_float(ctx);   /* missing key / non-dict: do_eval */
@@ -4690,44 +7802,200 @@ EvalValue Slice::do_eval(EvalContext *ctx, bool rec) const
         );
     }
 
-    return t->slice(
-        lval,
-        start_idx ? RValue(start_idx->eval(ctx)) : none,
-        end_idx ? RValue(end_idx->eval(ctx)) : none
-    );
+    /* the bounds LEFT TO RIGHT, explicitly: as two arguments of one call
+     * their order was unspecified, and a GCC build evaluated the END first
+     * - `a[f():g()]` called g before f in the tree-walker alone (RULE 2) */
+    const EvalValue start_v = start_idx ? RValue(start_idx->eval(ctx)) : none;
+    const EvalValue end_v = end_idx ? RValue(end_idx->eval(ctx)) : none;
+    return t->slice(lval, start_v, end_v);
+}
+
+/*
+ * Question 12: is `a` the exception `h` itself - a rethrow of it (a clone
+ * keeps the serial), or a `throw` of its caught value (the same struct
+ * instance; a built-in's bound exception object keeps the serial)?
+ */
+static bool exc_same(const RuntimeException &a, const RuntimeException &h)
+{
+    if (a.serial == h.serial)
+        return true;
+    if (!a.is_exception_object() || !h.is_exception_object())
+        return false;
+    const EvalValue &da = static_cast<const ExceptionObject &>(a).get_data();
+    const EvalValue &dh = static_cast<const ExceptionObject &>(h).get_data();
+    return da.is<intrusive_ptr<StructObject>>()
+           && dh.is<intrusive_ptr<StructObject>>()
+           && da.get_ref<intrusive_ptr<StructObject>>().get()
+                  == dh.get_ref<intrusive_ptr<StructObject>>().get();
+}
+
+/* Declared in errors.h - see the contract there. */
+void exc_note_context(RuntimeException &e, const RuntimeException &handled)
+{
+    if (exc_same(e, handled)) {
+        if (!e.context) {
+            e.context = handled.context;
+            e.context_cut = handled.context_cut;
+        }
+        return;
+    }
+    RuntimeException *tail = &e;
+    int depth = 0;
+    while (tail->context) {
+        tail = tail->context.get();
+        if (exc_same(*tail, handled))
+            return;
+        if (++depth == EXC_CONTEXT_MAX) {
+            e.context_cut = true;
+            return;
+        }
+    }
+    RuntimeException *c = handled.clone();
+    c->backtrace.clear();
+    c->backtrace.shrink_to_fit();
+    tail->context.reset(c);
+}
+
+/* Question 12: run a body that handles `handled` (a catch body, or a
+ * finally while `handled` propagates); an exception leaving it remembers
+ * `handled`. The VM does the same with a marker region (codegen). */
+template <class F>
+static void run_handling_body(const RuntimeException &handled, F &&body)
+{
+    try {
+        body();
+    } catch (RuntimeException &e) {
+        exc_note_context(e, handled);
+        throw;
+    }
+}
+
+/*
+ * Runs a catch body with `saved_ex` as the exception a `rethrow` in it
+ * raises - restoring the enclosing catch body's on any exit, since a
+ * catch body may hold a try whose own catch handles another exception.
+ */
+struct HandlingScope {
+
+    FlowState &fs;
+    RuntimeException *const prev;
+
+    HandlingScope(FlowState &fs, RuntimeException *ex)
+        : fs(fs), prev(fs.handling)
+    {
+        fs.handling = ex;
+    }
+
+    ~HandlingScope() { fs.handling = prev; }
+};
+
+/* the struct a thrown exception carries, or null (a built-in exception,
+ * or a box: a box<P> is not a P). `is_struct`: it carries a struct object
+ * at all, a box<P> included - which no built-in exception's name catches */
+const StructTypeDef *exc_struct_def(const RuntimeException *ex,
+                                    bool &is_struct)
+{
+    is_struct = false;
+    if (!ex->is_exception_object())
+        return nullptr;
+    const EvalValue &d = static_cast<const ExceptionObject *>(ex)->get_data();
+    if (!d.is<intrusive_ptr<StructObject>>())
+        return nullptr;
+    is_struct = true;
+    const StructObject &o = *d.get_ref<intrusive_ptr<StructObject>>();
+    return o.boxed ? nullptr : o.def;
+}
+
+/*
+ * Question 25 at COMPILE time. A function the parser runs (a constant
+ * call) may not have been through the inferencer, which is what resolves
+ * a clause's names (AllowedExList::defs): the untyped run of a pure
+ * function, -nti, a name a typed copy does not declare. There the name is
+ * resolved where the clause RUNS: the const scope chain is the lexical
+ * one (a struct binds at its block's entry, a pure function's body is
+ * parented to the scope that declared it), so the struct - or the alias -
+ * the name denotes is the one bound there. A name bound to no struct
+ * names a struct that does not exist yet (it is declared further down, or
+ * by a later REPL input), so no instance of it can have been thrown.
+ */
+static const StructTypeDef *
+const_scope_struct(EvalContext *ctx, const UniqueId *uid)
+{
+    for (EvalContext *c = ctx; c; c = c->parent) {
+        if (LValue *lv = c->lookup(uid)) {
+            const EvalValue &v = lv->get();
+            return v.is<StructTypeDef *>() ? v.get<StructTypeDef *>()
+                                           : nullptr;
+        }
+    }
+    return nullptr;
 }
 
 static bool
 do_catch(EvalContext *ctx,
          RuntimeException *saved_ex,
          IdList *exList,
+         const std::vector<const StructTypeDef *> &defs,
          Identifier *asId,
          Construct *catchBody)
 {
-    if (!exList) {
+    /* See vm_catch_match: an UNCATCHABLE runtime exception is never handled
+     * by a script, and the check must precede the catch-all. */
+    if (!saved_ex->is_catchable())
+        return false;
+
+    if (!exList && !asId) {
 
         /* Catch-anything block */
-        try {
-            catchBody->eval(ctx);
-        } catch (const RethrowEx &re) {
-            saved_ex->loc_start = re.start;
-            saved_ex->loc_end = re.end;
-            saved_ex->rethrow();
-        }
-
+        HandlingScope hs(*ctx->flow, saved_ex);
+        run_handling_body(*saved_ex, [&] { catchBody->eval(ctx); });
         return true;
     }
 
-    ExceptionObject *exObj = dynamic_cast<ExceptionObject *>(saved_ex);
+    ExceptionObject *exObj = saved_ex->is_exception_object()
+        ? static_cast<ExceptionObject *>(saved_ex) : nullptr;
     string_view ex_name = exObj ? exObj->get_name() : saved_ex->name;
+    /* `catch (dyn as e)` (question 25): the catch-all that binds */
+    const size_t n_types = exList ? exList->elems.size() : 0;
+    bool matched = !exList;
+    /* interned-pointer matching when available (#74 inc 3); the catch
+     * clause ids are interned already, so pointer == string equality */
+    const UniqueId *ex_uid = saved_ex->match_uid();
+    /* question 25: a clause names a struct by identity (defs, from the
+     * inferencer); a built-in exception's name matches no struct, boxed
+     * or not */
+    bool ex_is_struct = false;
+    const StructTypeDef *ex_def = exc_struct_def(saved_ex, ex_is_struct);
+    int const_eval = -1;            /* asked once, when a name needs it */
 
-    for (const unique_ptr<Identifier> &id : exList->elems) {
+    for (size_t ci = 0; ci < n_types && !matched; ci++) {
 
-        if (id->get_str() != ex_name)
+        const unique_ptr<Identifier> &id = exList->elems[ci];
+        const StructTypeDef *cd = ci < defs.size() ? defs[ci] : nullptr;
+        if (!cd) {
+            if (const_eval < 0)
+                const_eval = ctx->in_const_eval();
+            if (const_eval)
+                cd = const_scope_struct(ctx, id->uid);
+        }
+        if (cd) {
+            matched = cd == ex_def;
             continue;
+        }
+        /* a name. A built-in exception's catches no struct object; any
+         * other is a struct nothing has declared yet (const_scope_struct)
+         * - or, in an open world, a struct a later input may declare,
+         * which catches by name */
+        const bool builtin = is_catchable_ex_name(id->get_str());
+        if (builtin ? ex_is_struct : const_eval != 0)
+            continue;
+        matched = ex_uid ? id->uid == ex_uid : id->get_str() == ex_name;
+    }
+    if (!matched)
+        return false;
 
-        try {
-
+    {
+        {
             EvalContext catch_ctx(ctx);
 
             if (asId) {
@@ -4738,44 +8006,50 @@ do_catch(EvalContext *ctx,
                  * works). A payload-less built-in exception binds to a small
                  * exception object instead (printable, re-throwable).
                  */
-                EvalValue bind_val =
-                    (exObj && exObj->get_data()
-                                  .is<intrusive_ptr<StructObject>>())
-                        ? exObj->get_data()
-                        : EvalValue(make_intrusive<ExceptionObject>(
-                              exObj
-                                  ? *exObj
-                                  : ExceptionObject(saved_ex->name)));
+                EvalValue bind_val;
+                if (exObj && exObj->get_data()
+                                 .is<intrusive_ptr<StructObject>>()) {
+                    bind_val = exObj->get_data();
+                } else {
+                    /* a FRESH object, the caught exception's VALUE -
+                     * its name and data, not where it was raised (a
+                     * later `throw e` carets and frames its own raise)
+                     * nor its chain (question 12: a class payload
+                     * holding it could close a cycle). The serial says
+                     * it IS the caught exception, for a `throw e` in
+                     * this catch body. */
+                    auto xo = make_intrusive<ExceptionObject>(
+                        exObj ? std::string(exObj->get_name())
+                              : std::string(saved_ex->name),
+                        exObj ? exObj->get_data() : EvalValue());
+                    xo->serial = saved_ex->serial;
+                    bind_val = EvalValue(std::move(xo));
+                }
 
                 if (asId->sym.kind == SymKind::local && catch_ctx.frame) {
 
                     /* Resolved catch variable: bind it into its slot. */
                     Frame *f = catch_ctx.frame;
                     f->slots[asId->sym.slot] =
-                        LValue(move(bind_val), ctx->const_ctx);
+                        LValue(std::move(bind_val), ctx->const_ctx);
 
                 } else {
 
                     catch_ctx.emplace(
                         asId,
-                        move(bind_val),
+                        std::move(bind_val),
                         ctx->const_ctx
                     );
                 }
             }
 
-            catchBody->eval(&catch_ctx);
-
-        } catch (const RethrowEx &re) {
-            saved_ex->loc_start = re.start;
-            saved_ex->loc_end = re.end;
-            saved_ex->rethrow();
+            HandlingScope hs(*catch_ctx.flow, saved_ex);
+            run_handling_body(*saved_ex,
+                              [&] { catchBody->eval(&catch_ctx); });
         }
 
         return true;
     }
-
-    return false;
 }
 
 EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
@@ -4808,7 +8082,8 @@ EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
 
         for (const auto &p : catchStmts) {
             if (do_catch(ctx, saved_ex.get(), p.first.exList.get(),
-                         p.first.asId.get(), p.second.get()))
+                         p.first.defs, p.first.asId.get(),
+                         p.second.get()))
                 return;                    /* handled (do_catch may itself throw) */
         }
 
@@ -4835,14 +8110,19 @@ EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
 
     FlowState &fs = *ctx->flow;
     const FlowState::Type saved_type = fs.type;
-    EvalValue saved_val = move(fs.value);
+    EvalValue saved_val = std::move(fs.value);
     fs.type = FlowState::none;
 
-    finallyBody->eval(ctx);                /* may throw / set its own flow */
+    /* may throw / set its own flow; an exception it throws while one is
+     * pending remembers that one (question 12) */
+    if (pending)
+        run_handling_body(*pending, [&] { finallyBody->eval(ctx); });
+    else
+        finallyBody->eval(ctx);
 
     if (fs.type == FlowState::none) {
         fs.type = saved_type;              /* resume the suspended signal */
-        fs.value = move(saved_val);
+        fs.value = std::move(saved_val);
     } else {
         pending.reset();                   /* finally's own flow supersedes */
     }
@@ -4853,47 +8133,55 @@ EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
     return none; /* Make compilers unaware of [[noreturn]] happy */
 }
 
-LValue LValue::clone()
-{
-    LValue nl(valtype()->clone(val), is_const);
-    nl.container = container;
-    nl.container_idx = container_idx;
-    return nl;
-}
-
-EvalValue &LValue::get_value_for_put()
+LValue *LValue::write_target()
 {
     if (!container)
-        return val;
+        return this;
 
-    assert(container->is<SharedArrayObj>());
+    LValue *const cont = container;
+    ML_CHECK(cont->is<SharedArrayObj>());
 
-    if (container->valtype()->is_slice(container->val)) {
-        const size_type off = container->getval<SharedArrayObj>().offset();
-        *container = container->clone();
-        container_idx -= off;
-        return container->getval<SharedArrayObj>().get_vec()[container_idx].val;
+    if (cont->valtype()->is_slice(cont->val)) {
+        /*
+         * `this` lives in the slice's storage, and materializing the
+         * slice (every handle of it - question 3, Python's rule) RELEASES
+         * that storage - FREES it, when the slice was its only owner (a
+         * slice returned from a function whose array died with it). So
+         * everything is read from `this` first, and nothing after: until
+         * 2026-10-08 the index was adjusted on `this` and the type check
+         * read `this->val`, both after the free (an ASan
+         * heap-use-after-free in both engines).
+         */
+        const size_type idx =
+            container_idx - cont->getval<SharedArrayObj>().offset();
+        cont->getval<SharedArrayObj>().materialize_slice();
+        LValue *el = &cont->getval<SharedArrayObj>().get_vec()[idx];
+        el->container = cont;
+        el->container_idx = idx;
+        return el;
     }
 
-    if (container->valtype()->use_count(container->val) > 1)
-        container->getval<SharedArrayObj>().clone_aliased_slices(container_idx);
+    if (cont->valtype()->use_count(cont->val) > 1)
+        cont->getval<SharedArrayObj>().clone_aliased_slices(container_idx);
 
     /* an in-place element write changes the array's hash (the slice path above
      * returns a fresh clone, which is already hash-invalid). */
-    container->getval<SharedArrayObj>().invalidate_hash();
-    return val;
+    cont->getval<SharedArrayObj>().invalidate_hash();
+    return this;
 }
 
 void LValue::put_slow(const EvalValue &v)
 {
-    get_value_for_put() = v;
-    type_checks();
+    LValue *t = write_target();    /* `this` may be freed (write_target) */
+    t->val = v;
+    t->type_checks();
 }
 
 void LValue::put_slow(EvalValue &&v)
 {
-    get_value_for_put() = move(v);
-    type_checks();
+    LValue *t = write_target();
+    t->val = std::move(v);
+    t->type_checks();
 }
 
 /*
@@ -4986,17 +8274,20 @@ ForeachStmt::do_iter(EvalContext *ctx,
 
     } else {
 
-        for (size_type i = id_start; i < ids->elems.size(); i++) {
+        /* A dict entry: a key and a value, never padded - more variables
+         * is the strict unpack's error (the inferencer refuses it at
+         * compile time when the container is proven a dict). */
+        const size_type nvars = ids->elems.size() - id_start;
+        if (nvars > count)
+            throw TypeErrorEx(
+                intern_msg("foreach: a dict entry is a key and a value, "
+                           "which cannot be unpacked into " +
+                           std::to_string(nvars) + " variables"),
+                container->start, container->end);
 
-            const size_type val_i = i - id_start;
-
-            bind_loop_var(
-                ctx,
-                decl,
-                ids->elems[i].get(),
-                val_i < count ? elems[val_i] : none
-            );
-        }
+        for (size_type i = id_start; i < ids->elems.size(); i++)
+            bind_loop_var(ctx, decl, ids->elems[i].get(),
+                          elems[i - id_start]);
     }
 
     if (body)
@@ -5029,95 +8320,93 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
         const SharedArrayObj &arr = cval.get<SharedArrayObj>();
 
         /*
-         * Flat fast path: iterate the unboxed int/float vector directly, with
-         * no promotion to vector<LValue>. Each element is materialized into a
-         * scalar EvalValue per iteration (cheap, trivially-copyable).
+         * #53: the body may MUTATE the array it walks (append/pop/erase, an
+         * element store, a promotion of flat strs/struct storage to general),
+         * so nothing derived from its storage - a vector reference, a view, a
+         * size - survives an iteration. The DEFINED semantics, shared by
+         * every engine: the loop runs over the length the array had when it
+         * STARTED (an appended element is not visited); each element is read
+         * when its turn comes (a store the body made to a later element is
+         * seen); and if the body MOVED elements - pop, erase, an insert
+         * not at the end, through any alias - the loop raises
+         * OutOfBoundsEx at the container at its next step (option 1: the
+         * storage's shift epoch, recorded here; a slice view never shifts,
+         * so fe_mark answers -1 for one - until another name holding the
+         * same slice materializes it, question 3, when the loop's handle
+         * moves with it and fe_shifted reads the fresh storage). Without
+         * it, removing an element already visited silently SKIPPED the
+         * next one. The length test stays as the memory-safety net.
+         *
+         * So the storage is re-derived per element (`arr` shares it with the
+         * program's variables - the handle is the loop's pin). The flat
+         * scalar kinds cannot change kind (no promotion), the rest dispatch
+         * per element.
          */
-        if (arr.skind() == SharedArrayObj::Storage::ints) {
+        const size_type n = arr.size();
+        const int_type mark = arr.fe_mark();
+        intrusive_ptr<StructObject> reuse;
 
-            const auto &iv = arr.flat_ints();
-            const size_type off = arr.offset(), n = arr.size();
+        for (size_type i = 0; i < n; i++) {
 
-            for (size_type i = 0; i < n; i++) {
-                const EvalValue elem(iv[off + i]);
-                if (!do_iter(&loopCtx, i, &elem, 1))
-                    break;
-            }
+            if (arr.fe_shifted(mark) || i >= arr.size())
+                throw OutOfBoundsEx(container->start, container->end);
 
-        } else if (arr.skind() == SharedArrayObj::Storage::floats) {
+            const size_type at = arr.offset() + i;
+            EvalValue elem;
 
-            const auto &fv = arr.flat_floats();
-            const size_type off = arr.offset(), n = arr.size();
-
-            for (size_type i = 0; i < n; i++) {
-                const EvalValue elem(fv[off + i]);
-                if (!do_iter(&loopCtx, i, &elem, 1))
-                    break;
-            }
-
-        } else if (arr.skind() == SharedArrayObj::Storage::bools) {
-
-            const auto &bv = arr.flat_bools();
-            const size_type off = arr.offset(), n = arr.size();
-
-            for (size_type i = 0; i < n; i++) {
-                const EvalValue elem(static_cast<bool>(bv[off + i]));
-                if (!do_iter(&loopCtx, i, &elem, 1))
-                    break;
-            }
-
-        } else if (arr.skind() == SharedArrayObj::Storage::structs) {
-
-            /*
-             * Flat POD-struct array: rather than heap-allocate a StructObject
-             * per element, reuse ONE across iterations - overwrite its bytes in
-             * place and hand it to the body. COW guard: if the previous body
-             * captured the element (so something other than the loop var still
-             * holds it: use_count() > 2 == this local + the loop var's slot +
-             * a capture), allocate a fresh one so the capture keeps its value.
-             */
-            const auto &sv = arr.flat_structs();
-            const size_type n = arr.size(), base = arr.offset();
-            intrusive_ptr<StructObject> reuse;
-
-            for (size_type i = 0; i < n; i++) {
-
-                if (!reuse || reuse.use_count() > 2)
+            switch (arr.skind()) {
+            case SharedArrayObj::Storage::ints:
+                elem = EvalValue(arr.flat_ints()[at]);
+                break;
+            case SharedArrayObj::Storage::floats:
+                elem = EvalValue(arr.flat_floats()[at]);
+                break;
+            case SharedArrayObj::Storage::bools:
+                elem = EvalValue(static_cast<bool>(arr.flat_bools()[at]));
+                break;
+            case SharedArrayObj::Storage::structs: {
+                /*
+                 * Flat POD-struct array: rather than heap-allocate a
+                 * StructObject per element, reuse ONE across iterations -
+                 * overwrite its bytes in place and hand it to the body. COW
+                 * guard: if the previous body captured the element (so
+                 * something other than the loop var still holds it:
+                 * use_count() > 2 == this local + the loop var's slot + a
+                 * capture), allocate a fresh one so the capture keeps its
+                 * value.
+                 */
+                const auto &sv = arr.flat_structs();
+                if (!reuse || reuse.use_count() > 2 || reuse->def != sv.def)
                     reuse = intrusive_ptr<StructObject>(
                         make_intrusive<StructObject>(sv.def));
-
                 std::memcpy(reuse->bytes.data(),
-                            sv.buf.data() + (base + i) * sv.stride, sv.stride);
-
-                const EvalValue elem(reuse);
-                if (!do_iter(&loopCtx, i, &elem, 1))
-                    break;
+                            sv.buf.data() + at * sv.stride, sv.stride);
+                elem = EvalValue(reuse);
+                break;
+            }
+            default:
+                /* general / strs (a handle copy, not a byte copy) */
+                elem = arr_elem_boxed(arr, i);
+                /* a TYPED loop variable takes its element as the VM's
+                 * typed loads do (LoadElemInt/Float/Bool): a general
+                 * array<int> holds what a `dyn` alias stored, so a bool
+                 * reads as 0/1, an int widens into a float variable, and
+                 * anything else is a TypeErrorEx at the container - it
+                 * was bound as it was, and failed (or not) at its first
+                 * use */
+                if (elem_th == TypeHint::i)
+                    elem = EvalValue(typed_read_int(
+                        elem, container->start, container->end));
+                else if (elem_th == TypeHint::f)
+                    elem = EvalValue(typed_read_float(
+                        elem, container->start, container->end));
+                else if (elem_is_bool && !elem.is<bool>())
+                    throw TypeErrorEx(container->start, container->end);
+                break;
             }
 
-        } else if (arr.skind() == SharedArrayObj::Storage::strs) {
-
-            /* Flat STRING array (top-10 #7): bind each element as a boxed
-             * SharedStr copy (a handle, not a byte copy). */
-            const auto &tv = arr.flat_strs();
-            const size_type n = arr.size(), base = arr.offset();
-
-            for (size_type i = 0; i < n; i++) {
-                const EvalValue elem((SharedStr(tv[base + i])));
-                if (!do_iter(&loopCtx, i, &elem, 1))
-                    break;
-            }
-
-        } else {
-
-            const ArrayConstView &view = arr.get_view();
-
-            for (size_type i = 0; i < view.size(); i++) {
-
-                const EvalValue &elem = view[i].get();
-
-                if (!do_iter(&loopCtx, i, &elem, 1))
-                    break;
-            }
+            if (!do_iter(&loopCtx, i, &elem, 1))
+                break;
         }
 
     } else if (cval.is<SharedStr>()) {
@@ -5134,14 +8423,18 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
 
     } else if (cval.is<intrusive_ptr<DictObject>>()) {
 
-        const DictObject::inner_type &data
-            = cval.get<intrusive_ptr<DictObject>>()->get_ref();
+        /* #53: through a Cursor, so a body that inserts or erases keys of
+         * this dict is defined (DictObject::Cursor states the semantics).
+         * `cval` pins the dict for the loop. */
+        DictObject &dobj = *cval.get_ref<intrusive_ptr<DictObject>>();
+        DictObject::Cursor cur;
+        cur.start(dobj);
 
         size_type i = 0;
 
-        for (const auto &p : data) {
+        while (const auto *p = cur.next_entry(dobj)) {
 
-            const EvalValue elems[2] = { p.first, p.second.get() };
+            const EvalValue elems[2] = { p->first, p->second.get() };
 
             if (!do_iter(&loopCtx, i, elems, 2))
                 break;
@@ -5174,10 +8467,13 @@ EvalValue build_dict_from_pairs(const EvalValue *pairs, size_t npairs,
 {
     DictObject::inner_type data;
     data.reserve(npairs);   /* profile #5: kill the insert rehash chain */
+    /* insert_or_assign, as dict(pairs) does: a repeated key takes the
+     * LAST value and keeps the place of its first occurrence - the
+     * literal is built like successive stores (question 7) */
     for (size_t i = 0; i < npairs; i++)
-        data.emplace(make_const_clone(pairs[2 * i]),
-                     LValue(pairs[2 * i + 1], is_const));
-    return intrusive_ptr<DictObject>(make_intrusive<DictObject>(move(data)));
+        data.insert_or_assign(make_const_clone(pairs[2 * i], true),
+                              LValue(pairs[2 * i + 1], is_const));
+    return intrusive_ptr<DictObject>(make_intrusive<DictObject>(std::move(data)));
 }
 
 EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
@@ -5186,6 +8482,26 @@ EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
      * common small literal, heap for a large one), then the shared builder -
      * the same builder the VM's MakeDictV op calls with register values. */
     const size_t np = elems.size();
+    /* the VALUES widen as LiteralArray's elements do: by the stamp, or -
+     * a fully CONSTANT literal - by their own join */
+    const auto widen_vals = [&](EvalValue *buf) {
+        if (key_coerce != DeclType::none) {
+            for (size_t i = 0; i < np; i++)
+                buf[2 * i] = literal_elem_widen(std::move(buf[2 * i]),
+                                                key_coerce,
+                                                ctx->in_const_eval());
+        } else if (is_const && !annotated && ctx->in_const_eval()) {
+            const_values_widen(buf, np, 2, ctx->const_ctx);
+        }
+        if (val_coerce != DeclType::none) {
+            for (size_t i = 0; i < np; i++)
+                buf[2 * i + 1] =
+                    literal_elem_widen(std::move(buf[2 * i + 1]), val_coerce,
+                                       ctx->in_const_eval());
+        } else if (is_const && !annotated && ctx->in_const_eval()) {
+            const_values_widen(buf + 1, np, 2, ctx->const_ctx);
+        }
+    };
 
     if (np <= 8) {
         EvalValue buf[16];
@@ -5193,7 +8509,10 @@ EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
             buf[2 * i]     = RValue(elems[i]->key->eval(ctx));
             buf[2 * i + 1] = RValue(elems[i]->value->eval(ctx));
         }
-        return build_dict_from_pairs(buf, np, ctx->const_ctx);
+        widen_vals(buf);
+        EvalValue r = build_dict_from_pairs(buf, np, ctx->const_ctx);
+        stamp_ctype_top(r, ctype);
+        return r;
     }
 
     std::vector<EvalValue> buf(2 * np);
@@ -5201,7 +8520,10 @@ EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
         buf[2 * i]     = RValue(elems[i]->key->eval(ctx));
         buf[2 * i + 1] = RValue(elems[i]->value->eval(ctx));
     }
-    return build_dict_from_pairs(buf.data(), np, ctx->const_ctx);
+    widen_vals(buf.data());
+    EvalValue r = build_dict_from_pairs(buf.data(), np, ctx->const_ctx);
+    stamp_ctype_top(r, ctype);
+    return r;
 }
 
 /* True if `c` is rooted at a variable (an identifier, or a member/subscript
@@ -5211,9 +8533,9 @@ static bool is_lvalue_rooted(const Construct *c)
 {
     if (c->is_id())
         return true;
-    if (auto *m = dynamic_cast<const MemberExpr *>(c))
+    if (auto *m = node_cast<const MemberExpr>(c))
         return is_lvalue_rooted(m->what.get());
-    if (auto *s = dynamic_cast<const Subscript *>(c))
+    if (auto *s = node_cast<const Subscript>(c))
         return is_lvalue_rooted(s->what.get());
     return false;
 }
@@ -5243,7 +8565,7 @@ EvalValue member_read_core(const EvalValue &dval, const EvalValue &memId,
 
     if (dval.is<intrusive_ptr<StructObject>>()) {
 
-        const auto &obj = dval.get<intrusive_ptr<StructObject>>();
+        const auto &obj = dval.get_ref<intrusive_ptr<StructObject>>();
         const int slot = obj->def->slot_of(memUid);
 
         if (slot >= 0)
@@ -5282,13 +8604,21 @@ EvalValue member_read_core(const EvalValue &dval, const EvalValue &memId,
         throw TypeErrorEx("Expected dict object", bstart, bend);
 
     const auto &obj = dval.get<intrusive_ptr<DictObject>>();
-    DictObject::inner_type &data = obj->get_ref();
+    const DictObject::inner_type &data = obj->get_ref();
     const auto &it = data.find(memId);
 
     if (it != data.end())            /* present key -> the value */
         return it->second.get();
-    if (obj->get_has_default())      /* a default dict -> its default */
+    if (obj->get_has_default()) {
+        /* a default dict: its default, INSERTED (README) as `d[k]` and
+         * the tree-walker's lvalue path insert it - the VM's `d.k` read
+         * comes here, and left len(d) one short. A read-only dict cannot
+         * take the key. */
+        if (!obj->is_readonly())
+            obj->insert_new(ct_fit_key(*obj, EvalValue(memId)),
+                            LValue(obj->get_default(), false));
         return obj->get_default();
+    }
     throw KeyNotFoundEx(mstart, mend);   /* missing -> throw */
 }
 
@@ -5304,8 +8634,13 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
     const bool for_write = ctx->assign_target;
     ctx->assign_target = false;
 
-    EvalValue &&dval = RValue(what->eval(ctx));
+    return access(RValue(what->eval(ctx)), for_write,
+                  is_lvalue_rooted(what.get()));
+}
 
+EvalValue MemberExpr::access(const EvalValue &dval, bool for_write,
+                             bool rooted) const
+{
     /*
      * The assignable-lvalue / auto-vivify paths need `what` (rooting) or the
      * for_write flag; every other case is a VALUE read via member_read (shared
@@ -5313,46 +8648,54 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
      */
     if (dval.is<intrusive_ptr<StructObject>>()) {
 
-        const auto &obj = dval.get<intrusive_ptr<StructObject>>();
-        const int slot = obj->def->slot_of(memUid);
+        const auto &obj = dval.get_ref<intrusive_ptr<StructObject>>();
+        /* the compile-baked field slot (def-identity-checked): no name scan */
+        const int slot = obj->def == base_struct_def && field_slot >= 0
+            ? field_slot : obj->def->slot_of(memUid);
 
         /*
          * A rooted, mutable, boxed field -> an assignable field lvalue (so
          * `s.f = v` / `s.f += v` work). A POD field (bytes, no per-field
-         * LValue), a read-only instance, or a temporary base (`Point(1,2).x`)
-         * is a value read - member_read handles those.
+         * LValue), a read-only instance, or a temporary base (`Point(1,2).x`
+         * read, not stored: a store HOLDS its base) is a value read -
+         * member_read handles those.
          */
-        if (slot >= 0 && !obj->is_pod() && !obj->is_readonly()
-            && is_lvalue_rooted(what.get()))
+        if (slot >= 0 && !obj->is_pod() && !obj->is_readonly() && rooted)
             return &obj->fields[slot];
 
     } else if (dval.is<intrusive_ptr<DictObject>>()) {
 
         const auto &obj = dval.get<intrusive_ptr<DictObject>>();
-        DictObject::inner_type &data = obj->get_ref();
-        const auto &it = data.find(memId);
+        const DictObject::mut_iterator it = obj->find_mut(memId);
+        const bool present = it != obj->mut_end();
 
         /*
          * `d.key` mirrors `d[key]` (TypeDict::subscript): present -> the value
          * (an lvalue when mutable, so `d.k = v` / `d.k += v` work); missing ->
          * the default (default dict), else auto-vivify on a plain-assignment
          * target, else throw. A readonly dict's read (present / default /
-         * missing) is member_read's job.
+         * missing) is member_read's job. A read through a handle no
+         * variable holds (`[{"k": 1}][0].k`) gets the VALUE: the dict may
+         * die when the read ends, and a pointer into its entry dangled
+         * (TypeDict::subscript).
          */
         if (!obj->is_readonly()) {
-            if (it != data.end())
-                return &it->second;
-            if (obj->get_has_default())
-                return &(*data.emplace(memId, LValue(obj->get_default(), false))
-                              .first).second;
+            if (present)
+                return rooted ? EvalValue(&it->second) : it->second.get();
+            if (obj->get_has_default()) {    /* a new key (Cursor) */
+                LValue *lv = obj->insert_new(
+                    ct_fit_key(*obj, EvalValue(memId)),
+                    LValue(obj->get_default(), false));
+                return rooted ? EvalValue(lv) : lv->get();
+            }
             if (for_write)
-                return &(*data.emplace(memId,
-                    LValue(none, false)).first).second;
+                return obj->insert_new(ct_fit_key(*obj, EvalValue(memId)),
+                                       LValue(none, false));
             throw KeyNotFoundEx(start, end);
         }
         /* A readonly dict + a for_write missing-key (no default) -> `none`, so
          * the ensuing write fails NotLValueEx (not a KeyNotFound read). */
-        if (for_write && it == data.end() && !obj->get_has_default())
+        if (for_write && !present && !obj->get_has_default())
             return none;
     }
 
@@ -5393,6 +8736,7 @@ static bool member_pod_array_scalar(const Subscript *sub, EvalContext *ctx,
         return false;
 
     int_type idx = sub->index->eval_int(ctx);
+    ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
     if (idx < 0)
         idx += arr.size();
     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
@@ -5442,16 +8786,26 @@ dict_present_value(const intrusive_ptr<DictObject> &obj, const EvalValue &key)
 
 int_type MemberExpr::eval_int(EvalContext *ctx) const
 {
-    if (auto *sub = dynamic_cast<const Subscript *>(what.get())) {
+    if (auto *sub = node_cast<const Subscript>(what.get())) {
         int_type v;
-        if (member_pod_array_scalar(sub, ctx, memUid, start, end, v))
+        /* #125: the OOB caret is the SUBSCRIPT's span, not this
+         * MemberExpr's - the fault is the INDEX, not the field, and it is
+         * what every other element read reports (and what the VM has always
+         * reported for this shape). Passing `start, end` here spanned
+         * `row[i].y` and made the two engines disagree; nothing caught it,
+         * because the differential compares exception TYPES, not columns. */
+        if (member_pod_array_scalar(sub, ctx, memUid,
+                                    sub->start, sub->end, v))
             return v;
     }
 
     const EvalValue base = RValue(what->eval(ctx));
     if (base.is<intrusive_ptr<StructObject>>()) {
-        const StructObject &o = *base.get<intrusive_ptr<StructObject>>().get();
-        const int slot = o.def->slot_of(memUid);
+        const StructObject &o =
+            *base.get_ref<intrusive_ptr<StructObject>>().get();
+        /* the compile-baked field slot (def-identity-checked): no name scan */
+        const int slot = o.def == base_struct_def && field_slot >= 0
+            ? field_slot : o.def->slot_of(memUid);
         if (slot >= 0 && o.is_pod()) {
             const FieldDef &f = o.def->fields[slot];
             const char *p = o.bytes.data() + f.offset;
@@ -5467,9 +8821,7 @@ int_type MemberExpr::eval_int(EvalContext *ctx) const
     if (base.is<intrusive_ptr<DictObject>>()) {
         if (const EvalValue *v = dict_present_value(
                 base.get_ref<intrusive_ptr<DictObject>>(), memId)) {
-            if (v->is<bool>())
-                return v->get<bool>() ? 1 : 0;
-            return v->get<int_type>();
+            return typed_read_int(*v, start, end);
         }
     }
     return Construct::eval_int(ctx);   /* missing key / non-dict: do_eval */
@@ -5477,16 +8829,26 @@ int_type MemberExpr::eval_int(EvalContext *ctx) const
 
 float_type MemberExpr::eval_float(EvalContext *ctx) const
 {
-    if (auto *sub = dynamic_cast<const Subscript *>(what.get())) {
+    if (auto *sub = node_cast<const Subscript>(what.get())) {
         float_type v;
-        if (member_pod_array_scalar(sub, ctx, memUid, start, end, v))
+        /* #125: the OOB caret is the SUBSCRIPT's span, not this
+         * MemberExpr's - the fault is the INDEX, not the field, and it is
+         * what every other element read reports (and what the VM has always
+         * reported for this shape). Passing `start, end` here spanned
+         * `row[i].y` and made the two engines disagree; nothing caught it,
+         * because the differential compares exception TYPES, not columns. */
+        if (member_pod_array_scalar(sub, ctx, memUid,
+                                    sub->start, sub->end, v))
             return v;
     }
 
     const EvalValue base = RValue(what->eval(ctx));
     if (base.is<intrusive_ptr<StructObject>>()) {
-        const StructObject &o = *base.get<intrusive_ptr<StructObject>>().get();
-        const int slot = o.def->slot_of(memUid);
+        const StructObject &o =
+            *base.get_ref<intrusive_ptr<StructObject>>().get();
+        /* the compile-baked field slot (def-identity-checked): no name scan */
+        const int slot = o.def == base_struct_def && field_slot >= 0
+            ? field_slot : o.def->slot_of(memUid);
         if (slot >= 0 && o.is_pod()) {
             const FieldDef &f = o.def->fields[slot];
             const char *p = o.bytes.data() + f.offset;
@@ -5507,11 +8869,7 @@ float_type MemberExpr::eval_float(EvalContext *ctx) const
     if (base.is<intrusive_ptr<DictObject>>()) {
         if (const EvalValue *v = dict_present_value(
                 base.get_ref<intrusive_ptr<DictObject>>(), memId)) {
-            if (v->is<int_type>())
-                return static_cast<float_type>(v->get<int_type>());
-            if (v->is<bool>())
-                return v->get<bool>() ? 1.0 : 0.0;
-            return v->get<float_type>();
+            return typed_read_float(*v, start, end);
         }
     }
     return Construct::eval_float(ctx);   /* missing key / non-dict: do_eval */
@@ -5643,8 +9001,8 @@ wb_bin(TypedScalarExpr::Cat cat, Op op,
 {
     auto e = make_unique<TypedScalarExpr>(cat, TypeHint::i);
     e->th = TypeHint::i;
-    e->elems.emplace_back(Op::invalid, move(a));
-    e->elems.emplace_back(op, move(b));
+    e->elems.emplace_back(Op::invalid, std::move(a));
+    e->elems.emplace_back(op, std::move(b));
     return e;
 }
 
@@ -5654,7 +9012,7 @@ wb_assign(int dst, unique_ptr<Construct> rhs)
     auto a = make_unique<Expr14>();
     a->op = Op::assign;
     a->lvalue = wb_id(dst);
-    a->rvalue = move(rhs);
+    a->rvalue = std::move(rhs);
     return a;
 }
 
@@ -5699,9 +9057,8 @@ static double wb_time_eval(const Construct *n, EvalContext *ctx, long M)
 
 } // namespace
 
-void run_weight_bench()
+void run_weight_bench(long M)
 {
-    const long M = 20000000;
 
     /* A clean func-context root with an 8-slot int frame (slots pre-bound). */
     EvalContext ctx(nullptr, false, true);
@@ -5740,7 +9097,7 @@ void run_weight_bench()
         auto thn = make_unique<Block>();
         thn->elems.push_back(wb_assign(2,
             wb_bin(TypedScalarExpr::Cat::arith, Op::plus, wb_id(0), wb_id(1))));
-        iff->thenBlock = move(thn);
+        iff->thenBlock = std::move(thn);
     }
     double t_if = wb_time_eval(iff.get(), &ctx, M);
 
@@ -5755,8 +9112,8 @@ void run_weight_bench()
         auto r = make_unique<ReturnStmt>();
         r->elem = wb_bin(TypedScalarExpr::Cat::arith, Op::plus,
                          wb_id(0), wb_id(1));
-        body->elems.push_back(move(r));
-        fd->body = move(body);
+        body->elems.push_back(std::move(r));
+        fd->body = std::move(body);
     }
     fd->sync_params();
     fd->desc->resolved = true;
@@ -5793,8 +9150,8 @@ void run_weight_bench()
     const double w_call = t_call - 2 * t_id - body;  /* the call overhead    */
 
     auto rel = [&](double w) { return w / w_id; };
-    printf("\nInlining cost-model weights (ns/eval, best of 5, %ldM iters)\n",
-           M / 1000000);
+    printf("\nInlining cost-model weights (ns/eval, best of 5, %ld iters)\n",
+           M);
     printf("  built from hand-constructed AST nodes (optimizer-immune)\n\n");
     printf("  %-22s %8s %8s\n", "node", "ns", "xId");
     printf("  ------------------------------------------\n");
@@ -5810,13 +9167,14 @@ void run_weight_bench()
     printf("\n  benefit function: inline a body when the sum of its node\n");
     printf("  weights is below the CALL weight (%.1f xId).\n", rel(w_call));
     printf("\n  suggested integer weights (xId, rounded):\n");
+    /* rounded, at least 1 - and 1 for a ratio that is not finite: a run
+     * too short for the clock measures a slot read as 0 ns, and casting
+     * the inf (or NaN) that gives to int would be undefined */
+    auto iw = [&](double w) {
+        const double r = rel(w) + 0.5;
+        return std::isfinite(r) && r >= 1 ? (int)std::min(r, 1e6) : 1;
+    };
     printf("    id=%d lit=%d add=%d cmp=%d assign=%d return=%d if=%d CALL=%d\n",
-           1,
-           std::max(1, (int)(rel(w_lit)  + 0.5)),
-           std::max(1, (int)(rel(w_add)  + 0.5)),
-           std::max(1, (int)(rel(w_cmp)  + 0.5)),
-           std::max(1, (int)(rel(w_asn)  + 0.5)),
-           std::max(1, (int)(rel(w_ret)  + 0.5)),
-           std::max(1, (int)(rel(w_if)   + 0.5)),
-           std::max(1, (int)(rel(w_call) + 0.5)));
+           1, iw(w_lit), iw(w_add), iw(w_cmp), iw(w_asn), iw(w_ret),
+           iw(w_if), iw(w_call));
 }

@@ -9,7 +9,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
 
     - name: Create Build Environment
       run: cmake -E make_directory ${{github.workspace}}/build
@@ -28,11 +30,19 @@ jobs:
       run: cmake --build . --config $BUILD_TYPE
 
     - name: Test
-      working-directory: ${{github.workspace}}/build
       shell: bash
-      run:  ./mylang -rt
+      run: tests/run -o --logs test-logs --bin cmake-gcov=build/mylang
+           rt@cmake-gcov
 
     - name: Upload coverage data
       working-directory: ${{github.workspace}}/build
       shell: bash
       run:  bash <(curl -s https://codecov.io/bash)
+
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v6
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore

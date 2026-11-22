@@ -1,16 +1,35 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "disasm.h"
-#include "codegen.h"      /* codegen_program / codegen_chunk */
+#include "codegen.h"
+#include "inttest.h"
+#include "vm.h"
+#include "eval.h"      /* builtin_slot / builtin_slot_name */
+#include "env.h"      /* env_get / file_open - MSVC deprecates
+                       * getenv and fopen (C4996) */
+#include "jit.h"       /* jit_type_singletons (-vdj); JitCtx (native calls) */
+#include "funcdesc.h"  /* FuncDescriptor::vm_chunk (faithful native-call dump) */
 #include "coderender.h"   /* render_construct_code - shared AST decompiler */
 #include "syntax.h"
 #include "structtype.h"   /* StructTypeDef / FieldDef (the custom-type dump) */
 #include "errors.h"       /* InlineCtx (the inline_ctxs pool dump) */
 #include "lexer.h"        /* OpString */
+#include "reflect.h"      /* reflect_decl_annot (the fit_specs dump) */
+#include "inferencer.h"   /* for_each_child_of (the complete walker) */
 
+#include <algorithm>
 #include <sstream>
 #include <iomanip>
 #include <vector>
+#include <functional>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace { bool env_flag_on(const char *name); }
+
+/* MYLANG_VDJ_RAW, read once at load - a plain flag, so -rt can set it
+ * in-process (see vdj_raw) */
+bool g_vdj_raw = env_flag_on("MYLANG_VDJ_RAW");
 
 namespace {
 
@@ -31,16 +50,30 @@ std::string reg(const Chunk &ch, int_type slot)
  * `#N`. The immediate is rendered by its lit_kind (int / float / bool), so a
  * boxed op's `#3` / `#1.5` / `#true` prints correctly. (`is_float` is now
  * subsumed by lit_kind, kept only for call-site compatibility.) */
+/* A float literal that reads AS a float: an integral value keeps a
+ * trailing ".0" (so `2.0` doesn't render as the int-looking `2`). */
+std::string flit_str(float_type f)
+{
+    std::ostringstream s;
+    s << f;
+    const std::string t = s.str();
+    if (t.find('.') == std::string::npos && t.find('e') == std::string::npos
+            && t.find("inf") == std::string::npos
+            && t.find("nan") == std::string::npos)
+        return t + ".0";
+    return t;
+}
+
 std::string reg_or_imm(const Chunk &ch, const Operand &o, bool /*is_float*/)
 {
     if (!o.is_lit)
         return reg(ch, o.slot);
     std::ostringstream s;
-    s << "#";
     switch (o.lit_kind) {
-    case Operand::LitKind::f: s << o.flit; break;
+    case Operand::LitKind::f: s << flit_str(o.flit); break;
     case Operand::LitKind::b: s << (o.lit ? "true" : "false"); break;
-    default:                  s << o.lit; break;
+    default:                  s << o.lit; break;   /* decimal; no marker
+                                                    * (slots are rN/names) */
     }
     return s.str();
 }
@@ -51,8 +84,6 @@ static const char *throw_kind_name(Chunk::ThrowKind k)
     switch (k) {
     case Chunk::ThrowKind::undefined_var:  return "undefined_var";
     case Chunk::ThrowKind::not_lvalue:     return "not_lvalue";
-    case Chunk::ThrowKind::rebind_builtin: return "rebind_builtin";
-    case Chunk::ThrowKind::rebind_const:   return "rebind_const";
     case Chunk::ThrowKind::bad_args:       return "bad_args";
     }
     return "?";
@@ -82,6 +113,7 @@ std::string opsym(Op op)
     return OpString[static_cast<int>(op)];
 }
 
+
 /* The baked operator of a B1/B2 specialized arith op (bytecode.h). */
 const char *spec_arith_sym(OpCode op)
 {
@@ -107,39 +139,36 @@ std::string store_op(Op aop)
     return aop == Op::invalid ? std::string("=") : opsym(aop) + "=";
 }
 
+/* The Expr14-op spelling (`=` / `+=` / `<<=` / ...) for the stores whose
+ * `aop` carries the COMPOUND op, not the base arith form (DictStore,
+ * StoreMemberV, StoreElemValue, StoreElem2V). OpString already spells a
+ * compound op with its `=`, so this is a direct lookup - a new compound
+ * operator renders here with no edit. */
+static std::string expr14_op(Op aop)
+{
+    return aop == Op::assign ? std::string("=") : opsym(aop);
+}
+
 /* collect_funcs moved to codegen.cpp (shared with the VM's AOT precompile);
  * declared in codegen.h. */
 
-/* Every StructDeclStmt reachable from `c` (a custom type definition). Structs
- * appear only as STATEMENTS, so only the statement-containers are walked. */
+/* Every struct DEFINITION declared under `c`, in vm_compile's order (its
+ * take_structs): the COMPLETE walk, since a struct may be declared in a
+ * function literal written in an expression, and the declarations that
+ * OWN their definition - a copy of a function (a template's instance, an
+ * inlined body) shares its original's, which is listed once. */
 void collect_structs(const Construct *c,
                      std::vector<const StructDeclStmt *> &out)
 {
     if (!c)
         return;
-    if (auto *sd = dynamic_cast<const StructDeclStmt *>(c)) {
-        out.push_back(sd);
+    if (auto *sd = node_cast<const StructDeclStmt>(c)) {
+        if (sd->def_owner)
+            out.push_back(sd);
         return;
     }
-    auto rec = [&](const Construct *ch) { collect_structs(ch, out); };
-    if (auto *b = dynamic_cast<const Block *>(c)) {
-        for (const auto &e : b->elems) rec(e.get());
-    } else if (auto *fn = dynamic_cast<const FuncDeclStmt *>(c)) {
-        rec(fn->body.get());
-    } else if (auto *iff = dynamic_cast<const IfStmt *>(c)) {
-        rec(iff->thenBlock.get()); rec(iff->elseBlock.get());
-    } else if (auto *w = dynamic_cast<const WhileStmt *>(c)) {
-        rec(w->body.get());
-    } else if (auto *f = dynamic_cast<const ForStmt *>(c)) {
-        rec(f->body.get());
-    } else if (auto *fr = dynamic_cast<const ForRangeStmt *>(c)) {
-        rec(fr->body.get());
-    } else if (auto *fe = dynamic_cast<const ForeachStmt *>(c)) {
-        rec(fe->body.get());
-    } else if (auto *t = dynamic_cast<const TryCatchStmt *>(c)) {
-        rec(t->tryBody.get()); rec(t->finallyBody.get());
-        for (const auto &cs : t->catchStmts) rec(cs.second.get());
-    }
+    for_each_child_of(const_cast<Construct *>(c),
+                      [&](Construct *ch) { collect_structs(ch, out); });
 }
 
 const char *field_kind_str(FieldKind k)
@@ -152,6 +181,7 @@ const char *field_kind_str(FieldKind k)
     case FieldKind::f_array:  return "array";
     case FieldKind::f_dict:   return "dict";
     case FieldKind::f_dyn:    return "dyn";
+    case FieldKind::f_box:    return "box";
     case FieldKind::f_struct: return "struct";
     }
     return "?";
@@ -163,7 +193,8 @@ const char *field_kind_str(FieldKind k)
 void dump_struct_type(const StructTypeDef *def, std::ostringstream &s)
 {
     const bool pod = def->layout == StructTypeDef::Layout::pod;
-    s << "; struct " << def->name->val << "  [" << (pod ? "pod" : "boxed");
+    s << (def->is_class ? "; class " : "; struct ") << def->name->val
+      << "  [" << (pod ? "pod" : "boxed");
     if (pod)
         s << " size=" << def->size << " align=" << def->align;
     s << "]\n";
@@ -190,28 +221,115 @@ void dump_struct_type(const StructTypeDef *def, std::ostringstream &s)
 /* The chunk's serializable POOLS + side tables, printed after its code (a
  * `.myv` file stores exactly these, referenced by index/pc from the ops).
  * Only non-empty sections print, to keep a plain function's dump terse. */
+/* question 25: the struct table of the program being dumped (an image's,
+ * or the source's in collect_structs order - the order vm_compile stores
+ * it in), so a catch type names the struct it resolved to by its index:
+ * reproducible, and an image whose stored index is wrong dumps
+ * differently from the fresh compile */
+static std::vector<const StructTypeDef *> g_dis_structs;
+
 void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
 {
+    /* One blank line + a header: these are the SERIALIZABLE pools/side
+     * tables the ops reference by index/pc - the audit surface for the
+     * `.myv` stored-bytecode file, NOT needed to read the code above
+     * (names/values are already inlined at the use sites). */
+    s << "\n; ===== serializable pools (what a .myv file stores) =====\n";
     if (!ch.consts.empty()) {
         s << "; -- consts (" << ch.consts.size() << ") --\n";
         for (size_t i = 0; i < ch.consts.size(); i++)
-            s << ";   #" << i << "  "
+            s << ";   [" << i << "]" << "  "
               << ch.consts[i].get_type()->to_string_repr(ch.consts[i]) << "\n";
     }
     if (!ch.member_keys.empty()) {
         s << "; -- member_keys (" << ch.member_keys.size() << ") --\n";
         for (size_t i = 0; i < ch.member_keys.size(); i++) {
             const auto &mk = ch.member_keys[i];
-            s << ";   #" << i << "  " << (mk.optional ? "?." : ".")
-              << mk.memId.get_type()->to_string(mk.memId) << "\n";
+            s << ";   [" << i << "]" << "  " << (mk.optional ? "?." : ".")
+              << mk.memId.get_type()->to_string(mk.memId);
+            if (mk.bake_def && mk.bake_slot >= 0)
+                s << "  (baked " << mk.bake_def->name->val
+                  << " slot " << mk.bake_slot << ")";
+            s << "\n";
+        }
+    }
+    if (!ch.ctor_plans.empty()) {
+        /* the planned POD ctor's per-field {offset, act} (StructCtorV's
+         * b_dual_hi indexes this) - act 0 int, 1 float, 2 bool */
+        s << "; -- ctor_plans (" << ch.ctor_plans.size() << ") --\n";
+        for (size_t i = 0; i < ch.ctor_plans.size(); i++) {
+            s << ";   [" << i << "] ";
+            for (const auto &pf : ch.ctor_plans[i].f)
+                s << " {+" << pf.off << " "
+                  << (pf.act == 0 ? "int" : pf.act == 1 ? "float" : "bool")
+                  << " <- slot" << pf.src << "}";
+            s << "\n";
+        }
+    }
+    if (!ch.boxed_ops.empty()) {
+        /* model-flip nativize-ops: the JIT-bakeable operand data for
+         * BinOpV/CmpV/CompoundV (the op stores this index in its target2).
+         * DERIVED from the code (build_boxed_ops) - a .myv load rebuilds it. */
+        s << "; -- boxed_ops (" << ch.boxed_ops.size()
+          << ", derived) --\n";
+        for (size_t i = 0; i < ch.boxed_ops.size(); i++) {
+            const auto &bo = ch.boxed_ops[i];
+            s << ";   [" << i << "]  slot" << bo.target << " "
+              << opsym(bo.aop) << "\n";
         }
     }
     if (!ch.catch_types.empty()) {
         s << "; -- catch_types (" << ch.catch_types.size() << ") --\n";
         for (size_t i = 0; i < ch.catch_types.size(); i++) {
-            s << ";   #" << i << "  ";
-            for (size_t j = 0; j < ch.catch_types[i].size(); j++)
+            s << ";   [" << i << "]" << "  ";
+            for (size_t j = 0; j < ch.catch_types[i].size(); j++) {
                 s << (j ? ", " : "") << ch.catch_types[i][j];
+                const StructTypeDef *d = ch.catch_keys[i][j].def;
+                if (!d)
+                    continue;
+                /* its index in the struct table (a def the table lacks
+                 * would print the table's size: one past its last) */
+                s << " (struct #"
+                  << (std::find(g_dis_structs.begin(), g_dis_structs.end(),
+                                d) - g_dis_structs.begin())
+                  << ")";
+            }
+            s << "\n";
+        }
+    }
+    if (!ch.handler_sites.empty()) {
+        /* #78: the per-try-region catch table - what the raise path matches
+         * against (the CatchTest/Reraise chain in the code above mirrors it
+         * until step D removes those ops). */
+        s << "; -- handler_sites: try region -> clauses ("
+          << ch.handler_sites.size() << ") --\n";
+        for (size_t i = 0; i < ch.handler_sites.size(); i++) {
+            const auto &hs = ch.handler_sites[i];
+            s << ";   [" << i << "]  ";
+            if (hs.clauses.empty() && hs.fin_pc < 0 && hs.chain < 0) {
+                s << "(none)\n";
+                continue;
+            }
+            for (size_t j = 0; j < hs.clauses.size(); j++) {
+                const auto &cl = hs.clauses[j];
+                s << (j ? " | " : "");
+                if (cl.types_idx < 0)
+                    s << "(any)";
+                else {
+                    const auto &nm = ch.catch_types[cl.types_idx];
+                    for (size_t k = 0; k < nm.size(); k++)
+                        s << (k ? "|" : "") << nm[k];
+                }
+                if (cl.bind_slot >= 0)
+                    s << " as " << reg(ch, cl.bind_slot);
+                s << " -> L" << cl.body_pc;
+            }
+            if (hs.fin_pc >= 0)
+                s << (hs.clauses.empty() ? "" : "  ")
+                  << "finally L" << hs.fin_pc;
+            if (hs.chain >= 0)
+                s << (hs.clauses.empty() && hs.fin_pc < 0 ? "" : "  ")
+                  << "chain [" << hs.chain << "]";
             s << "\n";
         }
     }
@@ -219,52 +337,95 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         s << "; -- literal_objs (" << ch.literal_objs.size() << ") --\n";
         for (size_t i = 0; i < ch.literal_objs.size(); i++) {
             const auto &lo = ch.literal_objs[i];
-            s << ";   #" << i << "  "
+            s << ";   [" << i << "]" << "  "
               << lo.value.get_type()->to_string_repr(lo.value)
-              << (lo.immutable ? "  (immutable)" : "") << "\n";
+              << (lo.immutable ? "  (immutable)" : "");
+            /* Q2: the type the value's container was made with */
+            const TypeAnnot *ct =
+                lo.value.is<SharedArrayObj>()
+                    ? lo.value.get_ref<SharedArrayObj>().ctype()
+                : lo.value.is<intrusive_ptr<DictObject>>()
+                    ? lo.value.get_ref<intrusive_ptr<DictObject>>()->ctype()
+                    : nullptr;
+            if (ct)
+                s << "  ; " << annot_text(ct);
+            s << "\n";
         }
     }
     if (!ch.closure_defs.empty()) {
         s << "; -- closure_defs (" << ch.closure_defs.size() << ") --\n";
         for (size_t i = 0; i < ch.closure_defs.size(); i++) {
             const FuncDescriptor *fd = ch.closure_defs[i];
-            s << ";   #" << i << "  "
+            s << ";   [" << i << "]" << "  "
               << (fd->name ? std::string(fd->name->val) : "<lambda>") << "\n";
         }
     }
     if (!ch.struct_defs.empty()) {
         s << "; -- struct_defs (" << ch.struct_defs.size() << ") --\n";
         for (size_t i = 0; i < ch.struct_defs.size(); i++)
-            s << ";   #" << i << "  " << ch.struct_defs[i]->name->val
+            s << ";   [" << i << "]" << "  " << ch.struct_defs[i]->name->val
               << "\n";
+    }
+    if (!ch.ctypes.empty()) {               /* Q2 */
+        s << "; -- ctypes (" << ch.ctypes.size() << ") --\n";
+        for (size_t i = 0; i < ch.ctypes.size(); i++)
+            s << ";   [" << i << "]  " << annot_text(ch.ctypes[i]) << "\n";
+    }
+    if (!ch.fit_specs.empty()) {
+        static const char *const places[] = {
+            "variable", "field", "element", "dict value", "dict key" };
+        s << "; -- fit_specs (" << ch.fit_specs.size() << ") --\n";
+        for (size_t i = 0; i < ch.fit_specs.size(); i++) {
+            const FitSpec &f = ch.fit_specs[i];
+            s << ";   [" << i << "]  "
+              << places[static_cast<int>(f.place)];
+            if (f.name)
+                s << " '" << f.name->val << "'";
+            if (f.annot)
+                s << "  " << reflect_decl_annot(f.annot->kind,
+                                                f.annot->strct,
+                                                f.annot.get(),
+                                                f.annot->opt);
+            s << "\n";
+        }
     }
     if (!ch.boxed_ctors.empty()) {
         s << "; -- boxed_ctors (" << ch.boxed_ctors.size() << ") --\n";
         for (size_t i = 0; i < ch.boxed_ctors.size(); i++)
-            s << ";   #" << i << "  " << ch.boxed_ctors[i].def->name->val
-              << "  (" << ch.boxed_ctors[i].arg_locs.size() << " args)\n";
+            s << ";   [" << i << "]" << "  " << ch.boxed_ctors[i].def->name->val
+              << "  (" << ch.boxed_ctors[i].arg_locs.size() << " args"
+              << (ch.boxed_ctors[i].fit ? ", fit" : "") << ")\n";
     }
     if (!ch.throws.empty()) {
         s << "; -- throws (" << ch.throws.size() << ") --\n";
         for (size_t i = 0; i < ch.throws.size(); i++) {
             const auto &t = ch.throws[i];
-            s << ";   #" << i << "  " << throw_kind_name(t.kind)
+            s << ";   [" << i << "]" << "  " << throw_kind_name(t.kind)
               << (t.name ? " " + std::string(t.name->val) : "") << "\n";
         }
     }
     if (!ch.builtin_calls.empty()) {
-        s << "; -- builtin_calls (" << ch.builtin_calls.size() << ") --\n";
+        /* one entry per builtin call SITE: the name + the per-arg source
+         * carets a runtime type/arity error points at (the carets aren't
+         * shown here; the name is already inline at the `call.blt` op). */
+        s << "; -- builtin_calls: per-call-site name + arg carets ("
+          << ch.builtin_calls.size() << ") --\n";
         for (size_t i = 0; i < ch.builtin_calls.size(); i++) {
             const auto &bc = ch.builtin_calls[i];
-            s << ";   #" << i << "  " << (bc.name ? bc.name->val : "?")
-              << "  (" << bc.args.size() << " args)\n";
+            s << ";   [" << i << "]" << "  " << (bc.name ? bc.name->val : "?")
+              << "  (" << bc.args.size() << " args)";
+            if (!bc.steps.empty())      /* #32: the chain form's arg0 */
+                s << "  a0 chain of " << bc.steps.size();
+            if (bc.ct_store)            /* Q2: checked against the type */
+                s << "  checked";
+            s << "\n";
         }
     }
     if (!ch.emplace_sites.empty()) {
         s << "; -- emplace_sites (" << ch.emplace_sites.size() << ") --\n";
         for (size_t i = 0; i < ch.emplace_sites.size(); i++) {
             const auto &es = ch.emplace_sites[i];
-            s << ";   #" << i << "  "
+            s << ";   [" << i << "]" << "  "
               << (es.bname ? es.bname->val : "append") << " <- "
               << es.def->name->val
               << "  (" << es.field_locs.size() << " fields)\n";
@@ -272,16 +433,21 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
     }
     if (!ch.call_sites.empty()) {
         s << "; -- call_sites (" << ch.call_sites.size() << ") --\n";
-        static const char *fm[] = {"none", "slot", "elem", "member", "undef"};
+        static const char *fm[] = {"none", "slot", "elem", "member", "undef",
+                                   "chain"};
         for (size_t i = 0; i < ch.call_sites.size(); i++) {
             const auto &cs = ch.call_sites[i];
-            s << ";   #" << i << "  " << cs.args.size() << " args, a0="
+            s << ";   [" << i << "]" << "  " << cs.args.size() << " args, a0="
               << fm[static_cast<int>(cs.a0_form)];
             if (cs.a0_form == Chunk::CallSite::A0::slot
                 || cs.a0_form == Chunk::CallSite::A0::elem
-                || cs.a0_form == Chunk::CallSite::A0::member)
+                || cs.a0_form == Chunk::CallSite::A0::member
+                || cs.a0_form == Chunk::CallSite::A0::chain)
                 s << " k" << static_cast<int>(cs.a0_kind)
                   << "[" << cs.a0_slot << "]";
+            for (const Chunk::ChainStep &st : cs.a0_steps)
+                s << (st.is_member ? ".<m#" : "[r")
+                  << st.operand << (st.is_member ? ">" : "]");
             s << "\n";
         }
     }
@@ -289,11 +455,12 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         s << "; -- incdec_sites (" << ch.incdec_sites.size() << ") --\n";
         for (size_t i = 0; i < ch.incdec_sites.size(); i++) {
             const auto &is = ch.incdec_sites[i];
-            s << ";   #" << i << "  lval@" << is.lstart.line << ":"
+            s << ";   [" << i << "]" << "  lval@" << is.lstart.line << ":"
               << is.lstart.col << "  incdec@" << is.istart.line << ":"
               << is.istart.col;
             if (is.memUid)
-                s << "  ." << is.memUid->val;
+                s << "  ." << is.memUid->val << "  base@" << is.bstart.line
+                  << ":" << is.bstart.col;
             s << "\n";
         }
     }
@@ -301,25 +468,83 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         s << "; -- incdec_chains (" << ch.incdec_chains.size() << ") --\n";
         for (size_t i = 0; i < ch.incdec_chains.size(); i++) {
             const auto &ic = ch.incdec_chains[i];
-            s << ";   #" << i << "  steps=";
+            s << ";   [" << i << "]" << "  steps=";
             for (const Chunk::ChainStep &st : ic.steps)
                 s << (st.is_member ? ".<m#" : "[r")
                   << st.operand << (st.is_member ? ">" : "]");
             s << (ic.tier2 ? "  tier2" : "  dyn")
               << (ic.is_prefix ? " pre" : " post");
-            if (ic.allow_flat)
-                s << " flat-ok";
-            if (ic.allow_pod)
-                s << " pod-ok";
             s << "  incdec@" << ic.id_start.line << ":" << ic.id_start.col
               << "\n";
         }
     }
     if (!ch.locs.empty()) {
-        s << "; -- locs (" << ch.locs.size() << ") --\n";
+        /* a throwing op's SOURCE caret, looked up by pc only on the error
+         * path: `pcN -> line:col` = op N's error points at that source
+         * line:col. */
+        s << "; -- locs: throwing-op pc -> source line:col ("
+          << ch.locs.size() << ") --\n";
         for (const auto &l : ch.locs)
             s << ";   pc" << l.pc << " -> " << l.start.line << ":"
               << l.start.col << "\n";
+    }
+    if (!ch.base_locs.empty()) {
+        /* #127: a container store's SECOND caret - the BASE identifier's own
+         * span, used when that base is an unbound global (`locs` holds the
+         * whole `g[0]` lvalue, for the OOB/type errors). */
+        s << "; -- base_locs: store pc -> base line:col ("
+          << ch.base_locs.size() << ") --\n";
+        for (const auto &l : ch.base_locs)
+            s << ";   pc" << l.pc << " -> " << l.start.line << ":"
+              << l.start.col << "\n";
+    }
+    if (!ch.op_locs.empty()) {
+        /* RULE 2: a compound store's OPERATION caret - the whole
+         * `lv OP= rhs` span a div0 / negative shift / type error takes
+         * (`locs` holds the lvalue, for the errors reaching it). Both
+         * ends: `end` is half the caret. */
+        s << "; -- op_locs: compound store pc -> line:col-line:col ("
+          << ch.op_locs.size() << ") --\n";
+        for (const auto &l : ch.op_locs)
+            s << ";   pc" << l.pc << " -> " << l.start.line << ":"
+              << l.start.col << "-" << l.end.line << ":" << l.end.col
+              << "\n";
+    }
+    if (!ch.arg_locs.empty()) {
+        /* RULE 2: a user call op's THIRD caret - one span per argument,
+         * for a bind coercion to name the argument it rejected (`locs`
+         * holds the whole call, `base_locs` the argument list). Both
+         * ends printed: the round-trip oracle compares these tables
+         * entry-for-entry beside the dump, and `end` is half the caret. */
+        s << "; -- arg_locs: call pc -> per-argument line:col-col ("
+          << ch.arg_locs.size() << ") --\n";
+        for (const auto &ae : ch.arg_locs) {
+            s << ";   pc" << ae.pc << " ->";
+            for (uint32_t k = 0; k < ae.n; k++) {
+                const ArgLoc &al = ch.arg_loc_pool[ae.first + k];
+                s << " " << al.start.line << ":" << al.start.col << "-"
+                  << al.end.col;
+            }
+            s << "\n";
+        }
+    }
+    if (!ch.value_callees.empty()) {
+        /* #97 E1: the callee #116's analysis NAMED for a value-call site,
+         * as a closure_defs index - what the JIT bakes, and what its
+         * emitted identity compare then checks at run time. */
+        s << "; -- value_callees: call pc -> closure_defs idx (name) ("
+          << ch.value_callees.size() << ") --\n";
+        for (const auto &e : ch.value_callees) {
+            const FuncDescriptor *fd =
+                (e.def >= 0
+                 && static_cast<size_t>(e.def) < ch.closure_defs.size())
+                    ? ch.closure_defs[static_cast<size_t>(e.def)]
+                    : nullptr;
+            s << ";   pc" << e.pc << " -> [" << e.def << "] "
+              << (!fd ? std::string("<?>")
+                      : fd->name ? std::string(fd->name->val)
+                                 : std::string("<lambda>")) << "\n";
+        }
     }
     if (!ch.inline_ctxs.empty()) {
         s << "; -- inline_ctxs (" << ch.inline_ctxs.size() << ", "
@@ -339,8 +564,1049 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
 
 }  /* namespace */
 
+/* ============ Native-AOT fragment disassembler (-vdj) ============
+ *
+ * Decodes exactly the x86-64 forms jit.cpp emits (a small, fixed set),
+ * interleaving each VM op's `; pc N` boundary from NativeCode::Frag::marks.
+ * An unrecognized byte prints `.byte` and advances 1; the next op mark
+ * resyncs, so a decode slip is bounded to one op. The slot-window layout
+ * (stride 48, payload +0, type +24) is stable and mirrored here for the
+ * `slot N` / `slot N.type` labels (cosmetic - the JIT itself bakes the
+ * runtime-probed offsets). */
+/*
+ * The STRUCTURED-DECODE collector (disasm.h). Null by default - a
+ * shape test sets it around a `disassemble_program` call and gets the
+ * instructions the dump was RENDERED FROM, rather than parsing the
+ * rendering back and losing the slot-vs-register distinction the text
+ * collapses.
+ */
+std::vector<DecodedFrag> *g_jit_decode_sink = nullptr;
+
+namespace {
+
+/*
+ * A boolean MYLANG_* env knob: SET, non-empty and not "0". The same
+ * three-part test lowmem.h applies to MYLANG_NO_LOWMEM - stated once
+ * here because a presence-only check makes `=0` mean ON, which is the
+ * opposite of what anyone spelling it that way intends.
+ */
+bool env_flag_on(const char *name)
+{
+    /* env_get, not getenv: MSVC deprecates getenv and WERROR is on.
+     * jit.cpp may call getenv freely because every one of its calls is
+     * inside `#if ML_JIT_SUPPORTED`, which MSVC never compiles - this
+     * file is compiled on every platform. */
+    const std::optional<std::string> v = env_get(name);
+    return v && !v->empty() && *v != "0";
+}
+
+/* MYLANG_VDJ_ADDRS=1 - print baked ADDRESSES numerically instead of as
+ * `<addr>`. Off by default so the dump is REPRODUCIBLE (see tag_name);
+ * on when you are chasing one specific baked pointer and the digits are
+ * the thing you need. */
+bool vdj_show_addrs()
+{
+    /* ⛔ A VALUE CHECK, NOT A PRESENCE CHECK - `=0` MUST MEAN OFF.
+     * With a bare has_value() this knob turned the masking OFF for
+     * `MYLANG_VDJ_ADDRS=0`, so a reader who spelled the disable that way
+     * saw raw pointers and concluded the dump is NOT reproducible - the
+     * exact wrong conclusion the masking exists to prevent (it happened,
+     * 2026-08-29, while comparing a .myv image's -vdj against its
+     * source's). The idiom is lowmem.h's: set, non-empty, not "0". */
+    static const bool on = env_flag_on("MYLANG_VDJ_ADDRS");
+    return on;
+}
+
+/*
+ * MYLANG_VDJ_RAW=1 - render every operand the way objdump does, for
+ * `scripts/disasmcheck`'s operand comparison. A frame slot prints as
+ * the `[rbx+disp]` it is, a baked address or a Type tag as its number,
+ * a 32-bit register by its real name (r8d, not e8), a branch or call
+ * target as its FRAGMENT offset, and every memory operand as
+ * base+index*scale+disp. NOT reproducible by construction (the digits
+ * are the point), so nothing that compares dumps may use it - the same
+ * contract as MYLANG_VDJ_HEX. The default rendering is untouched.
+ */
+bool vdj_raw()
+{
+    return g_vdj_raw;
+}
+
+static std::string raw_hex(long long v)
+{
+    std::ostringstream o;
+    const unsigned long long u = v < 0 ? 0ull - static_cast<unsigned
+                                                long long>(v)
+                                       : static_cast<unsigned long long>(v);
+    o << (v < 0 ? "-0x" : "0x") << std::hex << u;
+    return o.str();
+}
+
+static const char *gp16(int r)
+{
+    static const char *n[16] = { "ax","cx","dx","bx","sp","bp",
+        "si","di","r8w","r9w","r10w","r11w","r12w","r13w","r14w","r15w" };
+    return (r >= 0 && r < 16) ? n[r] : "r?w";
+}
+
+static const char *gp32(int r)
+{
+    static const char *n[16] = { "eax","ecx","edx","ebx","esp","ebp",
+        "esi","edi","r8d","r9d","r10d","r11d","r12d","r13d","r14d","r15d" };
+    return (r >= 0 && r < 16) ? n[r] : "r?d";
+}
+
+const char *gp64(int r)
+{
+    static const char *n[16] = { "rax","rcx","rdx","rbx","rsp","rbp",
+        "rsi","rdi","r8","r9","r10","r11","r12","r13","r14","r15" };
+    return (r >= 0 && r < 16) ? n[r] : "r?";
+}
+
+/* The 8-bit register names. WITHOUT a REX prefix, encodings 4-7 are the
+ * legacy HIGH bytes ah/ch/dh/bh; WITH one they are the uniform low bytes
+ * spl/bpl/sil/dil. The JIT's byte store (`mov [rcx+r9], dil`) is the
+ * REX form, and naming it `bh` would be actively misleading. */
+const char *gp8(int r, bool rex)
+{
+    static const char *lo[16] = { "al","cl","dl","bl","spl","bpl","sil","dil",
+        "r8b","r9b","r10b","r11b","r12b","r13b","r14b","r15b" };
+    static const char *legacy[8] = { "al","cl","dl","bl","ah","ch","dh","bh" };
+    if (!rex && r >= 0 && r < 8) return legacy[r];
+    return (r >= 0 && r < 16) ? lo[r] : "r?b";
+}
+
+std::string hex2(uint8_t v)
+{
+    static const char *h = "0123456789abcdef";
+    return std::string(1, h[v >> 4]) + std::string(1, h[v & 15]);
+}
+
+/*
+ * ⛔ A BAKED ADDRESS MUST BE PRINTED SYMBOLICALLY, NOT NUMERICALLY.
+ *
+ * The JIT bakes absolute addresses (the Type singletons, helper
+ * entry points, pool buffers). Their numeric values move with every
+ * process under ASLR, so printing the number makes `-vdj` output
+ * NON-DETERMINISTIC - the same binary disassembling the same program
+ * twice produced different text. That is not cosmetic: `-vdj` is the
+ * evidence a JIT change is a pure restructuring, and a dump that
+ * differs from itself cannot be that evidence. It cost exactly that:
+ * scripts/vdjcmp reported 77 of 108 programs as differing from
+ * THEMSELVES, and worked around it with regex masking that then went
+ * stale the moment tags became imm32.
+ *
+ * So symbolise here, at the source, and let every consumer benefit.
+ * `tag_name` covers the three Type singletons in both the movabs
+ * (imm64) and imm32 spellings - the low-address arena means the SAME
+ * pointer appears as a full 8-byte immediate in one instruction and a
+ * sign-extended 4-byte one in the next.
+ */
+const char *tag_name(uint64_t imm, const void *ti, const void *tf,
+                     const void *ta)
+{
+    const void *pv = reinterpret_cast<const void *>(imm);
+    if (ti && pv == ti) return "<int-tag>";
+    if (tf && pv == tf) return "<float-tag>";
+    if (ta && pv == ta) return "<array-tag>";
+    return nullptr;
+}
+
+/*
+ * ⛔ EVERY IMMEDIATE GOES THROUGH HERE. THERE ARE TEN PRINTERS AND
+ * FIXING THREE OF THEM IS NOT FIXING THE BUG (2026-08-18).
+ *
+ * A baked pointer can appear as ANY immediate the emitter happens to
+ * use: `movabs` (imm64), `mov r/m, imm32`, `cmp rax, imm32`, and - the
+ * one that actually got through - the group-1 `cmp r/m, imm32` that
+ * guards a STRUCT INSTANCE against its `StructTypeDef *`. The first
+ * round of this fix patched the three printers I had seen misbehave;
+ * CI then failed on a struct program, because the fourth printer was
+ * never considered. That is the audit-table trap in its purest form:
+ * the defect is in the CLASS, so the fix belongs at the CLASS's one
+ * choke point.
+ *
+ * The rule, in order:
+ *   - a known Type singleton prints as its name;
+ *   - a power of two AT OR ABOVE 2^32 prints numerically. Real
+ *     emitted constants are bit patterns (0x8000000000000000 for the
+ *     INT_MIN division check), deterministic - masking them would
+ *     cost readability for no reproducibility gain. BELOW 2^32 the
+ *     exemption is a REPRODUCIBILITY HOLE, found the day it bit: the
+ *     MAP_32BIT arena sometimes lands at exactly 0x40000000, so a
+ *     baked singleton pointer printed as digits in the runs where
+ *     mmap returned a 1GiB-aligned base and as `<addr>` everywhere
+ *     else - the dump differed from ITSELF (vdjcmp's flake detector
+ *     caught it on 69_exc_crossframe, 2026-08-22);
+ *   - anything else >= 0x1000 is assumed to be an ADDRESS and prints as
+ *     `<addr>`, because its digits vary per process and would make the
+ *     dump differ from itself;
+ *   - everything else prints numerically.
+ * MYLANG_VDJ_ADDRS=1 disables the masking entirely.
+ */
+std::string imm_str(int64_t v, const void *ti, const void *tf,
+                    const void *ta)
+{
+    if (const char *t = tag_name(static_cast<uint64_t>(v), ti, tf, ta))
+        return t;
+    const uint64_t u = static_cast<uint64_t>(v < 0 ? -v : v);
+    const bool pow2 = u && (u & (u - 1)) == 0 && u >= (1ull << 32);
+    if (!vdj_show_addrs() && u >= 0x1000 && !pow2)
+        return "<addr>";
+    std::ostringstream o;
+    if (u >= 0x1000) o << "0x" << std::hex << u << std::dec;
+    else             o << v;
+    return o.str();
+}
+
+/*
+ * ⛔ THE DECODE FILLS A STRUCTURE AND THE TEXT IS RENDERED FROM IT
+ * (2026-09-22, the maintainer's call). It used to format straight into
+ * a stream, so every field it had computed - base, index, scale,
+ * displacement, and above all whether `[rbx+d]` resolves to a FRAME
+ * SLOT - existed only as characters. A shape test that wanted one
+ * operand had to parse those characters back, which is a second
+ * decoder in all but name, and one that cannot recover what the
+ * rendering COLLAPSED: a temp slot and a machine register are both
+ * spelled `rN`.
+ *
+ * `render_op` below is now the ONLY place a machine operand becomes
+ * text, so the dump and the structure cannot disagree, and `-vdj`'s
+ * output is byte-for-byte what it was (vdjcmp 128/128 across the
+ * refactor - that is what makes a rewrite of this size safe).
+ */
+using SlotNamer = std::function<std::string(int)>;
+
+/* [rbx+disp] IS a frame slot when the displacement lands on a slot's
+ * payload or its type word - a structural fact about the encoding, so
+ * it is decided here and the NAME is the renderer's business. The frame
+ * window base is rbx (callee-saved; it was rdi before the JIT moved the
+ * pins off the caller-saved registers). */
+DecOp mem_op(int base_reg, int32_t disp)
+{
+    DecOp x;
+    if (base_reg == 3 /*rbx*/) {
+        const int stride = 48, poff = 0, toff = 24;
+        /* reg/disp are kept beside the slot for the RAW rendering,
+         * which prints the encoding rather than the name. */
+        if (disp >= 0 && disp % stride == poff) {
+            x.kind = DecOp::Slot;
+            x.slot = disp / stride;
+            x.reg = base_reg;
+            x.disp = disp;
+            return x;
+        }
+        if (disp >= 0 && disp % stride == toff) {
+            x.kind = DecOp::Slot;
+            x.slot = disp / stride;
+            x.slot_type = true;
+            x.reg = base_reg;
+            x.disp = disp;
+            return x;
+        }
+    }
+    x.kind = DecOp::Mem;
+    x.reg = base_reg;
+    x.disp = disp;
+    return x;
+}
+
+DecOp dop_gpr(int r)   { DecOp x; x.kind = DecOp::Gpr;   x.reg = r; return x; }
+DecOp dop_gpr32(int r) { DecOp x; x.kind = DecOp::Gpr32; x.reg = r; return x; }
+DecOp dop_xmm(int r)   { DecOp x; x.kind = DecOp::Xmm;   x.reg = r; return x; }
+DecOp dop_cl()         { DecOp x; x.kind = DecOp::Cl;    return x; }
+DecOp dop_gpr8(int r, bool rex)
+{ DecOp x; x.kind = DecOp::Gpr8; x.reg = r; x.rex8 = rex; return x; }
+DecOp dop_imm(long long v)
+{ DecOp x; x.kind = DecOp::Imm; x.imm = v; return x; }
+DecOp dop_immdec(long long v)
+{ DecOp x; x.kind = DecOp::ImmDec; x.imm = v; return x; }
+DecOp dop_rel(long long t)
+{ DecOp x; x.kind = DecOp::Rel; x.imm = t; return x; }
+DecOp dop_callrel(long long d)
+{ DecOp x; x.kind = DecOp::CallRel; x.imm = d; return x; }
+DecOp dop_byte(DecOp x) { x.byte_ptr = true; return x; }
+
+/* MYLANG_VDJ_RAW's rendering (see vdj_raw): objdump's spelling. */
+static std::string render_op_raw(const DecOp &x)
+{
+    std::ostringstream o;
+    const char *bp = x.byte_ptr || x.size == 8 ? "byte " : "";
+    switch (x.kind) {
+    case DecOp::Gpr:
+        if (x.size == 32) return gp32(x.reg);
+        if (x.size == 16) return gp16(x.reg);
+        if (x.size == 8)  return gp8(x.reg, x.rex8);
+        return gp64(x.reg);
+    case DecOp::Gpr32:  return gp32(x.reg);
+    case DecOp::Gpr8:   return gp8(x.reg, x.rex8);
+    case DecOp::Xmm:    o << "xmm" << x.reg; return o.str();
+    case DecOp::Cl:     return "cl";
+    case DecOp::Slot:
+    case DecOp::Mem:
+        o << bp << "[";
+        if (x.rip) {
+            o << "rip";
+        } else {
+            if (x.reg >= 0) o << gp64(x.reg);
+            if (x.index >= 0)
+                o << (x.reg >= 0 ? "+" : "") << gp64(x.index) << "*"
+                  << x.scale;
+        }
+        if (!x.rip && x.reg < 0 && x.index < 0)
+            o << raw_hex(x.disp);
+        else
+            o << (x.disp < 0 ? "" : "+") << raw_hex(x.disp);
+        o << "]";
+        return o.str();
+    case DecOp::Imm:
+    case DecOp::ImmDec:
+    case DecOp::Rel:
+    case DecOp::CallRel:
+        return raw_hex(x.imm);
+    default: break;
+    }
+    return "?";
+}
+
+/* THE ONE PLACE A MACHINE OPERAND BECOMES TEXT. */
+std::string render_op(const DecOp &x, const SlotNamer &nm,
+                      const void *ti, const void *tf, const void *ta)
+{
+    std::ostringstream o;
+    const char *bp = x.byte_ptr ? "byte " : "";
+    switch (x.kind) {
+    /* a register at its ENCODED width, as objdump spells it: `mov eax,
+     * ecx` writes 32 bits and zeroes the top half, which `rax, rcx`
+     * would misstate (and `er9` is not a register) */
+    case DecOp::Gpr:
+        if (x.size == 32) return gp32(x.reg);
+        if (x.size == 16) return gp16(x.reg);
+        if (x.size == 8)  return gp8(x.reg, x.rex8);
+        return gp64(x.reg);
+    case DecOp::Gpr32:  return gp32(x.reg);
+    case DecOp::Gpr8:   return gp8(x.reg, x.rex8);
+    case DecOp::Xmm:    o << "xmm" << x.reg; return o.str();
+    case DecOp::Cl:     return "cl";
+    case DecOp::Slot:
+        o << bp << nm(x.slot) << (x.slot_type ? ".type" : "");
+        return o.str();
+    case DecOp::Mem:
+        o << bp << "[";
+        if (x.rip) {
+            o << "rip" << (x.disp < 0 ? "-0x" : "+0x") << std::hex
+              << (x.disp < 0 ? -int64_t(x.disp) : int64_t(x.disp))
+              << std::dec;
+        } else if (!x.via_sib) {
+            o << gp64(x.reg) << (x.disp < 0 ? "-0x" : "+0x") << std::hex
+              << (x.disp < 0 ? -int64_t(x.disp) : int64_t(x.disp))
+              << std::dec;
+        } else {
+            if (x.reg >= 0) o << gp64(x.reg);
+            if (x.index >= 0) {
+                if (x.reg >= 0) o << "+";
+                o << gp64(x.index) << "*" << x.scale;
+            }
+            if (x.reg < 0 && x.index < 0)
+                o << imm_str(static_cast<int64_t>(
+                                 static_cast<uint32_t>(x.disp)),
+                             ti, tf, ta);
+            else if (x.disp)
+                o << (x.disp < 0 ? "-0x" : "+0x") << std::hex
+                  << (x.disp < 0 ? -int64_t(x.disp) : int64_t(x.disp))
+                  << std::dec;
+        }
+        o << "]";
+        return o.str();
+    case DecOp::Imm:    return imm_str(x.imm, ti, tf, ta);
+    case DecOp::ImmDec: o << x.imm; return o.str();
+    case DecOp::Rel:    o << "+" << std::dec << x.imm; return o.str();
+    case DecOp::CallRel:
+        if (!vdj_show_addrs())
+            return "<helper>";
+        o << (x.imm < 0 ? "-0x" : "+0x") << std::hex
+          << (x.imm < 0 ? -x.imm : x.imm) << std::dec;
+        return o.str();
+    default: break;
+    }
+    return "?";
+}
+
+/* RAW mode's instruction line (MYLANG_VDJ_RAW): every operand in
+ * objdump's spelling, a call's target as a FRAGMENT offset - as objdump
+ * prints it for a blob that starts at the fragment */
+static std::string render_ins_raw(const DecodedIns &d)
+{
+    std::string s = d.mn;
+    for (int i = 0; i < d.n; i++) {
+        s += i ? ", " : " ";
+        DecOp t = d.ops[i];
+        if (t.kind == DecOp::CallRel)
+            t.imm = static_cast<long long>(d.off) + d.len + t.imm;
+        s += render_op_raw(t);
+    }
+    return s;
+}
+
+std::string render_ins(const DecodedIns &d, const SlotNamer &nm,
+                       const void *ti, const void *tf, const void *ta)
+{
+    if (vdj_raw())
+        return render_ins_raw(d);
+    std::string s = d.mn;
+    for (int i = 0; i < d.n; i++) {
+        s += i ? ", " : " ";
+        s += render_op(d.ops[i], nm, ti, tf, ta);
+    }
+    return s;
+}
+
+/* Decode ONE instruction at code[p]; fill `di`, render it into `out`,
+ * and advance p. Covers jit.cpp's emitted forms. */
+void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
+                std::string &cmt, const SlotNamer &nm,
+                const void *ti, const void *tf, const void *ta,
+                DecodedIns *di = nullptr, bool render = true)
+{
+    const uint32_t start = p;
+    DecodedIns D;
+    D.off = start;
+    cmt.clear();
+    const auto MN = [&](const char *m) { D.mn = m; };
+    const auto A  = [&](const DecOp &x) { if (D.n < 3) D.ops[D.n++] = x; };
+    bool pf_f2 = false, pf_66 = false;
+    while (p < n && (c[p] == 0xF2 || c[p] == 0xF3 || c[p] == 0x66)) {
+        if (c[p] == 0xF2) pf_f2 = true;
+        if (c[p] == 0x66) pf_66 = true;
+        p++;
+    }
+    uint8_t rex = 0;
+    if (p < n && (c[p] & 0xF0) == 0x40) rex = c[p++];
+    const bool W = rex & 8, R = rex & 4, X = rex & 2, B = rex & 1;
+    if (p >= n) goto undecoded;
+    {
+    const uint8_t op = c[p++];
+    auto rd32 = [&]() -> int32_t {
+        int32_t v = 0;
+        for (int i = 0; i < 4 && p < n; i++) v |= int32_t(c[p++]) << (i*8);
+        return v;
+    };
+    auto rd64 = [&]() -> uint64_t {
+        uint64_t v = 0;
+        for (int i = 0; i < 8 && p < n; i++) v |= uint64_t(c[p++]) << (i*8);
+        return v;
+    };
+    /*
+     * modrm: returns the reg field (+REX.R) and the r/m OPERAND,
+     * consuming the SIB byte and the displacement.
+     *
+     * ⛔ THE SIB ARM USED TO BE WRONG IN THREE WAYS, AND THE FIRST ONE
+     * DESYNCHRONISED THE WHOLE STREAM (fixed 2026-08-17):
+     *
+     *   1. it returned WITHOUT consuming the displacement, although a
+     *      SIB byte does not replace disp8/disp32 - mod still selects
+     *      one. `mov rdi, [rsp+8]` (48 8B 7C 24 08) therefore decoded
+     *      as `mov rdi, [rsp+rsp*8]` and left `08` behind as a stray
+     *      `.byte`, and every later instruction in that fragment was
+     *      decoded at the wrong offset until the next `; vm pc` mark
+     *      resynced. 330 of the corpus's undecoded bytes were this one
+     *      bug, and the garbage it printed FOR the instruction was
+     *      worse than the missing byte after it;
+     *   2. the SCALE field was ignored and hardcoded `*8`;
+     *   3. index == 4 means NO INDEX (the canonical `[rsp+disp]` form),
+     *      but it printed `rsp*8`. Note REX.X still applies, so r12 as
+     *      an index is index==4 WITH X set - the check must be on the
+     *      3-bit field before the extension, which is why `idx3` exists.
+     *
+     * mod==0 with base==5 (RIP-relative / no-base disp32) is likewise
+     * a real encoding and is handled; jit.cpp does not emit it today,
+     * but a decoder that silently mis-consumes it is exactly how this
+     * class of bug survives.
+     */
+    auto modrm = [&](int &regf, DecOp &rm) {
+        const uint8_t m = c[p++];
+        const int mod = m >> 6, reg = ((m >> 3) & 7) + (R ? 8 : 0),
+                  rmf = (m & 7) + (B ? 8 : 0);
+        regf = reg;
+        if (mod == 3) { rm = dop_gpr(rmf); return; }
+        if ((m & 7) == 4) {                       /* SIB byte follows */
+            const uint8_t sib = c[p++];
+            const int scale = 1 << (sib >> 6);
+            const int idx3 = (sib >> 3) & 7;      /* pre-REX.X */
+            const int idx = idx3 + (X ? 8 : 0);
+            const int base3 = sib & 7;
+            const int base = base3 + (B ? 8 : 0);
+            const bool no_base = (base3 == 5 && mod == 0);
+            const int32_t d = no_base ? rd32()
+                            : (mod == 2) ? rd32()
+                            : (mod == 1) ? int8_t(c[p++]) : 0;
+            rm = DecOp();
+            rm.kind = DecOp::Mem;
+            rm.via_sib = true;
+            rm.reg = no_base ? -1 : base;
+            /*
+             * ⛔ THE NO-BASE disp32 IS AN ABSOLUTE ADDRESS, AND IT
+             * MUST BE MASKED LIKE EVERY OTHER BAKED POINTER (render_op
+             * sends it through imm_str for exactly that reason).
+             *
+             * This is the low arena's operand (#97 step 1): a
+             * process-lifetime global reached in ONE instruction, with
+             * the pointer sitting in the displacement. Every other
+             * baked address in this dump prints as `<addr>` /
+             * `<int-tag>` / `<helper>` precisely so two runs and two
+             * separately-linked binaries produce IDENTICAL text - that
+             * is what `scripts/vdjcmp` IS - and this form was added
+             * later without learning the rule.
+             *
+             * ⛔ IT BROKE THE ORACLE AND NOTHING SAID SO. From the day
+             * the arena landed, `vdjcmp` failed its own SELF-TEST
+             * ("the same binary gave two different dumps") on every
+             * invocation, so every "verified byte-identical emitted
+             * code" claim since was unverifiable. The self-test did its
+             * job; nobody ran it. Same shape as the 2026-08-17
+             * mask-rot, one arena later.
+             */
+            /* ⛔ "no index" is the FULL 4-bit field == 4, i.e. 100b
+             * WITHOUT REX.X. With REX.X it is r12, a real index: the
+             * test used to read the 3-bit field, so
+             * `lea rax, [r14+r12]` printed as `lea rax, [r14+0x0]` -
+             * found by disasmcheck's operand comparison (2026-10-02),
+             * which the mnemonic check had passed. */
+            rm.index = idx != 4 ? idx : -1;       /* 4 == no index */
+            rm.scale = scale;
+            rm.disp = d;
+            return;
+        }
+        if (mod == 0 && (m & 7) == 5) {           /* RIP-relative disp32 */
+            rm = DecOp();
+            rm.kind = DecOp::Mem;
+            rm.rip = true;
+            rm.disp = rd32();
+            return;
+        }
+        const int32_t d = (mod == 2) ? rd32()
+                        : (mod == 1) ? int8_t(c[p++]) : 0;
+        rm = mem_op(rmf, d);   /* REX.B-extended base (r9 chains) */
+    };
+    int regf; DecOp rm;
+    uint8_t op2 = 0;             /* the 0F map's second byte */
+
+    switch (op) {
+    case 0xB8: case 0xB9: case 0xBA: case 0xBB:
+    case 0xBC: case 0xBD: case 0xBE: case 0xBF: {
+        const int rr = (op - 0xB8) + (B ? 8 : 0);
+        if (W) {
+            const uint64_t imm = rd64();
+            if (tag_name(imm, ti, tf, ta))
+                cmt = "the Type-tag constant";
+            MN("movabs"); A(dop_gpr(rr)); A(dop_imm(int64_t(imm)));
+        } else {
+            /* mov eNN, imm32 (zero-extending). Until #101 the only
+             * emitter of this form was the exit's resume-pc load, and
+             * the comment asserted that; movabs now auto-shortens
+             * every imm32-range literal to it, so the assertion would
+             * lie on ordinary staged constants - the tag comment (the
+             * REX.W arm's rule) is the one claim that stays true. */
+            const uint32_t imm = rd32();
+            if (tag_name(static_cast<uint64_t>(imm), ti, tf, ta))
+                cmt = "the Type-tag constant";
+            MN("mov"); A(dop_gpr32(rr)); A(dop_imm(int64_t(imm)));
+        }
+        break; }
+    case 0xC3: MN("ret"); break;
+    case 0x50: case 0x51: case 0x52: case 0x53:      /* push r64 */
+    case 0x54: case 0x55: case 0x56: case 0x57:
+        MN("push"); A(dop_gpr((op - 0x50) + (B ? 8 : 0))); break;
+    case 0x58: case 0x59: case 0x5A: case 0x5B:      /* pop r64 */
+    case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+        MN("pop"); A(dop_gpr((op - 0x58) + (B ? 8 : 0))); break;
+    case 0x8B: modrm(regf, rm); MN("mov"); A(dop_gpr(regf)); A(rm); break;
+    case 0x89: modrm(regf, rm); MN("mov"); A(rm); A(dop_gpr(regf)); break;
+    case 0x8D: modrm(regf, rm); MN("lea"); A(dop_gpr(regf)); A(rm);
+        break;                                /* lea (a helper's &slot arg) */
+    case 0x85: modrm(regf, rm); MN("test"); A(rm); A(dop_gpr(regf));
+        break;                                /* test (a helper's status) */
+    case 0x01: modrm(regf, rm); MN("add"); A(rm); A(dop_gpr(regf)); break;
+    case 0x29: modrm(regf, rm); MN("sub"); A(rm); A(dop_gpr(regf)); break;
+    /* The r64 <- r/m64 DIRECTION of the group-1 arithmetic (opcode
+     * bit 1 set). The `rm <- reg` forms above were here from the
+     * start; these were not, so `add rdx, [rcx+0xd8]` and
+     * `sub rcx, [rax+0x28]` - the M5b record-push address arithmetic -
+     * decoded as nothing at all. */
+    case 0x03: modrm(regf, rm); MN("add"); A(dop_gpr(regf)); A(rm); break;
+    case 0x2B: modrm(regf, rm); MN("sub"); A(dop_gpr(regf)); A(rm); break;
+    case 0x0B: modrm(regf, rm); MN("or");  A(dop_gpr(regf)); A(rm); break;
+    case 0x23: modrm(regf, rm); MN("and"); A(dop_gpr(regf)); A(rm); break;
+    case 0x33: modrm(regf, rm); MN("xor"); A(dop_gpr(regf)); A(rm); break;
+    /* movsxd r64, r/m32 - how a 32-bit frame_size / count field is
+     * widened before it is compared or added. */
+    case 0x63: modrm(regf, rm); MN("movsxd"); A(dop_gpr(regf)); A(rm);
+        break;
+    /* mov r/m8, r8 - the BYTE element store (`mov [rcx+r9], dil`, a
+     * flat array<bool> write). With REX present the source is the
+     * uniform low-byte set (dil/sil/spl/bpl), which is why this prints
+     * the low-byte name rather than gp64. */
+    case 0x88: { modrm(regf, rm);
+        MN("mov"); A(dop_byte(rm)); A(dop_gpr8(regf, rex != 0)); break; }
+    case 0x8A: { modrm(regf, rm);
+        MN("mov"); A(dop_gpr8(regf, rex != 0)); A(dop_byte(rm)); break; }
+    case 0x21: modrm(regf, rm); MN("and"); A(rm); A(dop_gpr(regf)); break;
+    case 0x09: modrm(regf, rm); MN("or");  A(rm); A(dop_gpr(regf)); break;
+    case 0x31: modrm(regf, rm); MN("xor"); A(rm); A(dop_gpr(regf)); break;
+    case 0x39: modrm(regf, rm); MN("cmp"); A(rm); A(dop_gpr(regf)); break;
+    /* ⛔ cmp rax, imm32 - the ACCUMULATOR short form (REX.W 3D id), with
+     * no modrm byte. This is what `cmp_reg_tag` emits for rax, so #96
+     * step 3 made it common, and it was undecoded: 168 corpus sites,
+     * each one also desynchronising the four immediate bytes after it.
+     * A tag-valued immediate is symbolised like the movabs form. */
+    case 0x3D: { const int32_t imm = rd32();
+        if (tag_name(uint64_t(uint32_t(imm)), ti, tf, ta))
+            cmt = "the Type-tag constant";
+        MN("cmp"); A(dop_gpr(0)); A(dop_imm(imm));
+        break; }
+    case 0x99: MN(W ? "cqo" : "cdq"); break;
+    /*
+     * ⛔ THE F7 GROUP - /3 neg AND /5 imul WERE MISSING, AND THEIR
+     * ABSENCE WAS SILENT (2026-08-19). Only /7 (idiv) was decoded;
+     * everything else printed `f7/? rdx`, which is neither a mnemonic
+     * nor a `.byte` - so the UNRELIABLE banner, which counts `.byte`
+     * lines, stayed quiet while the dump showed a placeholder. 284
+     * corpus sites: the div-magic sequence's `neg rdx` and `imul rdx`.
+     * Found by cross-checking against objdump (scripts/disasmcheck),
+     * because no self-check can see this - the decoder is the subject.
+     */
+    case 0xF7: { modrm(regf, rm); const uint8_t sub = regf & 7;
+        if (sub == 0) {                        /* test r/m64, imm32 */
+            const int32_t imm = rd32();
+            MN("test"); A(rm); A(dop_imm(imm));
+        } else {
+            static const char *const f7[8] = {
+                "", "", "not", "neg", "mul", "imul", "div", "idiv"
+            };
+            if (!*f7[sub])
+                goto undecoded;
+            MN(f7[sub]); A(rm);
+        }
+        break; }
+    case 0xC1: { modrm(regf, rm); const uint8_t imm = c[p++];
+        MN((regf & 7) == 4 ? "shl" : (regf & 7) == 5 ? "shr" : "sar");
+        A(rm); A(dop_immdec(int(imm)));
+        break; }
+    case 0x3B: { modrm(regf, rm);   /* cmp r64, r/m64 (the PushHandler
+                                     * capacity check) */
+        MN("cmp"); A(dop_gpr(regf)); A(rm); break; }
+    case 0x6B: { modrm(regf, rm);   /* imul r64, r/m64, imm8 - the SAME
+                                     * record-stride multiply when the
+                                     * stride fits a byte (0x30), which
+                                     * is the case the assembler
+                                     * actually picks */
+        const int8_t imm = int8_t(c[p++]);
+        MN("imul"); A(dop_gpr(regf)); A(rm); A(dop_immdec(int(imm)));
+        break; }
+    case 0x69: { modrm(regf, rm);   /* imul r64, r/m64, imm32 (the
+                                     * SetPend record-stride multiply) */
+        const int32_t imm = rd32();
+        MN("imul"); A(dop_gpr(regf)); A(rm); A(dop_imm(imm)); break; }
+    case 0xC6: { modrm(regf, rm);   /* /0: mov BYTE [rm], imm8 (the
+                                     * defined[gslot]=1 store) */
+        MN("mov"); A(dop_byte(rm)); A(dop_immdec(int(c[p++]))); break; }
+    case 0xC7: { modrm(regf, rm);   /* /0: mov r/m, imm32 (emit_raise's
+                                     * kind store `mov dword [rax], kind`,
+                                     * and since #96 step 3 the TYPE-TAG
+                                     * store, whose imm32 is a low-arena
+                                     * pointer - symbolise it, or the dump
+                                     * carries an ASLR-varying number) */
+        uint32_t imm = 0;
+        for (int i = 0; i < 4; i++) imm |= uint32_t(c[p++]) << (8 * i);
+        if (tag_name(uint64_t(imm), ti, tf, ta))
+            cmt = "the Type-tag constant";
+        MN("mov"); A(rm);
+        A(dop_imm(static_cast<int64_t>(static_cast<int32_t>(imm))));
+        break; }
+    case 0xD1: { modrm(regf, rm);   /* group-2 shift by 1 */
+        MN((regf & 7) == 4 ? "shl" : (regf & 7) == 5 ? "shr" : "sar");
+        A(rm); A(dop_immdec(1)); break; }
+    case 0xD3: { modrm(regf, rm);
+        MN((regf & 7) == 4 ? "shl" : (regf & 7) == 5 ? "shr" : "sar");
+        A(rm); A(dop_cl()); break; }
+    case 0xFF: { modrm(regf, rm);   /* group 5: /0 inc /1 dec /2 call
+                                     * /4 jmp /6 push (the reg field is the
+                                     * opcode extension, NOT a register) */
+        const int sub = regf & 7;
+        if (sub != 0 && sub != 1 && sub != 2 && sub != 4 && sub != 6)
+            goto undecoded;
+        MN(sub == 0 ? "inc" : sub == 1 ? "dec" : sub == 2 ? "call"
+           : sub == 4 ? "jmp" : "push");
+        A(rm);
+        break; }
+    case 0x80: { modrm(regf, rm); const uint8_t imm = c[p++];
+        MN("cmp"); A(dop_byte(rm)); A(dop_immdec(int(imm))); break; }
+    /* F6 /0: test r/m8, imm8 - the record-less return arm's frameless
+     * discriminator (bit 0 of the pushed dst word, #97 increment 2). Only
+     * /0 is emitted; the other subs of this group are not, so they stay
+     * undecoded rather than guessed. */
+    case 0xF6: { modrm(regf, rm);
+        if ((regf & 7) != 0)
+            goto undecoded;
+        const uint8_t imm = c[p++];
+        MN("test"); A(dop_byte(rm)); A(dop_immdec(int(imm))); break; }
+    /* group 1 (add/or/adc/sbb/and/sub/xor/cmp by the reg field) with an
+     * imm32 (0x81) or a sign-ext imm8 (0x83): the ref-check `cmp ecx, t_str`
+     * and the call prologue's `sub/add rsp, 8` alignment pad. */
+    case 0x81: case 0x83: { modrm(regf, rm);
+        static const char *g1[8] = {"add","or","adc","sbb",
+                                    "and","sub","xor","cmp"};
+        const int32_t imm = op == 0x81 ? rd32() : int8_t(c[p++]);
+        if (tag_name(uint64_t(uint32_t(imm)), ti, tf, ta))
+            cmt = "the Type-tag constant";
+        MN(g1[regf & 7]); A(rm); A(dop_imm(imm)); break; }
+    case 0x90: MN("nop"); break;
+    case 0xE8: { const int32_t d = rd32();
+        /* call rel32 to a C++ helper / libm. The DISPLACEMENT is the
+         * distance from this code page to the callee, so BOTH ends move
+         * under ASLR and the number is noise - and worse, its WIDTH
+         * varies (5 or 6 hex digits for the same libm target), which is
+         * what made a width-based mask in vdjcmp race with a
+         * call-based one and report a file as differing from itself.
+         * render_op prints the shape, not the digits. */
+        MN("call"); A(dop_callrel(d));
+        cmt = "rel32 call (C++ helper / libm)"; break; }
+    case 0xE9: { const int32_t d = rd32();
+        MN("jmp"); A(dop_rel(int32_t(p) + d)); break; }
+    case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75:
+    case 0x76: case 0x77: case 0x78: case 0x79: case 0x7A: case 0x7B:
+    case 0x7C: case 0x7D: case 0x7E: case 0x7F: case 0xEB: {
+        const int8_t d = int8_t(c[p++]);
+        static const char *js[16] = {"jo","jno","jb","jae","je","jne",
+            "jbe","ja","js","jns","jp","jnp","jl","jge","jle","jg"};
+        MN(op == 0xEB ? "jmp" : js[op - 0x70]);
+        A(dop_rel(int32_t(p) + d)); break; }
+    case 0x0F: {
+        const uint8_t o2 = c[p++];
+        op2 = o2;
+        /* the rm REGISTER of an SSE form is an XMM, not a GP (the
+         * generic modrm would print `rsi` for xmm6 - found live on
+         * 89_regs_float_08's xmm-pinned fj) */
+        const auto xmm_rm = [&](DecOp &x) {
+            const bool reg_form = (c[p] & 0xC0) == 0xC0;
+            const int rm_xmm = (c[p] & 7) + (B ? 8 : 0);
+            modrm(regf, x);
+            if (reg_form) x = dop_xmm(rm_xmm);
+        };
+        if (o2 == 0xAF) { modrm(regf, rm);
+            MN("imul"); A(dop_gpr(regf)); A(rm); }
+        else if (o2 >= 0x80 && o2 <= 0x8F) { const int32_t d = rd32();
+            static const char *j[16] = {"jo","jno","jb","jae","je","jne",
+                "jbe","ja","js","jns","jp","jnp","jl","jge","jle","jg"};
+            MN(j[o2 - 0x80]); A(dop_rel(int32_t(p) + d)); }
+        else if (o2 == 0x28) {         /* movaps (reg-reg fmov) */
+            xmm_rm(rm); MN("movaps"); A(dop_xmm(regf)); A(rm); }
+        else if (o2 == 0x57) {         /* xorps (#101: the cvtsi2sd
+                                        * merge-dependency break; always
+                                        * reg-reg, dst == src) */
+            xmm_rm(rm); MN("xorps"); A(dop_xmm(regf)); A(rm); }
+        else if (o2 == 0xEF && pf_66) {  /* pxor (66 [REX] 0F EF /r):
+                                        * the float divisor's zero test
+                                        * (`pxor fsb, fsb` before the
+                                        * ucomisd). Without 66 it is the
+                                        * MMX form, which the JIT never
+                                        * emits - left undecoded. */
+            xmm_rm(rm); MN("pxor"); A(dop_xmm(regf)); A(rm); }
+        else if (o2 == 0x10 || o2 == 0x11 || o2 == 0x51) {
+            xmm_rm(rm);
+            MN(o2 == 0x51 ? "sqrtsd" : "movsd");
+            if (o2 == 0x11) {           /* store direction: rm first */
+                A(rm); A(dop_xmm(regf));
+            } else {
+                A(dop_xmm(regf)); A(rm);
+            } }
+        else if (o2 == 0x58 || o2 == 0x59 || o2 == 0x5C || o2 == 0x5E) {
+            xmm_rm(rm);
+            MN(o2==0x58?"addsd":o2==0x59?"mulsd":
+               o2==0x5C?"subsd":"divsd");
+            A(dop_xmm(regf)); A(rm); }
+        else if (o2 == 0x2A) { modrm(regf, rm);
+            MN("cvtsi2sd"); A(dop_xmm(regf)); A(rm); }
+        else if (o2 == 0x6E) { modrm(regf, rm);
+            MN("movq"); A(dop_xmm(regf)); A(rm); }
+        else if (o2 == 0x7E) { modrm(regf, rm);   /* 66 REX.W 0F 7E:
+                                                   * movq r/m64, xmm */
+            MN("movq"); A(rm); A(dop_xmm(regf)); }
+        else if (o2 == 0x2E) {
+            xmm_rm(rm); MN("ucomisd"); A(dop_xmm(regf)); A(rm); }
+        else if (o2 >= 0x90 && o2 <= 0x9F) {   /* setcc r/m8 (CmpIntV) */
+            modrm(regf, rm);
+            static const char *sc[16] = {"seto","setno","setb","setae",
+                "sete","setne","setbe","seta","sets","setns","setp","setnp",
+                "setl","setge","setle","setg"};
+            MN(sc[o2 - 0x90]); A(rm); }
+        else if (o2 == 0xB6) { modrm(regf, rm);   /* movzx r32, r/m8 */
+            MN("movzx"); A(dop_gpr(regf)); A(rm); }
+        else { goto undecoded; }
+        break; }
+    default:
+        goto undecoded;
+    }
+    (void)pf_f2;
+    {
+        /* The operand WIDTH each general register operand was encoded
+         * at (DecOp::size, read by the RAW rendering only). An op with
+         * an operand-size attribute is 64-bit under REX.W, 16 under a
+         * 66 prefix, else 32; the byte forms are 8; push/pop/call/jmp
+         * default to 64. Fails towards 64, which RAW then prints as
+         * the 64-bit name - a mismatch disasmcheck reports. */
+        const int osz = W ? 64 : pf_66 ? 16 : 32;
+        const auto set_sz = [&](int i, int bits) {
+            if (i >= D.n)
+                return;
+            DecOp &x = D.ops[i];
+            if (x.kind == DecOp::Gpr) {
+                x.size = static_cast<unsigned char>(bits);
+                x.rex8 = rex != 0;
+            } else if ((x.kind == DecOp::Mem || x.kind == DecOp::Slot)
+                       && bits == 8) {
+                x.size = 8;      /* a byte memory operand */
+            }
+        };
+        const auto all_sz = [&](int bits) {
+            for (int i = 0; i < D.n; i++) set_sz(i, bits);
+        };
+        switch (op) {
+        case 0x01: case 0x03: case 0x09: case 0x0B: case 0x21: case 0x23:
+        case 0x29: case 0x2B: case 0x31: case 0x33: case 0x39: case 0x3B:
+        case 0x3D: case 0x69: case 0x6B: case 0x81: case 0x83: case 0x85:
+        case 0x89: case 0x8B: case 0x8D: case 0xC1: case 0xC7: case 0xD1:
+        case 0xD3: case 0xF7:
+            all_sz(osz); break;
+        case 0x63: set_sz(0, osz); set_sz(1, 32); break;
+        case 0x80: case 0x88: case 0x8A: case 0xC6: case 0xF6:
+            all_sz(8); break;
+        case 0xFF:
+            if (D.mn == "inc" || D.mn == "dec") all_sz(osz);
+            break;
+        case 0x0F:
+            if (op2 == 0xAF) all_sz(osz);
+            else if (op2 == 0xB6) { set_sz(0, osz); set_sz(1, 8); }
+            else if (op2 >= 0x90 && op2 <= 0x9F) all_sz(8);
+            else if (op2 == 0x2A) set_sz(1, osz);
+            break;
+        default: break;
+        }
+    }
+    D.ok = true;
+    D.len = p - start;
+    if (render)                  /* decode_ins wants the structure only */
+        out = render_ins(D, nm, ti, tf, ta);
+    if (di) *di = D;
+    return;
+    }
+    /*
+     * ⛔ ONE EXIT FOR "I DO NOT KNOW", AND IT MUST BE `.byte`.
+     *
+     * There used to be three ways to not know an instruction, and only
+     * one of them said so. `default:` emitted `.byte`, which
+     * disasm_native_frag COUNTS and reports in the `DUMP IS UNRELIABLE`
+     * banner - but an unhandled sub-opcode printed `f7/? rdx` or
+     * `ff/? rax`, and an unhandled two-byte opcode printed `.0f 0x38`.
+     * Those look like output. They are not counted, they do not trip
+     * the banner, and they claim a LENGTH the decoder has not earned -
+     * so the next instruction is read at the wrong offset.
+     *
+     * Every path now lands here: p rewinds to start + 1 and the byte is
+     * reported, so an unknown form is loud, has no length claim, and
+     * shows up in the banner exactly like every other one.
+     */
+undecoded:
+    p = start + 1;
+    out = ".byte 0x" + hex2(c[start]);
+    D = DecodedIns();
+    D.off = start;
+    D.len = 1;
+    if (di) *di = D;
+}
+
+/*
+ * MYLANG_VDJ_HEX=1 - print each instruction's RAW BYTES beside it.
+ *
+ * ⛔ THIS EXISTS SO AN INDEPENDENT DISASSEMBLER CAN CHECK OURS. The
+ * `DUMP IS UNRELIABLE` banner only catches bytes we FAILED to decode;
+ * it says nothing about a byte sequence we decode CONFIDENTLY AND
+ * WRONGLY, which is the failure that actually cost weeks (the SIB arm
+ * that never consumed its displacement printed `mov rdi,[rsp+rsp*8]`
+ * and desynchronised the whole fragment - well-formed, plausible, and
+ * wrong). No self-check can find that: the decoder is the thing under
+ * test. Only a SECOND decoder can.
+ *
+ * With the bytes in the dump, `scripts/disasmcheck` feeds them to
+ * objdump and compares both the instruction BOUNDARIES and the
+ * MNEMONICS. objdump is a development-time cross-check invoked by a
+ * script, exactly like python3 in the other scripts - it is not a
+ * build or test dependency of the interpreter.
+ */
+static bool vdj_hex_on()
+{
+    /* a VALUE check like its ADDRS sibling: `=0` means off */
+    static const bool on = env_flag_on("MYLANG_VDJ_HEX");
+    return on;
+}
+
+void disasm_native_frag(std::ostream &s, const uint8_t *code,
+                        const NativeCode::Frag &frag, const SlotNamer &nm,
+                        const std::function<std::string(const Instr &)>
+                            &render_instr,
+                        bool deleted_originals,
+                        const std::string &section)
+{
+    /* the STRUCTURED decode, collected beside the rendering rather than
+     * from a second walk: this loop already finds every fragment and
+     * the caller already named the section, and two walks are how two
+     * answers start to differ */
+    DecodedFrag *sink = nullptr;
+    if (g_jit_decode_sink) {
+        g_jit_decode_sink->push_back(DecodedFrag());
+        g_jit_decode_sink->back().section = section;
+        sink = &g_jit_decode_sink->back();
+    }
+    const void *ti = nullptr, *tf = nullptr, *ta = nullptr;
+    jit_type_singletons(ti, tf, ta);
+    s << "       . ---- native x86-64 (rbx=frame slots, rsi=int-tag,"
+      << " r8=float-tag; xmm=SSE) ----\n";
+    uint32_t p = 0, mi = 0;
+    unsigned drifted = 0, undecoded = 0;
+    bool first = true;
+    while (p < frag.len) {
+        /*
+         * ⛔ A SKIPPED MARK IS PROOF THE DECODER DRIFTED, and it is the
+         * only self-check this disassembler can have.
+         *
+         * Every `marks[i].off` is an offset the JIT recorded at a real
+         * instruction boundary. So if the decode ever steps PAST one -
+         * `off < p` - some instruction's length was wrong, and every
+         * mnemonic since then has been read at the wrong offset. That
+         * is far worse than an undecoded byte: it prints confident,
+         * well-formed, WRONG instructions.
+         *
+         * Both counts are reported at the end of the fragment rather
+         * than asserted, because `-vdj` is a debugging aid that must
+         * still produce its best effort on a fragment it cannot fully
+         * decode - but it must never do so SILENTLY. (Before 2026-08-17
+         * it did: 5543 undecoded bytes across the corpus, with nothing
+         * in the output saying the dump was untrustworthy.)
+         */
+        while (mi < frag.marks.size() && frag.marks[mi].off < p) {
+            drifted++;
+            mi++;
+        }
+        while (mi < frag.marks.size() && frag.marks[mi].off == p) {
+            const NativeCode::OpMark &mk = frag.marks[mi];
+            if (!first)
+                s << "       .\n";
+            first = false;
+            /* the mark's own copy of the op: on a delete-originals
+             * fragment (#56) the rebuilt code holds only the EnterNative
+             * head, so the op is named by its PRE-remap pc - the only
+             * numbering it still has (`vm op`, not `vm pc`, so a reader
+             * does not look for it in the listing above) */
+            if (deleted_originals)
+                s << "       . ; vm op " << mk.orig_pc << ": "
+                  << render_instr(mk.orig) << "\n";
+            else
+                s << "       . ; vm pc " << mk.vm_pc << ": "
+                  << render_instr(mk.orig) << "\n";
+            mi++;
+        }
+        const uint32_t st = p;
+        std::string mn, cmt;
+        DecodedIns di;
+        decode_one(code, frag.len, p, mn, cmt, nm, ti, tf, ta, &di);
+        if (sink)
+            sink->ins.push_back(di);
+        if (mn.compare(0, 6, ".byte ") == 0)
+            undecoded++;
+        std::ostringstream line;
+        line << "       .   +" << std::setw(3) << std::setfill(' ')
+             << std::dec << st << ": ";
+        if (vdj_hex_on()) {
+            std::ostringstream hx;
+            for (uint32_t q = st; q < p; q++)
+                hx << hex2(code[q]);
+            line << "{" << hx.str() << "} ";
+        }
+        line << mn;
+        if (!cmt.empty())
+            line << std::string(mn.size() < 26 ? 26 - mn.size() : 1, ' ')
+                 << "; " << cmt;
+        s << line.str() << "\n";
+    }
+    /* close the native block so it doesn't run into the next VM op */
+    if (undecoded || drifted) {
+        s << "       . ---- ⛔ DUMP IS UNRELIABLE: " << undecoded
+          << " undecoded byte(s), " << drifted << " skipped op mark(s)"
+          << " - decode_one is missing an opcode this fragment uses;"
+          << " see disasm.cpp ----\n";
+    }
+    s << "       . ---- end native ----\n";
+}
+
+}  // namespace
+
+/*
+ * THE JIT PROFILE MAP - see the contract in disasm.h. One header line
+ * per fragment plus one line per decoded instruction, at the RUNTIME
+ * address, appended to the file named by MYLANG_JIT_MAP.
+ *
+ * It reuses `decode_one`, the SAME decoder `-vdj` uses and that
+ * `scripts/disasmcheck` cross-checks against objdump - so a length
+ * this writes is a length objdump agrees with, which is what makes the
+ * address join sound. An undecodable byte would desynchronise the rest
+ * of the fragment, so the writer reports it in the header rather than
+ * emitting addresses it cannot stand behind.
+ */
+void jit_write_map(const Chunk &chunk, const std::string &name)
+{
+    const std::optional<std::string> path = env_get("MYLANG_JIT_MAP");
+    if (!path || path->empty() || !chunk.native.base)
+        return;
+    FILE *f = file_open(path->c_str(), "a");
+    if (!f)
+        return;
+    const uint8_t *base = static_cast<const uint8_t *>(chunk.native.base);
+    const SlotNamer nm = [](int i) {
+        return "s" + std::to_string(i);
+    };
+    for (size_t r = 0; r < chunk.native.frags.size(); r++) {
+        const NativeCode::Frag &fr = chunk.native.frags[r];
+        const uint8_t *code = base + fr.start;
+        uint32_t p = 0, undecoded = 0;
+        std::string body;
+        while (p < fr.len) {
+            const uint32_t st = p;
+            std::string mn, cmt;
+            /* a REAL namer: decode_one CALLS it for every slot operand,
+             * and an empty std::function throws bad_function_call (which
+             * a `noexcept`-free path turns into terminate - watched). */
+            decode_one(code, fr.len, p, mn, cmt, nm, nullptr,
+                       nullptr, nullptr);
+            if (mn.compare(0, 6, ".byte ") == 0)
+                undecoded++;
+            char buf[64];
+            snprintf(buf, sizeof(buf), "i %p %u ",
+                     static_cast<const void *>(code + st), p - st);
+            body += buf;
+            body += mn;
+            body += "\n";
+        }
+        fprintf(f, "frag %p %u %s#%zu undecoded=%u\n",
+                static_cast<const void *>(code), fr.len, name.c_str(), r,
+                undecoded);
+        fputs(body.c_str(), f);
+    }
+    fclose(f);
+}
+
 std::string disassemble(const Chunk &chunk, const std::string &title,
-                        const std::vector<std::string> &cap_names)
+                        const std::vector<std::string> &cap_names,
+                        const JitCtx *jc)
 {
     std::ostringstream s;
     s << "; ===== " << title << "  (" << chunk.code.size() << " instr, "
@@ -354,6 +1620,107 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         s << " }\n";
     }
     s << "; registers: a source var reads by NAME; `rN` is a scratch temp\n";
+
+    /* The frame's slot map: named locals (slot < slot_count) then the
+     * scratch-temp range. A `subscript.v r7 = r4[r5]` reads clearly once
+     * you can look r4/r5/r7 up here (temps have no source name). */
+    {
+        int named = 0;
+        for (int sl = 0; sl < chunk.slot_count; sl++)
+            if (static_cast<size_t>(sl) < chunk.slot_names.size()
+                    && !chunk.slot_names[sl].empty())
+                named++;
+        s << "; frame: " << chunk.slot_count << " locals + "
+          << chunk.n_temps << " temps = "
+          << (chunk.slot_count + chunk.n_temps) << " slots";
+        if (chunk.n_temps > 0)
+            s << "  (r" << chunk.slot_count << "..r"
+              << (chunk.slot_count + chunk.n_temps - 1) << " are temps)";
+        s << "\n";
+        /*
+         * -vdj only: the slots that may hold a reference (ref_slots, and
+         * ref_slots_raw for a raw-scalar bind) - what the frame pop
+         * releases and every JIT tier guards. DERIVED, never stored, and
+         * NOT in -vd on purpose: a compile and its image may disagree
+         * here (the loader re-derives from the final code and cannot
+         * verify every call's scalar-result claim), and -vd is the
+         * image round trip's oracle, which must stay exact.
+         */
+        const auto refs = [&](const char *nm,
+                              const std::vector<int32_t> &v) {
+            s << "; " << nm << ":";
+            if (v.empty())
+                s << " none";
+            for (const int32_t r : v)
+                s << " r" << r;
+            s << "\n";
+        };
+        if (g_jit_annotate) {
+            refs("refs", chunk.ref_slots);
+            if (chunk.ref_slots_raw != chunk.ref_slots)
+                refs("refs (raw-scalar bind)", chunk.ref_slots_raw);
+        }
+        if (named) {
+            for (int sl = 0; sl < chunk.slot_count; sl++)
+                if (static_cast<size_t>(sl) < chunk.slot_names.size()
+                        && !chunk.slot_names[sl].empty())
+                    s << ";   r" << sl << " -> " << chunk.slot_names[sl]
+                      << "\n";
+        }
+    }
+    if (chunk.native_leaf)
+        s << "; native_leaf: whole body -> one fragment @+"
+          << chunk.native_entry_off << "  (call-able; #55)\n";
+    /* #97 inc 2: the second prologue, emitted only when MAIN's pre-pass
+     * (jit_mark_frameless_wanted) found a site that will call it */
+    if (chunk.frameless_entry_off >= 0)
+        s << "; frameless entry @+" << chunk.frameless_entry_off
+          << "  (a leaf main calls with no record; #97)\n";
+    /* plans/archived/model-flip.md M1: the container plan - how this body partitions
+     * into NATIVE / ISLAND segments, and whether it could be ONE native
+     * container. For a mixed body, list each island's pc span + the distinct
+     * un-nativizable opcodes blocking it (the "what to nativize next" surface).
+     * DUMP-ONLY; no emission consumes it yet. */
+    {
+        const ContainerPlan plan = jit_container_plan(chunk, jc);
+        if (!plan.segs.empty()) {
+            /* A native_leaf is container-ready by definition; its own header
+             * line already says so, so only note READY for the interesting
+             * not-a-leaf-yet-ready case (below MIN_RUN, multi-run, or no
+             * trailing ReturnV - all things the flip WOULD nativize). */
+            if (plan.container_ready && !chunk.native_leaf)
+                s << "; container plan: READY - whole body native ("
+                  << plan.native_op_count << " ops, "
+                  << plan.segs.size() << " native run"
+                  << (plan.segs.size() == 1 ? "" : "s") << ")\n";
+            else if (!plan.container_ready) {
+                s << "; container plan: NOT ready - " << plan.island_count
+                  << " island" << (plan.island_count == 1 ? "" : "s") << " ("
+                  << plan.island_op_count << " island ops, "
+                  << plan.native_op_count << " native ops)\n";
+                for (const ContainerSeg &sg : plan.segs) {
+                    if (sg.native)
+                        continue;
+                    s << ";   island [pc " << sg.begin << ".." << sg.end
+                      << "):";
+                    /* distinct blocker opcodes, in first-seen order */
+                    std::vector<OpCode> seen;
+                    for (size_t p = sg.begin; p < sg.end; p++) {
+                        const OpCode op = chunk.code[p].op;
+                        bool have = false;
+                        for (OpCode q : seen)
+                            if (q == op) { have = true; break; }
+                        if (!have) {
+                            seen.push_back(op);
+                            s << " " << opcode_name(op);
+                        }
+                    }
+                    s << "\n";
+                }
+            }
+        }
+    }
+    s << "\n";   /* separate the header block from the code */
 
     /* A capture slot as its field name (the anon capture-struct field), else
      * `cN`. */
@@ -383,9 +1750,16 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         if (kind == 2) return "c" + std::to_string(slot);    /* capture */
         return reg(chunk, slot);                             /* local (or -1) */
     };
+    /* A builtin-table entry as `name` when resolvable, else `builtin[N]`.
+     * Robust: a value-ABI adapter whose fn-pointer doesn't match the
+     * registry, or a non-Builtin slot, falls back to the index. */
+    auto BLT = [&](int_type idx) -> std::string {
+        return std::string(builtin_slot_name(static_cast<int>(idx)));
+    };
 
-    for (size_t pc = 0; pc < chunk.code.size(); pc++) {
-        const Instr &in = chunk.code[pc];
+    /* Render ONE VM op's mnemonic (shared by the main listing and the
+     * -vdj native fragment's `; vm pc N: <op>` markers). */
+    auto render_instr = [&](const Instr &in) -> std::string {
         std::ostringstream row;
 
         switch (in.op) {
@@ -402,45 +1776,39 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "throw        " << D(in.a_slot());
             break;
         case OpCode::PushHandler:
-            row << "try.push     catch=L" << in.target;
+            /* #78 step D: no catch pc - the region id names the
+             * handler_sites entry the raise path dispatches from. */
+            row << "try.push     region=" << in.a_lit();
             break;
         case OpCode::PopHandler:
             row << "try.pop";
             break;
-        case OpCode::CatchTest: {
-            row << "catch.test   ";
-            if (in.a_lit() < 0)
-                row << "(any)";
-            else {
-                const auto &names = chunk.catch_types[in.a_lit()];
-                for (size_t i = 0; i < names.size(); i++)
-                    row << (i ? "|" : "") << names[i];
-            }
-            if (in.target2 >= 0)
-                row << " as " << reg(chunk, in.target2);
-            row << " -> L" << in.target;
-            break;
-        }
-        case OpCode::Reraise:
-            row << "reraise";
-            break;
         case OpCode::Rethrow:
-            row << "rethrow";
+            row << "rethrow      region=" << in.a_lit();
             break;
         case OpCode::SetPend:
             /* Only the shared finally's exits: normal or reraise (a flow op
              * inlines its own finally, so it never sets a pending action). */
             row << "set.pend     "
-                << (in.target == 0 ? "normal" : "reraise");
+                << (in.target == 0 ? "normal" : "reraise")
+                << "  region=" << in.a_lit()
+                << (in.target2 == 1 ? "  drop" : "");
             break;
         case OpCode::EndFinally:
-            row << "end.finally";
+            row << "end.finally  region=" << in.a_lit();
             break;
 
         case OpCode::IntBin:
             row << "i.bin        " << D(in.target) << " = "
                 << RI(in.a(), false) << " " << opsym(in.aop) << " "
                 << RI(in.b(), false);
+            break;
+        case OpCode::CmpIntV:
+        case OpCode::CmpFloatV:
+            row << (in.op == OpCode::CmpIntV ? "i.cmp.v      "
+                                             : "f.cmp.v      ")
+                << D(in.target) << " = " << RI(in.a(), false) << " "
+                << opsym(in.aop) << " " << RI(in.b(), false) << "   ; bool";
             break;
         /* B1/B2 specialized arithmetic: same 3-address render, the operator
          * baked in the opcode (the shape is visible from the operands). */
@@ -490,7 +1858,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             /* E4 fusion */
             row << "i.addmod     " << D(in.target) << " = ("
                 << RI(in.a(), false) << " + " << RI(in.b(), false)
-                << ") % #" << in.target2;
+                << ") % " << in.target2;
             break;
         case OpCode::JumpUnlessElemInt:
             /* E4 fusion */
@@ -503,7 +1871,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << RI(in.b(), false) << "; " << D(in.target2)
                 << (in.aop == Op::lt || in.aop == Op::le ? "++" : "--")
                 << ", if " << D(in.target2) << " " << opsym(in.aop) << " "
-                << (in.a_is_lit() ? "#" : "r")
+                << (in.a_is_lit() ? "" : "r")
                 << in.a_dual_hi() << " -> L" << in.target;
             break;
         case OpCode::ForStepElemInt:
@@ -514,6 +1882,16 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << RI(in.a(), false) << ": " << D(in.b_dual_hi()) << " = "
                 << D(in.b_dual_lo()) << "[" << D(in.target2)
                 << "] -> L" << in.target;
+            break;
+        case OpCode::EnterNative:
+            /* native-AOT: the fragment entry (jit.cpp; bytes auditable
+             * via `objdump -D -b binary -m i386:x86-64` on the dump) */
+            row << "enter.nat    frag@+" << in.a_lit();
+            break;
+        case OpCode::ExitBlock:
+            /* model-flip M2: an island's fall-through exit; a_lit = the pc the
+             * container resumes at. Not emitted by codegen yet (M3). */
+            row << "exit.block   -> L" << in.a_lit();
             break;
         case OpCode::StructFieldAddInt:
             /* #9 fusion: b_dual = (field idx, other slot) */
@@ -528,6 +1906,16 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::LoadElemFloat:
             row << "load.elem.f  " << D(in.target) << " = " << D(in.target2)
                 << "[" << RI(in.a(), false) << "]";
+            break;
+        case OpCode::LoadElem2Int:
+        case OpCode::LoadElem2Float:
+            /* the fused nested read - the row is BORROWED, never boxed */
+            row << (in.op == OpCode::LoadElem2Int ? "load.elem2.i "
+                                                  : "load.elem2.f ")
+                << D(in.target) << " = " << D(in.target2)
+                << "[" << D(in.a_dual_lo()) << "]["
+                << RI(in.b(), false) << "]   ; locs[" << in.a_dual_hi()
+                << "]";
             break;
         case OpCode::LoadElemBool:
             row << "load.elem.b  " << D(in.target) << " = " << D(in.target2)
@@ -582,7 +1970,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << "] (" << in.b_lit() << ")";
             break;
         case OpCode::UnpackElemTargets: {
-            row << "unpack.elem.t targets#" << in.target << " = "
+            row << "unpack.elem.t targets[" << in.target << "]" << " = "
                 << D(in.target2) << "[" << RI(in.a(), false) << "] ("
                 << in.b_lit() << ") [";
             const std::vector<int32_t> &tg = chunk.unpack_targets[in.target];
@@ -611,6 +1999,27 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "arr.len      " << D(in.target) << " = len("
                 << D(in.target2) << ")";
             break;
+        case OpCode::ArrEpochMark:      /* #53 option 1 */
+            row << "arr.mark     " << D(in.target) << " = epoch("
+                << D(in.target2) << ")";
+            break;
+        case OpCode::ArrEpochCheck:
+            row << "arr.check    epoch(" << D(in.target2) << ") == "
+                << RI(in.a(), false) << "   ; else OutOfBounds";
+            break;
+        case OpCode::UnpackLenCheck:
+        {
+            const int_type fl = in.b_is_lit() ? in.b_lit() : 0;
+            row << "unpack.len   ";
+            if (in.target >= 0)
+                row << D(in.target) << " = flat "
+                    << ((fl & 2) ? "int" : "float") << "(" << D(in.target2)
+                    << ") ; ";
+            row << "len(" << D(in.target2) << ") == "
+                << (in.a_is_lit() ? in.a_lit() : -1) << " else the strict "
+                << ((fl & 1) ? "foreach " : "") << "unpack error";
+        }
+            break;
         case OpCode::StrLen:
             row << "str.len      " << D(in.target) << " = len("
                 << D(in.target2) << ")   ; str chars";
@@ -618,6 +2027,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::LoadStrChar:
             row << "load.strchar " << D(in.target) << " = "
                 << D(in.target2) << "[" << RI(in.a(), false) << "]";
+            break;
+        case OpCode::OrdCharV:
+            row << "ord.char     " << D(in.target) << " = ord("
+                << D(in.target2) << "[" << RI(in.a(), false) << "])";
             break;
         case OpCode::StoreElemInt:
             row << "store.elem.i " << bref(in.target, in.target2) << "["
@@ -631,22 +2044,14 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         case OpCode::DictStore: {
             /* aop is the Expr14 op (assign/addeq/...), not the arith form. */
-            const char *o = in.aop == Op::assign ? "=" :
-                            in.aop == Op::addeq  ? "+=" :
-                            in.aop == Op::subeq  ? "-=" :
-                            in.aop == Op::muleq  ? "*=" :
-                            in.aop == Op::diveq  ? "/=" : "%=";
+            const std::string o = expr14_op(in.aop);
             row << "dict.store   " << bref(in.target, in.target2) << "["
                 << RI(in.a(), false) << "] " << o << " " << RI(in.b(), false);
             break;
         }
         case OpCode::StoreMemberV: {
             /* aop is the Expr14 op; the member name comes from the pool. */
-            const char *o = in.aop == Op::assign ? "=" :
-                            in.aop == Op::addeq  ? "+=" :
-                            in.aop == Op::subeq  ? "-=" :
-                            in.aop == Op::muleq  ? "*=" :
-                            in.aop == Op::diveq  ? "/=" : "%=";
+            const std::string o = expr14_op(in.aop);
             row << "member.store " << bref(in.target, in.target2) << "."
                 << chunk.member_keys[in.a_lit()].memId.get_type()
                        ->to_string(chunk.member_keys[in.a_lit()].memId)
@@ -654,21 +2059,13 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         }
         case OpCode::StoreElemValue: {
-            const char *o = in.aop == Op::assign ? "=" :
-                            in.aop == Op::addeq  ? "+=" :
-                            in.aop == Op::subeq  ? "-=" :
-                            in.aop == Op::muleq  ? "*=" :
-                            in.aop == Op::diveq  ? "/=" : "%=";
+            const std::string o = expr14_op(in.aop);
             row << "store.elem.v " << bref(in.target, in.target2) << "["
                 << RI(in.a(), false) << "] " << o << " " << RI(in.b(), false);
             break;
         }
         case OpCode::StoreElem2V: {
-            const char *o = in.aop == Op::assign ? "=" :
-                            in.aop == Op::addeq  ? "+=" :
-                            in.aop == Op::subeq  ? "-=" :
-                            in.aop == Op::muleq  ? "*=" :
-                            in.aop == Op::diveq  ? "/=" : "%=";
+            const std::string o = expr14_op(in.aop);
             row << "store.elem2 " << D(in.target2) << "[" << RI(in.a(), false)
                 << "][" << RI(in.b(), false) << "] " << o << " " << D(in.target);
             break;
@@ -821,8 +2218,12 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             const int nvals = static_cast<int>(bc.args.size()) - 1;
             row << "call.blt.lvm " << D(in.target) << " = "
                 << builtin_call_name(chunk, bcidx) << "("
-                << lval_ref(in.a_dual_hi(), in.target2) << "."
-                << (bc.member ? bc.member->val : "?");
+                << lval_ref(in.a_dual_hi(), in.target2);
+            if (bc.steps.empty())       /* #32: else the chain form */
+                row << "." << (bc.member ? bc.member->val : "?");
+            for (const Chunk::ChainStep &st : bc.steps)
+                row << (st.is_member ? ".<m#" : "[r")
+                    << st.operand << (st.is_member ? ">" : "]");
             for (int i = 0; i < nvals; i++)
                 row << ", " << reg(chunk, in.b_lit() + i);
             row << ")";
@@ -853,20 +2254,74 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "call.val.dyn " << D(in.target) << " = " << D(in.target2)
                 << arglist(chunk, in.a_lit(),
                            static_cast<int>(in.b_lit() & 0xfff))
-                << "   ; runtime dispatch, site #" << (in.b_lit() >> 12);
+                << "   ; runtime dispatch, site [" << (in.b_lit() >> 12) << "]";
+            break;
+        case OpCode::CheckNoneArgsV:
+            /* RULE 1: the next call's callee (g<n> = a global slot, as
+             * call.v shows it) and its argument run */
+            row << "check.none   "
+                << (in.target == 0 ? D(in.target2)
+                                   : "g" + std::to_string(in.target2))
+                << arglist(chunk, in.a_lit(), in.b_lit())
+                << "  ; throw if none meets a non-opt parameter";
             break;
         case OpCode::CheckCallableV:
             row << "check.call   " << RI(in.a(), false)
                 << "  ; throw if not callable";
+            break;
+        case OpCode::LoadBoxV: {
+            /* `*b`: the box's value, checked against the proven box */
+            static const char *const wants[] = {
+                nullptr, "int", "float", "bool", "str" };
+            const int_type w = in.b_lit();
+            row << "load.box     " << D(in.target) << " = *"
+                << RI(in.a(), false);
+            if (w >= 1 && w <= 4)
+                row << "  ; box<" << wants[w] << ">";
+            else if (w == 5 && in.target2 >= 0
+                     && static_cast<size_t>(in.target2)
+                            < chunk.struct_defs.size())
+                row << "  ; box<"
+                    << chunk.struct_defs[in.target2]->name->val << ">";
+            break;
+        }
+        case OpCode::StoreBoxV:
+            row << "store.box    *" << RI(in.a(), false) << " = "
+                << RI(in.b(), false);
+            break;
+        case OpCode::StampTypeV:
+            /* Q2: an array sum takes its static type */
+            row << "stamp.type   " << RI(in.a(), false) << "  ; "
+                << annot_text(chunk.ctype_ref(
+                       static_cast<unsigned>(in.target2)));
+            break;
+        case OpCode::CastV:
+            row << "cast         " << D(in.target) << " = "
+                << RI(in.a(), false) << "  ; cast<"
+                << annot_type_text(chunk.cast_types[
+                       static_cast<size_t>(in.target2)])
+                << ">";
+            break;
+        case OpCode::CheckFitV:
+            /* #49: the value a store is about to put into a typed place */
+            row << "check.fit    " << RI(in.a(), false) << "  ; fit ["
+                << in.target2 << "]";
             break;
         case OpCode::CheckFuncV:
             row << "check.func   " << RI(in.a(), false)
                 << "  ; throw if not a function";
             break;
         case OpCode::MapFilterV:
-            row << (in.target2 ? "filter       " : "map          ")
+            row << ((in.target2 & 1) ? "filter       " : "map          ")
                 << D(in.target) << " = " << RI(in.a(), false) << "("
                 << RI(in.b(), false) << ")";
+            if ((in.target2 >> 1) & 3)
+                row << "  ; flat "
+                    << ((((in.target2 >> 1) & 3) == 1) ? "int"
+                        : (((in.target2 >> 1) & 3) == 2) ? "float" : "bool");
+            if (const TypeAnnot *t = chunk.ctype_ref(
+                    static_cast<unsigned>(in.target2) >> 3))
+                row << "  ; " << annot_text(t);
             break;
         case OpCode::ReturnV:
             row << "return.v     " << RI(in.a(), false);
@@ -874,21 +2329,40 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::MakeArrayV:
             row << "make.arr     " << D(in.target) << " = "
                 << arglist(chunk, in.a_lit(), in.b_lit())
-                << "  ; array literal, hint " << in.target2;
+                << "  ; array literal, hint " << (in.target2 & 0xff);
+            if (const TypeAnnot *t = chunk.ctype_ref(
+                    static_cast<unsigned>(in.target2) >> 8))
+                row << ", " << annot_text(t);
             break;
         case OpCode::MakeDictV:
             row << "make.dict    " << D(in.target) << " = "
                 << arglist(chunk, in.a_lit(), 2 * in.b_lit())
                 << "  ; dict literal (" << in.b_lit() << " pairs)";
+            if (const TypeAnnot *t = chunk.ctype_ref(
+                    static_cast<unsigned>(in.target2)))
+                row << ", " << annot_text(t);
             break;
         case OpCode::MakeClosureV:
             row << "make.closure " << D(in.target) << " = closure_defs["
                 << in.target2 << "]";
+            if (in.a_dual_hi() > 0)             /* #97 increment 3 */
+                row << "   ; captures from " << D(in.a_dual_lo())
+                    << " (spliced)";
             break;
         case OpCode::StructCtorV:
             row << "struct.ctor  " << D(in.target) << " = struct_defs["
-                << in.target2 << "]("
-                << arglist(chunk, in.a_lit(), in.b_lit()) << ")";
+                << in.target2 << "](";
+            if (in.b_dual_hi() >= 0) {
+                /* planned: print each field's SRC slot (a direct local or
+                 * a computed-run temp; a is the computed mini-run dual) */
+                const Chunk::CtorPlan &cp =
+                    chunk.ctor_plans[in.b_dual_hi()];
+                for (size_t k = 0; k < cp.f.size(); k++)
+                    row << (k ? ", " : "") << D(cp.f[k].src);
+                row << ") plan[" << in.b_dual_hi() << "]";
+            } else {
+                row << arglist(chunk, in.a_lit(), in.b_dual_lo()) << ")";
+            }
             break;
         case OpCode::StructCtorBoxedV: {
             const Chunk::BoxedCtor &bc = chunk.boxed_ctors[in.target2];
@@ -915,10 +2389,10 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             break;
         }
         case OpCode::LoadImmInt:
-            row << "load         " << D(in.target) << ", #" << in.a_lit();
+            row << "load         " << D(in.target) << ", " << in.a_lit();
             break;
         case OpCode::LoadImmFloat:
-            row << "load         " << D(in.target) << ", #" << in.a_flit();
+            row << "load         " << D(in.target) << ", " << flit_str(in.a_flit());
             break;
         case OpCode::LoadConstV: {
             const EvalValue &c = chunk.consts[in.target2];
@@ -992,8 +2466,8 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << "]";
             break;
         case OpCode::LoadBuiltinV:
-            row << "load.builtin " << D(in.target) << ", builtin["
-                << in.target2 << "]";
+            row << "load.builtin " << D(in.target) << ", " << BLT(in.target2)
+                << "   ; = builtin[" << in.target2 << "]";
             break;
         case OpCode::SubscriptV:
             row << "subscript.v  " << D(in.target) << " = " << D(in.target2)
@@ -1013,6 +2487,8 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << D(in.target) << " = " << D(in.target2) << "."
                 << chunk.member_keys[in.a_lit()].memId.get_type()
                        ->to_string(chunk.member_keys[in.a_lit()].memId);
+            if (in.b_dual_lo() >= 0)
+                row << " @+" << in.b_dual_lo();     /* baked byte offset */
             break;
         case OpCode::SliceV:
             row << "slice.v      " << D(in.target) << " = " << D(in.target2)
@@ -1029,18 +2505,119 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "jmp.notnone  " << RI(in.a(), false) << ", L" << in.target
                 << "   ; ?? short-circuit";
             break;
+        case OpCode::GuardCalleeV:
+            row << "guard.callee " << D(in.a_slot()) << " is closure_defs["
+                << in.target2 << "], else L" << in.target
+                << "   ; inlined value call";
+            break;
+        case OpCode::LoadCaptureOfV:
+            row << "load.capof   " << D(in.target) << ", "
+                << D(in.a_slot()) << ".cap[" << in.target2 << "]";
+            break;
+        case OpCode::StoreCaptureOfV:
+            row << "store.capof  " << D(in.b_slot()) << ".cap[" << in.target
+                << "] = " << RI(in.a(), false);
+            break;
         case OpCode::Halt:
             row << "halt";
             break;
         }
+        /* Q2: a store checked against the container's own type */
+        if (Instr::ct_store_op(in.op) && in.ct_checked())
+            row << "  ; checked";
+        return row.str();
+    };
 
-        s << std::setw(4) << pc << "  " << row.str() << "\n";
+    for (size_t pc = 0; pc < chunk.code.size(); pc++) {
+        const Instr &in = chunk.code[pc];
+        s << std::setw(4) << pc << "  " << render_instr(in) << "\n";
+
+        /* -vdj: after an EnterNative line, disassemble its fragment. */
+        if (in.op == OpCode::EnterNative && chunk.native.base
+                && !chunk.native.frags.empty()) {
+            const uint32_t off = static_cast<uint32_t>(in.a_lit());
+            for (const NativeCode::Frag &fr : chunk.native.frags)
+                if (fr.start == off) {
+                    /* a fragment whose ops were DELETED (#56) has more
+                     * marks than the surviving code has ops after its
+                     * head - its marks name the originals */
+                    bool deleted = false;
+                    for (const NativeCode::OpMark &mk : fr.marks)
+                        if (mk.vm_pc >= chunk.code.size()
+                                || chunk.code[mk.vm_pc].op != mk.orig.op) {
+                            deleted = true;
+                            break;
+                        }
+                    disasm_native_frag(
+                        s, static_cast<const uint8_t *>(chunk.native.base)
+                               + fr.start, fr,
+                        [&chunk](int sl) { return reg(chunk, sl); },
+                        render_instr, deleted, title);
+                    break;
+                }
+        }
     }
 
     /* The serializable POOLS + side tables this chunk carries (a `.myv` file
      * stores exactly these) - printed after the code, non-empty ones only. */
     dump_chunk_pools(chunk, s);
 
+    return s.str();
+}
+
+/*
+ * The LOADED-IMAGE dump (.myv): the same sections disassemble_program emits,
+ * but read from a VmProgram instead of re-compiling an AST - no AST exists
+ * after a load. Titles come from the descriptors (the same `func <name>` /
+ * `closure#N` / `lambda#N` scheme), so a round-trip dump is byte-identical
+ * to the source-side one.
+ */
+std::string disassemble_image(const VmProgram &prog)
+{
+    std::ostringstream s;
+
+    if (!prog.structs.empty()) {
+        s << "; ===== types (" << prog.structs.size() << ") =====\n";
+        for (const auto &sd : prog.structs)
+            dump_struct_type(sd.get(), s);
+        s << "\n";
+    }
+    g_dis_structs.clear();
+    for (const auto &sd : prog.structs)
+        g_dis_structs.push_back(sd.get());
+
+    /* the JitCtx the load's JIT used for each chunk (vm_jit_program):
+     * the M1 container plan below asks the native-call gate, whose answer
+     * for a self-call depends on it - with none, an image's dump said
+     * READY where the fresh compile's said "islands" (a sanitized build,
+     * where the native stack is off) */
+    const std::vector<const FuncDescriptor *> slot_desc =
+        vm_image_slot_desc(prog);
+    JitCtx mjc;
+    mjc.slot_desc = &slot_desc;
+    mjc.slot_reassigned = &prog.global_slot_reassigned;
+    s << disassemble(prog.root, "main", {}, &mjc);
+
+    int anon = 0;
+    for (const auto &d : prog.funcs) {
+        if (!d->vm_chunk)
+            continue;
+        JitCtx djc;
+        djc.slot_desc = &slot_desc;
+        djc.slot_reassigned = &prog.global_slot_reassigned;
+        djc.caller_desc = d.get();
+        std::vector<std::string> cap_names;
+        for (const auto &c : d->captures)
+            cap_names.push_back(std::string(c.name->val));
+        std::string title;
+        if (d->name)
+            title = "func " + std::string(d->name->val);
+        else
+            title = (cap_names.empty() ? "lambda#" : "closure#")
+                    + std::to_string(anon++);
+        s << "\n" << disassemble(*static_cast<const Chunk *>(d->vm_chunk),
+                                 title, cap_names, &djc);
+    }
     return s.str();
 }
 
@@ -1059,24 +2636,134 @@ std::string disassemble_program(const Block *root)
             dump_struct_type(sd->def, s);
         s << "\n";
     }
-
-    s << disassemble(codegen_program(root), "main");
+    g_dis_structs.clear();
+    for (const StructDeclStmt *sd : structs)
+        g_dis_structs.push_back(sd->def);
 
     std::vector<const FuncDeclStmt *> funcs;
     for (const auto &e : root->elems)
         collect_funcs(e.get(), funcs);
 
-    /* Drive off the COMPILED CHUNK SET, not the raw AST walk: codegen_func_body
-     * compiles a function ONLY if it has bytecode (skips a base template - a
-     * monomorphization source that is never called/compiled - a non-scope-free
-     * closure, and an all-fallback body). So a base template shows NO chunk
-     * because it HAS none (it does not exist as a chunk), not because we filter
-     * it - a faithful bytecode image. (When every function is native, this set
-     * equals all non-template functions.) */
-    int anon = 0;
+    /* #97 E1: the same live-descriptor set a real compile installs - this is
+     * a SECOND codegen driver, and without it `-vd` dumps the un-baked form
+     * of a program a real run bakes (caught exactly that way: the image had
+     * the value_callees table and the fresh dump did not). */
+    CodegenLiveDescs live_guard(funcs);
+
+    /* #55 STEP 2: dump EXACTLY what execution runs, native calls included. The
+     * VM's precompile (vm_precompile_all) codegens ALL bodies THEN jits ALL
+     * with a JitCtx (the slot->descriptor map) so a caller's native-call gate
+     * sees every callee's native_leaf flag; a per-function codegen+jit here
+     * (with no JitCtx) would show interpreted CallVs instead. Replicate that
+     * two-pass on THROWAWAY chunks, pointing each descriptor's `vm_chunk` at its
+     * local chunk for the gate's native_leaf check, and RESTORE it after (so a
+     * later execution / a test in the same process is unaffected). */
+    std::unordered_map<const FuncDescriptor *, Chunk> chunks;
+    std::vector<std::pair<const FuncDescriptor *, const void *>> saved;
+
+    /* Pass A: codegen every compiled body (jit=false) - the native_leaf flag is
+     * set by codegen_chunk. Point each desc->vm_chunk at its local chunk. */
     for (const FuncDeclStmt *fn : funcs) {
         Chunk ck;
-        if (!codegen_func_body(fn, ck))
+        /* codegen_func_body compiles ONLY a function with bytecode (skips a base
+         * template - a never-called monomorphization source - and a
+         * non-scope-free closure). A skipped function shows NO chunk because it
+         * HAS none, a faithful image. */
+        if (!codegen_func_body(fn, ck, /*jit=*/false))
+            continue;
+        auto it = chunks.emplace(fn->desc, std::move(ck)).first;
+        saved.push_back({ fn->desc, fn->desc->vm_chunk });
+        fn->desc->vm_chunk = &it->second;
+    }
+    Chunk main_ck = codegen_program(root, /*jit=*/false);
+
+    /* The global slot -> callee descriptor map (as vm_precompile_all builds). */
+    std::vector<const FuncDescriptor *> slot_desc(
+        root->global_func_names.size(), nullptr);
+    for (const FuncDeclStmt *fn : funcs)
+        if (fn->id && fn->id->sym.kind == SymKind::global) {
+            const int slot = fn->id->sym.slot;
+            if (slot >= 0 && static_cast<size_t>(slot) < slot_desc.size())
+                slot_desc[slot] = fn->desc;
+        }
+
+    /* `fast_bind` is computed by vm_precompile_all's pass A and the SPLICE
+     * gates on it (a typed param needs the coercing bind, which a MoveV is
+     * not) - so it must be set here too, or a -vd dump would decline an
+     * inline that execution performs. */
+    for (const FuncDeclStmt *fn : funcs)
+        compute_bind_flags(fn->desc);
+
+    /* THE SPLICE, before the jit pass, exactly as vm_precompile_all does -
+     * otherwise -vd would dump the un-inlined bytecode and lie about what
+     * runs (the dump is the audit surface for the .myv image). */
+    /*
+     * ⛔ ITERATE `funcs` (SOURCE ORDER), NOT `chunks` - IT IS AN
+     * unordered_map KEYED BY A POINTER (2026-08-18).
+     *
+     * These three passes used to walk `chunks` directly. Its key is a
+     * `const FuncDescriptor *`, so the iteration order is a hash of
+     * HEAP ADDRESSES - which differ between two parses of the same
+     * source in the same process, and between two processes. Splice
+     * and JIT order is observable in the dump (the code arena is filled
+     * in that order), so `-vdj` was NON-DETERMINISTIC on any program
+     * with more than one compiled function.
+     *
+     * It surfaced as a red Coverage lane: the new `-vdj decodes every
+     * emitted form, reproducibly` check compared two dumps of one
+     * struct program and they differed - on CI, on the first try, after
+     * eight clean local runs. The disassembler was innocent; the DUMP
+     * DRIVER was not. Same family as the builtin-slot hazard in
+     * serialize.cpp, where a `std::map` keyed by an interned pointer
+     * gave a different slot order per process (CLAUDE.md).
+     *
+     * `funcs` is built by a source-order walk, so it is stable. Any
+     * future pass added here must use it for the same reason.
+     */
+    BcInlineSnapshots bc_snaps;
+    for (const FuncDeclStmt *fn : funcs) {
+        auto it = chunks.find(fn->desc);
+        if (it != chunks.end())
+            bc_inline_snapshot(it->second, bc_snaps);
+    }
+    const std::vector<const FuncDescriptor *> bc_slots =
+        bc_inline_slot_map(slot_desc, root->global_slot_reassigned);
+    for (const FuncDeclStmt *fn : funcs) {
+        auto it = chunks.find(fn->desc);
+        if (it != chunks.end()) {
+            ML_INT_ONLY(g_bc_int_caller = bc_int_key_fn(fn->desc,
+                                                        it->second);)
+            bc_inline_chunk(it->second, bc_slots, bc_snaps);
+        }
+    }
+    /* #97 closure inlining: main's VALUE sites, as vm_precompile_all */
+    ML_INT_ONLY(g_bc_int_caller = "main";)
+    bc_inline_chunk(main_ck, bc_slots, bc_snaps, /*value_only=*/true);
+
+    /* Pass B: the native tier through the ONE driver (vm_jit_program,
+     * vm.h) - the frameless pre-pass over main, every body with its own
+     * JitCtx, main last with the same map. A hand copy of that sequence
+     * sat here and went stale twice (main jitted with no map; no
+     * pre-pass), so `-vdj` dumped the generic push on a program whose
+     * run took every call framelessly. Source order for the bodies, so
+     * the arena fills reproducibly (see the note above). */
+    std::vector<std::pair<Chunk *, const FuncDescriptor *>> bodies;
+    for (const FuncDeclStmt *fn : funcs) {
+        auto it = chunks.find(fn->desc);
+        if (it != chunks.end())
+            bodies.push_back({ &it->second, it->first });
+    }
+    vm_jit_program(&main_ck, bodies, slot_desc, root->global_slot_reassigned);
+
+    JitCtx mjc;          /* main's, as Pass B's: no caller descriptor */
+    mjc.slot_desc = &slot_desc;
+    mjc.slot_reassigned = &root->global_slot_reassigned;
+    s << disassemble(main_ck, "main", {}, &mjc);
+
+    int anon = 0;
+    for (const FuncDeclStmt *fn : funcs) {
+        auto it = chunks.find(fn->desc);
+        if (it == chunks.end())
             continue;
 
         /* The capture list IS the closure's anonymous struct: its field names,
@@ -1084,7 +2771,7 @@ std::string disassemble_program(const Block *root)
         std::vector<std::string> cap_names;
         if (fn->captures)
             for (const auto &cap : fn->captures->elems)
-                if (auto *id = dynamic_cast<const Identifier *>(cap.get()))
+                if (auto *id = node_cast<const Identifier>(cap.get()))
                     cap_names.push_back(std::string(id->get_str()));
 
         /* Label: a named func is `func <name>`; an anonymous lambda gets a
@@ -1096,8 +2783,18 @@ std::string disassemble_program(const Block *root)
             title = (cap_names.empty() ? "lambda#" : "closure#")
                     + std::to_string(anon++);
 
-        s << "\n" << disassemble(ck, title, cap_names);
+        /* Same JitCtx Pass B used, so the M1 container plan counts a native
+         * CallV as native (a null jc would show it as an island). */
+        JitCtx djc;
+        djc.slot_desc = &slot_desc;
+        djc.slot_reassigned = &root->global_slot_reassigned;
+        djc.caller_desc = fn->desc;
+        s << "\n" << disassemble(it->second, title, cap_names, &djc);
     }
+
+    for (const auto &sv : saved)   /* leave the descriptors as we found them */
+        sv.first->vm_chunk = sv.second;
+
     return s.str();
 }
 
@@ -1132,11 +2829,143 @@ const char *mnemonic_color(const std::string &m)
     return "\033[38;5;78m";                         /* mem/other - green   */
 }
 
+/* An operand identifier that is a REGISTER (a machine reg OR a VM slot
+ * `rN`/`gN`/`cN`/`xmmN`) - colored muted, so a source VARIABLE name (any
+ * other identifier) stands out. `byte`/`type` are plumbing keywords. */
+bool is_reg_token(const std::string &id)
+{
+    static const std::unordered_set<std::string> x86 = {
+        "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
+        "eax","ebx","ecx","edx","esi","edi","ebp","esp",
+        "al","bl","cl","dl" };
+    if (x86.count(id))
+        return true;
+    const auto tail_digits = [&](size_t from) {
+        if (id.size() <= from)
+            return false;
+        for (size_t x = from; x < id.size(); x++)
+            if (!isdigit((unsigned char)id[x]))
+                return false;
+        return true;
+    };
+    if ((id[0] == 'r' || id[0] == 'g' || id[0] == 'c') && tail_digits(1))
+        return true;                             /* rN/gN/cN + r8..r15 */
+    if (id.compare(0, 3, "xmm") == 0 && tail_digits(3))
+        return true;
+    return false;
+}
+
+bool is_kw_token(const std::string &id)
+{
+    return id == "byte" || id == "type" || id == "ptr" || id == "word"
+        || id == "qword" || id == "dword";
+}
+
+/* Color the operand run (from index `i` to EOL): immediates, `L<n>`
+ * labels, registers (gray), source VARIABLES (cyan), keywords, comments,
+ * punctuation. Shared by the VM ops and the native disasm. */
+void scan_operands(std::ostringstream &o, const std::string &line, size_t i)
+{
+    while (i < line.size()) {
+        const char c = line[i];
+        if (c == ';') {                              /* inline comment -> EOL */
+            o << "\033[38;5;245m" << line.substr(i) << RST;
+            return;
+        }
+        if (c == ' ') { o << c; i++; continue; }
+        if (isdigit((unsigned char)c)
+            || (c == '-' && i + 1 < line.size()
+                && isdigit((unsigned char)line[i + 1]))) {
+            size_t k = i + 1;                        /* immediate / number */
+            while (k < line.size()
+                   && (isdigit((unsigned char)line[k]) || line[k] == 'x'
+                       || (line[k] >= 'a' && line[k] <= 'f')
+                       || line[k] == '.'))
+                k++;
+            o << "\033[38;5;150m" << line.substr(i, k - i) << RST;
+            i = k;
+            continue;
+        }
+        if (isalpha((unsigned char)c) || c == '_') {
+            size_t k = i;
+            while (k < line.size()
+                   && (isalnum((unsigned char)line[k]) || line[k] == '_'))
+                k++;
+            const std::string id = line.substr(i, k - i);
+            bool label = id.size() > 1 && id[0] == 'L';
+            for (size_t x = 1; label && x < id.size(); x++)
+                if (!isdigit((unsigned char)id[x]))
+                    label = false;
+            const bool field = i > 0 && line[i - 1] == '.';   /* `.type` */
+            const char *col =
+                label                       ? "\033[38;5;213m"   /* pink   */
+              : field || is_kw_token(id)    ? "\033[38;5;244m"   /* gray   */
+              : is_reg_token(id)            ? "\033[38;5;244m"   /* gray   */
+                                            : "\033[38;5;81m";   /* VAR cyan */
+            o << col << id << RST;
+            i = k;
+            continue;
+        }
+        o << "\033[38;5;243m" << c << RST;           /* operator / punct */
+        i++;
+    }
+}
+
 std::string hl_line(const std::string &line)
 {
     size_t i = 0;
     while (i < line.size() && line[i] == ' ')
         i++;
+
+    /* A native-fragment line (-vdj): `. ---- ...`, `. ; vm pc N: <op>`,
+     * `.   +off: mnemonic operands ; cmt`, or a bare `.`. */
+    if (i < line.size() && line[i] == '.') {
+        std::ostringstream o;
+        o << line.substr(0, i) << "\033[38;5;238m.\033[0m";   /* the marker */
+        size_t k = i + 1;
+        while (k < line.size() && line[k] == ' ') o << line[k++];
+        if (k >= line.size())
+            return o.str();                          /* bare `.` */
+        if (line[k] == '-' || line[k] == ';') {
+            /* a `---- ... ----` rule or a `; vm pc N: <op>` marker: dim
+             * the rule/marker prefix, then colorize the trailing VM op. */
+            const size_t colon = line.find(": ", k);
+            if (line[k] == ';' && colon != std::string::npos) {
+                /* This marker is a COMMENT: the VM op was REPLACED by the
+                 * native code below it, so it must NOT look like a live
+                 * instruction. A dark-gray gradient - the `; vm pc N:`
+                 * label darker than the (still legible) rendered op. */
+                o << "\033[38;5;240m" << line.substr(k, colon + 2 - k)
+                  << "\033[38;5;245m" << line.substr(colon + 2) << RST;
+            } else {
+                o << "\033[38;5;238m" << line.substr(k) << RST;
+            }
+            return o.str();
+        }
+        /* an instruction line: `+off:` (dim), mnemonic (category), operands */
+        if (line[k] == '+') {
+            size_t e = line.find(':', k);
+            if (e != std::string::npos) e++;
+            else e = k;
+            o << "\033[38;5;240m" << line.substr(k, e - k) << RST;
+            k = e;
+            while (k < line.size() && line[k] == ' ') o << line[k++];
+            size_t m = k;
+            while (m < line.size()
+                   && (islower((unsigned char)line[m]) || isdigit(
+                           (unsigned char)line[m])))
+                m++;
+            if (m > k) {
+                const std::string mn = line.substr(k, m - k);
+                o << mnemonic_color(mn) << mn << RST;
+                k = m;
+            }
+            scan_operands(o, line, k);
+            return o.str();
+        }
+        scan_operands(o, line, k);
+        return o.str();
+    }
 
     /* whole-line comment / section header */
     if (i < line.size() && line[i] == ';') {
@@ -1174,47 +3003,27 @@ std::string hl_line(const std::string &line)
         i = m;
     }
 
-    /* operands - a token scan */
-    while (i < line.size()) {
-        const char c = line[i];
-        if (c == ';') {                              /* inline comment -> EOL */
-            o << "\033[38;5;245m" << line.substr(i) << RST;
-            break;
-        }
-        if (c == ' ') {
-            o << c;
-            i++;
-            continue;
-        }
-        if (c == '#' || isdigit((unsigned char)c)) {  /* immediate / number */
-            size_t k = i + (c == '#' ? 1 : 0);
-            while (k < line.size() && isdigit((unsigned char)line[k]))
-                k++;
-            o << "\033[38;5;150m" << line.substr(i, k - i) << RST;
-            i = k;
-            continue;
-        }
-        if (isalpha((unsigned char)c) || c == '_') {  /* reg / name / label */
-            size_t k = i;
-            while (k < line.size()
-                   && (isalnum((unsigned char)line[k]) || line[k] == '_'))
-                k++;
-            const std::string id = line.substr(i, k - i);
-            bool label = id.size() > 1 && id[0] == 'L';
-            for (size_t x = 1; label && x < id.size(); x++)
-                if (!isdigit((unsigned char)id[x]))
-                    label = false;
-            o << (label ? "\033[38;5;213m" : "\033[38;5;80m") << id << RST;
-            i = k;
-            continue;
-        }
-        o << "\033[38;5;243m" << c << RST;           /* operator / punct */
-        i++;
-    }
+    scan_operands(o, line, i);
     return o.str();
 }
 
 } // namespace
+
+/* The bare enum NAME of an opcode (for the M1 container-plan blocker list -
+ * the full mnemonic lives in render_instr's per-op switch; here the enum
+ * spelling is the clearest "what op is blocking nativization"). */
+const char *opcode_name(OpCode op)
+{
+    /* a TABLE, generated from THE list (bytecode.h) in enum order, not a
+     * switch: a switch's one case per opcode is a branch no dump reaches
+     * for most of them, and the coverage universe counted each twice -
+     * here and in codegen's own copy (bc_op_name, gone) */
+#define ML_OPCODE_NAME(N) #N,
+    static const char *const names[] = { ML_FOR_EACH_OPCODE(ML_OPCODE_NAME) };
+#undef ML_OPCODE_NAME
+    const size_t i = static_cast<size_t>(op);
+    return i < sizeof names / sizeof names[0] ? names[i] : "?";
+}
 
 std::string highlight_disasm(const std::string &plain)
 {
@@ -1230,4 +3039,68 @@ std::string highlight_disasm(const std::string &plain)
         start = nl + 1;
     }
     return out.str();
+}
+
+void decode_ins(const uint8_t *code, uint32_t n, uint32_t &p,
+                DecodedIns &out)
+{
+    std::string mn, cmt;
+    static const SlotNamer nm = [](int i) {
+        return "s" + std::to_string(i);
+    };
+    decode_one(code, n, p, mn, cmt, nm, nullptr, nullptr, nullptr, &out,
+               /*render=*/false);
+}
+
+uint32_t decoded_gp_writes(const DecodedIns &d)
+{
+    const std::string &m = d.mn;
+    const auto gp = [&](int i) -> uint32_t {
+        if (i >= d.n)
+            return 0;
+        const DecOp &o = d.ops[i];
+        if (o.kind == DecOp::Gpr || o.kind == DecOp::Gpr32
+                || o.kind == DecOp::Gpr8)
+            return 1u << o.reg;
+        return 0;
+    };
+    if (m.empty())
+        return 0;
+    /* the forms that write NO general register (an xmm destination is
+     * handled by gp() returning 0 for a non-GP operand); dispatched on
+     * the first letter, since this runs on every emitted instruction
+     * of every ASSERTS build */
+    const uint32_t RAX = 1u << 0, RDX = 1u << 2;
+    switch (m[0]) {
+    case 'j':
+        return 0;                                /* jmp / jcc */
+    case 'c':
+        if (m == "cmp" || m == "call")
+            return 0;
+        if (m == "cqo" || m == "cdq")
+            return RDX;
+        break;
+    case 't': if (m == "test") return 0; break;
+    case 'p': if (m == "push") return 0; break;
+    case 'r': if (m == "ret") return 0; break;
+    case 'n': if (m == "nop") return 0; break;
+    case 'u': if (m == "ucomisd") return 0; break;
+    case 'd': if (m == "div") return RAX | RDX; break;
+    case 'm': if (m == "mul") return RAX | RDX; break;
+    case 'i':
+        if (m == "idiv" || (m == "imul" && d.n == 1))
+            return RAX | RDX;
+        break;
+    default: break;
+    }
+    return gp(0);
+}
+
+/* the instruction rendering -vdj prints, with no slot names: -rt sets
+ * g_vdj_raw and checks RAW mode against what objdump prints for the
+ * same bytes */
+std::string render_ins_for_test(const DecodedIns &d)
+{
+    return render_ins(d, [](int) { return std::string(); }, nullptr,
+                      nullptr, nullptr);
 }

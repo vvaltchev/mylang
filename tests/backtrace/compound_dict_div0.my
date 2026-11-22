@@ -1,0 +1,9 @@
+# a dict / dyn compound's operation error: the whole expression, not
+# the subscript
+func g(d, z) { d["k"] %= z; }
+func drive(int n) {
+    var dyn d = {"k": 5};
+    for (var i = 0; i < n; i++) g(d, i == 2 ? runtime(0) : 2);
+    return n;
+}
+print(drive(runtime(4)));

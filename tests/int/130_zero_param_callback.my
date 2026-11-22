@@ -1,0 +1,8 @@
+# INT-SOURCE: ../functional/113_zero_param_callback.my
+#
+# INT unit (#107): a function with no parameters called with arguments -
+# directly, through a dyn value, as a builtin's callback - is refused by
+# the argument count in every engine. The functional program runs as a
+# coverage unit under the default engines (INT-SOURCE); it owns the
+# tree-walker's count refusal for a parameter-less callee
+# (do_func_bind_params) and the callback invoker's (VmInvoker::invoke).

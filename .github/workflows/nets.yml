@@ -1,0 +1,485 @@
+# The NETS lane - the correctness tools that were never wired into CI.
+#
+# Until now CI ran `-rt`, driver_checks and myv_doc_check and
+# nothing else, so the project's differential corpus and all four
+# fuzzers only ever ran when someone remembered to run them by hand.
+# That is not theoretical: corpus_diff caught a JIT abort (a mixed-kind
+# call chain tripping jit_ret_audit) that `-rt` passed straight through,
+# and the Net 3 enumeration caught a ref_slots leak that BOTH missed.
+#
+# These are slower than the -rt lanes by design; they run in parallel
+# with them, not in front of them, so a fast `-rt` failure still
+# reports quickly.
+#
+# Every job builds with CMake (CI is where that build system gets
+# exercised) and hands the binary to tests/run with --bin, so the tests
+# are the ones `tests/run` runs locally: same commands, same vacuity
+# guards, same reproduce lines. A failed job uploads its test-logs/.
+name: Nets
+
+on: [pull_request, push, workflow_dispatch]
+
+jobs:
+  # ---------------------------------------------------------------- #
+  # The engine differential + the no-record tier's nets 2 and 3.
+  # Debug, so ASan + UBSan + VM_HARDENING are all live: the enumeration
+  # deliberately drives exception unwinds through mixed frame kinds,
+  # which is exactly where a sanitizer finding is worth having.
+  # ---------------------------------------------------------------- #
+  differential:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
+    - name: Build (Debug)
+      run: |
+        cmake -S . -B build -DTESTS=1 -DVM_HARDENING=ON \
+              -DCMAKE_BUILD_TYPE=Debug
+        cmake --build build -j
+
+    # corpus_diff: the tree-walker vs the default engine over
+    # tests/functional + samples.
+    #
+    # vdjcmp: ⛔ IS -vdj REPRODUCIBLE? Its SELF-TEST - one binary
+    # against ITSELF over the whole corpus - is what makes every
+    # "emitted code byte-identical" claim mean anything, and until
+    # 2026-08-27 it ran ONLY when someone remembered to. It did not go
+    # wrong quietly: from the day #97 step 1a added the absolute-disp32
+    # operand (whose raw address reached the text) it FAILED on every
+    # invocation and refused to compare. Nobody invoked it.
+    # A SELF-TEST THAT IS NOT IN CI IS NOT A NET. The whole point of
+    # one is that it fires without being asked.
+    #
+    # bt_oracle (#38 repro B): with inlining ON, every CLI configuration
+    # (the JIT levers, the splice off, a .myv image, --no-opt all) must
+    # render the backtrace and caret `-ni -tw` renders. An engine
+    # differential cannot see a frame the inliner loses: it is lost in
+    # every engine.
+    #
+    # norec_enum (Net 3): every program in a bounded shape space, four
+    # engines, compared byte-for-byte - depth 3 here (480 programs).
+    #
+    # norec_sweep (Net 2): force a frame reconstruction at the Nth call
+    # event, one process per N, in shadow AND production.
+    #
+    # disasmcheck: -vdj vs objdump on this Debug build, both arenas -
+    # the sanitizers watch the decoder, and ASan's native-stack-off
+    # emission is the one form the rel-hard matrix (below) cannot see.
+    - name: tests/run
+      run: tests/run -o --logs test-logs --bin dbg=build/mylang
+           corpus_diff vdjcmp bt_oracle norec_enum norec_sweep disasmcheck
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v6
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- #
+  # The two longest steps of `differential`, on the same Debug build in
+  # a job of their own, so the two halves run side by side: the corpus
+  # under every JIT lever turned off, and the random nested fuzzer.
+  # ---------------------------------------------------------------- #
+  differential-levers-fuzz:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
+    - name: Build (Debug)
+      run: |
+        cmake -S . -B build -DTESTS=1 -DVM_HARDENING=ON \
+              -DCMAKE_BUILD_TYPE=Debug
+        cmake --build build -j
+
+    # the corpus with each JIT lever forced off, one at a time; and
+    # random deep-nested programs against a CPython twin, all engines.
+    # A FRESH SEED PER RUN (the run id; a re-run keeps it): with a fixed
+    # seed every push ran the same 250 programs, a regression corpus
+    # rather than a fuzzer. The seed is printed; a failure reproduces
+    # with it. All three fuzzers here do this.
+    - name: tests/run
+      run: tests/run -o --logs test-logs --seed ${{github.run_id}}
+           --bin dbg=build/mylang corpus_diff-levers nested_fuzz
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v6
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- #
+  # ⛔ IS THE DISASSEMBLER TELLING THE TRUTH? Every instruction the JIT
+  # emits, cross-checked against objdump - boundaries, mnemonics AND
+  # every operand. This is the only net that can catch a CONFIDENTLY
+  # WRONG decode; `DUMP IS UNRELIABLE` and the -rt coverage check both
+  # only catch bytes we KNOW we failed on. It found two missing F7
+  # sub-opcodes (neg, imul) that printed a silent `f7/?` placeholder on
+  # 284 corpus sites. --matrix sweeps both arenas, every pin-pool
+  # rotation and a range of pin budgets, because those change WHICH
+  # encodings get emitted.
+  #
+  # On a rel-hard build (optimized, asserts and VM hardening on): each
+  # -vdj run is 11x faster than the Debug one, and it emits every form
+  # the Debug build does in any of the 23 configurations except ASan's
+  # native-stack-off check, which `differential` covers (disasmcheck on
+  # its Debug build, both arenas). Its items run on a pool, so one job
+  # does what three Debug shards did (2026-11-15).
+  # ---------------------------------------------------------------- #
+  disasmcheck:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
+    - name: Build (rel-hard)
+      run: |
+        cmake -S . -B build -DTESTS=1 -DVM_HARDENING=ON \
+              -DCMAKE_BUILD_TYPE=Release
+        cmake --build build -j
+
+    - name: "disasm: every emitted instruction agrees with objdump"
+      run: tests/run -o --logs test-logs --bin rel-hard=build/mylang
+           disasmcheck-matrix
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v6
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- #
+  # THE NO-ARENA CONFIGURATION - the JIT with its type tags in
+  # REGISTERS instead of imm32.
+  #
+  # lowmem.h places the Type singletons below 2^31 so a tag store is
+  # `mov qword [rbx+d], imm32`. Where that mapping is unavailable -
+  # Darwin, Windows, a hardened kernel, an exhausted low 2GB, A FAILED
+  # MAP_32BIT ON AN ORDINARY LINUX BOX - store_type_tag and cmp_reg_tag
+  # emit a register form instead, and jit_xcache_busy then denies r8 to
+  # the pin pool. Materially different emitted code, and it SHIPS.
+  #
+  # Until MYLANG_NO_LOWMEM existed no build and no lane could enter it,
+  # because the arena is an mmap at static init with no switch. That is
+  # the lto0 shape: a configuration only one platform can take is a
+  # configuration nobody tests. Its first run found a shipped wrong
+  # answer - store_dst_bool naming a register for the t_bool tag whose
+  # `movabs` had been deleted when the imm32 form landed - with `-rt`
+  # 1922/1922 and plain corpus_diff 20/20 throughout.
+  #
+  # TWO BUILDS, because they catch different things (the myv-fuzz job's
+  # reasoning, same file) - and that is MEASURED here, not assumed.
+  # Reintroducing the store_dst_bool defect and running `-rt` off-arena
+  # in each:
+  #     debug-sanitized     rc=134, an ABORT with a located UBSan
+  #                         report naming the bad Type access
+  #     release-no-asserts  rc=139, a SEGFAULT - the ML_CHECK tripwires
+  #                         are compiled away, so the defect arrives as
+  #                         the raw crash a user would get, in the build
+  #                         configuration a shipped program runs under
+  # Neither is redundant: the first says WHERE, the second proves the
+  # failure survives without the assertion net holding it up.
+  # ---------------------------------------------------------------- #
+  nolowmem:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: debug-sanitized
+            lane: dbg
+            cmake: -DTESTS=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
+          - name: release-no-asserts
+            lane: rna
+            cmake: -DTESTS=1 -DASSERTS=OFF -DCMAKE_BUILD_TYPE=Release
+    name: nolowmem (${{matrix.name}})
+    steps:
+    - uses: actions/checkout@v5
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
+    - name: Build
+      run: |
+        cmake -S . -B build ${{matrix.cmake}}
+        cmake --build build -j
+
+    # ⛔ THE VACUITY GUARD COMES FIRST, inside tests/run (guard_nolowmem):
+    # each of these tests first proves `mylang -v` says `lowmem 1` by
+    # default and `lowmem 0` under MYLANG_NO_LOWMEM=1 - a lane that
+    # tests a configuration must PROVE it is in it, or it passes green
+    # doing nothing the day a default moves (why the lto0 lane asserts
+    # `lto 0` before it tests anything). Then -rt and the engine
+    # differential with the arena refused (the tree-walker has no JIT,
+    # so that is tw vs the register-form emission), and driver_checks.
+    - name: tests/run
+      run: tests/run -o --logs test-logs --bin ${{matrix.lane}}=build/mylang
+           rt-nolowmem@${{matrix.lane}} corpus_diff-nolowmem@${{matrix.lane}}
+           driver_checks@${{matrix.lane}}
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v6
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- #
+  # THE STACK-ALIGNMENT GROUND TRUTH (SP2/SP3). System V requires
+  # rsp % 16 == 0 AT the call; the emitter has a MODEL of rsp that says
+  # so at emit time, and a model is complete only while every
+  # rsp-moving emission goes through one of its seams. This lane emits
+  # `test rsp, 15` before every call and reads the REAL rsp, so it
+  # needs no model - it is what catches a MISSING seam.
+  #
+  # TWO BUILDS, and they are not redundant: the FIRST bug it found was
+  # invisible to every checked build (-rt 2016/2016, every corpus
+  # matrix 35/35, --spcheck itself 35/35 on Debug) and showed only at
+  # ASSERTS=0, where the branch-state table it also revives from had
+  # been compiled out. Same split as the myv-fuzz lane above.
+  # ---------------------------------------------------------------- #
+  spcheck:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: debug-sanitized
+            lane: dbg
+            cmake: -DTESTS=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
+          - name: release-no-asserts
+            lane: rna
+            cmake: -DTESTS=1 -DASSERTS=OFF -DCMAKE_BUILD_TYPE=Release
+    name: spcheck (${{matrix.name}})
+    steps:
+    - uses: actions/checkout@v5
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
+    - name: Build
+      run: |
+        cmake -S . -B build ${{matrix.cmake}}
+        cmake --build build -j
+
+    # THE VACUITY GUARD (guard_spcheck, inside tests/run): the check is
+    # emitted code, so each test first proves `test rsp, 15` is in the
+    # dump under the lever and absent without it.
+    - name: tests/run
+      run: tests/run -o --logs test-logs --bin ${{matrix.lane}}=build/mylang
+           rt-spcheck@${{matrix.lane}} corpus_diff-spcheck@${{matrix.lane}}
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v6
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- #
+  # THE INTRUSIVE TESTS (#107, plans/intrusive-tests.md). An INT_TESTS
+  # build runs tests/int_run (-rt, every tests/int program under both
+  # engines, and the site census: a site no run reached fails). Plus the
+  # NON-PERTURBATION check: the INT build must emit byte-identical
+  # bytecode and machine code to a plain TESTS build of the same commit -
+  # an INT build may cost speed and memory, never a decision.
+  # ---------------------------------------------------------------- #
+  int:
+    runs-on: ubuntu-latest
+    env:
+      CXX: g++-14        # MC/DC (-fcondition-coverage) needs GCC >= 14
+    steps:
+    - uses: actions/checkout@v5
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
+    - name: Install GCC 14
+      run: sudo apt-get update && sudo apt-get install -y g++-14
+    - name: Build (INT_TESTS + GCOV)
+      run: |
+        cmake -S . -B build-int -DINT_TESTS=ON -DGCOV=ON \
+              -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
+        cmake --build build-int -j
+    - name: Build (TESTS, the reference)
+      run: |
+        cmake -S . -B build-ref -DTESTS=1 -DVM_HARDENING=ON \
+              -DCMAKE_BUILD_TYPE=Debug
+        cmake --build build-ref -j
+
+    # The binaries are checked against their builds first (`int_tests 1`
+    # / `0`, both directions). int-vdjcmp is the NON-PERTURBATION check:
+    # the INT build must emit byte-identical bytecode and machine code to
+    # the plain TESTS build. int_run-gcov is the suite, the site census
+    # and the coverage universe in ONE pass: every unit must own an
+    # element, and the uncovered count may not exceed this compiler's
+    # line in tests/int/coverage-floor.txt (it runs alone on its build:
+    # it clears and reads the gcov counters). driver_checks runs with
+    # MYLANG_EXPECT_INT_TESTS=1, which tests/run sets for an INT build.
+    - name: tests/run
+      run: tests/run -o --logs test-logs --bin int-gcov=build-int/mylang
+           --bin dbg=build-ref/mylang
+           int-vdjcmp int_run-gcov driver_checks@int-gcov
+    - name: Upload the coverage report
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: int-coverage
+        path: test-logs/int_run-gcov-report.txt
+        if-no-files-found: ignore
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v6
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- #
+  # The #107 P3 DECISION ENUMERATOR, tier 1: every legal alternative of
+  # every register pick a default run makes, over tests/functional,
+  # against the tree-walker. Correctness must not depend on which legal
+  # register the allocator picks - its first run found five JIT bugs no
+  # default pick reaches. The FAST lane (optimized, ASSERTS on so the
+  # REGTRACK net and the ML_CHECKs stay live, LTO off for the build
+  # time): ~40 s locally for the whole corpus.
+  # ---------------------------------------------------------------- #
+  int-enum:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
+    - name: Build (INT_TESTS, optimized, asserts on)
+      run: |
+        cmake -S . -B build-enum -DINT_TESTS=ON \
+              -DCMAKE_BUILD_TYPE=Release -DASSERTS=ON -DLTO=OFF
+        cmake --build build-enum -j
+    # The build check comes first (`int_tests 1`, `asserts 1`: an
+    # enumerator run on a build without the hooks, or without the
+    # tracker, would answer "0 failures" doing nothing).
+    #
+    # int_enum-1 / -2: tiers 1 and 2 over tests/functional plus the
+    # samples that need no input (bench/ is NOT a correctness corpus);
+    # tier 2 is TWO decisions at once, every combination, in each SMALL
+    # scope - ~3k runs. Tier 3 (~110k runs) is on demand: int-deep.yml.
+    #
+    # disasmcheck-rex: disasmcheck (-vdj vs objdump, every operand) in
+    # configurations no matrix axis reaches - forced allocator picks
+    # that put a float stage in xmm8-15 and a GP scratch/pin in r8/r15,
+    # the REX.R/X/B forms a decoder can drop and still print the right
+    # mnemonic. Its guard first proves each pick still lands in r8-r15 /
+    # xmm8-15, so a key the program drifted away from fails instead of
+    # checking the default registers again.
+    - name: tests/run
+      run: tests/run -o --logs test-logs --bin int-rel=build-enum/mylang
+           int_enum-1 int_enum-2 disasmcheck-rex
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v6
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- #
+  # The .myv corruption fuzzer, on BOTH build types on purpose:
+  # CLAUDE.md records that a sanitizer build and an assert-free release
+  # catch DIFFERENT things here - the debug one finds the memory error,
+  # the release one finds the case where a check the debug build relies
+  # on has been compiled away.
+  # ---------------------------------------------------------------- #
+  myv-fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: debug-asan
+            lane: dbg
+            cmake: -DTESTS=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
+          - name: release-noassert
+            lane: rna
+            cmake: -DTESTS=1 -DASSERTS=OFF -DCMAKE_BUILD_TYPE=Release
+    name: "myv-fuzz (${{ matrix.name }})"
+    steps:
+    - uses: actions/checkout@v5
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
+    - name: Build
+      run: |
+        cmake -S . -B build ${{matrix.cmake}}
+        cmake --build build -j
+
+    # A finding is saved in test-logs/, uploaded on failure: an image
+    # embeds its source path. The seed replays it too, through tests/run
+    # on a build of the same commit (tests/CLAUDE.md says how).
+    - name: tests/run
+      run: tests/run -o --logs test-logs --seed ${{github.run_id}}
+           --bin ${{matrix.lane}}=build/mylang myv_fuzz@${{matrix.lane}}
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v6
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- #
+  # The REPL fuzzer under RECYCLE=1 + ASan, which is the combination
+  # CLAUDE.md names for this: the REPL RETAINS its input ASTs, so it is
+  # where a stale-node identity bug would live, and the recycling
+  # allocator is what makes that class deterministic.
+  # ---------------------------------------------------------------- #
+  repl-fuzz:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
+    - name: Build (RECYCLE)
+      run: |
+        cmake -S . -B build -DTESTS=1 -DRECYCLE=ON -DVM_HARDENING=ON \
+              -DCMAKE_BUILD_TYPE=Debug
+        cmake --build build -j
+    - name: tests/run
+      run: tests/run -o --logs test-logs --seed ${{github.run_id}}
+           --bin recycle=build/mylang repl_fuzz@recycle
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v6
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- #
+  # Net 4: the coverage RATCHET over the no-record tier's walk and
+  # reconstruction surface.
+  #
+  # The floors below are NOT the goal - the goal is 100% (--gate), and
+  # docs/jit-optimizations.md's Net 4 entry records what is still
+  # uncovered and why. They exist so the surface can only improve: a
+  # plain `-rt` alone measures 54.8%/47.0% here, so a change that
+  # stopped the shadow workload from running would fall straight
+  # through these floors even though the absolute target is ahead.
+  # ---------------------------------------------------------------- #
+  coverage-gate:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
+    - name: Build (GCOV)
+      run: |
+        cmake -S . -B build -DTESTS=1 -DGCOV=1 -DVM_HARDENING=ON \
+              -DCMAKE_BUILD_TYPE=Debug
+        cmake --build build -j
+    - name: "Net 4: no-record coverage ratchet"
+      run: tests/run -o --logs test-logs --bin cmake-gcov=build/mylang
+           norec_coverage
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v6
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore

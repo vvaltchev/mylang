@@ -1,0 +1,9 @@
+# a block-bodied inlinee with locals, and one with an if-chain
+func h(x) { var t = x + 1; var q = t * 2; return 50 / (q - 8); }
+func g(x) { if (x > 100) return 0; if (x < -100) return 1; return h(x); }
+func drive(n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) s = s + g(int(runtime(i)));
+    return s;
+}
+print(drive(runtime(5)));

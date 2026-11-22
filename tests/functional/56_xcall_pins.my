@@ -1,0 +1,126 @@
+# #124(b): a run that CALLS may pin in caller-saved registers too. The
+# call op is emitted with every caller-saved pin (and every float pin)
+# written back and out of the register view, and reloaded where its
+# paths rejoin. Every shape keeps EIGHT hot locals live across a call,
+# so the fifth and later pins land in caller-saved registers. Each must
+# print exactly what the tree-walker prints.
+
+func leaf(int x) {
+    var t = x * 3;
+    for (var j = 0; j < 2; j++) t = t + j;
+    return t & 1023;
+}
+
+# a plain call per iteration
+func plain(int n) {
+    var a0 = 1; var a1 = 2; var a2 = 3; var a3 = 4;
+    var a4 = 5; var a5 = 6; var a6 = 7; var a7 = 8;
+    for (var i = 0; i < n; i++) {
+        a0 = (a0 * 3 + i) & 65535; a1 = (a1 ^ i) + 7;
+        a2 = (a2 + a0) & 65535;    a3 = (a3 * 5 + 1) & 65535;
+        a4 = (a4 ^ a1) & 65535;    a5 = (a5 + i * 2) & 65535;
+        a6 = (a6 * 7 + a2) & 65535;
+        a7 = (a7 + leaf(a3 + a5)) & 65535;
+    }
+    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7;
+}
+print("plain", plain(int(runtime(50))));
+
+# a SELF recursion deep enough to leave the native frames (the switch)
+# and come back through a post-call resume stub, with locals live
+# across every level
+func deep(int n) {
+    if (n == 0) return 1;
+    var a0 = n; var a1 = n * 2; var a2 = n * 3; var a3 = n * 5;
+    var a4 = n * 7; var a5 = n * 11; var a6 = n * 13; var a7 = n * 17;
+    var r = deep(n - 1);
+    return (r + a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7) & 1048575;
+}
+print("deep", deep(int(runtime(600))));
+
+# mutual recursion
+func ev(int n) {
+    if (n == 0) return 1;
+    var a0 = n; var a1 = n + 1; var a2 = n + 2; var a3 = n + 3;
+    var a4 = n + 4; var a5 = n + 5;
+    var r = od(n - 1);
+    return (r * 3 + a0 + a1 + a2 + a3 + a4 + a5) & 65535;
+}
+func od(int n) {
+    if (n == 0) return 2;
+    var b0 = n; var b1 = n * 2; var b2 = n * 3; var b3 = n * 4;
+    var b4 = n * 5; var b5 = n * 6;
+    var r = ev(n - 1);
+    return (r * 5 + b0 + b1 + b2 + b3 + b4 + b5) & 65535;
+}
+print("mutual", ev(int(runtime(40))));
+
+# an exception thrown out of the call and caught in the loop
+struct Boom { int v; }
+func thrower(int x) {
+    var t = x;
+    for (var j = 0; j < 2; j++) t = t + j;
+    if (x % 7 == 3) throw Boom(x);
+    return t;
+}
+func catching(int n) {
+    var a0 = 1; var a1 = 2; var a2 = 3; var a3 = 4;
+    var a4 = 5; var a5 = 6; var a6 = 7; var a7 = 0;
+    for (var i = 0; i < n; i++) {
+        a0 = a0 + i; a1 = a1 + a0; a2 = a2 ^ a1; a3 = a3 + 3;
+        a4 = a4 + a2; a5 = (a5 * 3) & 65535; a6 = a6 + a5;
+        try { a7 = a7 + thrower(i); } catch (Boom as b) { a7 = a7 - b.v; }
+    }
+    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7;
+}
+print("catching", catching(int(runtime(40))));
+
+# a closure (value) call
+func with_closure(int n) {
+    var k = n % 5;
+    var f = func [k] (int x) { var t = x + k; for (var j = 0; j < 2; j++) t = t + j; return t; };
+    var a0 = 1; var a1 = 2; var a2 = 3; var a3 = 4;
+    var a4 = 5; var a5 = 6; var a6 = 7; var a7 = 8;
+    for (var i = 0; i < n; i++) {
+        a0 = a0 + i; a1 = a1 + a0; a2 = (a2 + a1) & 65535; a3 = a3 ^ a2;
+        a4 = a4 + 1; a5 = (a5 + a4) & 65535; a6 = a6 + 2;
+        a7 = (a7 + f(a6)) & 65535;
+    }
+    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7;
+}
+print("closure", with_closure(int(runtime(30))));
+
+# float pins live across a call (every xmm is caller-saved)
+func fhelp(float x) {
+    var t = x * 0.5;
+    for (var j = 0; j < 2; j++) t = t + 0.25;
+    return t;
+}
+func floats(int n) {
+    var x0 = 1.0; var x1 = 2.0; var x2 = 3.0; var x3 = 4.0;
+    var s = 0.0;
+    for (var i = 0; i < n; i++) {
+        x0 = x0 * 0.5 + 1.0; x1 = x1 * 0.25 + x0;
+        x2 = x2 * 0.125 + x1; x3 = x3 * 0.5 + x2;
+        s = s * 0.5 + fhelp(x3 + x1);
+    }
+    return int(s * 1000.0) + int(x0 + x1 + x2 + x3);
+}
+print("floats", floats(int(runtime(30))));
+
+# a call OUTSIDE the hot loop: the run calls, but no caller-saved pin is
+# live across a call inside a loop - so the loop keeps all its registers
+func pre(int n) {
+    var base = leaf(n);
+    var a0 = base; var a1 = 2; var a2 = 3; var a3 = 4;
+    var a4 = 5; var a5 = 6; var a6 = 7; var a7 = 8;
+    for (var i = 0; i < n; i++) {
+        a0 = (a0 * 3 + i) & 65535; a1 = (a1 ^ i) + 7;
+        a2 = (a2 + a0) & 65535;    a3 = (a3 * 5 + 1) & 65535;
+        a4 = (a4 ^ a1) & 65535;    a5 = (a5 + i * 2) & 65535;
+        a6 = (a6 * 7 + a2) & 65535; a7 = (a7 + a3 + a5) & 65535;
+    }
+    var tail = leaf(a7);
+    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + tail;
+}
+print("pre", pre(int(runtime(60))));

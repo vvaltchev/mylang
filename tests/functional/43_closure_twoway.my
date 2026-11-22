@@ -1,0 +1,52 @@
+# #97 closure inlining, increment 2: a value call whose callee the
+# analysis narrows to TWO functions is spliced as a GUARD CHAIN - guard
+# the first candidate, its body; guard the second, its body; else the
+# original call. Every shape must print what the call printed:
+#  - two named functions returning ints (both parameters read in place);
+#  - two VOID bodies whose result is discarded, storing into a parameter
+#    array and into a GLOBAL array (an element store in a spliced body);
+#  - a void body whose result IS used - it declines (its `none` would
+#    have to be loaded), and prints none;
+#  - two CLOSURES from two factories, each keeping its own mutable
+#    capture across calls;
+#  - a closure storing into a CAPTURED array - that arm declines (the
+#    store would index the caller's captures), the other still inlines.
+# MYLANG_JIT_COLD=guard runs every guard's MISS arm - the original call.
+func inc(int x) { var y = x + 1; return y; }
+func dbl(int x) { var y = x * 2; return y; }
+
+var g = [0, 0];
+func a1(st, x) { st[0] = st[0] + x; g[1] = x; }
+func a2(st, x) { st[0] = st[0] - x; }
+
+func mk_up(int s) { var c = s; return func [c] () { c++; return c; }; }
+func mk_dn(int s) { var c = s; return func [c] () { c--; return c; }; }
+
+func mk_log(int n) {
+    var hist = [0, 0, 0];
+    return func [hist] (int k) { hist[k % 3] = hist[k % 3] + 1; return hist[0]; };
+}
+func mk_id(int n) { return func [n] (int k) { return n + k; }; }
+
+var fops = [inc, dbl];
+var vops = [a1, a2];
+var cops = [mk_up(runtime(10)), mk_dn(runtime(100))];
+var lops = [mk_log(runtime(0)), mk_id(runtime(5))];
+var st = [0];
+var s = 0;
+var t = 0;
+var u = 0;
+for (var i = 0; i < 40; i++) {
+    var f = fops[i % 2];
+    s = s + f(i);
+    var fn = vops[i % 2];
+    fn(st, i);
+    var c = cops[i % 2];
+    t = t + c();
+    var l = lops[i % 2];
+    u = u + l(i);
+}
+var fr = vops[runtime(1)];
+var r = 7;          # a stale value: an inlined void body would leave it
+r = fr(st, 3);
+print(s, st[0], g[1], r, t, u, cops[0](), cops[1]());

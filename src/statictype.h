@@ -10,7 +10,7 @@
 class UniqueId;
 
 /*
- * Static types for MyLang's type-inference pass (see plans/type-inference.md).
+ * Static types for MyLang's type-inference pass (see plans/archived/type-inference.md).
  *
  * An StaticType is a node in the inference type graph. It is distinct from
      the runtime
@@ -30,7 +30,7 @@ class UniqueId;
  * operations (resolve / unify / assignable / join / equal / to_string), with no
  * AST wiring yet. The lattice rules (none-nullability, int<=float promotion,
  * mixed containers falling to dyn, type conflicts being errors) are specified
- * in plans/type-inference.md sections 2 and 4.
+ * in plans/archived/type-inference.md sections 2 and 4.
  */
 
 enum class StaticTypeKind {
@@ -44,7 +44,8 @@ enum class StaticTypeKind {
     Dict,         /* uses `key`, `val` */
     Func,         /* uses `params`, `param_opt`, `ret` */
     Exception,
-    Struct,       /* uses `struct_def` (future; see plans/structs.md) */
+    Struct,       /* uses `struct_def` (future; see plans/archived/structs.md) */
+    Box,          /* `box<T>`, a reference to a boxed value: uses `elem` */
     Dyn,          /* explicit dynamic top */
 };
 
@@ -58,23 +59,12 @@ struct StaticType {
     /* Unknown only: union-find link. Non-null => this var is bound to *link. */
     StaticTypeRef link = nullptr;
 
-    StaticTypeRef elem = nullptr;             /* Array */
+    StaticTypeRef elem = nullptr;             /* Array, Box */
     StaticTypeRef key = nullptr;              /* Dict */
     StaticTypeRef val = nullptr;              /* Dict */
     std::vector<StaticTypeRef> params;        /* Func */
     std::vector<bool> param_opt;       /* Func */
     StaticTypeRef ret = nullptr;              /* Func */
-    /*
-     * Func only - value-template tracking (plans/value-template-
-     * instantiation.md): the set of TEMPLATE FuncInfo* (opaque here; the
-     * inferencer owns the type) whose VALUES may flow through this type.
-     * Seeded by func_static_type for a template, UNIONED by join, copied by
-     * with_opt. METADATA: never part of equal/assignable/unify. When a join
-     * DROPS the set (a collapse to dyn / an irreconcilable conflict), the
-     * members land in the arena's `escaped_finfos` ledger - the inferencer
-     * drains it and marks those templates unsafe for value instantiation.
-     */
-    std::vector<void *> finfos;
     const void *struct_def = nullptr;  /* Struct: the StructTypeDef* identity */
     const UniqueId *struct_name = nullptr;  /* Struct: name (for to_string) */
 
@@ -108,6 +98,7 @@ public:
         false);
     StaticTypeRef struct_ty(const void *def, const UniqueId *name, bool opt =
         false);
+    StaticTypeRef box_of(StaticTypeRef elem, bool opt = false);
     StaticTypeRef func_of(std::vector<StaticTypeRef> params,
                    std::vector<bool> param_opt,
                    StaticTypeRef ret,
@@ -119,9 +110,15 @@ public:
     /* Least upper bound; nullptr on an irreconcilable type conflict. */
     StaticTypeRef join(StaticTypeRef a, StaticTypeRef b);
 
-    /* Value-template escape ledger (see StaticType::finfos): joins that drop
-     * a finfo set append the members here; the inferencer drains per round. */
-    std::vector<void *> escaped_finfos;
+    /*
+     * `t` with every UNFILLED container component - an array's element,
+     * a dict's key or value typed `none`, which is what `[]`, `{}` and
+     * array(N) give and nothing typed ever replaced (join_elem absorbs
+     * it) - made `dyn`, at every depth (question 9: an empty container
+     * is the most generic one). `t` itself when there is none.
+     */
+    StaticTypeRef fill_unfilled(StaticTypeRef t);
+
 
 private:
 

@@ -1,0 +1,1979 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Behaviour of the CLI DRIVER itself - the part `-rt` structurally cannot
+# reach. The `-rt` suite runs in-process: it calls lexer/parser/infer/
+# resolve directly and never goes through mylang.cpp's argument handling, so
+# a flag that is wired to the wrong side of an `if` is invisible to all 1866
+# of those tests.
+#
+# That is not hypothetical. `-nr` ("compile and validate, don't run") called
+# run_optimizers only when it was going to RUN, so every diagnostic living in
+# resolve_names - the step 7 prover, the whole warning tier, FIX-1, the TDZ,
+# the duplicate-decl check - was silently skipped, and `-nr` exited 0 on a
+# program a plain run refuses (#147). Every prover test passed throughout.
+#
+#   tests/driver_checks ./build/mylang
+#
+# Exit 0 if every check passes, 1 otherwise. POSIX sh, no dependencies.
+
+BIN="${1:-./build/mylang}"
+here=$(dirname "$0")
+[ -x "$BIN" ] || { echo "usage: $0 <path-to-mylang>"; exit 2; }
+
+TMP="${TMPDIR:-/tmp}/mylang-driver-$$"
+mkdir -p "$TMP" || exit 2
+trap 'rm -rf "$TMP"' EXIT INT TERM
+
+rc=0
+pass() { printf '  ok    %s\n' "$1"; }
+fail() { printf '  FAIL  %s\n' "$1"; rc=1; }
+
+# $1 = label, $2 = expected exit code, $3 = a grep -E pattern stderr+stdout
+# must match ("" = must produce NO output), $4.. = the program lines
+check() {
+    label=$1 want_rc=$2 want=$3
+    shift 3
+    : > "$TMP/p.my"
+    for line in "$@"; do printf '%s\n' "$line" >> "$TMP/p.my"; done
+
+    out=$("$BIN" -nr "$TMP/p.my" 2>&1)
+    got_rc=$?
+
+    if [ "$got_rc" != "$want_rc" ]; then
+        fail "$label (exit $got_rc, wanted $want_rc)"
+        return
+    fi
+    if [ -z "$want" ]; then
+        if [ -n "$out" ]; then
+            fail "$label (expected silence, got: $out)"
+            return
+        fi
+    elif ! printf '%s' "$out" | grep -Eq "$want"; then
+        fail "$label (no match for '$want' in: $out)"
+        return
+    fi
+    pass "$label"
+}
+
+echo "driver checks: $BIN"
+
+# -nr must REFUSE what a plain run refuses. Each of these lives in a
+# different pass reached only after run_optimizers, and each exited 0 in
+# silence before #147.
+check "-nr: step 7 prover" 1 'UseBeforeBindingEx' \
+    'func fetch() { return g; }' \
+    'var dyn t = fetch();' \
+    'var g = 5;'
+
+check "-nr: prover through a write-once alias" 1 'UseBeforeBindingEx' \
+    'func fetch() { return g; }' \
+    'var f = fetch;' \
+    'var dyn t = f();' \
+    'var g = 5;'
+
+check "-nr: FIX-1, a name declared nowhere" 1 'nosuchname' \
+    'var x = nosuchname + 1;'
+
+check "-nr: a duplicate declaration in one scope" 1 'AlreadyDefined' \
+    'var a = 1;' \
+    'var a = 2;'
+
+# ... and it must EMIT the warning tier, which needs g_warnings drained on
+# this path too - a second, separate wiring mistake with the same symptom.
+check "-nr: the warning tier, definite arm" 0 'warning:.*may fail' \
+    'func fetch() { return g; }' \
+    'if (runtime(0) > 1) { var dyn t = fetch(); }' \
+    'var g = 5;'
+
+check "-nr: the warning tier, weak arm" 0 'warning:.*might fail' \
+    'func fetch() { return g; }' \
+    'var ops = [fetch];' \
+    'var dyn t = ops[0]();' \
+    'var g = 5;'
+
+# The other direction, which matters just as much: -nr must stay QUIET and
+# exit 0 on a correct program, or it is useless as a CI gate.
+check "-nr: a correct program is silent" 0 '' \
+    'func fetch() { return g; }' \
+    'var g = 5;' \
+    'var dyn t = fetch();'
+
+# -nr must not RUN the program. `print` would put "ran" on stdout.
+check "-nr: does not execute" 0 '' \
+    'print("ran");'
+
+# -s promises the const-folded tree AND the post-optimizer one; under -nr it
+# used to print only the first, because there was no optimized tree to show.
+: > "$TMP/s.my"
+printf 'var a = 2 + 3;\nprint(a);\n' > "$TMP/s.my"
+if "$BIN" -nr -s "$TMP/s.my" 2>&1 | grep -q '^Optimized syntax tree'; then
+    pass "-nr -s: both trees"
+else
+    fail "-nr -s: the optimized tree is missing"
+fi
+
+# ---------------------------------------------------------------------
+# THE DEPTH CAP (MYLANG_VM_STACK) - untested until 2026-08-13, though the
+# whole point of the segmented slot stack is that a runaway recursion
+# throws a CATCHABLE StackOverflowEx where the old per-call C-stack model
+# SEGFAULTED. It can only be tested from here: the cap is read ONCE per
+# process into a static, so an in-process `-rt` entry cannot set it.
+# The recursion RUNS AWAY (it counts up from 1): how deep an engine gets
+# before the budget ends it is unspecified (RULE 2, revised 2026-09-23 -
+# a native tier may carve frames from the machine stack and go far
+# deeper than the slot budget), so a bounded one would be a statement
+# about memory, not about the exception.
+: > "$TMP/so.my"
+cat > "$TMP/so.my" <<'EOF'
+func down(int n) {
+    if (n <= 0)
+        return 0;
+    var r = down(n + 1);
+    return r + 1;
+}
+var caught = 0;
+try {
+    var d = down(runtime(1));
+    print("NO THROW", d);
+} catch (StackOverflowEx) {
+    caught = 1;
+}
+print("caught:", caught);
+EOF
+out=$(MYLANG_VM_STACK=4000 "$BIN" "$TMP/so.my" 2>&1)
+got_rc=$?
+if [ "$got_rc" = 0 ] && printf '%s' "$out" | grep -q '^caught: 1'; then
+    pass "depth cap: deep recursion throws a CATCHABLE StackOverflowEx"
+else
+    fail "depth cap: wanted a caught StackOverflowEx, got rc=$got_rc [$out]"
+fi
+
+# ... and the cap must be the only thing stopping it: the SAME program at
+# a depth that fits must run to completion. A cap change that throws too
+# EARLY is the dangerous direction (it refuses a working program), and
+# nothing else in the tree would notice.
+: > "$TMP/ok.my"
+cat > "$TMP/ok.my" <<'EOF'
+func down(int n) {
+    if (n <= 0)
+        return 0;
+    var r = down(n - 1);
+    return r + 1;
+}
+print("depth:", down(runtime(300)));
+EOF
+out=$(MYLANG_VM_STACK=4000 "$BIN" "$TMP/ok.my" 2>&1)
+got_rc=$?
+if [ "$got_rc" = 0 ] && printf '%s' "$out" | grep -q '^depth: 300'; then
+    pass "depth cap: a recursion that FITS still completes"
+else
+    fail "depth cap: the fitting program failed rc=$got_rc [$out]"
+fi
+
+# An UNCAUGHT overflow must still be a clean, located error - not a crash.
+: > "$TMP/sou.my"
+cat > "$TMP/sou.my" <<'EOF'
+func down(int n) {
+    if (n <= 0)
+        return 0;
+    var r = down(n + 1);
+    return r + 1;
+}
+print("d:", down(runtime(1)));
+EOF
+out=$(MYLANG_VM_STACK=4000 "$BIN" "$TMP/sou.my" 2>&1)
+got_rc=$?
+if [ "$got_rc" = 1 ] && printf '%s' "$out" | grep -q 'StackOverflowEx'; then
+    pass "depth cap: an UNCAUGHT overflow is a located error, not a crash"
+else
+    fail "depth cap: uncaught overflow rc=$got_rc [$out]"
+fi
+
+# EVERY ENGINE CONFIGURATION ENDS A RUNAWAY RECURSION IN A CATCHABLE
+# StackOverflowEx (RULE 2, as revised 2026-09-23). The DEPTH is
+# unspecified - how much memory an engine has is a property of the
+# environment, and a native tier that carves frames from the machine
+# stack may go deeper than the slot segment - so it is MASKED: the
+# program prints only whether it got well past a trivial depth. What
+# must match is everything else: that the overflow happened, that it was
+# caught, and all the output around it. The caps straddle a SEG_SLOTS
+# (16384) boundary, where the budget arithmetic changes, and the shapes
+# are the ones the call tiers treat differently (the vacuity threshold
+# is 200, not 500: the closure-inlining splice grows viacl's frame from
+# 5 slots to 8, and cap 3001 then holds ~370 levels): plain self
+# recursion, a leaf call per level, mutual recursion, a closure call per
+# level, and a leaf called from MAIN (the frameless site's home). Its
+# first run, in its earlier depth-exact form, found two real bugs in the
+# depth-cap SWITCH materializer (docs/jit-optimizations.md).
+cat > "$TMP/sodepth.my" <<'SODEOF'
+var depth = 0;
+func leaf(int x) { var a = x + 1; var b = a * 2; return b - a; }
+func self(int n) { depth = n; return self(n + 1) + 1; }
+func withleaf(int n) {
+    depth = n; var t = leaf(n); return withleaf(n + 1) + t;
+}
+func ev(int n) { depth = n; return od(n + 1) + 1; }
+func od(int n) { depth = n; return ev(n + 1) + 1; }
+func mk(int k) { return func [k] (int n) { return k + n; }; }
+var cl = mk(3);
+func viacl(int n) { depth = n; var q = cl(n); return viacl(n + 1) + q; }
+func run(int which) {
+    depth = 0;
+    try {
+        if (which == 0) print(self(runtime(1)));
+        if (which == 1) print(withleaf(runtime(1)));
+        if (which == 2) print(ev(runtime(1)));
+        if (which == 3) print(viacl(runtime(1)));
+    } catch (StackOverflowEx) { print("overflow", which, depth > 200); }
+}
+for (var w = 0; w < 4; w++) { print(leaf(w)); run(w); }
+SODEOF
+sod_ok=1
+for cap in 3001 16384 16390 40000; do
+    want=$(MYLANG_VM_STACK=$cap "$BIN" -nj "$TMP/sodepth.my" 2>&1)
+    if ! printf '%s\n' "$want" | grep -q '^overflow 3 true'; then
+        fail "overflow: -nj did not overflow every shape at cap $cap
+      (the check would be vacuous) [$want]"
+        sod_ok=0
+        continue
+    fi
+    # MYLANG_NATIVE_STACK=0 puts a release build's sync depth cap at 200,
+    # so its deep calls take the SWITCH protocol the way a sanitized
+    # build's (cap 32) always do - the path both bugs this check found
+    # on its first run live on (2026-09-23)
+    for cfg in "" "MYLANG_JIT_OFF=norec" "MYLANG_JIT_OFF=frameless" \
+               "MYLANG_JIT_OFF=bakecallee" "MYLANG_NATIVE_STACK=0"; do
+        got=$(env $cfg MYLANG_VM_STACK=$cap "$BIN" "$TMP/sodepth.my" 2>&1)
+        if [ "$got" != "$want" ]; then
+            fail "overflow: cap $cap, [${cfg:-default}] differs from -nj:
+      want: $(printf '%s' "$want" | tr '\n' '|')
+      got:  $(printf '%s' "$got" | tr '\n' '|')"
+            sod_ok=0
+        fi
+    done
+    # -nti: every call is a `dyn` one (CallValueGenericV), which ran a
+    # NESTED vm_run_chunk per call until 2026-09-30 - the C stack, not
+    # the slot cap, ended the recursion (an ASan stack-overflow at ~300
+    # levels, a SIGSEGV past the budget in a release build)
+    for flags in "-nti" "-nti -nj"; do
+        got=$(MYLANG_VM_STACK=$cap "$BIN" $flags "$TMP/sodepth.my" 2>&1)
+        if [ "$got" != "$want" ]; then
+            fail "overflow: cap $cap, [$flags] differs from -nj:
+      want: $(printf '%s' "$want" | tr '\n' '|')
+      got:  $(printf '%s' "$got" | tr '\n' '|' | cut -c1-300)"
+            sod_ok=0
+        fi
+    done
+done
+[ $sod_ok = 1 ] &&
+    pass "overflow: a catchable StackOverflowEx in every engine configuration (4 caps)"
+
+# The VACUITY GUARD for the MYLANG_NATIVE_STACK=0 configuration above: it
+# must actually take the deep calls off the native stack - in a TESTS
+# build the sync tier's depth counter says so - or that row compares the
+# default with itself. (An ASan build compiles the native stack out, and
+# the variable with it; a build without TESTS has no counter.) Mutation
+# testing found the gap: a mutant ignoring the variable survived every
+# stage (2026-11-11).
+if "$BIN" -v 2>/dev/null | grep -Eq '^ *tests +1' &&
+   "$BIN" -v 2>/dev/null | grep -Eq '^ *asan +0' &&
+   "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
+    printf 'func d(int n) { if (n == 0) return 0; var r = d(n - 1); %s\n%s\n' \
+        'return r + 1; }' 'print(d(int(runtime(2000))));' > "$TMP/ns.my"
+    ns_on=$(MYLANG_JITSTATS=1 "$BIN" "$TMP/ns.my" 2>&1 >/dev/null |
+            awk '$1 == "sync_depth_max" { print $2 }')
+    ns_off=$(MYLANG_NATIVE_STACK=0 MYLANG_JITSTATS=1 "$BIN" "$TMP/ns.my" \
+             2>&1 >/dev/null | awk '$1 == "sync_depth_max" { print $2 }')
+    if [ -n "$ns_on" ] && [ -n "$ns_off" ] && [ "$ns_off" -gt "$ns_on" ]; then
+        pass "MYLANG_NATIVE_STACK=0 moves deep calls to the sync tier \
+(depth $ns_on -> $ns_off)"
+    else
+        fail "MYLANG_NATIVE_STACK=0 changed nothing: sync_depth_max \
+[$ns_on] by default, [$ns_off] with it"
+    fi
+else
+    echo "  skip  MYLANG_NATIVE_STACK=0 vacuity (needs TESTS, no ASan, the JIT)"
+fi
+
+# -v REPORTS THE ARENA, and MYLANG_NO_LOWMEM=1 refuses it. This is the
+# VACUITY GUARD for the no-arena CI lane: a lane that tests a
+# configuration must be able to prove it is IN that configuration, or it
+# goes green doing nothing the day a default moves (the lto0 lane's
+# reason for asserting `lto 0` before it tests anything). Checked in
+# BOTH directions, so neither a stuck-on nor a stuck-off answer passes.
+out=$("$BIN" -v 2>&1)
+if printf '%s' "$out" | grep -q '^  lowmem  *1'; then
+    pass "-v: the low-address arena is reported, and is ON by default"
+else
+    fail "-v: expected 'lowmem 1' by default [$out]"
+fi
+out=$(MYLANG_NO_LOWMEM=1 "$BIN" -v 2>&1)
+if printf '%s' "$out" | grep -q '^  lowmem  *0'; then
+    pass "-v: MYLANG_NO_LOWMEM=1 refuses the arena"
+else
+    fail "-v: MYLANG_NO_LOWMEM=1 did not refuse the arena [$out]"
+fi
+
+# -v REPORTS WHETHER THE INTRUSIVE TEST INSTRUMENTATION IS COMPILED IN
+# (#107). bench/run.py refuses `int_tests 1`, and the intrusive runner
+# will refuse `int_tests 0` - both read this line, so it must exist in
+# every build and its value must match the build: MYLANG_EXPECT_INT_TESTS
+# (default 0) names what this lane was built with.
+out=$("$BIN" -v 2>&1)
+want_int=${MYLANG_EXPECT_INT_TESTS:-0}
+if printf '%s' "$out" | grep -q "^  int_tests  *$want_int"; then
+    pass "-v: reports int_tests $want_int"
+else
+    fail "-v: expected 'int_tests $want_int' [$out]"
+fi
+
+# -v REPORTS THE SANITIZERS THE BINARY CARRIES, checked against the binary
+# itself: an ASan build calls __asan_init (each instrumented module's
+# constructor does), a UBSan build calls its __ubsan_handle_* runtime. -v
+# read only the compiler's own macros, and GCC defines none for
+# -fsanitize=undefined (13.3 has __SANITIZE_ADDRESS__ alone), so a gcc
+# debug build said `ubsan 0` with every UBSan check compiled in. Both
+# directions, so neither a stuck-on nor a stuck-off answer passes.
+out=$("$BIN" -v 2>&1)
+for san in asan:__asan_init ubsan:__ubsan_handle_; do
+    key=${san%%:*} sym=${san#*:}
+    if grep -q "$sym" "$BIN"; then want=1; else want=0; fi
+    got=$(printf '%s\n' "$out" | awk -v k="$key" '$1 == k { print $2 }')
+    if [ "$got" = "$want" ]; then
+        pass "-v: reports $key $want, as the binary's $sym says"
+    else
+        fail "-v: '$key $got', but the binary's $sym says $want"
+    fi
+done
+
+# A .myv whose chunk pool holds a FUNCTION value must LOAD. #137 bounds
+# every operand an image CONTAINS, but nothing bounded a constructor the
+# LOADER ITSELF calls: read_value built FuncObject(desc, nullptr), and the
+# ctor walked get_root_ctx(nullptr) - `while (ctx->parent)` on a null
+# pointer - so `mylang prog.myv` SEGFAULTED (rc 139) on a valid image of
+# our own making. A `pure func` in a const array is all it takes; nothing
+# in the corpus had one, which is why no net saw it. RULE 2 wants the
+# image to print exactly what the source printed, so compare the two runs
+# instead of just checking that neither crashed.
+cat > "$TMP/pool.my" <<'PROG'
+pure func sq(x) => x * x;
+const OPS = [sq];
+var dyn ops = runtime(OPS);
+var dyn f = ops[runtime(0)];
+print(len(ops), array_storage(ops), f(7));
+PROG
+src_out=$("$BIN" "$TMP/pool.my" 2>&1)
+src_rc=$?
+if "$BIN" -c "$TMP/pool.my" -o "$TMP/pool.myv" >/dev/null 2>&1; then
+    img_out=$("$BIN" "$TMP/pool.myv" 2>&1)
+    img_rc=$?
+    if [ "$src_rc" = 0 ] && [ "$img_rc" = 0 ] && \
+       [ "$img_out" = "$src_out" ]; then
+        pass "myv: an image whose pool holds a FUNCTION value loads and runs"
+    else
+        det="src $src_rc [$src_out] img $img_rc [$img_out]"
+        fail "myv: a pool FUNCTION value did not load ($det)"
+    fi
+else
+    fail "myv: -c refused a program with a function value in a pool"
+fi
+
+# RULE 2 (2026-09-20): a bind coercion carets the FAILING ARGUMENT, and an
+# image must render it exactly as the source run does - the per-argument
+# spans travel in the image's arg_locs table (v16), and this is the only
+# net that renders an error THROUGH the file driver from a loaded image
+# (-rt's round trip compares the tables, not the caret a user sees). The
+# throw is on a WARMED re-descent so the emitted site's stamp - a run-time
+# select on the exception's bind_arg - is what renders under the JIT.
+cat > "$TMP/argcaret.my" <<'PROG'
+func mk2(int z) { return func [z] (int a, int b) { return a + b + z; }; }
+var f2 = mk2(1);
+var dyn z = 0; z = runtime("str"); var s = 0;
+for (var i = 0; i < runtime(4); i++) { s = s + f2(i, i); s = s + f2(z, i); }
+print(s);
+PROG
+# (the header names the file as each run was given it - the absolute
+# path here, the image's stored relative reference - so the name is
+# masked; everything else, the caret line included, must be identical)
+mask_at='s/ at [^,]*, line/ at F, line/'
+src_out=$("$BIN" "$TMP/argcaret.my" 2>&1 | sed "$mask_at")
+if "$BIN" -c "$TMP/argcaret.my" -o "$TMP/argcaret.myv" >/dev/null 2>&1; then
+    img_out=$("$BIN" "$TMP/argcaret.myv" 2>&1 | sed "$mask_at")
+    if [ "$img_out" = "$src_out" ] && \
+       printf '%s' "$src_out" | grep -q 'line 4, col 69:70'; then
+        pass "myv: a bind coercion's per-argument caret renders from an image"
+    else
+        det="src [$src_out] img [$img_out]"
+        fail "myv: per-argument caret from an image ($det)"
+    fi
+else
+    fail "myv: -c refused the per-argument caret program"
+fi
+
+# ... and a function in a STRUCT's const member (#52, v20). The struct
+# table used to be read BEFORE the descriptor table, so a descriptor index
+# in a const member resolved against an empty one: `-c` first wrote an
+# image that died as "corrupt .myv (descriptor)", then refused the
+# program outright. v20's table of contents builds every struct and
+# descriptor SHELL first, so the image must now compile, load and print
+# exactly what the source run prints - including an array and a dict of
+# functions, and a function literal as the member itself.
+cat > "$TMP/sconst.my" <<'PROG'
+pure func sq(x) => x * x;
+struct Ops {
+    const F = sq;
+    const LT = pure func(a, b) => a < b;
+    const ALL = [sq, pure func(x) => 0 - x];
+    const BY = {"sq": sq};
+}
+var dyn f = runtime(Ops.F);
+var xs = [3, 1, 2];
+print(f(7), sort(xs, Ops.LT), Ops.ALL[runtime(1)](4), Ops.BY["sq"](5));
+PROG
+src_out=$("$BIN" "$TMP/sconst.my" 2>&1)
+if "$BIN" -c "$TMP/sconst.my" -o "$TMP/sconst.myv" >/dev/null 2>&1; then
+    img_out=$("$BIN" "$TMP/sconst.myv" 2>&1)
+    got_rc=$?
+    if [ "$got_rc" = 0 ] && [ "$img_out" = "$src_out" ] && \
+       printf '%s' "$src_out" | grep -q '^49 \[1, 2, 3\] -4 25'; then
+        pass "myv: functions in a struct's const members round-trip"
+    else
+        fail "myv: struct-const functions: rc=$got_rc src=[$src_out] \
+img=[$img_out]"
+    fi
+else
+    fail "myv: -c refused a function in a struct's const member"
+fi
+
+# A dict keeps INSERTION ORDER (#50), and an image writes a constant dict's
+# pairs in that order and loads them in file order - so a loaded image
+# prints a dict as the source run does. With the hash map's own order a
+# rebuilt dict iterated differently, the one way a loaded image's output
+# could differ from a fresh compile's.
+cat > "$TMP/dord.my" <<'PROG'
+const CD = {"y": 1, "c": 2, "x": 3, "a": 4};
+pure func mk(int n) {
+    var r = {};
+    for (var i = n; i > 0; i--)
+        r["k" + str(i)] = i;
+    return r;
+}
+var folded = mk(3);
+var e = {};
+for (var i = 9; i > 6; i--)
+    e[i] = runtime(i);
+print(CD, folded, e, keys(CD));
+PROG
+src_out=$("$BIN" "$TMP/dord.my" 2>&1)
+want='{"y": 1, "c": 2, "x": 3, "a": 4} {"k3": 3, "k2": 2, "k1": 1} {9: 9, 8: 8, 7: 7} ["y", "c", "x", "a"] '
+if "$BIN" -c "$TMP/dord.my" -o "$TMP/dord.myv" >/dev/null 2>&1; then
+    img_out=$("$BIN" "$TMP/dord.myv" 2>&1)
+    got_rc=$?
+    if [ "$got_rc" = 0 ] && [ "$img_out" = "$src_out" ] && \
+       [ "$src_out" = "$want" ]; then
+        pass "myv: a dict keeps its insertion order through an image"
+    else
+        fail "myv: dict order: rc=$got_rc src=[$src_out] img=[$img_out]"
+    fi
+else
+    fail "myv: -c refused the dict-order program"
+fi
+
+# A store CHAIN (`m[k][1] = v`, `o.ins[k].v[0] = v`) and an INC-DEC chain
+# (`m[1 - k][1]++`, `o.i.y++`) keep their steps and per-step carets in
+# chunk pools of their own, and a constant pool may hold a class
+# instance, a flat bool array, a string array and a default dict. No
+# image any test wrote had a chain in it until 2026-11-07 (the coverage
+# report showed those writer and reader sections never ran): the image
+# must run exactly as its source does, under the JIT and under -nj.
+cat > "$TMP/chains.my" <<'PROG'
+struct In { int y; array<int> v; }
+struct Out { In i; array<In> ins; }
+class C { int n; }
+const KC = C(5);
+const KB = [true, false, true];
+const KS = ["p", "q"];
+const KD = dict(7);
+func f(int k) {
+    var m = [[1, 2], [3, 4]];
+    m[k][1] = 9;
+    m[k][0] += 5;
+    m[1 - k][1]++;
+    var o = Out(In(1, [1, 2]), [In(2, [3]), In(3, [4, 5])]);
+    o.i.y++;
+    o.i.v[1] += 10;
+    o.ins[k].v[0] = 40;
+    o.ins[1].y--;
+    var d = {"a": {"b": [1, 2]}};
+    d["a"]["b"][k]++;
+    d["a"]["c"] = [k];
+    var e = clone(KD);
+    e["x"] += 1;
+    return str(m) + " " + str(o) + " " + str(d) + " " + str(e);
+}
+print(f(int(runtime(0))));
+print(KC.n, KB, KS, KD["zz"]);
+PROG
+src_out=$("$BIN" "$TMP/chains.my" 2>&1)
+if "$BIN" -c "$TMP/chains.my" -o "$TMP/chains.myv" >/dev/null 2>&1; then
+    img_out=$("$BIN" "$TMP/chains.myv" 2>&1)
+    got_rc=$?
+    nj_out=$("$BIN" -nj "$TMP/chains.myv" 2>&1)
+    if [ "$got_rc" = 0 ] && [ "$img_out" = "$src_out" ] && \
+       [ "$nj_out" = "$src_out" ] && \
+       [ "${src_out#\[\[6, 9\]}" != "$src_out" ]; then
+        pass "myv: store and inc-dec chains run from an image like source"
+    else
+        fail "myv: chains: rc=$got_rc src=[$src_out] img=[$img_out] \
+nj=[$nj_out]"
+    fi
+else
+    fail "myv: -c refused the store-chain program"
+fi
+
+# A CLASS instance has identity, and its hash is its identity NUMBER
+# (v33's `cls` record): an image must keep two references to one constant
+# instance one object, keep two declarations two objects, and give each
+# instance the number the compile gave it - a dict keyed by constant
+# instances then iterates in the source run's order. Its struct const
+# members are read while the struct table is still being filled. An array
+# of class instances keeps the flat CLASS storage (v34's `objs` kind).
+cat > "$TMP/clsimg.my" <<'PROG'
+class C { int v; }
+struct S { const Z = C(9); }
+const A = C(1);
+const B = C(1);
+const L = [A, A, B, S.Z];
+var d = {};
+foreach (var k in L) { d[k] = k.v; }
+var e = C(7); d[e] = 7;
+foreach (k, v in d) { print(k.v, v); }
+print(L[0] == L[1], L[0] == L[2], A == B, len(d), S.Z == L[3],
+      array_storage(L));
+PROG
+src_out=$("$BIN" "$TMP/clsimg.my" 2>&1)
+if "$BIN" -c "$TMP/clsimg.my" -o "$TMP/clsimg.myv" >/dev/null 2>&1; then
+    img_out=$("$BIN" "$TMP/clsimg.myv" 2>&1)
+    got_rc=$?
+    if [ "$got_rc" = 0 ] && [ "$img_out" = "$src_out" ] && \
+       printf '%s' "$src_out" | grep -q '^true false false 4 true class'; then
+        pass "myv: class instances keep their identity and hash in an image"
+    else
+        fail "myv: class identity: rc=$got_rc src=[$src_out] img=[$img_out]"
+    fi
+else
+    fail "myv: -c refused a program with constant class instances"
+fi
+
+# signature() renders each parameter's annotation as declared - from the
+# descriptor, since a loaded image has no AST: a struct, a parameterized
+# container or a box parameter's text rides in the image (v36's
+# `sig_type`). Without it an image would print `func f(p, array a, ...)`
+# where its source prints the annotations.
+cat > "$TMP/sigimg.my" <<'PROG'
+struct P { int x; }
+func f(P p, array<int> ai, dict<str,P>? dp, box<int> bx, opt int oi) => 1;
+print(signature(f));
+print(f(P(1), [2], none, box(3), none));
+PROG
+src_out=$("$BIN" "$TMP/sigimg.my" 2>&1)
+if "$BIN" -c "$TMP/sigimg.my" -o "$TMP/sigimg.myv" >/dev/null 2>&1; then
+    img_out=$("$BIN" "$TMP/sigimg.myv" 2>&1)
+    got_rc=$?
+    want='func f(P p, array<int> ai, dict<str,P>? dp, box<int> bx, opt int oi)'
+    if [ "$got_rc" = 0 ] && [ "$img_out" = "$src_out" ] && \
+       printf '%s' "$src_out" | grep -qF "$want"; then
+        pass "myv: signature() gives a parameter's annotation in an image"
+    else
+        fail "myv: signature: rc=$got_rc src=[$src_out] img=[$img_out]"
+    fi
+else
+    fail "myv: -c refused the annotated-parameter program"
+fi
+
+# A LOADED image whose main takes a SWITCHED call (recursion past the
+# JIT's sync depth cap, an exception across a call) must run exactly like
+# its source. The script driver moves the VmProgram it loads out of
+# myv_read's return slot into its own variable, and main's root chunk is
+# ADDRESS-BAKED by the native tier (every NorecSite's caller, the
+# fragment -> chunk map): the compile path rebound after its move, the load
+# path did not, and `mylang prog.myv` resumed main at a stack address that
+# had gone out of scope - ASan on 12_deep_switch, a wild read in a
+# release build (found 2026-09-22 by running every corpus image against
+# its source). The rebind lives in VmProgram's move operations now; this is
+# the only net that reaches the driver's move, since -rt runs in-process.
+# Deep enough to cross the cap in every lane (32 under the sanitizers).
+cat > "$TMP/deep.my" <<'PROG'
+func ev(int n) { if (n == 0) { return 0; } var r = od(n - 1); return r + 1; }
+func od(int n) { if (n == 0) { return 0; } var r = ev(n - 1); return r + 1; }
+var t = 0;
+for (var k = 0; k < 3; k++)
+    t += ev(runtime(220));
+print("deep:", t);
+PROG
+src_out=$("$BIN" "$TMP/deep.my" 2>&1)
+src_rc=$?
+if "$BIN" -c "$TMP/deep.my" -o "$TMP/deep.myv" >/dev/null 2>&1; then
+    img_out=$("$BIN" "$TMP/deep.myv" 2>&1)
+    img_rc=$?
+    if [ "$src_rc" = 0 ] && [ "$img_rc" = 0 ] && \
+       [ "$img_out" = "$src_out" ]; then
+        pass "myv: an image whose main takes a SWITCHED call runs like src"
+    else
+        img_head=$(printf '%s' "$img_out" | head -3)
+        det="src $src_rc [$src_out] img $img_rc [$img_head]"
+        fail "myv: a switched call from a loaded image's main ($det)"
+    fi
+else
+    fail "myv: -c refused the deep-recursion program"
+fi
+
+# A CONSTANT THAT CONTAINS ITSELF (README, "Values that contain
+# themselves"): a pure function builds a ring at compile time. The program
+# runs, but a .myv image stores a value as a tree, so `-c` must REFUSE it -
+# exit 1, a MyvError naming the constant, and no file. It used to overflow
+# the C stack in the writer (a SIGSEGV in a release build). -rt checks the
+# writer in-process; this is the only net for the driver's exit code and
+# for the file it would leave.
+cat > "$TMP/cyc.my" <<'PROG'
+pure func mkr(n) { var dyn r = [n, "x"]; r[1] = r; return r; }
+const C = mkr(1);
+print(str(C));
+PROG
+src_out=$("$BIN" "$TMP/cyc.my" 2>&1)
+src_rc=$?
+c_out=$("$BIN" -c "$TMP/cyc.my" -o "$TMP/cyc.myv" 2>&1)
+c_rc=$?
+if [ "$src_rc" = 0 ] && [ "$src_out" = "[1, [...]] " ] && \
+   [ "$c_rc" = 1 ] && [ ! -e "$TMP/cyc.myv" ] && \
+   printf '%s' "$c_out" | \
+       grep -q '^MyvError: a constant .*holds a reference cycle'; then
+    pass "myv: -c refuses a constant that contains itself, writes nothing"
+else
+    c_head=$(printf '%s' "$c_out" | head -2 | tr '\n' ' ')
+    fail "myv: cyclic constant: src $src_rc [$src_out] -c $c_rc [$c_head]"
+fi
+
+# A source with CRLF line ends and no final newline: an error from its
+# image quotes the source line as a source run does (the CRs dropped, the
+# last line kept). And -c to an output path that cannot be opened is a
+# MyvError, exit 1 - not a crash and not a silent success.
+printf 'var a = 1;\r\nvar z = int(runtime(0));\r\nprint(a / z);' \
+    > "$TMP/crlf.my"
+crlf_src=$("$BIN" "$TMP/crlf.my" 2>&1)
+"$BIN" -c "$TMP/crlf.my" -o "$TMP/crlf.myv" > /dev/null 2>&1
+crlf_img=$("$BIN" "$TMP/crlf.myv" 2>&1)
+# (the header names the file as the image stores it, relative to its
+# root, so the comparison starts at the source line)
+if [ "$(printf '%s' "$crlf_img" | sed 1d)" = \
+     "$(printf '%s' "$crlf_src" | sed 1d)" ] &&
+   printf '%s' "$crlf_img" | head -1 | grep -q 'line 3, col 11:12$' &&
+   printf '%s' "$crlf_img" | grep -q '^    print(a / z);$'; then
+    pass "myv: a CRLF source's line renders in an error from its image"
+else
+    fail "myv: CRLF source: [$(printf '%s' "$crlf_img" | head -c 200)] vs \
+[$(printf '%s' "$crlf_src" | head -c 200)]"
+fi
+# ...and an error ON a CRLF-terminated line, the last line ending in a
+# bare CR: a source run keeps a CRLF file's CRs in its lines and an image
+# reading its source back drops them, so the quoted line differed by a
+# trailing CR until the renderer dropped one (2026-11-12, RULE 2).
+printf 'var a = 1;\r\nprint(a / int(runtime(0)));\r\nprint(2);\r' \
+    > "$TMP/crlf2.my"
+crlf2_src=$("$BIN" "$TMP/crlf2.my" 2>&1)
+"$BIN" -c "$TMP/crlf2.my" -o "$TMP/crlf2.myv" > /dev/null 2>&1
+crlf2_img=$("$BIN" "$TMP/crlf2.myv" 2>&1)
+if [ "$(printf '%s' "$crlf2_img" | sed 1d)" = \
+     "$(printf '%s' "$crlf2_src" | sed 1d)" ] &&
+   [ "$(printf '%s' "$crlf2_src" | tr -d '\r')" = "$crlf2_src" ] &&
+   printf '%s' "$crlf2_img" | grep -q '^    print(a / int(runtime(0)));$'
+then
+    pass "myv: a CRLF line quoted in an error: no CR, from source or image"
+else
+    fail "myv: CRLF line 2: [$(printf '%s' "$crlf2_img" | od -c |
+          head -c 300)] vs [$(printf '%s' "$crlf2_src" | od -c |
+          head -c 300)]"
+fi
+nout=$("$BIN" -c "$TMP/crlf.my" -o "$TMP/no/such/dir/x.myv" 2>&1)
+nrc=$?
+if [ $nrc = 1 ] &&
+   printf '%s' "$nout" | grep -q '^MyvError: cannot open the output file'
+then
+    pass "myv: -c to an output path that cannot be opened: a MyvError"
+else
+    fail "myv: unwritable output: exit $nrc: $(printf '%s' "$nout" |
+          head -c 200)"
+fi
+
+# #96: the hardcoded-register RATCHET (scripts/regcensus.py header has
+# the rule). A source-analysis check, not a binary one - it lives here
+# because every CI lane and the local battery already run this script.
+# The gate fails on drift in EITHER direction: a new unjustified site,
+# or an improvement whose floor was not lowered in the same commit.
+if command -v python3 >/dev/null 2>&1 && \
+   [ -f "$here/../scripts/regcensus.py" ]; then
+    if python3 "$here/../scripts/regcensus.py" --gate >/dev/null 2>&1; then
+        pass "regcensus --gate: UNJUSTIFIED hardcoded-register floors hold"
+    else
+        fail "regcensus --gate: floors drifted (run scripts/regcensus.py --gate)"
+    fi
+fi
+
+# ⛔ `-vdj` IS REPRODUCIBLE ACROSS PROCESSES - the property
+# scripts/vdjcmp rests on, and the one -rt structurally CANNOT check
+# (it runs in-process, so it can only assert the address-free INVARIANT
+# that implies it; see the `-vdj decodes every emitted form` entry).
+#
+# This is the end-to-end form: two separate runs of the same binary on
+# the same program must produce byte-identical text. It exists because
+# the invariant check, correct as it was, enumerated WHERE an address
+# could appear and went blind to a new operand form (#97 step 1a's
+# absolute disp32) - after which the dump was non-reproducible and
+# vdjcmp refused every comparison, unread, because nothing in the
+# battery ran it.
+# ⛔ AND THE GUARD SAYS WHEN IT SKIPS. The first version tested
+# `grep '^jit 1'` against a `-v` line that is actually indented and
+# column-aligned, so it matched nothing and the whole check skipped in
+# SILENCE - the vacuous-guard trap, in the check written to close a
+# silent gap. A skip is now reported.
+if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
+    a=$("$BIN" -vdj "$here/../samples/gcd" 2>/dev/null | md5sum)
+    b=$("$BIN" -vdj "$here/../samples/gcd" 2>/dev/null | md5sum)
+    c=$("$BIN" -vdj "$here/../samples/shopping" 2>/dev/null | md5sum)
+    d=$("$BIN" -vdj "$here/../samples/shopping" 2>/dev/null | md5sum)
+    if [ -z "$a" ]; then
+        fail "-vdj produced NO output for samples/gcd - the check is vacuous"
+    elif [ "$a" = "$b" ] && [ "$c" = "$d" ]; then
+        pass "-vdj: two processes, byte-identical dumps"
+    else
+        fail "-vdj is NOT reproducible across processes - a baked address
+      reached the text. Every vdjcmp comparison is void until it is
+      fixed; run '$BIN -vdj samples/gcd' twice and diff to see it."
+    fi
+else
+    echo "  skip  -vdj reproducibility (this build reports jit 0)"
+fi
+
+# ⛔ `-vdj` DUMPS THE NATIVE TIER A RUN USES (#97 inc 2, 2026-09-20).
+# The dump is a SECOND codegen driver, and its hand copy of the JIT
+# pass sequence went stale twice: main jitted with no map, no frameless
+# pre-pass - so `-vdj bench/my/78` showed the generic `call rdx` push
+# for a program whose run took 2,000,002 frameless calls, and the tier
+# was being "read" off a dump of code that never ran. The drivers share
+# vm_jit_program now; this asks the CLI itself, over the bench the tier
+# was built for: its four leaves (two factories, two closures - the
+# count MYLANG_JITSTATS reports) must each show their frameless entry.
+# The factories take TYPED parameters, so by default the bytecode
+# inliner pastes them into main and only the two closures remain;
+# MYLANG_BCINLINE_TYPED=0 keeps all four reachable.
+if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
+    b78="$here/../bench/my/78_typed_param_call.my"
+    n=$("$BIN" -npc -vdj "$b78" 2>/dev/null \
+            | grep -c '^; frameless entry @+')
+    n4=$(MYLANG_BCINLINE_TYPED=0 "$BIN" -npc -vdj "$b78" 2>/dev/null \
+            | grep -c '^; frameless entry @+')
+    if [ "$n" = "2" ] && [ "$n4" = "4" ]; then
+        pass "-vdj: the dump carries the frameless tier a run uses (2 / 4)"
+    else
+        fail "-vdj shows $n / $n4 frameless entries for bench/my/78 (want
+      2 / 4): the dump driver is not running the JIT sequence a run does"
+    fi
+else
+    echo "  skip  -vdj frameless parity (this build reports jit 0)"
+fi
+
+# #97 inc 3 W3: the frameless SITE leaves a raw-written, unlisted window
+# slot UNINITIALISED - and only a NON-TESTS binary shows that form,
+# because a TESTS build poisons such a slot instead (the abort-by-name
+# net every -rt lane runs on). So the -rt shape test can only ever pin
+# the poison; the elided form is pinned HERE, over the same bench, by
+# what the site of 78's `add(i)` does after the parameter's int tag:
+# in a TESTS build a `movabs r11` (the sentinel) and two r11 stores at
+# the temps' type words; in a release build NOTHING - the tag store is
+# followed straight by the residue's `lea rcx`. Both configurations are
+# asserted, so neither can rot: the poison (the net) and the elision
+# (the point). The VALUE-SITE SPLICE is off for this and the W4 check
+# (MYLANG_BCINLINE_VALUE=0): since #97's closure inlining, `add(i)` is
+# inlined behind a guard and the frameless site under test survives
+# only as the guard's miss arm, in a different shape.
+if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
+    site=$(MYLANG_BCINLINE_VALUE=0 "$BIN" -npc -vdj \
+            "$here/../bench/my/78_typed_param_call.my" \
+            2>/dev/null | sed -n '/; ===== main/,$p' \
+          | sed -n '/sub rsp, 144/,/call <helper>/p' \
+          | sed -n '1,/call <helper>/p')
+    # REGCALL 1A: the int parameter goes in rdi, not into the window -
+    # so the window base is followed directly by the residue's lea
+    after_tag=$(printf '%s\n' "$site" \
+          | sed -n '/mov r10, rsp/{n;p;}' | head -1)
+    if "$BIN" -v 2>/dev/null | grep -Eq '^ *tests +1'; then
+        if printf '%s\n' "$site" | grep -q 'movabs r11, <addr>' \
+                && printf '%s\n' "$site" | grep -q 'mov \[r10+0x48\], r11' \
+                && printf '%s\n' "$site" | grep -q 'mov \[r10+0x78\], r11'; then
+            pass "-vdj: W3 - a TESTS build poisons the skipped window slots"
+        else
+            fail "-vdj: W3 - a TESTS build should poison the two temps of
+      78's add(i) site (movabs r11 + two r11 stores); the site read:
+$site"
+        fi
+    else
+        case "$after_tag" in
+        *"lea rcx, [rbx+"*)
+            pass "-vdj: W3 - a release build leaves the temps' init out" ;;
+        *)
+            fail "-vdj: W3 - a release build should follow the window base
+      straight with the residue's lea (the temps' init elided, the int
+      parameter in rdi - REGCALL 1A); the instruction after it was:
+      $after_tag" ;;
+        esac
+    fi
+else
+    echo "  skip  -vdj W3 site form (this build reports jit 0)"
+fi
+
+# #97 inc 3 W4: the frameless SITE of a W4 callee neither repoints
+# ctx.captures nor restores it - the callee's entry takes its capture
+# base from the FuncObject in rdx. A release build shows the residue
+# push followed STRAIGHT by the call; a TESTS build stores the poison
+# captures between them (movabs + store), so both forms are asserted,
+# over 78's `add(i)` site again (the closure is a W4 body: one proven
+# capture read, one add).
+if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
+    site=$(MYLANG_BCINLINE_VALUE=0 "$BIN" -npc -vdj \
+            "$here/../bench/my/78_typed_param_call.my" \
+            2>/dev/null | sed -n '/; ===== main/,$p' \
+          | sed -n '/sub rsp, 144/,/call <helper>/p' \
+          | sed -n '1,/call <helper>/p' \
+          | grep -v 'push rax\|inc \[rax+0x0\]\|pop rax' \
+          | grep -v 'mov rdi, ')   # REGCALL 1A: the argument register
+    after_push=$(printf '%s\n' "$site" \
+          | sed -n '/push \[r9+0x/{n;p;}' | head -1)
+    if "$BIN" -v 2>/dev/null | grep -Eq '^ *tests +1'; then
+        case "$after_push" in
+        *"movabs rax, <addr>"*)
+            pass "-vdj: W4 - a TESTS build stores the poison captures" ;;
+        *)
+            fail "-vdj: W4 - a TESTS build should store the poison captures
+      after the residue push of 78's add(i) site; the line after it was:
+      $after_push" ;;
+        esac
+    else
+        case "$after_push" in
+        *"call <helper>"*)
+            pass "-vdj: W4 - a release build: residue push, then the call" ;;
+        *)
+            fail "-vdj: W4 - a release build should follow the residue push of
+      78's add(i) site straight with the call (no ctx.captures repoint);
+      the line after it was: $after_push" ;;
+        esac
+    fi
+else
+    echo "  skip  -vdj W4 site form (this build reports jit 0)"
+fi
+
+# ---------------------------------------------------------------------
+# -dcs: the CALLEE-SET dump (#116).
+#
+# ⛔ A NEW CLI FLAG NEEDS A CASE HERE, because `-rt` runs in-process and
+# cannot see mylang.cpp's argument handling at all - the whole reason
+# this file exists (#147: `-nr` was wired to the wrong side of an `if`
+# and every one of its prover tests passed regardless).
+#
+# What the driver must do, and what only a spawned process can show:
+# ANSWER (a real set, not an empty dump), then EXIT WITHOUT RUNNING -
+# `-dti` and `-a` are the precedent, and a dump flag that also executed
+# the program would be useless on anything with side effects.
+cat > "$TMP/dcs.my" <<'DCSEOF'
+func sq(int x) => x * x;
+var a = sq;
+var b = a;
+print("RAN", b(2));
+DCSEOF
+out=$("$BIN" -dcs "$TMP/dcs.my" 2>&1)
+if [ $? != 0 ]; then
+    fail "-dcs exited non-zero"
+elif ! printf '%s' "$out" | grep -q 'one.*sq'; then
+    fail "-dcs produced no MUST answer for a plain copy chain - the dump
+      is vacuous, which is indistinguishable from the analysis being
+      dead. Got:
+$out"
+elif printf '%s' "$out" | grep -q 'RAN'; then
+    fail "-dcs RAN the program; it must dump and exit (like -dti / -a)"
+else
+    pass "-dcs: names the callee of a copy chain, and does not run"
+fi
+
+# ---------------------------------------------------------------------
+# The ANALYSIS DUMPS over a folded TYPE QUERY. `typestr`/`kindstr`/
+# `type`/`decltype` fold at inference time by REPLACING their argument
+# with the folded literal - and the argument used to be FREED while the
+# inferencer still keyed its identifiers (id_sym), its calls and its
+# lambdas by node address. `-dti` and `-a` then ITERATE id_sym and read
+# the freed nodes: a heap-use-after-free under ASan, a wild vtable read
+# without it. The argument now stays alive for the inferencer's
+# lifetime (`retired`), so its uses are real, listed occurrences.
+# `-rt` cannot see this: no in-process test runs a dump. The ASan lane
+# runs this file, which is what makes the case a net.
+cat > "$TMP/tq.my" <<'TQEOF'
+var x = 3;
+var a = [1, 2];
+print(typestr(x));
+print(kindstr(a));
+print(typestr(x + len(a)));
+print(typestr(func(int k) { return k + x; }));
+var dyn t = type(a);
+print(decltype(x));
+TQEOF
+for f in -dti "-a --no-color" -dcs -s; do
+    # shellcheck disable=SC2086
+    out=$("$BIN" $f "$TMP/tq.my" 2>&1)
+    if [ $? != 0 ]; then
+        fail "$f over a folded type query exited non-zero:
+$out"
+    else
+        pass "$f over a folded type query"
+    fi
+done
+out=$("$BIN" -dti "$TMP/tq.my" 2>&1)
+if ! printf '%s\n' "$out" | grep -Eq '^ti	x	.*	1:5,3:15'; then
+    fail "-dti lost the use of x INSIDE a folded typestr(x):
+$out"
+else
+    pass "-dti lists a use inside a folded type query"
+fi
+
+# ---------------------------------------------------------------------
+# -nti (#51): with type inference off, the VM codegen refused every user
+# call that reached it (NotLoweredEx: it lowered a call only on a TYPE
+# proof), while the tree-walker ran the program. A flag is the driver's,
+# and no `-rt` entry runs untyped, so the case lives here too (the corpus
+# lane is tests/corpus_diff's `-nti` pass).
+cat > "$TMP/nti.my" <<'NTIEOF'
+struct P { int x; }
+func f(a) { var r = a[0] + 1; return r; }
+func g(n) { var p = P(n); return p.x; }
+var t = 0;
+for (var i = 0; i < 3; i++) {
+    var a = [i, 2];
+    t += f(a) + g(runtime(i));
+}
+print(t);
+NTIEOF
+a=$("$BIN" -tw -nti "$TMP/nti.my" 2>&1)
+b=$("$BIN" -nti "$TMP/nti.my" 2>&1)
+got_rc=$?
+if [ "$got_rc" = 0 ] && [ "$a" = "9 " ] && [ "$a" = "$b" ]; then
+    pass "-nti: a user call in a loop runs, both engines agree"
+else
+    fail "-nti: rc=$got_rc tw=[$a] vm=[$b]"
+fi
+
+# -nti: with no types, make_array guesses its storage from the first
+# element and moves to a general array when a later one does not fit -
+# the one path a typed run never takes (its storage follows its type,
+# rule 4), so the case lives here (plans/strict-container-types.md).
+cat > "$TMP/nti_mkarr.my" <<'NTIEOF'
+var a = make_array(3, func(i) { if (i == 0) return 1; return "s"; });
+var b = make_array(3, func(i) { if (i == 0) return 1.5; return 2; });
+var c = make_array(2, func(i) { if (i == 0) return true; return 1; });
+var e = make_array(2, func(i) => 0.5);
+var g = make_array(2, func(i) => i > 0);
+print(a, b, c, e, g, array_storage(a), array_storage(e), array_storage(g));
+NTIEOF
+a=$("$BIN" -tw -nti "$TMP/nti_mkarr.my" 2>&1)
+b=$("$BIN" -nti "$TMP/nti_mkarr.my" 2>&1)
+got_rc=$?
+want_mk='[1, "s", "s"] [1.500000, 2, 2] [true, 1] [0.500000, 0.500000] [false, true] general float bool '
+if [ "$got_rc" = 0 ] && [ "$a" = "$want_mk" ] && [ "$a" = "$b" ]; then
+    pass "-nti: make_array's storage follows its elements, both engines agree"
+else
+    fail "-nti make_array: rc=$got_rc tw=[$a] vm=[$b]"
+fi
+
+# -nti: `n++` on a variable declared with a type (`int n`, a typed
+# parameter, a typed global) had no lowering - the statement form took
+# only an untyped variable and the typed one waits for a numeric proof,
+# which -nti never makes - so the VM refused the program (NotLoweredEx)
+# while the tree-walker ran it. A misfit is the same TypeErrorEx.
+cat > "$TMP/nti_incdec.my" <<'NTIEOF'
+int g = 1;
+func h() { g++; }
+func w(int n) { while (n < 4) n++; return n; }
+int n = 1;
+float f = 1;
+var y = n++;
+f++;
+h();
+print(y, n, ++n, n--, f, g, w(runtime(1)));
+str s = "a";
+s++;
+NTIEOF
+a=$("$BIN" -tw -nti "$TMP/nti_incdec.my" 2>&1)
+b=$("$BIN" -nti "$TMP/nti_incdec.my" 2>&1)
+got_rc=$?
+case "$a" in
+    "1 2 3 3 2.000000 2 4 "*"TypeErrorEx"*) ok=1 ;;
+    *) ok=0 ;;
+esac
+if [ "$got_rc" = 1 ] && [ "$ok" = 1 ] && [ "$a" = "$b" ]; then
+    pass "-nti: inc-dec of a typed variable runs, both engines agree"
+else
+    fail "-nti inc-dec: rc=$got_rc tw=[$a] vm=[$b]"
+fi
+
+# ---------------------------------------------------------------------
+# An optional member `a?.f` is not an assignable location (2026-10-05):
+# the PARSER refuses it as the target of `=`, `+=` and `++` / `--`, so it
+# is the same compile error with type inference off. Under -nti the
+# tree-walker used to raise NotLValueEx at run time and the VM refused
+# with NotLoweredEx (an internal error); -rt runs typed only.
+for prog in 'p?.x++;' '--p?.x;' 'p?.x = 5;' 'p?.x += 1;'; do
+    printf 'struct P { int x; }\nvar dyn p = runtime(none);\n%s\n' \
+        "$prog" > "$TMP/opt.my"
+    bad=
+    for flags in "-tw" "" "-nti -tw" "-nti"; do
+        # shellcheck disable=SC2086
+        out=$("$BIN" $flags "$TMP/opt.my" 2>&1)
+        got_rc=$?
+        if [ "$got_rc" != 1 ] \
+                || ! printf '%s' "$out" | grep -q 'SyntaxError'; then
+            bad="$bad [$flags] rc=$got_rc $(printf '%s' "$out" | head -1)"
+        fi
+    done
+    if [ -z "$bad" ]; then
+        pass "optional member target refused: $prog"
+    else
+        fail "optional member target refused: $prog:$bad"
+    fi
+done
+
+# And a `++` / `--` operand of any other non-location shape - a call
+# result, an arithmetic chain, a slice, another inc-dec - by the same
+# parser rule (pRefuseUnassignable). Under -nti the tree-walker failed at
+# run time and the VM refused to compile (until 2026-10-05).
+for prog in 'f()++;' '(a + 1)++;' 's[0:1]++;' '--f();' 'a++ ++;'; do
+    printf 'func f() { return runtime(1); }
+var dyn a = runtime(1);
+%s
+%s
+' \
+        'var dyn s = runtime([1, 2]);' "$prog" > "$TMP/inc.my"
+    bad=
+    for flags in "-tw" "" "-nti -tw" "-nti"; do
+        # shellcheck disable=SC2086
+        out=$("$BIN" $flags "$TMP/inc.my" 2>&1)
+        got_rc=$?
+        if [ "$got_rc" != 1 ] \
+                || ! printf '%s' "$out" | grep -q 'SyntaxError'; then
+            bad="$bad [$flags] rc=$got_rc $(printf '%s' "$out" | head -1)"
+        fi
+    done
+    if [ -z "$bad" ]; then
+        pass "inc-dec of a non-location refused: $prog"
+    else
+        fail "inc-dec of a non-location refused: $prog:$bad"
+    fi
+done
+
+# ---------------------------------------------------------------------
+# -nc (#54): the flag turns off constant FOLDING, and until #54 it also
+# stopped the parser REGISTERING consts, struct types and pure funcs -
+# so this program was refused ("expression is not const", "'P' is not a
+# type") and a nested POD field was laid out boxed. RULE 2: the flag is
+# an optimization switch, so the output must equal the default run's.
+cat > "$TMP/nc.my" <<'NCEOF'
+const K = 3;
+struct S { const Z = K * 2; }
+struct P { int x; }
+struct O { P p; int c; }
+pure func f(x) => x * K;
+const T = f(4);
+P q = P(runtime(5));
+print(S.Z, T, q.x, layout(O).pod, layout(O).size);
+NCEOF
+a=$("$BIN" "$TMP/nc.my" 2>&1)
+b=$("$BIN" -nc "$TMP/nc.my" 2>&1)
+got_rc=$?
+if [ "$got_rc" = 0 ] && [ "$a" = "6 12 5 true 16 " ] && [ "$a" = "$b" ]; then
+    pass "-nc: consts, struct types and layouts are the default run's"
+else
+    fail "-nc: rc=$got_rc default=[$a] -nc=[$b]"
+fi
+
+# ---------------------------------------------------------------------
+# Question 5 (decision A): a function the PARSER runs runs typed - a copy
+# inferred for its argument types - so `f(3)` folded computes what
+# `f(int(runtime(3)))` computes at run time ("3.000000": `x` is a float
+# from its declaration on). The driver turns it on with inference and OFF
+# under -nti, where both calls run untyped ("3"). -rt sets it in-process,
+# so this is the only net for the driver's wiring; an image stores the
+# folded answer.
+cat > "$TMP/pt.my" <<'PTEOF'
+pure func f(int n) { var x = n; var r = str(x); x = 2.5; return r; }
+print(f(3), f(int(runtime(3))));
+PTEOF
+a=$("$BIN" "$TMP/pt.my" 2>&1)
+b=$("$BIN" -nc "$TMP/pt.my" 2>&1)
+c=$("$BIN" -nti "$TMP/pt.my" 2>&1)
+d=$("$BIN" -nti -nc "$TMP/pt.my" 2>&1)
+"$BIN" -c "$TMP/pt.my" -o "$TMP/pt.myv" >/dev/null 2>&1
+e=$("$BIN" "$TMP/pt.myv" 2>&1)
+if [ "$a" = "3.000000 3.000000 " ] && [ "$b" = "$a" ] && [ "$e" = "$a" ] \
+        && [ "$c" = "3 3 " ] && [ "$d" = "$c" ]; then
+    pass "a parse-time call runs typed, and untyped under -nti"
+else
+    fail "parse-time typed: default=[$a] -nc=[$b] -nti=[$c]" \
+         "-nti -nc=[$d] image=[$e]"
+fi
+
+# ---------------------------------------------------------------------
+# Question 6 (decision A): a constant expression that throws is a compile
+# error, inside a `try` too, and the message says so and names runtime()
+# as the way to raise it when the program runs. Only the DRIVER knows the
+# program has not started (-rt compiles in-process), so the note is checked
+# here: every compiling mode prints it, a run-time error (from source or
+# from an image) does not.
+cat > "$TMP/ce.my" <<'CEEOF'
+pure func half(int x) => 10 / x;
+try { print(half(0)); } catch (DivisionByZeroEx) { print("caught"); }
+CEEOF
+cat > "$TMP/rte.my" <<'RTEOF'
+pure func half(int x) => 10 / x;
+try { print(half(runtime(0))); } catch (DivisionByZeroEx) { print("ok"); }
+print(half(runtime(0)));
+RTEOF
+note='^note: a constant expression is evaluated while compiling'
+ce_ok=1
+for fl in "" -nc -tw -nr -nti; do
+    out=$("$BIN" $fl "$TMP/ce.my" 2>&1)
+    got_rc=$?
+    if [ "$got_rc" != 1 ] || ! printf '%s\n' "$out" | grep -q "$note" \
+            || ! printf '%s\n' "$out" | grep -q 'DivisionByZeroEx'; then
+        ce_ok=0
+        ce_bad="$fl: rc=$got_rc [$out]"
+    fi
+done
+out=$("$BIN" -c "$TMP/ce.my" -o "$TMP/ce.myv" 2>&1)
+if ! printf '%s\n' "$out" | grep -q "$note"; then
+    ce_ok=0
+    ce_bad="-c: [$out]"
+fi
+out=$(printf 'var x = 1;\nx = "s";\n' > "$TMP/te.my"; "$BIN" "$TMP/te.my" 2>&1)
+if printf '%s\n' "$out" | grep -q "$note" \
+        || ! printf '%s\n' "$out" | grep -q 'TypeMismatchEx'; then
+    ce_ok=0
+    ce_bad="a type error: [$out]"
+fi
+out=$("$BIN" -e 'print(nosuchname7);' 2>&1)
+if printf '%s\n' "$out" | grep -q "$note" \
+        || ! printf '%s\n' "$out" | grep -q "nosuchname7"; then
+    ce_ok=0
+    ce_bad="an undefined name: [$out]"
+fi
+r1=$("$BIN" "$TMP/rte.my" 2>&1)
+"$BIN" -c "$TMP/rte.my" -o "$TMP/rte.myv" >/dev/null 2>&1
+r2=$("$BIN" "$TMP/rte.myv" 2>&1)
+for r in "$r1" "$r2"; do
+    if printf '%s\n' "$r" | grep -q "$note" \
+            || ! printf '%s\n' "$r" | grep -q '^ok' \
+            || ! printf '%s\n' "$r" | grep -q 'DivisionByZeroEx'; then
+        ce_ok=0
+        ce_bad="run-time error: [$r]"
+    fi
+done
+if [ "$ce_ok" = 1 ]; then
+    pass "a throwing constant expression is a compile error that says so"
+else
+    fail "constant-expression note: $ce_bad"
+fi
+
+# ---------------------------------------------------------------------
+# readln() at END OF INPUT is none (typed `opt str`), so a script can
+# tell it from an empty line - both used to read as "", and
+# samples/shopping busy-looped forever on a closed stdin. A last line
+# with no newline is still returned; the call after it is none. -rt runs
+# in-process with no stdin to feed, so the net lives here. Every engine
+# and a .myv image must agree, and both interactive samples must exit 0
+# on an empty stdin.
+cat > "$TMP/eof.my" <<'EOFEOF'
+var a = readln();
+var b = readln();
+var c = readln();
+var d = readln();
+print(a, len(b), c, d == none, (d ?? "dflt"));
+EOFEOF
+"$BIN" -c "$TMP/eof.my" -o "$TMP/eof.myv" >/dev/null 2>&1
+want="x 0 z true dflt "
+eof_ok=1
+for mode in "" -nj -tw -nti "$TMP/eof.myv"; do
+    if [ "$mode" = "$TMP/eof.myv" ]; then
+        got=$(printf 'x\n\nz' | "$BIN" "$TMP/eof.myv" 2>&1)
+    else
+        got=$(printf 'x\n\nz' | "$BIN" $mode "$TMP/eof.my" 2>&1)
+    fi
+    [ "$got" = "$want" ] || { eof_ok=0; fail "readln EOF [$mode]: [$got]"; }
+done
+for s in shopping phonebook; do
+    if ! timeout 10 "$BIN" "$here/../samples/$s" </dev/null >/dev/null 2>&1
+    then
+        eof_ok=0; fail "readln EOF: samples/$s did not exit 0 on EOF"
+    fi
+done
+[ $eof_ok = 1 ] && pass "readln: none at end of input, every engine + image"
+
+# ---- -rt's own options (2026-10-05): --list, --only REGEX, -s -------- #
+# tests/run reproduces one failing -rt case with --only, so the selection
+# must run exactly what --list says it selects, refuse a regex matching
+# nothing (a misspelt reproduction must not pass by running nothing) and
+# refuse an option it does not know. Only a TESTS build has the suite.
+if "$BIN" -v 2>/dev/null | grep -q '^  tests  *1'; then
+    rt_ok=1
+    n=$("$BIN" -rt --only '^elem2: ' --list | wc -l | tr -d ' ')
+    out=$("$BIN" -rt --only '^elem2: ' 2>&1)
+    [ "$n" -gt 0 ] 2>/dev/null || { rt_ok=0; fail "-rt --list: no elem2 case"; }
+    printf '%s\n' "$out" | grep -q "^Tests passed: $n/$n " \
+        || { rt_ok=0; fail "-rt --only: did not run the $n listed cases"; }
+    if "$BIN" -rt --only 'no such case at all' >/dev/null 2>&1; then
+        rt_ok=0; fail "-rt --only: a regex matching nothing passed"
+    fi
+    if "$BIN" -rt --no-such-option >/dev/null 2>&1; then
+        rt_ok=0; fail "-rt: an unknown option was accepted"
+    fi
+    [ $rt_ok = 1 ] && pass "-rt: --list and --only select the same cases"
+fi
+
+# ---- out of memory (2026-10-05) ------------------------------------- #
+# A refused allocation is the catchable OutOfMemoryEx, never a C++
+# terminate: under a memory cap, a string doubled until the allocator
+# refuses must be caught by the script's catch, and the uncaught second
+# loop must end in a rendered OutOfMemoryEx and exit 1 - in each engine.
+# Not under ASan: its shadow memory cannot live under `ulimit -v`.
+if "$BIN" -v 2>/dev/null | grep -q '^  asan  *0'; then
+    cat > "$TMP/oom.my" <<'MY'
+var s = "xxxxxxxxxxxxxxxx";
+try {
+    while (true)
+        s += s;
+} catch (OutOfMemoryEx) {
+    print("caught");
+}
+var t = "y";
+while (true)
+    t += t;
+MY
+    oom_ok=1
+    for e in "" -nj -tw; do
+        out=$( (ulimit -v 2000000; timeout 60 "$BIN" $e "$TMP/oom.my") 2>&1 )
+        r=$?
+        if [ $r != 1 ] || ! printf '%s' "$out" | grep -q '^caught' ||
+           ! printf '%s' "$out" | grep -q '^OutOfMemoryEx: .*line 10'
+        then
+            oom_ok=0
+            fail "out of memory${e:+ ($e)}: exit $r: $(printf '%s' "$out" |
+                  head -3 | tr '\n' ' ')"
+        fi
+    done
+    [ $oom_ok = 1 ] && pass "out of memory: OutOfMemoryEx, caught and uncaught"
+fi
+
+# A path naming a DIRECTORY opens fine on POSIX and then fails every read
+# (EISDIR), and libstdc++'s filebuf THROWS when read(2) fails: `-c DIR`
+# ended in std::terminate (rc 134), and a plain run read zero lines and ran
+# an EMPTY program, exit 0. Both must refuse the path. (An image whose
+# source reference names a directory is -rt's myv_source_ref_directory.)
+mkdir -p "$TMP/adir"
+dir_ok=1
+out=$("$BIN" "$TMP/adir" 2>&1); r=$?
+if [ $r != 1 ] || ! printf '%s' "$out" | grep -q 'Failed to open file'; then
+    dir_ok=0; fail "a directory as the script: exit $r: $out"
+fi
+out=$("$BIN" -c "$TMP/adir" -o "$TMP/adir.myv" 2>&1); r=$?
+if [ $r != 1 ] || [ -e "$TMP/adir.myv" ]; then
+    dir_ok=0; fail "-c of a directory: exit $r: $out"
+fi
+[ $dir_ok = 1 ] && pass "a directory is not a script: refused, no crash"
+
+# A struct a `pure` call throws while it is folded at PARSE time is a
+# compile error, rendered by main() with its payload - after the parse has
+# unwound, freeing the struct's definition with the statements parsed so
+# far: the payload read a freed def (ASan: heap-use-after-free; a SIGSEGV
+# in a release build). pBlock renders it while the definition is alive.
+cat > "$TMP/pthrow.my" <<'EOF'
+struct Neg { int x; }
+pure func f(int x) {
+    if (x < 0) { throw Neg(x); }
+    return x * 2;
+}
+try { print(f(-1)); } catch (Neg) { print("never: a compile error"); }
+EOF
+out=$("$BIN" "$TMP/pthrow.my" 2>&1)
+r=$?
+if [ $r = 1 ] &&
+   printf '%s' "$out" | grep -q "Uncaught exception 'Neg', data: Neg(x: -1)" &&
+   ! printf '%s' "$out" | grep -q never; then
+    pass "a struct thrown by a parse-time pure call renders its payload"
+else
+    fail "a struct thrown at parse time (rc $r): $(printf '%s' "$out" |
+          head -c 300)"
+fi
+
+# The same while the OPTIMIZERS fold: AutoConst runs a call with constant
+# arguments at compile time, and its block used to move every statement
+# into a second vector as it went - a throw freed them all, the function
+# owning the thrown struct's definition included, and the report read the
+# freed definition (heap-use-after-free, every engine, 2026-11-16).
+cat > "$TMP/athrow.my" <<'EOF'
+func a() { struct Err { int n; } throw Err(1); }
+a();
+EOF
+# And the branch a decided `if` keeps: AutoConst folded it while holding
+# it in a local, which the unwind freed the same way (`on` is a write-once
+# variable, so the PARSER does not decide this `if` - AutoConst does).
+cat > "$TMP/athrow2.my" <<'EOF'
+var on = true;
+if (on) {
+    func a() { struct Err { int n; } throw Err(1); }
+    a();
+}
+EOF
+# And a struct whose definition a function LITERAL owns, thrown by a call
+# the PARSER folds: the literal is in a parse function's local when the
+# exception passes, and died before the enclosing block could render the
+# payload (the block's own freeze read the freed definition). The call
+# that raises it renders it now, where it leaves the constant evaluation.
+cat > "$TMP/athrow3.my" <<'EOF'
+var x = (pure func() { struct Err { int n; } throw Err(1); })();
+print(x);
+EOF
+cat > "$TMP/athrow4.my" <<'EOF'
+print(map(pure func(v) { struct Err { int n; } throw Err(v); }, [1, 2]));
+EOF
+uaf_bad=""
+for p in athrow athrow2 athrow3 athrow4; do
+    for e in "" -tw -nj; do
+        # shellcheck disable=SC2086
+        out=$("$BIN" $e "$TMP/$p.my" 2>&1)
+        r=$?
+        { [ $r = 1 ] &&
+          printf '%s' "$out" |
+              grep -q "Uncaught exception 'Err', data: Err(n: 1)"
+        } || uaf_bad="$uaf_bad [$p ${e:-default} rc $r: $(
+                 printf '%s' "$out" | head -c 200)]"
+    done
+done
+if [ -z "$uaf_bad" ]; then
+    pass "a struct a compile-time fold throws outlives the fold"
+else
+    fail "a struct thrown by a compile-time fold:$uaf_bad"
+fi
+
+# THE DRIVER'S FLAGS. Each flag `-h` documents does what it says, and a
+# flag that takes a value refuses to run without one. -rt never parses
+# argv, so a flag wired to nothing passes every one of its tests; these
+# are the checks that would see it.
+# $1 = label, $2 = expected exit code, $3 = a grep -E pattern the output
+# (stdout + stderr) must match, $4.. = the arguments
+flag() {
+    label=$1 want_rc=$2 want=$3
+    shift 3
+    out=$("$BIN" "$@" 2>&1 < /dev/null)
+    r=$?
+    if [ "$r" = "$want_rc" ] && printf '%s' "$out" | grep -Eq -- "$want"
+    then
+        pass "$label"
+    else
+        fail "$label (exit $r, wanted $want_rc): $(printf '%s' "$out" |
+              head -c 300)"
+    fi
+}
+printf 'print(1 + 2);\n' > "$TMP/f3.my"
+flag "no arguments off a terminal: the usage" 0 '^Syntax:'
+flag "-h: the usage" 0 '^Syntax:' -h
+flag "--help: the usage" 0 '^Syntax:' --help
+flag "-e with no expression: the usage, exit 1" 1 '^Syntax:' -e
+flag "-e joins every argument after it into one program" 0 '^5' \
+     -e 'var a = 2;' 'print(a + 3);'
+flag "--version: the build configuration" 0 '^mylang build configuration' \
+     --version
+printf 'print(1);\n}\n' > "$TMP/stray.my"
+flag "a stray } after the program: a syntax error, exit 1" 1 \
+     "Unexpected token at the end '}'" "$TMP/stray.my"
+flag "-t: the token dump" 0 "Tok\(id_\): 'print'" -t "$TMP/f3.my"
+flag "-bi: the bytecode inliner on" 0 '^3' -bi "$TMP/f3.my"
+flag "--no-opt needs a pass list" 1 'requires a pass list' --no-opt
+flag "--no-opt refuses an unknown pass after a known one" 1 \
+     "unknown --no-opt pass 'bogus'" --no-opt licm,bogus "$TMP/f3.my"
+flag "--no-opt takes empty list members" 0 '^3' \
+     --no-opt licm,,typed, "$TMP/f3.my"
+flag "-it needs a value" 1 'requires a value' -it
+flag "-o needs a path" 1 'requires an output path' -o
+flag "--source needs a root" 1 'requires a project-root path' --source
+flag "-vm then -tw: refused" 1 'mutually exclusive' -vm -tw "$TMP/f3.my"
+flag "-tw then -vm: refused" 1 'mutually exclusive' -tw -vm "$TMP/f3.my"
+flag "--trace needs a category list" 1 'requires a category list' -T
+printf 'var x = 3;\nprint(x + 1);\n' > "$TMP/tr.my"
+flag "--trace warns on an unknown category" 0 \
+     "unknown trace category 'bogus'" -T infer,bogus, "$TMP/tr.my"
+flag "--trace traces a known category to stderr" 0 \
+     'infer +var x : int' --trace infer "$TMP/tr.my"
+flag "--analyze: the long spelling, plain under --no-color" 0 \
+     '^print\(1 \+ 2\);$' --analyze --no-color "$TMP/f3.my"
+# -a (--analyze) prints the source colored by what the optimizers did,
+# and --trace fold narrates the folds. Here AutoConst's work INSIDE a
+# function body (a top-level name is never auto-const): the dead arm of
+# a const-false `if` - then or else - and a `while` that never runs are
+# dim, the auto-const names yellow; the short-circuits of the same
+# constants are traced. The program's output is the same either way.
+cat > "$TMP/an.my" <<'EOF'
+func h(x) {
+    var c = false;
+    var k = 3;
+    var t = true;
+    if (c) { print(1); } else { print(k); }
+    if (!c) { print(2); } else { print(4); }
+    while (c) { print(5); }
+    if (c && x > 1) { print(6); }
+    if (c || x > 1) { print(7); }
+    if (t || x > 1) { print(8); }
+    return k + x;
+}
+print(h(runtime(2)));
+EOF
+dim=$(printf '\033[2m') yel=$(printf '\033[33m')
+an=$("$BIN" -a "$TMP/an.my" 2>&1)
+if printf '%s' "$an" | grep -qF "{ ${dim}print(1); }" &&
+   printf '%s' "$an" | grep -qF "else { ${dim}print(4); }" &&
+   printf '%s' "$an" | grep -qF "${dim}while (" &&
+   printf '%s' "$an" | grep -qF "var ${yel}k" &&
+   ! printf '%s' "$an" | grep -q '^3$'; then
+    pass "-a dims AutoConst's dead code in a function body, without running it"
+else
+    fail "-a: $(printf '%s' "$an" | head -c 400)"
+fi
+# ...and the other colors: an array<dyn> red, an inlined call blue, a
+# call redirected to a specialization clone cyan, and a dead branch that
+# spans several lines dim on every one of them.
+cat > "$TMP/an2.my" <<'EOF'
+func sq(x) => x * x;
+func pick(a, int b) {
+    if (b > 5)
+        return a * 2;
+    return a + b;
+}
+func g(int n) {
+    var mixed = [1, "a"];
+    var r = sq(n) + pick(n, 3) + len(mixed);
+    if (false) {
+        print("never");
+        print("again");
+    }
+    return r;
+}
+print(g(int(runtime(2))));
+EOF
+red=$(printf '\033[31m') blu=$(printf '\033[94m') cyn=$(printf '\033[36m')
+an2=$("$BIN" -a "$TMP/an2.my" 2>&1)
+if printf '%s' "$an2" | grep -qF "var ${red}mixed" &&
+   printf '%s' "$an2" | grep -qF "${blu}sq(n" &&
+   printf '%s' "$an2" | grep -qF "${cyn}pick(n" &&
+   printf '%s' "$an2" | grep -qF "${dim}        print(\"again\");" &&
+   [ "$("$BIN" "$TMP/an2.my" 2>&1)" = "11 " ]; then
+    pass "-a: a dyn array, inlined/specialized calls, a long dead branch"
+else
+    fail "-a colors: $(printf '%s' "$an2" | head -c 400)"
+fi
+tr=$("$BIN" --trace fold "$TMP/an.my" 2>"$TMP/an.err")
+if [ "$tr" = "$("$BIN" "$TMP/an.my" 2>/dev/null)" ] &&
+   grep -q 'short-circuit && -> false' "$TMP/an.err" &&
+   grep -q 'short-circuit || -> true' "$TMP/an.err" &&
+   grep -q 'drop non-contributing const operand' "$TMP/an.err"; then
+    pass "--trace fold narrates the short-circuit folds, output unchanged"
+else
+    fail "--trace fold: $(head -c 300 "$TMP/an.err")"
+fi
+printf 'print(argv);\n' > "$TMP/av.my"
+flag "argv holds the script's own arguments" 0 '^\["x", "y z"\]' \
+     "$TMP/av.my" x "y z"
+
+# -it N is the inliner's size limit: at 0 nothing is inlined, so the
+# three calls the default inlines stay calls in the optimized tree.
+cat > "$TMP/it.my" <<'EOF'
+func f(int x) => x * 3 + 1;
+func g(int a) { return f(a) + f(a + 1); }
+print(g(int(runtime(2))));
+EOF
+calls() {
+    "$BIN" "$@" -s "$TMP/it.my" 2>&1 |
+        sed -n '/Optimized/,$p' | grep -c DirectCallExpr
+}
+c_def=$(calls); c_zero=$(calls -it 0)
+if [ "$c_def" = 0 ] && [ "$c_zero" = 3 ] &&
+   [ "$("$BIN" -it 0 "$TMP/it.my")" = "17 " ]; then
+    pass "-it 0: no call is inlined, the answer is the same"
+else
+    fail "-it: $c_def calls by default, $c_zero with -it 0"
+fi
+
+# --weights [N] runs the inliner's cost-model calibration
+# (run_weight_bench) with N iterations per measured node. A small N makes
+# the numbers noise and the run instant, so this checks that the tool runs
+# to its table, not what the table says.
+flag "--weights N: the count it ran" 0 'best of 5, 2000 iters' \
+     --weights 2000
+flag "--weights 1: a count too short for the clock still prints" 0 \
+     'CALL=[0-9]+' --weights 1
+flag "--weights refuses a count that is not a number" 1 \
+     'positive iteration count' --weights 2k
+flag "--weights refuses a zero count" 1 'positive iteration count' \
+     --weights 0
+
+# --max-instances N bounds one template's typed instances: a call with a
+# new signature past N runs the template itself, a one-time warning names
+# it, and the answer is the same. The base must then be compiled - a
+# dropped one aborted the VM (2026-11-09).
+cat > "$TMP/mi.my" <<'EOF'
+func show(x) { var t = x + x; return str(t) + ":" + typestr(t); }
+print(show(1), show(2.5), show("ab"), show(3));
+var fs = [show];
+var dyn g = fs[runtime(0)];
+print(g(int(runtime(5))));
+EOF
+flag "--max-instances needs a count" 1 'requires a count' --max-instances
+flag "--max-instances refuses a negative count" 1 'requires a count' \
+     --max-instances -1 "$TMP/mi.my"
+flag "--max-instances refuses a non-number" 1 'requires a count' \
+     --max-instances 2x "$TMP/mi.my"
+flag "--max-instances refuses an empty value" 1 'requires a count' \
+     --max-instances "" "$TMP/mi.my"
+flag "--max-instances refuses a count past INT_MAX" 1 'requires a count' \
+     --max-instances 99999999999 "$TMP/mi.my"
+mi_want="2:int 5.000000:float abab:str 6:int 
+10:int "
+for m in 2 0; do
+    for eng in "" -nj -tw; do
+        out=$("$BIN" $eng --max-instances $m "$TMP/mi.my" 2> "$TMP/mi.err")
+        r=$?
+        lbl="--max-instances $m${eng:+ $eng}"
+        if [ "$r" = 0 ] && [ "$out" = "$mi_want" ] &&
+           grep -q "template 'show' exceeded $m instantiations" \
+                "$TMP/mi.err"; then
+            pass "$lbl: the base runs, with a warning"
+        else
+            fail "$lbl (exit $r): $out / $(head -c 300 \
+                  "$TMP/mi.err")"
+        fi
+    done
+done
+out=$("$BIN" "$TMP/mi.my" 2> "$TMP/mi.err")
+if [ "$out" = "$mi_want" ] && [ ! -s "$TMP/mi.err" ]; then
+    pass "--max-instances: the default 64 instantiates all four"
+else
+    fail "--max-instances default: $out / $(head -c 300 "$TMP/mi.err")"
+fi
+
+# --strict refuses a non-local read above its declaration, which a plain
+# run accepts (the read happens after the declaration has run).
+cat > "$TMP/st.my" <<'EOF'
+func f() { return later; }
+var later = 4;
+print(f());
+EOF
+flag "a forward read of a global runs without --strict" 0 '^4' \
+     "$TMP/st.my"
+flag "--strict refuses a forward read of a global" 1 \
+     "UseBeforeBindingEx: --strict: 'later' is used before" \
+     --strict "$TMP/st.my"
+
+# The source's last line has no newline, and a syntax error at the end
+# of the file carets the column after the last token.
+printf 'var x = 3;\nprint(x / runtime(0));' > "$TMP/nonl.my"
+flag "a file with no final newline: its last line is read" 1 \
+     'print\(x / runtime\(0\)\);' "$TMP/nonl.my"
+printf 'var x = 3 +' > "$TMP/eof.my"
+flag "a syntax error at the end of the file" 1 \
+     'line 1, col 12:12' "$TMP/eof.my"
+
+# -c with no -o writes the source's .myv twin: the extension replaced,
+# appended when there is none - and a dot in a DIRECTORY name is not an
+# extension.
+mkdir -p "$TMP/d.x"
+cp "$TMP/f3.my" "$TMP/tw.my"
+cp "$TMP/f3.my" "$TMP/d.x/prog"
+"$BIN" -c "$TMP/tw.my" >/dev/null 2>&1
+"$BIN" -c "$TMP/d.x/prog" >/dev/null 2>&1
+if [ -f "$TMP/tw.myv" ] && [ -f "$TMP/d.x/prog.myv" ] &&
+   [ ! -e "$TMP/d.myv" ] && [ "$("$BIN" "$TMP/tw.myv")" = "3 " ]; then
+    pass "-c with no -o: the source's .myv twin"
+else
+    fail "-c with no -o: $(ls "$TMP" "$TMP/d.x" | tr '\n' ' ')"
+fi
+# ...and a path with no directory part (run from the source's directory)
+cp "$TMP/f3.my" "$TMP/rel.my"
+abs_bin="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
+if (cd "$TMP" && "$abs_bin" -c rel.my >/dev/null 2>&1) &&
+   [ -f "$TMP/rel.myv" ] && [ "$("$BIN" "$TMP/rel.myv")" = "3 " ]; then
+    pass "-c with no -o and no directory: rel.my -> rel.myv"
+else
+    fail "-c with no -o and no directory: $(ls "$TMP" | tr '\n' ' ')"
+fi
+# ...and a path with no dot at all ($TMP itself has one): prog -> prog.myv
+rm -f "$TMP/d.x/prog.myv"
+if (cd "$TMP/d.x" && "$abs_bin" -c prog >/dev/null 2>&1) &&
+   [ -f "$TMP/d.x/prog.myv" ] &&
+   [ "$("$BIN" "$TMP/d.x/prog.myv")" = "3 " ]; then
+    pass "-c with no -o and no dot in the path: prog -> prog.myv"
+else
+    fail "-c with no -o and no dot: $(ls "$TMP/d.x" | tr '\n' ' ')"
+fi
+flag "-c refuses an argument it does not know" 1 \
+     'unexpected argument after -c: extra' -c "$TMP/tw.my" extra
+flag "-vd of an image disassembles the loaded program" 0 \
+     '===== main' -vd "$TMP/tw.myv"
+
+# Where an image finds its source (README, *.myv*): the paths stored at
+# compile time, else --source ROOT; a source that changed since is
+# ignored with a warning unless -f; --strip-source stores no reference.
+mkdir -p "$TMP/proj/sub" "$TMP/none"
+printf 'var x = 3;\nprint(x / runtime(0));\n' > "$TMP/proj/sub/q.my"
+# compiled from the project root, so the stored root is $TMP/proj (BIN
+# may be a relative path: made absolute for the cd)
+abs_bin=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+(cd "$TMP/proj" && "$abs_bin" -c sub/q.my -o ../q.myv &&
+     "$abs_bin" -c sub/q.my -o ../qs.myv --strip-source) >/dev/null 2>&1
+flag "an image renders its source line" 1 \
+     '^    print\(x / runtime\(0\)\);' "$TMP/q.myv"
+# the stored path holds the source here, so only --source can hide it
+out=$("$BIN" --source "$TMP/none" "$TMP/q.myv" 2>&1)
+if ! printf '%s' "$out" | grep -q 'print(x'; then
+    pass "--source ROOT is the only place looked in"
+else
+    fail "--source ROOT, the stored path present: $(printf '%s' "$out" |
+          head -c 300)"
+fi
+mv "$TMP/proj" "$TMP/moved"
+out=$("$BIN" "$TMP/q.myv" 2>&1)
+if printf '%s' "$out" | grep -q 'sub/q.my, line 2' &&
+   ! printf '%s' "$out" | grep -Eq 'warning|print\(x'; then
+    pass "an image whose source is gone: located, no source line"
+else
+    fail "an image whose source is gone: $(printf '%s' "$out" |
+          head -c 300)"
+fi
+flag "--source ROOT finds the moved source" 1 \
+     '^    print\(x / runtime\(0\)\);' --source "$TMP/moved" "$TMP/q.myv"
+# an edit that keeps the file's SIZE: only the CRC can tell
+printf 'var x = 4;\nprint(x / runtime(0));\n' > "$TMP/moved/sub/q.my"
+out=$("$BIN" --source "$TMP/moved" "$TMP/q.myv" 2>&1)
+if printf '%s' "$out" | grep -q 'has changed since .* ignoring it' &&
+   ! printf '%s' "$out" | grep -q 'print(x'; then
+    pass "a changed source of the same size is ignored, with a warning"
+else
+    fail "a same-size edit: $(printf '%s' "$out" | head -c 300)"
+fi
+printf 'var x = 3;\nprint(x / runtime(0)); # edited\n' > \
+    "$TMP/moved/sub/q.my"
+out=$("$BIN" --source "$TMP/moved" "$TMP/q.myv" 2>&1)
+if printf '%s' "$out" | grep -q 'has changed since .* ignoring it' &&
+   ! printf '%s' "$out" | grep -q edited; then
+    pass "a changed source is ignored, with a warning"
+else
+    fail "a changed source: $(printf '%s' "$out" | head -c 300)"
+fi
+flag "-f uses a changed source, with a warning" 1 \
+     'using it anyway \(-f\)' --source "$TMP/moved" -f "$TMP/q.myv"
+flag "--force: the long spelling" 1 '# edited' \
+     --source "$TMP/moved" --force "$TMP/q.myv"
+flag "--strip-source: an image with no source reference" 1 \
+     '^DivisionByZeroEx: Division by zero at line 2' "$TMP/qs.myv"
+# -o and --strip-source may come BEFORE the file too, and a -o left with
+# no path after the file is refused
+(cd "$TMP/moved" && "$abs_bin" -o ../qp.myv --strip-source -c sub/q.my) \
+    >/dev/null 2>&1
+flag "-o and --strip-source before the file" 1 \
+     '^DivisionByZeroEx: Division by zero at line 2' "$TMP/qp.myv"
+flag "-c FILE -o with no path: refused" 1 \
+     'unexpected argument after -c: -o' -c "$TMP/f3.my" -o
+
+# THE IMAGE ROUND TRIP OVER THE CORPUS. A loaded image's bytecode dump is
+# a fresh compile's (README *.myv*; -rt's myv_round_trip checks it for its
+# own programs): every functional program an image can hold is stored,
+# and the two -vd dumps must be the same, byte for byte. The JIT is off
+# (-nj): an image holds no native code, the load re-runs the tier. Its
+# first run found two loader gaps no hand-picked program had (a cycle of
+# scalar-result claims, a builtin value in a constant) and a dump-only
+# difference (the container plan asked without the load's JitCtx).
+# The tests/int programs go through it too (2026-11-11: it found that a
+# folded type() could not be stored at all - a Type instance, whose
+# native struct no image could name); one calling an int_* builtin is
+# skipped on a build without them. NOT on an INT build, where each of
+# them is a coverage unit of its own (tests/int_run): compiling them all
+# here reached the very code they exist to own, and seven of them owned
+# nothing. Only stdout is compared: a compile's warnings go to stderr,
+# and loading an image compiles nothing.
+rt_int="$here/int/*.my"
+"$BIN" -v 2>/dev/null | grep -Eq '^ *int_tests +1' && rt_int=
+rt_n=0 rt_bad=0
+for p in "$here"/functional/*.my $rt_int; do
+    b=$(basename "$p" .my)
+    if ! "$BIN" -c "$p" -o "$TMP/rt.myv" > "$TMP/rt.c" 2>&1; then
+        # the one documented refusal: a constant holding a cycle
+        grep -q 'holds a reference cycle' "$TMP/rt.c" && continue
+        grep -q "Undefined variable 'int_" "$TMP/rt.c" && continue
+        rt_bad=$((rt_bad + 1))
+        fail "image round trip: -c $b: $(head -c 200 "$TMP/rt.c")"
+        continue
+    fi
+    rt_n=$((rt_n + 1))
+    "$BIN" -nj -vd "$p" > "$TMP/rt.src" 2>/dev/null
+    "$BIN" -nj -vd "$TMP/rt.myv" > "$TMP/rt.img" 2>/dev/null
+    if ! cmp -s "$TMP/rt.src" "$TMP/rt.img"; then
+        rt_bad=$((rt_bad + 1))
+        fail "image round trip: $b: $(diff "$TMP/rt.src" "$TMP/rt.img" |
+              head -c 300)"
+    fi
+done
+if [ $rt_bad = 0 ] && [ $rt_n -ge 100 ]; then
+    pass "image round trip: $rt_n programs, -vd identical"
+elif [ $rt_bad = 0 ]; then
+    fail "image round trip: only $rt_n programs stored - vacuous"
+fi
+
+# THE REPL FRONT END - run_repl, which -rt's `repl:` cases never reach
+# (they drive ReplEngine directly). A session is fed on stdin, HOME
+# pointing at a scratch directory (the history file). Kept HERE rather
+# than as a tests/int/repl session when it adds no coverage of its own:
+# a session is a coverage unit, and one that owns no element fails
+# int_run --gcov as redundant.
+repl_run() {
+    mkdir -p "$TMP/home"
+    printf '%s' "$1" > "$TMP/repl.in"
+    HOME="$TMP/home" "$BIN" --repl < "$TMP/repl.in" > "$TMP/repl.out" \
+        2> "$TMP/repl.err"
+}
+
+# `:quit` / `:q` exit with trailing whitespace too: the loop compared the
+# whole input with ":quit", so `:quit ` neither exited nor did anything.
+quit_ok=1
+for q in ':quit ' "$(printf ':q\t')"; do
+    repl_run "print(1)
+$q
+print(\"not reached\")
+"
+    r=$?
+    if [ $r != 0 ] || [ -s "$TMP/repl.err" ] ||
+       grep -q 'not reached' "$TMP/repl.out"; then
+        quit_ok=0
+        fail "repl: '$q' did not exit (rc $r): $(tr '\n' ' ' \
+              < "$TMP/repl.out")"
+    fi
+done
+[ $quit_ok = 1 ] && pass "repl: :quit / :q exit with trailing whitespace"
+
+# A struct thrown while an input is COMPILED (the optimizers fold `th()`)
+# is reported and the session goes on. It escaped run_repl, and main()
+# rendered it after ~ReplEngine had freed the struct's definition: an
+# ASan heap-use-after-free (a sanitized build), the REPL gone (any build).
+repl_run 'struct E {}
+func th() { throw E(); }
+th()
+print("after")
+'
+r=$?
+if [ $r = 0 ] && [ ! -s "$TMP/repl.err" ] &&
+   grep -q "Uncaught exception 'E', data: E()" "$TMP/repl.out" &&
+   grep -q '>> after' "$TMP/repl.out"; then
+    pass "repl: a struct thrown while compiling an input, then the next one"
+else
+    fail "repl: a struct thrown while compiling an input (rc $r): $(head -c \
+          300 "$TMP/repl.err")"
+fi
+
+# The history file holds one INPUT per line, its newlines and backslashes
+# escaped: a block came back after a restart as one entry per line (Up
+# recalled a lone `}`). A run re-saves what it loaded, so a second run
+# leaves the entry as it was - the decode undoes the encode. A file of the
+# old format (no header line) loads one entry per line.
+rm -rf "$TMP/home"
+repl_run 'if (1 > 0) {
+  print("a\\b")
+}
+else {
+  print(0)
+}
+'
+hist="$TMP/home/.mylang_history"
+want_blk='if (1 > 0) {\n  print("a\\\\b")\n}\nelse {\n  print(0)\n}'
+hist_ok=1
+[ "$(sed -n 1p "$hist")" = '#mylang-history 2' ] &&
+    [ "$(sed -n 2p "$hist")" = "$want_blk" ] && [ "$(wc -l < "$hist")" = 2 ] ||
+    hist_ok=0
+repl_run '1
+'
+[ "$(sed -n 2p "$hist")" = "$want_blk" ] && [ "$(sed -n 3p "$hist")" = 1 ] ||
+    hist_ok=0
+printf 'print(1)\nx = 2\n' > "$hist"
+repl_run '3
+'
+[ "$(cat "$hist")" = "$(printf '#mylang-history 2\nprint(1)\nx = 2\n3')" ] ||
+    hist_ok=0
+if [ $hist_ok = 1 ]; then
+    pass "repl: a multi-line input is one history entry, across restarts"
+else
+    fail "repl: the history file: $(head -c 300 "$hist")"
+fi
+
+# MYLANG_JIT_MAP=<path> (disasm.cpp, jit_write_map) - the instruction
+# map scripts/jitprofile.py joins with a callgrind profile, written by
+# the PROFILED run itself. A `frag ADDR LEN NAME undecoded=N` line, then
+# one `i ADDR LEN MNEMONIC` line per instruction: the lengths must sum to
+# exactly the fragment's (a wrong length desynchronises the rest of the
+# fragment, the -vdj decoder's failure mode, and the last instruction
+# then runs past the end) and nothing may be undecoded. The program's
+# output is unchanged by the map.
+if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
+    rm -f "$TMP/jit.map"
+    plain=$("$BIN" "$here/../samples/primes" 2>&1)
+    mapped=$(MYLANG_JIT_MAP="$TMP/jit.map" "$BIN" \
+             "$here/../samples/primes" 2>&1)
+    verdict=$(awk '
+        function close_frag() {
+            if (inf && sum != flen) bad = bad " " fname ":sum=" sum "/" flen
+        }
+        $1 == "frag" {
+            close_frag(); inf = 1; nf++; sum = 0; flen = $3; fname = $4
+            if ($5 != "undecoded=0") bad = bad " " fname ":" $5
+            next }
+        $1 == "i" { ni++; sum += $3; next }
+        { bad = bad " junk:" $0 }
+        END { close_frag()
+              if (nf == 0 || ni == 0) print "EMPTY"
+              else if (bad != "") print "BAD" bad
+              else print "OK " nf " " ni }' "$TMP/jit.map" 2>&1)
+    case "$verdict" in
+        OK*) if [ "$plain" = "$mapped" ]; then
+                 pass "MYLANG_JIT_MAP: every fragment's map adds up, nothing \
+undecoded (${verdict#OK })"
+             else
+                 fail "MYLANG_JIT_MAP changed the program's output"
+             fi ;;
+        *) fail "MYLANG_JIT_MAP: $verdict" ;;
+    esac
+else
+    echo "  skip  MYLANG_JIT_MAP (this build reports jit 0)"
+fi
+
+# MYLANG_JITSTATS=1 (jit_stats_report) - which tier a program's calls
+# took, from counters bumped by EMITTED code. A TESTS build prints the
+# table after the run (samples/primes is ~540 calls of one function:
+# native returns, and under -nj the no-record reach); any other JIT build
+# says the counters are not compiled in, rather than printing zeros. The
+# program's stdout is unchanged either way.
+if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
+    plain=$("$BIN" "$here/../samples/primes" 2>/dev/null)
+    st_out=$(MYLANG_JITSTATS=1 "$BIN" "$here/../samples/primes" \
+             2>"$TMP/stats.err")
+    nj_out=$(MYLANG_JITSTATS=1 "$BIN" -nj "$here/../samples/primes" \
+             2>"$TMP/stats-nj.err")
+    if [ "$st_out" != "$plain" ] || [ "$nj_out" != "$plain" ]; then
+        fail "MYLANG_JITSTATS changed the program's output"
+    elif "$BIN" -v 2>/dev/null | grep -Eq '^ *tests +1'; then
+        if grep -q '^jit stats$' "$TMP/stats.err" &&
+           grep -Eq '^  native_returns +[1-9]' "$TMP/stats.err" &&
+           grep -q '^no-record tier reach' "$TMP/stats-nj.err" &&
+           grep -Eq '^  calls_total +[1-9]' "$TMP/stats-nj.err"; then
+            pass "MYLANG_JITSTATS: the tier table, JIT on and off"
+        else
+            fail "MYLANG_JITSTATS: $(head -c 300 "$TMP/stats.err") / \
+$(head -c 300 "$TMP/stats-nj.err")"
+        fi
+    elif grep -q '^jit stats: unavailable' "$TMP/stats.err"; then
+        pass "MYLANG_JITSTATS: a build without TESTS says so"
+    else
+        fail "MYLANG_JITSTATS (no TESTS): $(head -c 300 "$TMP/stats.err")"
+    fi
+else
+    echo "  skip  MYLANG_JITSTATS (this build reports jit 0)"
+fi
+
+# The JIT's developer dumps and caps (jit.cpp, docs/jit-optimizations.md):
+# each dump prints its own lines on stderr and each cap - BINDING here,
+# 0 or 1 - changes which code is emitted; neither may change what the
+# program prints or its exit code. 17_elem2_divmod_roles reaches every
+# dump's pass (SHAREDBG and MAXSHARE belong to the legacy pick, hence
+# MYLANG_JIT_OFF=lsra), each cap below changes its emitted code, and no
+# tests/int unit runs it (INT-SOURCE) - this check reaching the paths a
+# unit exists to own made that unit redundant. 55_regcall (no unit's
+# source either) is the one whose float temps take the linear scan's own
+# plan, the dump's `fr[` and `ftrans` lines. A NON-binding pin cap (99,
+# above any budget) is a no-op to the byte: its -vdj equals the plain
+# one.
+if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
+    fdir="$here/functional"
+    dbg_bad=""
+    dbg_n=0
+    pg=17_elem2_divmod_roles
+    for spec in \
+        "MYLANG_LSRADBG=1|$pg|^LSRADBG " \
+        "MYLANG_LSRADBG=1|55_regcall|^LSRADBG +ftrans " \
+        "MYLANG_SPILLDBG=1|$pg|^SPILLDBG run" \
+        "MYLANG_CACHEAUDIT=1|$pg|^CACHEAUDIT pinned" \
+        "MYLANG_REGAUDIT=1|$pg|^REGAUDIT TOTAL" \
+        "MYLANG_HOISTDBG=1|05_elem_tiers|hoist\[" \
+        "MYLANG_ESTDBG=1|05_elem_tiers|^est\[" \
+        "MYLANG_RELDBG=1|05_elem_tiers|^relent\[" \
+        "MYLANG_DELAUDIT=1|22_closure_store|^DELAUDIT run" \
+        "MYLANG_JIT_OFF=lsra MYLANG_SHAREDBG=1|$pg|^SHAREDBG" \
+        "MYLANG_JIT_MAXPINS=0|$pg|" \
+        "MYLANG_JIT_MAXPINS=1|$pg|" \
+        "MYLANG_JIT_MAXSPILL=0|$pg|" \
+        "MYLANG_JIT_OFF=lsra MYLANG_JIT_MAXSHARE=0|$pg|" \
+        "MYLANG_JIT_OFF=lsra MYLANG_JIT_MAXSHARE=1|$pg|"
+    do
+        envs=${spec%%|*}; rest=${spec#*|}
+        prog="$fdir/${rest%%|*}.my"; tag=${rest#*|}
+        want=$("$BIN" "$prog" 2>/dev/null; echo "rc=$?")
+        # shellcheck disable=SC2086
+        got=$(env $envs "$BIN" "$prog" 2>"$TMP/dbg.err"; echo "rc=$?")
+        dbg_n=$((dbg_n + 1))
+        if [ "$got" != "$want" ]; then
+            dbg_bad="$dbg_bad [$envs: output changed]"
+        elif [ -n "$tag" ] && ! grep -Eq "$tag" "$TMP/dbg.err"; then
+            dbg_bad="$dbg_bad [$envs: no '$tag' line]"
+        fi
+    done
+    "$BIN" -vdj "$fdir/$pg.my" > "$TMP/pins.vdj" 2>&1
+    MYLANG_JIT_MAXPINS=99 "$BIN" -vdj "$fdir/$pg.my" \
+        > "$TMP/pins99.vdj" 2>&1
+    cmp -s "$TMP/pins.vdj" "$TMP/pins99.vdj" ||
+        dbg_bad="$dbg_bad [MYLANG_JIT_MAXPINS=99: -vdj differs]"
+    if [ -z "$dbg_bad" ]; then
+        pass "the JIT's debug dumps and caps leave the output alone \
+($dbg_n configurations, and a non-binding pin cap emits the same code)"
+    else
+        fail "JIT debug dumps / caps:$dbg_bad"
+    fi
+else
+    echo "  skip  JIT debug dumps and caps (this build reports jit 0)"
+fi
+
+# tmpdir(): $TMPDIR, else $TEMP, else $TMP - an empty one counts as unset -
+# else /tmp, with no trailing separator (a lone "/" stays). The test runner
+# always sets TMPDIR, so the fallbacks run only here.
+td_bad=""
+for spec in "/x/tmp|TMPDIR=/x/tmp//" "/w/t|TMPDIR= TEMP=/w/t/" \
+            '/v|TMPDIR= TEMP= TMP=/v\' "/tmp|TMPDIR= TEMP= TMP=" "/|TMPDIR=/"
+do
+    want=${spec%%|*}; envs=${spec#*|}
+    # shellcheck disable=SC2086
+    got=$(env $envs "$BIN" -e 'print(tmpdir());' 2>&1 | sed 's/ *$//')
+    [ "$got" = "$want" ] || td_bad="$td_bad [$envs: got '$got']"
+done
+if [ -z "$td_bad" ]; then
+    pass "tmpdir(): TMPDIR, TEMP, TMP, /tmp, no trailing separator"
+else
+    fail "tmpdir():$td_bad"
+fi
+
+[ $rc = 0 ] && echo "all driver checks passed"
+exit $rc

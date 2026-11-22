@@ -4,6 +4,7 @@
 
 #include "bytecode.h"   /* Chunk */
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 class Construct;
@@ -36,17 +37,52 @@ extern std::unique_ptr<RuntimeException> g_vm_exc_pending;
  * chunk is the only way to run it - the no-fail rule). Filled AOT by
  * vm_precompile_all; this entry point is the never-hit lazy safety net.
  */
-const Chunk *vm_func_chunk(const FuncDescriptor *fdesc);
+/* `jit` (default true): jit-compile the body immediately. The AOT precompile's
+ * codegen pass passes FALSE (it jits every body in a later pass, so a caller's
+ * native-call gate sees every callee's native_leaf flag - #55 STEP 2). */
+const Chunk *vm_func_chunk(const FuncDescriptor *fdesc, bool jit = true);
+
+/* .myv LOAD (plans/archived/myv-serializer.md): install a deserialized chunk as a
+ * descriptor's body - the loader's equivalent of what vm_precompile_all
+ * does for a fresh compile (own the chunk, stamp vm_chunk/vm_chunk_tried).
+ * The AOT native tier is (re-)run here too: only the VM image is stored. */
+void vm_install_func_chunk(const FuncDescriptor *fdesc, Chunk &&ck);
+
+
+
+/* .myv LOAD: re-resolve a builtin by NAME against the singleton table
+ * (a stored image names its builtins; an unknown name is refused). */
+bool vm_lookup_builtin(const UniqueId *name, Builtin &out);
 
 /*
  * Drive a chunk against `ctx` (a function body's args context, or main). Runs
  * until Halt or an in-flight `return`; the caller reads ctx->flow->value.
+ *
+ * #60 (b): this is the per-INVOCATION entry (activation + boundary window +
+ * g_current_ctx setup) around the bare dispatch loop (vm_dispatch, file-local
+ * in vm.cpp). A builtin CALLBACK loop (VmInvoker) that already
+ * owns those re-enters vm_dispatch DIRECTLY, paying no per-element entry setup.
  */
 void vm_run_chunk(const Chunk &chunk, EvalContext &ctx);
+/* RULE 2: a loc-less exception out of a call's SETUP (arity, a bind
+ * coercion, the window push) gets the ARGUMENT LIST's caret - the call
+ * op's second caret (base_locs) - as the tree-walker's CallExpr::do_eval
+ * stamps it; `locs` (the whole call) is the fallback. See the definition. */
+struct Exception;
+void vm_stamp_setup_caret(Exception &e, const Chunk &chunk, size_t pc);
+
+/*
+ * model-flip M2 (plans/archived/model-flip.md): headless self-test for vm_exec_block -
+ * the interpreted-ISLAND executor the native container will call. Hand-builds
+ * tiny islands (fall-through, an internal boxed branch, a return, an uncaught
+ * throw) and asserts the returned status + resulting state. Defined only under
+ * TESTS; returns true on success. Called from the -rt table.
+ */
+bool vm_exec_block_selftest();
 
 /*
  * Allocate / release a callee frame WINDOW on the current activation's
- * segmented slot stack (plans/vm-native-call-stack.md): do_func_call binds a
+ * segmented slot stack (plans/archived/vm-native-call-stack.md): do_func_call binds a
  * chunked body's params into the returned view Frame instead of constructing
  * a per-call Frame. push returns null when no activation is live (the caller
  * falls back to a plain Frame); throws the catchable StackOverflowEx at the
@@ -55,17 +91,57 @@ void vm_run_chunk(const Chunk &chunk, EvalContext &ctx);
 Frame *vm_window_push(int_type nslots, const Chunk *ck);
 void vm_window_pop();
 
+#ifdef TESTS
+/* lever 2 execution proof: VmInvoker's DIRECT fragment entries */
+extern unsigned long g_jit_invoke_direct;
+/* #93 reach: functions with >=1 non-escaping param, and params marked
+ * (resolver.cpp) - a COMPILE-time count, so it says whether the analysis
+ * sees anything in a real program at all */
+extern unsigned long g_noescape_funcs;
+extern unsigned long g_noescape_marks;
+extern unsigned long g_noescape_cands;
+extern unsigned long g_noescape_unsafe;
+extern unsigned long g_esc_p_callee, g_esc_p_gwrite;
+extern unsigned long g_esc_p_hobuiltin, g_esc_p_shape;
+extern unsigned long g_esc_named_by_cs;
+/* Which VmInvoker::call entry each callback element took (vm.cpp) */
+extern unsigned long g_invoke_prepared;
+extern unsigned long g_invoke_fallback;
+extern unsigned long g_invoke_raw;   /* prepared entries bound RAW (#97) */
+extern unsigned long g_invoke_test_inline; /* #84: test() served inline */
+extern unsigned long g_invoke_test_regs;   /* #84: ...answered from rdx */
+/* lever 4 execution proof: per-element runs of the SPECIALIZED dyn-foreach
+ * Next bodies (resolved once at ForeachDynInit): 0 int / 1 float / 2 bool /
+ * 3 gen / 4 dict */
+extern unsigned long g_dyn_foreach_fast[5];
+/* H3 (#159) execution proof: unpack binds that took the direct SharedStr
+ * copy-assign (no type-erased dispatch) instead of put() */
+extern unsigned long g_unpack_fast_binds;
+/* #121 execution proof: slot binds that took the direct same-kind handle
+ * move-assign (vm_slot_bind_ref) instead of put()'s three-frame chain */
+extern unsigned long g_ref_bind_fast;
+#ifdef INT_TESTS
 /*
- * Phase D: run a builtin's USER-CALLBACK (eval_func's funnel) as a boundary
- * frame on the current activation - no per-element do_func_call/
- * EvalContext. False = not available (no activation / const-eval / no
- * chunk); the caller falls back to do_func_call. May throw exactly what
- * do_func_call would (arity, bind coercion, the callee's exceptions with
- * this frame's backtrace entry appended).
+ * #107 P4/P5: the FRAME-SLOT half of the state checker - a slot outside
+ * `ref_slots` holds no reference, a borrowed slot a non-slice one, an
+ * array value's slice registration holds, no object counts fewer handles
+ * than the owning slots holding it, and (our own bytecode only) a typed
+ * parameter holds its scalar. `skip[i]` marks a slot whose memory is not
+ * authoritative (a JIT pin, a spill home, an elided type); a slot whose
+ * type word is the W3 poison is skipped too. Returns null, or what is
+ * wrong with slot `bad`. Shared by the dispatch loop and the JIT probe.
  */
+const char *int_slots_fault(const std::vector<int32_t> &ref_slots,
+                            const std::vector<unsigned char> &param_kinds,
+                            const LValue *slots, int n,
+                            const std::vector<char> *skip,
+                            int &bad) noexcept;
+#endif
+
+#endif
+
 class FuncObject;
-bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
-                   const EvalValue *argv, size_t n, EvalValue &out);
+class CaptureSlots;   /* a closure's captured values (eval.h) */
 
 /*
  * Phase D, the LOOP form (roadmap C2): a builtin that invokes the SAME
@@ -76,32 +152,208 @@ bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
  * window push/pop, or record churn. Reference slots are reset between
  * elements (per-call frame-death semantics preserved - COW/use_count
  * behavior stays byte-identical to fresh frames). RAII: the dtor pops the
- * window and restores captures even when a callback throws. When !ready()
- * (tree-walk engine, const-eval, no activation, chunk-less callee) the
- * builtin falls back to eval_func per element.
+ * window and restores captures even when a callback throws.
+ *
+ * ⛔ `call(args...)` IS THE ONE ENTRY EVERY BUILTIN USES - do NOT add a
+ * per-builtin variant. It takes the callback's arguments in whatever C++
+ * types the builtin holds them in and picks the tier ITSELF: the prepared
+ * `invoke` above, or `eval_func` when the invoker is not ready() (the
+ * tree-walk engine, const-eval, no activation, a chunk-less callee). So a
+ * NEW higher-order builtin writes `inv.call(x)` and gets the best
+ * available tier with no ladder of its own - which is the point: the five
+ * existing call sites (sort's comparator, find's key, make_array,
+ * make_dict, map/filter) each spelled that ladder out, and each spelled it
+ * slightly differently.
+ *
+ * ⛔ IT ALSO EXISTS TO BOX EACH ARGUMENT EXACTLY ONCE, WHICH IS WHERE ITS
+ * MEASURED WIN COMES FROM. `sort` used to reach its invoker through a
+ * `cmp2(EvalValue, EvalValue)` lambda shared by the five storage arms, so
+ * a flat int comparison built TWO EvalValues for cmp2's parameters and
+ * then copied them into a two-element argv - four constructions per
+ * comparison. Taking the raw `int_type`s here builds the argv directly:
+ * two. Measured on 34_sort_custom_cmp, -16.2% instructions (893.6M ->
+ * 748.9M) and 0.89x wall clock; 12_higher_order 0.87x; full suite flat at
+ * 1.002x, with 33_sort_ints - the same sort with no comparator - flat, as
+ * it must be.
+ *
+ * ⛔ AND DO NOT "IMPROVE" IT BY BINDING THE RAW SCALAR STRAIGHT INTO THE
+ * WINDOW SLOT - THAT WAS BUILT, MEASURED AND REMOVED, TWICE. Skipping the
+ * argv entirely and writing the scalar into the callee's slot from its
+ * static type is the obvious next step and it LOSES: with it reaching
+ * 2,820,290 of 2,820,290 comparisons on 34_sort_custom_cmp (proven with
+ * MYLANG_JITSTATS' cb_ counters), the bench measured 1.20x-1.22x SLOWER
+ * than this in FOUR different shapes - bind inlined at the site, bind
+ * inlined with the body shared through an always-inline helper, the same
+ * plus a non-inlinable body, and the whole typed entry out-of-line. Every
+ * metric that can be SIMULATED said it should be faster (-28.2%
+ * instructions, -28% branches, identical D1/LL misses, +2.5%
+ * mispredicts), which is this codebase's known front-end/code-layout
+ * signature and is exactly why the wall clock is the number that decides.
+ * The full record is in plans/top5-cpp-gap.md.
  */
 struct VmActivation;
 class VmInvoker {
 public:
-    VmInvoker(EvalContext *ctx, FuncObject &obj);
+    /* `site` is the BUILTIN CALL's location (its argument list's start,
+     * which every engine has: ArgLocs::start / the builtin_calls pool;
+     * map/filter pass their container argument's) - the callback's
+     * backtrace frame names it as its call site (#44). A callback has no
+     * call op of its own, so without it the frame was captured loc-less
+     * and its caller rendered "at line 0". Required, not defaulted, so a
+     * new higher-order builtin cannot forget it. */
+    VmInvoker(EvalContext *ctx, FuncObject &obj, Loc site);
     ~VmInvoker();
     VmInvoker(const VmInvoker &) = delete;
     bool ready() const { return ready_; }
+
+    /*
+     * THE callback entry (see the class comment). `args` are the callback's
+     * arguments in whatever C++ types the builtin holds them in - a raw
+     * int_type/float_type/bool element of a flat array, a SharedStr, or an
+     * already-boxed EvalValue. An argument must not alias the callee
+     * window (every caller passes array elements or freshly built values).
+     */
+    template <class... A>
+    EvalValue call(A &&... args)
+    {
+        /* #97: an all-SCALAR argument list (a flat int/float/bool array's
+         * raw elements, make_array's index) skips the argv entirely - the
+         * prepared window's slots are written in place (call_scalars). */
+        if constexpr (sizeof...(A) > 0
+                      && (cb_scalar_v<std::decay_t<A>> && ...)) {
+            const CbScalar ra[] = {
+                CbScalar(static_cast<std::decay_t<A>>(args))... };
+            return call_scalars(ra, sizeof...(A));
+        }
+        /* Each argument is boxed EXACTLY ONCE, here, straight from its
+         * static C++ type - that single-boxing is the win (see the class
+         * comment). Then the prepared window entry, or the per-call path
+         * when there is no window to run on. */
+        const EvalValue argv[] = { EvalValue(static_cast<A &&>(args))... };
+        if (ready_)
+            return invoke(argv, sizeof...(A));
+        return call_eval_func(argv, sizeof...(A));
+    }
+
+    /*
+     * The ARITY-1 ALREADY-BOXED form (#99, the 67_make_dict finding):
+     * a const-lvalue EvalValue argument is forwarded BY POINTER - no
+     * copy, no retain/release. The template's single-boxing line
+     * copy-constructs an already-boxed argument into its local argv,
+     * a full EvalValue copy per callback that the pre-unification
+     * call sites never paid (+5.9% Ir on 67_make_dict, ~27/call).
+     * Overload resolution keeps everything else on the template: a
+     * non-template function beats the template for a const lvalue,
+     * while an RVALUE EvalValue prefers the template's && binding
+     * (move into argv) and raw C++ types only match the template -
+     * so the single-boxing contract for those is unchanged. Same
+     * argument contract as the template: it must outlive the call
+     * and must not alias the callee window. Arity >= 2 cannot use
+     * this trick - invoke's argv is contiguous, and two separate
+     * lvalues are not.
+     */
+    /*
+     * #97 CB7: the callback's result as a TRUTH VALUE - what sort's
+     * comparator and filter's predicate ask. The scalar path reads it in
+     * place in flow->value (no EvalValue move out, no temporary to
+     * destroy); anything else is call(...).truthy().
+     */
+    template <class... A>
+    bool test(A &&... args)
+    {
+        if constexpr (sizeof...(A) > 0
+                      && (cb_scalar_v<std::decay_t<A>> && ...)) {
+            const CbScalar ra[] = {
+                CbScalar(static_cast<std::decay_t<A>>(args))... };
+            return test_scalars(ra, sizeof...(A));  /* vminvoke.h */
+        } else {
+            return call(static_cast<A &&>(args)...).truthy();
+        }
+    }
+
+    EvalValue call(const EvalValue &arg)
+    {
+        if (ready_)
+            return invoke(&arg, 1);
+        return call_eval_func(&arg, 1);
+    }
+
     EvalValue invoke(const EvalValue *argv, size_t n);
 
 private:
+    /*
+     * #97 THE RAW SCALAR BIND. A scalar argument is written straight into
+     * its window slot - no argv, no EvalValue assignment's type dispatch
+     * - when the callee binds plainly (fast_bind: no parameter coerces),
+     * the arity is exact, and each slot is trivial and not borrowed
+     * (after a call the release scan leaves every ref-listed slot
+     * trivial, so this holds on every element but a pathological one,
+     * which boxes instead). 34_sort_custom_cmp -24.5% Ir, 0.82x wall.
+     *
+     * ⛔ THIS WAS BUILT IN FOUR SHAPES ON 2026-08-14 AND REJECTED (1.20x
+     * slower on the wall clock at -28% Ir; plans/top5-cpp-gap.md). The
+     * diagnosis then was "front-end / code layout", unmeasurable on that
+     * box (WSL2, no PMU). On native hardware with top-down counters
+     * (2026-09-25) the path is BACKEND-bound, not front-end, and a
+     * same-binary A/B (an env switch around this very path, so layout
+     * was identical) measured -23% cycles; the interleaved --baseline
+     * wall clock against the unmodified tree agreed (0.82x). The August
+     * loss does not reproduce here.
+     */
+    struct CbScalar {
+        uint8_t kind;            /* 0 int, 1 float, 2 bool */
+        union { int_type i; float_type f; };
+        CbScalar(int_type v) : kind(0), i(v) {}
+        CbScalar(float_type v) : kind(1), f(v) {}
+        CbScalar(bool v) : kind(2), i(v ? 1 : 0) {}
+    };
+    template <class T>
+    static constexpr bool cb_scalar_v = std::is_same_v<T, int_type>
+        || std::is_same_v<T, float_type> || std::is_same_v<T, bool>;
+    EvalValue call_scalars(const CbScalar *ra, size_t n);
+    EvalValue call_scalars_boxed(const CbScalar *ra, size_t n);
+    bool call_scalars_test(const CbScalar *ra, size_t n);
+    void bind_raw(const CbScalar *ra, size_t n);
+    /* #84: the INLINE test path (vminvoke.h - included by the one TU
+     * whose builtins call test(), and by vm.cpp) and its out-of-line
+     * uncommon half */
+    bool test_scalars(const CbScalar *ra, size_t n);
+    bool test_tail(size_t r);
+    bool test_result();
+
+    EvalValue call_eval_func(const EvalValue *argv, size_t n);
+
     bool ready_ = false;
+    bool fast_bind_ = false;
+    /* ready_ && fast_bind_ && no fit check (#49), the raw bind's one
+     * gate (#97 CB6) */
+    bool raw_ok_ = false;
+    Loc site_;                 /* the builtin call's site (#44) */
     VmActivation *act_ = nullptr;
     EvalContext *c_ = nullptr;
     const Chunk *cck_ = nullptr;
     const FuncDescriptor *desc_ = nullptr;
     Frame *w_ = nullptr;
-    std::vector<LValue> *saved_caps_ = nullptr;
+    CaptureSlots *saved_caps_ = nullptr;
+    /* #60: g_current_ctx is owned for the whole loop (set once in the ctor,
+     * restored in the dtor) so invoke() re-enters vm_dispatch with no per-
+     * element CtxGuard store. */
+    EvalContext *saved_gctx_ = nullptr;
+    /* Loop-fixed arity fields (hoisted from desc_ - read once, not per call). */
+    size_t nparams_ = 0;
+    size_t min_args_ = 0;
+    /* Lever 2: the callee fragment's DIRECT entry (body starts native),
+     * cached once per loop; null = the vm_dispatch fallback. */
+    const char *entry_ = nullptr;
+    /* The not-ready fallback's two operands, kept so `call` can absorb the
+     * eval_func arm and a builtin needs no ladder of its own. */
+    EvalContext *caller_ctx_ = nullptr;
+    FuncObject *obj_ = nullptr;
 };
 void vm_window_pop();
 
 /*
- * The COMPLETE compiled program image (plans/vm-ast-free-runtime.md): the root
+ * The COMPLETE compiled program image (plans/archived/vm-ast-free-runtime.md): the root
  * chunk, the root-context data the run needs (slot count + the global table's
  * names), and - crucially - OWNERSHIP of every FuncDescriptor and
  * StructTypeDef, MOVED here from the AST by vm_compile. After that transfer
@@ -114,13 +366,50 @@ void vm_window_pop();
 struct VmProgram {
     Chunk root;
     int root_slot_count = 0;
+    /* compiled with type inference: containers take types when they enter
+     * a typed place (g_ctype_adopt; vm_run sets it from here, so an image
+     * runs as its compile would). ⛔ The two moves below list every member
+     * by hand: a new one joins both, or a moved program loses it (this one
+     * did, and -nti ran as a typed program). */
+    bool typed = true;
     std::vector<const UniqueId *> global_func_names;
+    /* the root block's per-global-slot "may be reassigned" flags - the
+     * native-call gate reads them, so a .myv carries them (else a loaded
+     * image could not rebuild the same native tier). */
+    std::vector<char> global_slot_reassigned;
     std::vector<std::unique_ptr<FuncDescriptor>> funcs;
     std::vector<std::unique_ptr<StructTypeDef>> structs;
+
+    /*
+     * ⛔ A JIT'd ROOT CHUNK IS ADDRESS-BAKED, SO A MOVE MUST REBIND IT
+     * (2026-09-22). `root` is a by-value member, and the native tier
+     * records ITS ADDRESS in two places that outlive the move: every
+     * NorecSite's `caller` (the record-less tier's retarget writes it into
+     * a record's `ret_chunk`) and the fragment -> chunk map. The function
+     * chunks are heap objects a descriptor points at and never move; main's
+     * is the one that does - out of vm_compile's / myv_read's return slot
+     * into the caller's variable. The script driver's compile path called
+     * `jit_norec_rebind` after its move and the LOAD path did not: `mylang
+     * prog.myv` resumed main at a stack address that had gone out of scope
+     * (ASan on 12_deep_switch, 07_exceptions, 23_baked_callee - any image
+     * whose main takes a switched call; a wild read in a release build).
+     * So the move itself rebinds now, in the two operations and nowhere
+     * else - a caller cannot forget what the type does for it.
+     */
+    VmProgram() = default;
+    /* erases THIS program's function chunks from the process-global chunk
+     * map: they are keyed by descriptors this object owns and frees, so a
+     * chunk outliving its program is a stale-keyed entry (and kept its
+     * constants alive - the #107 object census saw it) */
+    ~VmProgram();
+    VmProgram(VmProgram &&o) noexcept;
+    VmProgram &operator=(VmProgram &&o) noexcept;
+    VmProgram(const VmProgram &) = delete;
+    VmProgram &operator=(const VmProgram &) = delete;
 };
 
 /*
- * The runtime bytecode VM - the -vm execution engine (plans/bytecode-vm.md).
+ * The runtime bytecode VM - the -vm execution engine (plans/archived/bytecode-vm.md).
  * `root` is the OPTIMIZED program AST (post infer / resolve_names /
  * specialize_types), exactly what the tree-walker's root->eval(nullptr) runs.
  * vm_execute lowers it to bytecode and drives it through the SAME root context
@@ -137,7 +426,86 @@ struct VmProgram {
  * teardown proof in mylang.cpp). vm_execute = compile + run (the -rt
  * harness's path, AST retained for the differential oracle).
  */
-VmProgram vm_compile(const Construct *root);
+/* `jit` false: skip the native AOT tier - the .myv WRITER stores PRE-jit
+ * bytecode (the JIT rewrites code in place: EnterNative ops whose fragments
+ * are NOT serialized), and the LOADER re-runs the tier itself. */
+/* .myv LOAD: run the AOT native tier over a fully-read image - the loader's
+ * equivalent of vm_precompile_all's two passes (set every native_leaf flag,
+ * then jit each body with a JitCtx rebuilt from the image), so a loaded
+ * program gets the IDENTICAL native tier a fresh compile does. */
+void vm_jit_loaded_image(VmProgram &prog);
+/* a loaded image's global slot -> descriptor map, by name: the one the
+ * load's JIT builds and the image's -vd dump reads */
+std::vector<const FuncDescriptor *> vm_image_slot_desc(const VmProgram &prog);
+
+/*
+ * THE JIT DRIVER - the one pass sequence that turns a codegen'd program
+ * into its native tier, shared by the THREE places that run it: a fresh
+ * compile (vm_precompile_all), a `.myv` load (vm_jit_loaded_image) and
+ * the -vd/-vdj dump driver (disassemble_program). In order: the
+ * frameless pre-pass over MAIN (which callees will main call
+ * framelessly - a body reads the answer to decide whether to emit its
+ * frameless entry and return arm), every body with its own JitCtx
+ * (caller_desc = the descriptor keying it), then main LAST with the
+ * same map and a null caller_desc (bake_final: every callee main can
+ * name is placed by then).
+ *
+ * ⛔ ONE copy, not three. The dump driver used to replicate this by
+ * hand and went stale TWICE without anything noticing: it jitted main
+ * with no JitCtx after #97 step 4 gave main the map, and it never ran
+ * the #97 inc 2 pre-pass - so `-vdj` showed the generic `call rdx` push
+ * on a program whose real run took 2,000,002 frameless calls. The dump
+ * is the instrument this tier is measured with; a driver of its own is
+ * a second implementation free to drift (the vm_precompile_all /
+ * vm_jit_loaded_image pair had already drifted once, the 649-byte
+ * main). `bodies` pairs each chunk with its descriptor, in whatever
+ * order the caller iterates (the dump driver's is source order, for a
+ * reproducible arena; a fresh compile's is g_func_chunks' - order does
+ * not change any fragment's text, only its placement). `main` may be
+ * null (a program with no root chunk to jit).
+ */
+void vm_jit_program(Chunk *main,
+                    const std::vector<std::pair<Chunk *,
+                                                const FuncDescriptor *>>
+                        &bodies,
+                    const std::vector<const FuncDescriptor *> &slot_desc,
+                    const std::vector<char> &slot_reassigned);
+
+/*
+ * #137: REFUSE a structurally impossible image, BEFORE the JIT or the
+ * interpreter indexes anything in it. Runs verify_chunk (codegen.h) over the
+ * root and every function body.
+ *
+ * It lives here, not in the loader, because the limits ARE VM facts: a
+ * chunk's frame is `frame_size + n_temps` slots and its captures come from
+ * the descriptor, so the bounds must be computed from the same expressions
+ * vm_run/do_func_call size the frame with - a second copy would be free to
+ * drift and would then either reject a valid image or accept a fatal one.
+ *
+ * THROWS (a plain "MyvError" Exception) - it guards hostile input, so it is
+ * on in a release build too. The `.myv` loader calls it unconditionally;
+ * vm_compile calls it under ASSERTS, where it is the net that proves the
+ * per-opcode table agrees with what codegen actually emits.
+ */
+void vm_verify_program(const VmProgram &prog);
+
+/*
+ * #137 tier 1: can `aop` be dispatched by vm_num_binop?
+ *
+ * A boxed arith/compare op's `aop` is ONE RAW BYTE in a `.myv`, cast straight
+ * into `enum class Op`. A corrupt one finds no method - `binop_pmf` and
+ * `cmp_pmf` both return null - and the call then goes through a NULL
+ * pointer-to-member. That was a real SIGSEGV in the DEFAULT release build
+ * (the ML_VM_CHECK that catches it belongs to the VM_HARDENING tier, which a
+ * release turns off).
+ *
+ * Exported so verify_chunk can refuse it AT LOAD, for free, in every build -
+ * and exported rather than duplicated so the verifier asks the SAME two
+ * tables the dispatch uses. A new operator joins them in one place.
+ */
+bool vm_aop_dispatchable(Op aop);
+
+VmProgram vm_compile(const Construct *root, bool jit = true);
 void vm_run(VmProgram &prog);
 void vm_execute(const Construct *root);
 

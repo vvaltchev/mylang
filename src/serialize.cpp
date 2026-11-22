@@ -1,0 +1,2933 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
+/*
+ * The `.myv` stored-bytecode reader/writer (plans/archived/myv-serializer.md).
+ *
+ * ONLY the VM image is stored - never native code. The AOT tier re-runs at
+ * LOAD time, so a `.myv` is portable across machines and across the JIT's
+ * own evolution (serializing fragments would need a relocating linker: the
+ * library and own-text addresses differ per run - a later increment).
+ *
+ * ⛔ THE PAIRING RULE: every record's WRITE and READ live ADJACENT here, in
+ * the same order, so the two can never drift. ANY format change bumps
+ * MYV_FORMAT_VERSION (serialize.h) in the SAME commit.
+ *
+ * Cross-references are indices, never pointers: `UniqueId *` -> a string
+ * index (the loader re-interns), `Builtin` -> its NAME (re-resolved against
+ * the builtin table; an unknown name is refused), struct defs and function
+ * descriptors -> table indices. Values go through the recursive codec below,
+ * which ABORTS (loudly) on a type it does not know - the writer never emits
+ * a silently-lossy image.
+ */
+
+#include "serialize.h"
+#include "defs.h"
+#include "errors.h"
+#include "evalvalue.h"
+#include "bytecode.h"
+#include "funcdesc.h"
+#include "structtype.h"
+#include "vm.h"
+#include "eval.h"
+#include "jit.h"
+#include <unordered_map>
+#include <unordered_set>
+#include "codegen.h"
+#include "env.h"
+#include "cyclewalk.h"   /* the value codec refuses a value with a cycle */
+
+#include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <new>
+#include <sys/stat.h>
+#include <map>
+#include <string>
+#include <vector>
+
+/* getcwd(), for the source reference's project root */
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <unistd.h>
+#endif
+
+namespace {
+
+const char MYV_MAGIC[4] = { 'M', 'Y', 'L', 'V' };
+constexpr uint32_t MYV_ENDIAN_MARK = 0x01020304u;
+
+[[noreturn]] void bad_image(const char *what)
+{
+    throw Exception("MyvError", what);
+}
+
+/* ------------------------------------------------------------------ */
+/* The SOURCE REFERENCE: CRC32 + path math (no <filesystem>: it would  */
+/* need -lstdc++fs on the older GCCs the CI still builds with)         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * CRC-32 (the reflected form: polynomial 0xedb88320, init/final inverted) -
+ * computed a bit at a time, so there is no 1KB table to carry. It runs once
+ * per compile and once per image load over a source file, so speed is
+ * irrelevant; what matters is that a source edited after `-c` is DETECTED.
+ */
+uint32_t crc32_of(const std::string &data)
+{
+    uint32_t c = 0xffffffffu;
+
+    for (unsigned char b : data) {
+        c ^= b;
+        for (int i = 0; i < 8; i++) {
+            /* subtract the low bit as a MASK: branch-free, and it keeps the
+             * conditional xor obvious */
+            c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1u)));
+        }
+    }
+
+    return ~c;
+}
+
+/* '/' is accepted as a separator by both platforms; Windows also takes '\'. */
+bool is_sep(char c)
+{
+#ifdef _WIN32
+    return c == '/' || c == '\\';
+#else
+    return c == '/';
+#endif
+}
+
+bool is_absolute(const std::string &p)
+{
+    if (p.empty())
+        return false;
+#ifdef _WIN32
+    if (p.size() >= 3 && p[1] == ':' && is_sep(p[2]))
+        return true;                      /* C:\... or C:/... */
+    return is_sep(p[0]);                  /* \\server\share, \abs */
+#else
+    return p[0] == '/';
+#endif
+}
+
+std::string cwd_path()
+{
+    /* PATH_MAX is not portable (and Hurd has none), so grow until it fits -
+     * but only while the failure IS "too small" (ERANGE); any other errno is
+     * permanent and would just spin through every size. */
+    for (size_t cap = 512; cap <= (1u << 16); cap *= 2) {
+        std::vector<char> buf(cap);
+        errno = 0;
+#ifdef _WIN32
+        if (_getcwd(buf.data(), static_cast<int>(cap)))
+#else
+        if (getcwd(buf.data(), cap))
+#endif
+            return std::string(buf.data());
+        if (errno != ERANGE)
+            break;
+    }
+    return std::string();   /* no root: the source's own dir is used */
+}
+
+std::string join_path(const std::string &dir, const std::string &rel)
+{
+    if (dir.empty())
+        return rel;
+    if (is_sep(dir.back()))
+        return dir + rel;
+    return dir + "/" + rel;
+}
+
+/*
+ * Resolve + VERIFY the source of an image being loaded, per the reference and
+ * the load options. The rules (README / plans/archived/myv-serializer.md):
+ *  - `--source ROOT` given: look ONLY under it (`ROOT/rel`) - an explicit
+ *    root that does not have the file is a mistake worth reporting, not a
+ *    reason to silently fall back to a stale absolute path.
+ *  - else: the stored absolute path, then the stored `root/rel` (identical
+ *    by construction, but explicit - and the pair is what a future relocation
+ *    scheme would key on).
+ * A file that is THERE but whose size/CRC32 differs is REFUSED (warning, no
+ * text) unless `force`, because a caret drawn on the wrong text is worse than
+ * no caret. A file that is simply ABSENT is silent: shipping an image without
+ * its source is a supported, ordinary thing to do.
+ */
+void resolve_source(const MyvSourceRef &ref, const MyvLoadOpts &opts,
+                    MyvSource &out)
+{
+    if (ref.rel.empty() && ref.abs.empty())
+        return;                           /* --strip-source: no reference */
+
+    out.name = !ref.rel.empty() ? ref.rel : ref.abs;
+
+    std::vector<std::string> cands;
+
+    if (!opts.root.empty()) {
+        if (!ref.rel.empty())
+            cands.push_back(join_path(opts.root, ref.rel));
+    } else {
+        if (!ref.abs.empty())
+            cands.push_back(ref.abs);
+        if (!ref.root.empty() && !ref.rel.empty()) {
+            const std::string p = join_path(ref.root, ref.rel);
+            if (cands.empty() || p != cands.front())
+                cands.push_back(p);
+        }
+    }
+
+    std::string text;
+    std::string found;
+
+    for (const std::string &c : cands)
+        if (read_file(c, text)) { found = c; break; }
+
+    if (found.empty())
+        return;                           /* absent: plain errors, no fuss */
+
+    /* `out.name` stays the RELATIVE path (set above), not `found`: it is what
+     * a compiler prints, it is machine-independent, and it makes an image's
+     * error output byte-identical to the same error from the source. Which
+     * copy was read only matters when it MISMATCHES - the warning says so. */
+
+    if (text.size() != ref.size || crc32_of(text) != ref.crc) {
+
+        out.warning = "warning: '" + found + "' has changed since the image "
+                      "was compiled";
+
+        if (!opts.force) {
+            out.warning += " - ignoring it (pass -f to use it anyway)";
+            return;                       /* no text: no misplaced carets */
+        }
+
+        out.warning += " - using it anyway (-f): carets may be misplaced";
+    }
+
+    /* Split exactly as mylang.cpp's read_script does (getline semantics: a
+     * trailing newline does NOT add an empty last line), and drop a CR so a
+     * CRLF checkout renders the same carets as an LF one. */
+    std::string line;
+
+    for (char ch : text) {
+        if (ch == '\n') {
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            out.lines.push_back(line);
+            line.clear();
+        } else {
+            line.push_back(ch);
+        }
+    }
+
+    if (!line.empty()) {
+        if (line.back() == '\r')
+            line.pop_back();
+        out.lines.push_back(line);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Primitive writer / reader (the pairing rule starts here)             */
+/* ------------------------------------------------------------------ */
+
+struct Writer {
+    std::string buf;
+    /* the string TABLE: deduped, index-stable (insertion order) */
+    std::map<std::string, uint32_t> str_ids;
+    std::vector<std::string> strs;
+    /* index maps for the cross-referenced tables */
+    std::map<const StructTypeDef *, uint32_t> struct_ids;
+    std::map<const FuncDescriptor *, uint32_t> desc_ids;
+    /* the class instances already written (by identity number): a later
+     * occurrence is written as a reference, so two references to one
+     * instance load as one */
+    std::unordered_set<uint64_t> classes_written;
+
+    /*
+     * True while writing the STRUCT table's folded `const` members, which
+     * the reader parses BEFORE the descriptor table exists - so a `func`
+     * value there is unreadable however faithfully it is written. The
+     * writer knows every descriptor index up front and so cannot notice;
+     * the reader's `r.descs` is simply still empty, and the image dies as
+     * "corrupt .myv (descriptor)" on a file that is nothing of the kind.
+     * Refuse it AT WRITE TIME instead - an image is never silently lossy.
+     * THE REAL FIX is NOT a section swap - it works today only because
+     * a descriptor references nothing, and CLASSES make the table
+     * references cyclic (a class names its methods, a method names its
+     * class), and a cycle has no traversal order. It is the
+     * identity-before-content read designed in
+     * plans/myv-table-ordering.md; until then this is a clean
+     * compile-time refusal, not a broken file.
+     */
+
+    /*
+     * The containers the value codec is inside (cyclewalk.h). A constant
+     * may contain itself, and the format has no back reference - a value
+     * is stored as a tree - so a container met again on its own path is
+     * REFUSED (write_value), never followed forever. `holder` says which
+     * constant, for the message.
+     */
+    CycStack cyc;
+    std::string holder = "a constant";
+
+    void u8v(uint8_t v) { buf.push_back(static_cast<char>(v)); }
+    void u32v(uint32_t v)
+    {
+        for (int i = 0; i < 4; i++)
+            u8v(static_cast<uint8_t>((v >> (8 * i)) & 0xff));
+    }
+    void i64v(int64_t v)
+    {
+        const uint64_t u = static_cast<uint64_t>(v);
+        for (int i = 0; i < 8; i++)
+            u8v(static_cast<uint8_t>((u >> (8 * i)) & 0xff));
+    }
+    void f64v(double v)
+    {
+        uint64_t u;
+        static_assert(sizeof(u) == sizeof(v), "double is not 8 bytes");
+        memcpy(&u, &v, sizeof(u));
+        i64v(static_cast<int64_t>(u));
+    }
+    void boolv(bool b) { u8v(b ? 1 : 0); }
+    void u16v(uint16_t v)
+    {
+        u8v(static_cast<uint8_t>(v & 0xff));
+        u8v(static_cast<uint8_t>((v >> 8) & 0xff));
+    }
+
+    /*
+     * A POOL Loc - NARROW: `u16` line + `u8` col, THREE bytes instead of
+     * eight, each field with a whole-byte sentinel escape to a plain 4-byte
+     * little-endian int32 (the same rule the loc table's delta fields use;
+     * nothing here is an odd-width integer either). Measured over
+     * bench/ + samples/: 1618 pool Locs, widest line 206, widest column 77,
+     * so NOTHING escaped - but a 70000-line file or a 300-column caret still
+     * round-trips exactly, at 7-9 bytes for those Locs.
+     *
+     * These are ABSOLUTE (unlike the loc TABLE's, which delta against the
+     * previous entry): a caret pool's Locs have no ordering relationship to
+     * each other, so there is nothing to delta against - hence `u16` for the
+     * line rather than a byte, since a one-byte line would escape in any file
+     * over 254 lines. Read side: Reader::locv.
+     */
+    void locv(const Loc &l)
+    {
+        if (l.line >= 0 && l.line <= 65534) {
+            u16v(static_cast<uint16_t>(l.line));
+        } else {
+            u16v(0xffff);
+            u32v(static_cast<uint32_t>(static_cast<int32_t>(l.line)));
+        }
+
+        if (l.col >= 0 && l.col <= 254) {
+            u8v(static_cast<uint8_t>(l.col));
+        } else {
+            u8v(0xff);
+            u32v(static_cast<uint32_t>(static_cast<int32_t>(l.col)));
+        }
+    }
+    void raw(const std::string &s) { u32v(static_cast<uint32_t>(s.size()));
+                                     buf += s; }
+
+    /* a STRING-TABLE index (the loader re-interns; null uid -> ~0u) */
+    uint32_t sid(const std::string &s)
+    {
+        auto it = str_ids.find(s);
+        if (it != str_ids.end())
+            return it->second;
+        const uint32_t id = static_cast<uint32_t>(strs.size());
+        strs.push_back(s);
+        str_ids.emplace(s, id);
+        return id;
+    }
+    void uidv(const UniqueId *u)
+    {
+        u32v(u ? sid(std::string(u->val)) : 0xffffffffu);
+    }
+    void strv(const std::string &s) { u32v(sid(s)); }
+
+    /* The COMPACT instruction fields: the narrowest of 1/2/4/8 bytes that
+     * holds `v` exactly. See the Instr write/read pair for the width codes. */
+    void narrowv(int64_t v, unsigned code)
+    {
+        const int bytes = 1 << (code - 1);   /* codes 1..4 -> 1/2/4/8 bytes */
+        const uint64_t u = static_cast<uint64_t>(v);
+        for (int i = 0; i < bytes; i++)
+            u8v(static_cast<uint8_t>((u >> (8 * i)) & 0xff));
+    }
+};
+
+/*
+ * The width CODE for a compact instruction field: the smallest signed width
+ * that round-trips `v` exactly. 0 is reserved for "the field is at its
+ * DEFAULT and is not stored at all".
+ */
+unsigned width_code(int64_t v)
+{
+    if (v >= -128 && v <= 127)
+        return 1;                                     /* 1 byte  */
+    if (v >= -32768 && v <= 32767)
+        return 2;                                     /* 2 bytes */
+    if (v >= -2147483648LL && v <= 2147483647LL)
+        return 3;                                     /* 4 bytes */
+    return 4;                                         /* 8 bytes */
+}
+
+struct Reader {
+    const std::string &buf;
+    size_t p = 0;
+    std::vector<const UniqueId *> uids;      /* the interned string table */
+    std::vector<std::string> strs;
+    std::vector<StructTypeDef *> structs;
+    std::vector<FuncDescriptor *> descs;
+    /* #52: false while the descriptors are empty shells (the struct table
+     * is read first), and the pool closures materialized meanwhile, whose
+     * capture-free check the wiring phase runs once they are filled. */
+    bool descs_filled = false;
+    std::vector<const FuncDescriptor *> deferred_funcs;
+    /* the class instances read so far, by identity number (a `cls`
+     * reference names one) */
+    std::unordered_map<uint64_t, intrusive_ptr<StructObject>> classes;
+    /* A struct value must match its def: a class instance (`cls`) a class
+     * def, a `strct` record a struct def of the same layout and size. A
+     * value read while the struct records are still being read (a const
+     * member) is checked once every layout is computed. */
+    bool layouts_done = false;
+    struct StructValCheck {
+        const StructTypeDef *def;
+        bool cls, pod;
+        size_t n;            /* bytes (pod) or fields */
+    };
+    std::vector<StructValCheck> deferred_struct_vals;
+
+    void check_struct_val(const StructTypeDef *def, bool cls, bool pod,
+                          size_t n)
+    {
+        if (!layouts_done) {
+            deferred_struct_vals.push_back({ def, cls, pod, n });
+            return;
+        }
+        if (def->is_class != cls || def->is_pod() != pod
+            || n != (pod ? static_cast<size_t>(def->size)
+                         : def->fields.size()))
+            bad_image("corrupt .myv (a struct value does not match its "
+                      "struct)");
+    }
+
+    explicit Reader(const std::string &b) : buf(b) { }
+
+    void need(size_t n) const
+    {
+        if (p + n > buf.size())
+            bad_image("corrupt or incompatible .myv (truncated)");
+    }
+    /*
+     * #137 sweep: an ELEMENT COUNT, bounded by the input that is left.
+     *
+     * Every count in this format precedes records that each consume at least
+     * one byte, so a count larger than the remaining bytes cannot describe a
+     * real image - and reserving on it is what a corrupt file exploits. A
+     * 400-mutation fuzz over an 800-byte image produced 19 HANGS and 20
+     * CRASHES, and the dominant signature was exactly this: an
+     * AddressSanitizer allocator failure, or 5 GB of RSS in five seconds
+     * from one `reserve()` on a mangled u32.
+     *
+     * The bound is deliberately the WEAKEST universally-true one - "no more
+     * entries than bytes" - rather than a per-record minimum size, because
+     * that needs no knowledge of the record it guards and so cannot drift
+     * when a record's encoding changes. It caps the damage at the file size;
+     * a tighter per-site bound is a later refinement, not a prerequisite.
+     */
+    uint32_t countv()
+    {
+        const uint32_t n = u32v();
+        if (n > buf.size() - p)
+            bad_image("corrupt .myv (element count exceeds the file)");
+        return n;
+    }
+    /*
+     * #137: a STANDALONE count - one that sizes something the VM allocates
+     * but that no record array follows, so `countv`'s "no more entries than
+     * bytes remaining" does not apply: a chunk's frame slots and temps, its
+     * dict / dyn iterator slices, its try-region slice.
+     *
+     * They were read with a bare u32v and therefore had NO bound at all, and
+     * that is a HANG, not a crash: one mutated top byte turned n_dyn_iters
+     * into 234 million and n_trys into 1.8 billion, and the run sat there
+     * building the slices. Nothing else in the image changed - the two
+     * disassemblies were byte-identical - which is why only a fuzz run could
+     * have found it.
+     *
+     * The bound is the WHOLE FILE, not what remains: each of these counts one
+     * thing that must ALSO appear somewhere in the image (a slot is written
+     * or read by an op, or named by a param record; an iterator has its Init
+     * op; a try region has its PushHandler), and those bytes may lie before
+     * this field as easily as after it. Like `countv`, it is deliberately the
+     * weakest universally-true bound - it caps the damage at the file size
+     * and cannot drift when a record's encoding changes.
+     */
+    uint32_t sizev(const char *what)
+    {
+        const uint32_t n = u32v();
+        if (n > buf.size())
+            bad_image(what);
+        return n;
+    }
+    /*
+     * #137 tier 1: an ENUM read from a byte. Every one of these used to be a
+     * bare `static_cast<E>(u8v())` - a garbage value straight into a type the
+     * code then switches on, or indexes a table with.
+     *
+     * `last` is the LAST VALID ENUMERATOR, named rather than counted, so the
+     * check reads as what it means. Appending an enumerator makes this stale
+     * in the SAFE direction: it starts REFUSING images that use the new value,
+     * which the round-trip test fails on loudly - the opposite of silently
+     * admitting an out-of-range one.
+     */
+    template <class E>
+    E enumv(E last, const char *what)
+    {
+        const uint8_t v = u8v();
+        if (v > static_cast<uint8_t>(last))
+            bad_image(what);
+        return static_cast<E>(v);
+    }
+    uint8_t u8v() { need(1); return static_cast<uint8_t>(buf[p++]); }
+    uint32_t u32v()
+    {
+        need(4);
+        uint32_t v = 0;
+        for (int i = 0; i < 4; i++)
+            v |= static_cast<uint32_t>(static_cast<uint8_t>(buf[p + i]))
+                 << (8 * i);
+        p += 4;
+        return v;
+    }
+    int64_t i64v()
+    {
+        need(8);
+        uint64_t v = 0;
+        for (int i = 0; i < 8; i++)
+            v |= static_cast<uint64_t>(static_cast<uint8_t>(buf[p + i]))
+                 << (8 * i);
+        p += 8;
+        return static_cast<int64_t>(v);
+    }
+    double f64v()
+    {
+        const int64_t i = i64v();
+        double d;
+        uint64_t u = static_cast<uint64_t>(i);
+        memcpy(&d, &u, sizeof(d));
+        return d;
+    }
+    bool boolv() { return u8v() != 0; }
+
+    /* The write side is Writer::narrowv: read `code`'s bytes and SIGN-EXTEND
+     * from that width (all-unsigned arithmetic + a memcpy, so no
+     * implementation-defined shift or out-of-range signed cast). */
+    int64_t narrowv(unsigned code)
+    {
+        const int bytes = 1 << (code - 1);
+        need(static_cast<size_t>(bytes));
+        uint64_t u = 0;
+        for (int i = 0; i < bytes; i++)
+            u |= static_cast<uint64_t>(static_cast<uint8_t>(buf[p + i]))
+                 << (8 * i);
+        p += static_cast<size_t>(bytes);
+
+        if (bytes < 8) {
+            const uint64_t sign = 1ull << (8 * bytes - 1);
+            if (u & sign)
+                u |= ~((1ull << (8 * bytes)) - 1);
+        }
+
+        int64_t v;
+        memcpy(&v, &u, sizeof(v));
+        return v;
+    }
+
+    uint16_t u16v()
+    {
+        const uint8_t lo = u8v(), hi = u8v();
+        return static_cast<uint16_t>(lo | (hi << 8));
+    }
+
+    /* A POOL Loc - the narrow form; the field layout and the escape rule are
+     * documented at the write site (Writer::locv). */
+    Loc locv()
+    {
+        const uint16_t l16 = u16v();
+        const int line = l16 != 0xffff
+                             ? static_cast<int>(l16)
+                             : static_cast<int>(static_cast<int32_t>(u32v()));
+        const uint8_t c8 = u8v();
+        const int col = c8 != 0xff
+                            ? static_cast<int>(c8)
+                            : static_cast<int>(static_cast<int32_t>(u32v()));
+        return Loc(line, col);
+    }
+    std::string raw()
+    {
+        const uint32_t n = u32v();
+        need(n);
+        std::string s = buf.substr(p, n);
+        p += n;
+        return s;
+    }
+    const UniqueId *uidv()
+    {
+        const uint32_t id = u32v();
+        if (id == 0xffffffffu)
+            return nullptr;
+        if (id >= uids.size())
+            bad_image("corrupt .myv (string index)");
+        return uids[id];
+    }
+    /* A name its record cannot do without - a struct's, a field's, a
+     * parameter's: the null form (0xFFFFFFFF) is refused HERE, not
+     * dereferenced later. myv_fuzz fat-259 / fat-309 (2026-10-04): a
+     * struct whose name was nulled loaded cleanly and crashed the `throw`
+     * that named it (UBSan in a debug build, SIGSEGV in a release one). */
+    const UniqueId *uid_req(const char *what)
+    {
+        const UniqueId *u = uidv();
+        if (!u)
+            bad_image(what);
+        return u;
+    }
+    const std::string &strv()
+    {
+        const uint32_t id = u32v();
+        if (id >= strs.size())
+            bad_image("corrupt .myv (string index)");
+        return strs[id];
+    }
+    /*
+     * A MANDATORY table reference: it must name a real entry. This is the
+     * DEFAULT because the permissive form was, and three call sites indexed
+     * with the 0xffffffff "absent" sentinel it let through - a read four
+     * billion elements past the end. Strict-by-default means a new call site
+     * gets the safe one and has to ask for the other.
+     */
+    uint32_t idx(size_t limit, const char *what)
+    {
+        const uint32_t v = u32v();
+        if (v >= limit)
+            bad_image(what);
+        return v;
+    }
+
+    /* An OPTIONAL reference: 0xffffffff means "none". Only for a field that
+     * genuinely has a null form - the CALLER must test for the sentinel
+     * before indexing. */
+    uint32_t idx_opt(size_t limit, const char *what)
+    {
+        const uint32_t v = u32v();
+        if (v != 0xffffffffu && v >= limit)
+            bad_image(what);
+        return v;
+    }
+};
+
+/*
+ * v37: a TypeAnnot record (a FieldDef's annot, a parameter's fit check,
+ * a store's fit spec, a boxed ctor's field checks). u8 kind (0xFF: no
+ * annotation), bool opt, u32 struct index (0xFFFFFFFF: none), then the
+ * children: elem for an array or a box, key then val for a dict.
+ */
+static uint32_t native_sref(const StructTypeDef *d);
+static StructTypeDef *native_at(uint32_t ref);
+static constexpr uint32_t SREF_NATIVE_ANNOT = 0xfffffff0u;
+
+static void write_annot(Writer &w, const TypeAnnot *a)
+{
+    if (!a) {
+        w.u8v(0xFF);
+        return;
+    }
+    w.u8v(static_cast<uint8_t>(a->kind));
+    w.boolv(a->opt);
+    uint32_t si = 0xffffffffu;
+    if (a->strct) {
+        auto it = w.struct_ids.find(a->strct);
+        if (it != w.struct_ids.end())
+            si = it->second;
+        else if ((si = native_sref(a->strct)) == 0xffffffffu)
+            bad_image("unserializable image (annot struct)");
+    }
+    w.u32v(si);
+    if (a->kind == DeclType::arr || a->kind == DeclType::box)
+        write_annot(w, a->elem.get());
+    else if (a->kind == DeclType::dict) {
+        write_annot(w, a->key.get());
+        write_annot(w, a->val.get());
+    }
+}
+
+static constexpr int MYV_ANNOT_MAX_DEPTH = 256;
+
+static std::shared_ptr<TypeAnnot> read_annot(Reader &r, int depth)
+{
+    if (depth > MYV_ANNOT_MAX_DEPTH)
+        bad_image("corrupt .myv (annot depth)");
+    const uint8_t k = r.u8v();
+    if (k == 0xFF)
+        return nullptr;
+    if (k > static_cast<uint8_t>(DeclType::box))
+        bad_image("corrupt .myv (annot kind)");
+    auto a = std::make_shared<TypeAnnot>();
+    a->kind = static_cast<DeclType>(k);
+    a->opt = r.boolv();
+    const uint32_t si = r.u32v();
+    if (si != 0xffffffffu) {
+        /* v43: a program's struct, or one of the binary's reflection
+         * structs (an array<Type>'s element) */
+        if (a->kind != DeclType::strct
+                || (si < SREF_NATIVE_ANNOT ? si >= r.structs.size()
+                                           : si > SREF_NATIVE_ANNOT + 2))
+            bad_image("corrupt .myv (annot struct)");
+        a->strct = si >= SREF_NATIVE_ANNOT ? native_at(si)
+                                           : r.structs[si];
+    }
+    if (a->kind == DeclType::arr || a->kind == DeclType::box)
+        a->elem = read_annot(r, depth + 1);
+    else if (a->kind == DeclType::dict) {
+        a->key = read_annot(r, depth + 1);
+        a->val = read_annot(r, depth + 1);
+    }
+    return a;
+}
+
+/* A cast's type is COMPLETE: no bare `array` / `dict` anywhere in it (the
+ * parser refuses one), and a struct annotation names its struct */
+static bool annot_complete(const TypeAnnot *a)
+{
+    switch (a->kind) {
+    case DeclType::arr:
+    case DeclType::box:
+        return a->elem && annot_complete(a->elem.get());
+    case DeclType::dict:
+        return a->key && a->val && annot_complete(a->key.get())
+               && annot_complete(a->val.get());
+    case DeclType::strct:
+        return a->strct != nullptr;
+    case DeclType::none:
+        return false;
+    default:
+        return true;
+    }
+}
+
+/* Q2 (v43): a container's own type - an annotation, interned at load. A
+ * container's type is an array<T> / dict<K, V> with no top-level `?`
+ * (`dict`: which of the two this container is) */
+static void write_ctype(Writer &w, const TypeAnnot *t)
+{
+    write_annot(w, t);
+}
+
+/* ...either kind: a builtin call's (it builds an array or a dict) */
+static const TypeAnnot *read_ctype_any(Reader &r)
+{
+    std::shared_ptr<TypeAnnot> a = read_annot(r, 0);
+    if (!a)
+        return nullptr;
+    if (a->opt || (a->kind != DeclType::arr && a->kind != DeclType::dict))
+        bad_image("corrupt .myv (container type)");
+    return annot_intern(*a);
+}
+
+static const TypeAnnot *read_ctype(Reader &r, bool dict)
+{
+    std::shared_ptr<TypeAnnot> a = read_annot(r, 0);
+    if (!a)
+        return nullptr;
+    if (a->opt || a->kind != (dict ? DeclType::dict : DeclType::arr))
+        bad_image("corrupt .myv (container type)");
+    return annot_intern(*a);
+}
+
+/* ------------------------------------------------------------------ */
+/* The VALUE codec (recursive; consts, literal_objs, struct consts)     */
+/* ------------------------------------------------------------------ */
+
+enum class VTag : uint8_t {
+    none = 0, boolean, integer, flt, str, arr, dict, strct, structtype, func,
+    cls, bltn
+};
+
+/* v40: the binary's own reflection structs (eval.cpp) - a folded type() /
+ * decltype() bakes a Type instance into a pool, and a member read on one
+ * is baked against Type - and no program declares them, so an sref names
+ * them by a RESERVED number (docs/myv-format.txt, `sref`) and the loader
+ * hands back this binary's def. Accepted only where a program can reach
+ * one: a struct value's def, a member key's bake_def. */
+static constexpr uint32_t SREF_NATIVE = 0xfffffff0u;   /* + 0, 1, 2 */
+
+static uint32_t native_sref(const StructTypeDef *d)
+{
+    if (d == native_struct_field_def())
+        return SREF_NATIVE;
+    if (d == native_struct_layout_def())
+        return SREF_NATIVE + 1;
+    if (d == native_struct_type_def())
+        return SREF_NATIVE + 2;
+    return 0xffffffffu;
+}
+
+static StructTypeDef *native_at(uint32_t ref)
+{
+    /* the native defs are never written through (a const def) */
+    return const_cast<StructTypeDef *>(
+        ref == SREF_NATIVE ? native_struct_field_def()
+        : ref == SREF_NATIVE + 1 ? native_struct_layout_def()
+        : native_struct_type_def());
+}
+
+/* The name a builtin VALUE is written under: the least, by spelling, of the
+ * names registered with its implementation - a fixed choice, so two
+ * compiles write the same bytes. Only a CONST builtin can be in a pool (a
+ * pool holds what the compile-time evaluator built, and it sees no other),
+ * but both tables are searched, as find_builtin_name does. */
+static void builtin_value_name_scan(
+    const std::map<const UniqueId *, LValue> &tbl, const Builtin &b,
+    const UniqueId *&best)
+{
+    for (const auto &kv : tbl)
+        if (kv.second.get().is<Builtin>()
+                && kv.second.get().get_ref<Builtin>().func == b.func
+                && (!best || kv.first->val < best->val))
+            best = kv.first;
+}
+
+/* (a plain function, not a generic lambda: MSVC did not see a generic
+ * lambda's implicit captures - C2065, 'b' and 'best' undeclared) */
+static const UniqueId *builtin_value_name(const Builtin &b)
+{
+    const UniqueId *best = nullptr;
+    builtin_value_name_scan(EvalContext::const_builtins, b, best);
+    builtin_value_name_scan(EvalContext::builtins, b, best);
+    return best;
+}
+
+void write_value(Writer &w, const EvalValue &v);
+EvalValue read_value(Reader &r);
+
+void write_array(Writer &w, const SharedArrayObj &a)
+{
+    const auto kind = a.skind();
+    w.u8v(static_cast<uint8_t>(kind));
+    w.boolv(a.is_readonly());
+    write_ctype(w, a.ctype());              /* v43 */
+    const size_type n = a.size();
+    w.u32v(static_cast<uint32_t>(n));
+    /* Slices and offsets are NOT stored: a stored array is materialized as
+     * its own storage (an on-disk const is a fresh value at load, exactly
+     * as the in-memory const pool holds a self-contained value). */
+    switch (kind) {
+    case SharedArrayObj::Storage::ints:
+        for (size_type i = 0; i < n; i++)
+            w.i64v(a.flat_ints()[a.offset() + i]);
+        break;
+    case SharedArrayObj::Storage::floats:
+        for (size_type i = 0; i < n; i++)
+            w.f64v(a.flat_floats()[a.offset() + i]);
+        break;
+    case SharedArrayObj::Storage::bools:
+        for (size_type i = 0; i < n; i++)
+            w.boolv(a.flat_bools()[a.offset() + i] != 0);
+        break;
+    case SharedArrayObj::Storage::strs:
+        for (size_type i = 0; i < n; i++)
+            w.raw(std::string(a.flat_strs()[a.offset() + i].get_view()));
+        break;
+    case SharedArrayObj::Storage::structs: {
+        const auto &sv = a.flat_structs();
+        auto it = w.struct_ids.find(sv.def);
+        if (it == w.struct_ids.end())
+            bad_image("unserializable value (struct-array def)");
+        w.u32v(it->second);
+        w.u32v(static_cast<uint32_t>(sv.stride));
+        for (size_type i = 0; i < n; i++)
+            w.buf.append(&sv.buf[(a.offset() + i) * sv.stride], sv.stride);
+        break;
+    }
+    case SharedArrayObj::Storage::objs:       /* class references */
+        for (size_type i = 0; i < n; i++)
+            write_value(w, obj_elem_value(a.flat_objs()[a.offset() + i]));
+        break;
+    default:                                  /* general */
+        for (size_type i = 0; i < n; i++)
+            write_value(w, a.get_view()[i].get());
+        break;
+    }
+}
+
+EvalValue read_array(Reader &r)
+{
+    const auto kind = r.enumv(SharedArrayObj::Storage::objs,
+                              "corrupt .myv (array storage kind)");
+    const bool ro = r.boolv();
+    const TypeAnnot *ct = read_ctype(r, false);     /* v43 */
+    const uint32_t n = r.countv();
+    SharedArrayObj out;
+    switch (kind) {
+    case SharedArrayObj::Storage::ints: {
+        std::vector<int_type> v;
+        v.reserve(n);
+        for (uint32_t i = 0; i < n; i++)
+            v.push_back(static_cast<int_type>(r.i64v()));
+        out = SharedArrayObj(std::move(v));
+        break;
+    }
+    case SharedArrayObj::Storage::floats: {
+        std::vector<float_type> v;
+        v.reserve(n);
+        for (uint32_t i = 0; i < n; i++)
+            v.push_back(static_cast<float_type>(r.f64v()));
+        out = SharedArrayObj(std::move(v));
+        break;
+    }
+    case SharedArrayObj::Storage::bools: {
+        std::vector<unsigned char> v;
+        v.reserve(n);
+        for (uint32_t i = 0; i < n; i++)
+            v.push_back(r.boolv() ? 1 : 0);
+        out = SharedArrayObj(std::move(v));
+        break;
+    }
+    case SharedArrayObj::Storage::strs: {
+        std::vector<SharedStr> v;
+        v.reserve(n);
+        for (uint32_t i = 0; i < n; i++)
+            v.push_back(SharedStr(r.raw()));
+        out = SharedArrayObj(std::move(v));
+        break;
+    }
+    case SharedArrayObj::Storage::structs: {
+        const uint32_t di = r.idx(r.structs.size(), "corrupt .myv (struct)");
+        const uint32_t stride = r.u32v();
+        const size_t bytes = static_cast<size_t>(n) * stride;
+        r.need(bytes);
+        std::vector<char> b(r.buf.begin() + static_cast<long>(r.p),
+                            r.buf.begin() + static_cast<long>(r.p + bytes));
+        r.p += bytes;
+        /* an element is a POD struct value of `stride` bytes: the def must
+         * be a POD struct of exactly that size (checked once the layouts
+         * exist). A stride of another size made every byte-level reader
+         * of the array overrun its element - vm_emplace_struct copied
+         * `stride` bytes out of a buffer of the def's size (myv_fuzz,
+         * CI seed 43176902900, fat-276). */
+        r.check_struct_val(r.structs[di], false, true, stride);
+        out = SharedArrayObj(SharedArrayObj::svec_type(
+            std::move(b), r.structs[di], static_cast<int>(stride)));
+        break;
+    }
+    case SharedArrayObj::Storage::objs: {
+        SharedArrayObj::ovec_type v;
+        v.v.reserve(n);
+        for (uint32_t i = 0; i < n; i++) {
+            const EvalValue e = read_value(r);
+            if (!is_obj_elem(e))
+                bad_image("corrupt .myv (class array element)");
+            v.push(obj_elem_ptr(e));
+        }
+        out = SharedArrayObj(std::move(v));
+        break;
+    }
+    default: {
+        std::vector<LValue> v;
+        v.reserve(n);
+        for (uint32_t i = 0; i < n; i++)
+            v.emplace_back(read_value(r), false);
+        out = SharedArrayObj(std::move(v));
+        break;
+    }
+    }
+    out.set_ctype(ct);
+    if (ro)
+        out.set_readonly();
+    return EvalValue(std::move(out));
+}
+
+void write_value(Writer &w, const EvalValue &v)
+{
+    /* a value that contains itself: the format cannot say "the container
+     * N levels up" (no back reference), so the image is refused */
+    CycKey k;
+    const bool keyed = cyc_key(v, k);
+    if (keyed && w.cyc.contains(k))
+        throw Exception("MyvError", intern_msg(
+            w.holder + " holds a reference cycle (a value that contains "
+            "itself), which a .myv image cannot store"));
+    CycGuard g(w.cyc, k, keyed);
+
+    if (v.get_type()->t == Type::t_none) {
+        w.u8v(static_cast<uint8_t>(VTag::none));
+    }
+    else if (v.is<bool>()) {
+        w.u8v(static_cast<uint8_t>(VTag::boolean));
+        w.boolv(v.get<bool>());
+    } else if (v.is<int_type>()) {
+        w.u8v(static_cast<uint8_t>(VTag::integer));
+        w.i64v(static_cast<int64_t>(v.get<int_type>()));
+    } else if (v.is<float_type>()) {
+        w.u8v(static_cast<uint8_t>(VTag::flt));
+        w.f64v(static_cast<double>(v.get<float_type>()));
+    } else if (v.is<SharedStr>()) {
+        w.u8v(static_cast<uint8_t>(VTag::str));
+        w.raw(std::string(v.get<SharedStr>().get_view()));
+    } else if (v.is<SharedArrayObj>()) {
+        w.u8v(static_cast<uint8_t>(VTag::arr));
+        write_array(w, v.get_ref<SharedArrayObj>());
+    } else if (v.is<intrusive_ptr<DictObject>>()) {
+        w.u8v(static_cast<uint8_t>(VTag::dict));
+        const DictObject &d = *v.get<intrusive_ptr<DictObject>>();
+        w.boolv(d.is_readonly());
+        write_ctype(w, d.ctype());          /* v43 */
+        w.boolv(d.get_has_default());
+        if (d.get_has_default())
+            write_value(w, d.get_default());
+        w.u32v(static_cast<uint32_t>(d.get_ref().size()));
+        for (const auto &kv : d.get_ref()) {
+            write_value(w, kv.first);
+            write_value(w, kv.second.get());
+        }
+    } else if (v.is<intrusive_ptr<StructObject>>()
+               && v.get_ref<intrusive_ptr<StructObject>>()->boxed) {
+        /* box() is a run-time builtin, so no constant holds a box */
+        bad_image("unserializable value (a box)");
+    } else if (v.is<intrusive_ptr<StructObject>>()
+               && v.get_ref<intrusive_ptr<StructObject>>()->def->is_class) {
+        /* a CLASS instance: its identity is part of its value - written
+         * once, then referred to by number (a constant's class instances
+         * keep the numbers the compile gave them, so their hashes, and a
+         * dict keyed by them, are the same in the source run) */
+        w.u8v(static_cast<uint8_t>(VTag::cls));
+        const StructObject &so = *v.get_ref<intrusive_ptr<StructObject>>();
+        auto it = w.struct_ids.find(so.def);
+        if (it == w.struct_ids.end())
+            bad_image("unserializable value (class def)");
+        w.u32v(it->second);
+        w.i64v(static_cast<int64_t>(so.ident));
+        if (!w.classes_written.insert(so.ident).second) {
+            w.u8v(0);                               /* a reference */
+        } else {
+            w.u8v(1);                               /* the instance */
+            w.boolv(so.is_readonly());
+            w.u32v(static_cast<uint32_t>(so.fields.size()));
+            for (const LValue &f : so.fields)
+                write_value(w, f.get());
+        }
+    } else if (v.is<intrusive_ptr<StructObject>>()) {
+        w.u8v(static_cast<uint8_t>(VTag::strct));
+        const StructObject &so = *v.get<intrusive_ptr<StructObject>>();
+        auto it = w.struct_ids.find(so.def);
+        const uint32_t nat = native_sref(so.def);
+        if (it == w.struct_ids.end() && nat == 0xffffffffu)
+            bad_image("unserializable value (struct def)");
+        w.u32v(it != w.struct_ids.end() ? it->second : nat);
+        w.boolv(so.is_readonly());
+        const bool pod = so.def->layout == StructTypeDef::Layout::pod;
+        w.boolv(pod);
+        if (pod) {
+            w.u32v(static_cast<uint32_t>(so.bytes.size()));
+            w.buf.append(so.bytes.data(), so.bytes.size());
+        } else {
+            w.u32v(static_cast<uint32_t>(so.fields.size()));
+            for (const LValue &f : so.fields)
+                write_value(w, f.get());
+        }
+    } else if (v.is<StructTypeDef *>()) {
+        w.u8v(static_cast<uint8_t>(VTag::structtype));
+        auto it = w.struct_ids.find(v.get<StructTypeDef *>());
+        if (it == w.struct_ids.end())
+            bad_image("unserializable value (struct type)");
+        w.u32v(it->second);
+    } else if (v.is<intrusive_ptr<FuncObject>>()) {
+        /* A const-pool FuncObject is capture-free by construction (a
+         * capturing closure is built at runtime by MakeClosureV). */
+        const FuncObject &fo = *v.get<intrusive_ptr<FuncObject>>();
+        if (!fo.capture_slots.empty())
+            bad_image("unserializable value (capturing closure in a pool)");
+        auto it = w.desc_ids.find(fo.func);
+        if (it == w.desc_ids.end())
+            bad_image("unserializable value (func descriptor)");
+        w.u8v(static_cast<uint8_t>(VTag::func));
+        w.u32v(it->second);
+    } else if (v.is<Builtin>()) {
+        /* a builtin VALUE (`const OPS = [len, abs];`): its name, re-bound
+         * on load as a BuiltinCall's is */
+        const UniqueId *nm = builtin_value_name(v.get_ref<Builtin>());
+        if (!nm)
+            bad_image("unserializable value (an unregistered builtin)");
+        w.u8v(static_cast<uint8_t>(VTag::bltn));
+        w.uidv(nm);
+    } else {
+        /* The loud abort: an image is never silently lossy. */
+        bad_image("unserializable value type in a chunk pool");
+    }
+}
+
+EvalValue read_value(Reader &r)
+{
+    switch (static_cast<VTag>(r.u8v())) {
+    case VTag::none:    return EvalValue();
+    case VTag::boolean: return EvalValue(r.boolv());
+    case VTag::integer: return EvalValue(static_cast<int_type>(r.i64v()));
+    case VTag::flt:     return EvalValue(static_cast<float_type>(r.f64v()));
+    case VTag::str:     return EvalValue(SharedStr(r.raw()));
+    case VTag::arr:     return read_array(r);
+    case VTag::dict: {
+        const bool ro = r.boolv();
+        auto d = make_intrusive<DictObject>();
+        d->set_ctype(read_ctype(r, true));  /* v43 */
+        if (r.boolv())
+            d->set_default(read_value(r));
+        const uint32_t n = r.countv();
+        for (uint32_t i = 0; i < n; i++) {
+            EvalValue k = read_value(r);
+            EvalValue val = read_value(r);
+            d->build_emplace(std::move(k), LValue(std::move(val), false));
+        }
+        if (ro)
+            d->set_readonly();
+        return EvalValue(std::move(d));
+    }
+    case VTag::strct: {
+        const uint32_t di = r.u32v();
+        if (di < SREF_NATIVE ? di >= r.structs.size() : di > SREF_NATIVE + 2)
+            bad_image("corrupt .myv (struct)");
+        const bool ro = r.boolv();
+        const bool pod = r.boolv();
+        auto so = make_intrusive<StructObject>();
+        so->def = di >= SREF_NATIVE ? native_at(di) : r.structs[di];
+        if (pod) {
+            const uint32_t n = r.countv();
+            r.need(n);
+            so->bytes.assign(r.buf.begin() + static_cast<long>(r.p),
+                             r.buf.begin() + static_cast<long>(r.p + n));
+            r.p += n;
+        } else {
+            const uint32_t n = r.countv();
+            so->fields.reserve(n);
+            for (uint32_t i = 0; i < n; i++)
+                so->fields.emplace_back(read_value(r), false);
+        }
+        if (ro)
+            so->set_readonly();
+        r.check_struct_val(so->def, false, pod,
+                           pod ? so->bytes.size() : so->fields.size());
+        return EvalValue(std::move(so));
+    }
+    case VTag::cls: {
+        const uint32_t di = r.idx(r.structs.size(), "corrupt .myv (class)");
+        const uint64_t ident = static_cast<uint64_t>(r.i64v());
+        if (r.u8v() == 0) {
+            auto it = r.classes.find(ident);
+            if (it == r.classes.end() || it->second->def != r.structs[di])
+                bad_image("corrupt .myv (a class reference names no "
+                          "instance)");
+            return EvalValue(it->second);
+        }
+        auto so = make_intrusive<StructObject>();
+        so->def = r.structs[di];
+        so->ident = ident;
+        /* registered BEFORE its fields: a field may refer back to it */
+        if (!r.classes.emplace(ident, so).second)
+            bad_image("corrupt .myv (two class instances share a number)");
+        const bool ro = r.boolv();
+        const uint32_t n = r.countv();
+        so->fields.reserve(n);
+        for (uint32_t i = 0; i < n; i++)
+            so->fields.emplace_back(read_value(r), false);
+        if (ro)
+            so->set_readonly();
+        r.check_struct_val(so->def, true, false, so->fields.size());
+        return EvalValue(std::move(so));
+    }
+    case VTag::structtype: {
+        const uint32_t di = r.idx(r.structs.size(), "corrupt .myv (struct)");
+        return EvalValue(r.structs[di]);
+    }
+    case VTag::func: {
+        const uint32_t fi = r.idx(r.descs.size(), "corrupt .myv (descriptor)");
+        const FuncDescriptor *fd = r.descs[fi];
+        /* While the descriptors are still SHELLS (a struct const member
+         * is read before the descriptor table's content, #52), the check
+         * below would read an empty capture list and pass vacuously: it
+         * is DEFERRED to the wiring phase, which runs it on the filled
+         * record. The FuncObject stores only the pointer - its ctor reads
+         * `captures`, empty on a shell, so it never touches the null
+         * context either way. */
+        if (!r.descs_filled) {
+            r.deferred_funcs.push_back(fd);
+            return EvalValue(make_intrusive<FuncObject>(fd, nullptr));
+        }
+        /*
+         * A pool FuncObject is capture-free - the WRITER refuses any other
+         * kind - and the loader must not TRUST that: a capture snapshot
+         * reads its sources from a context, and there is NONE here (the
+         * loader runs before any EvalContext exists). Refuse the image
+         * instead, so a hostile one ends in a clean MyvError like every
+         * other #137 case rather than in the ctor walking a null ctx.
+         */
+        if (!fd->captures.empty())
+            bad_image("corrupt .myv (capturing closure in a pool)");
+        /* No context, hence no root of its own: do_func_call substitutes
+         * the CALLER's root for a ctx-less closure (see capture_root). */
+        return EvalValue(make_intrusive<FuncObject>(fd, nullptr));
+    }
+    case VTag::bltn: {
+        Builtin b(nullptr);
+        if (!vm_lookup_builtin(r.uidv(), b))
+            bad_image("corrupt or incompatible .myv (unknown builtin)");
+        return EvalValue(b);
+    }
+    }
+    bad_image("corrupt .myv (value tag)");
+}
+
+/* ------------------------------------------------------------------ */
+/* Small shared records                                                 */
+/* ------------------------------------------------------------------ */
+
+/* (The `Operand` codec that lived here is GONE with the boxed_ops pool - the
+ * derived pool was its only user, and an `Instr`'s own operands ride the
+ * compact instruction encoding, not this fat 14-byte form.) */
+
+/*
+ * ONE delta-coded loc FIELD (the write/read pair; used by the `locs` table).
+ * A field is EITHER a single byte holding the value, OR the reserved sentinel
+ * byte followed by the value as a plain 4-byte little-endian int32. There is
+ * deliberately NO in-between width: nothing in this format is a 5-byte (or
+ * any non-multiple-of-8-bit) integer that would need a shifted top byte.
+ *
+ * The unsigned form: 0..254 direct, 255 = escape.
+ * The signed form: -127..127 direct (as a two's-complement byte), -128 = esc.
+ */
+void put_u8_esc(Writer &w, int64_t v)
+{
+    if (v >= 0 && v <= 254) {
+        w.u8v(static_cast<uint8_t>(v));
+        return;
+    }
+    w.u8v(0xff);
+    w.u32v(static_cast<uint32_t>(static_cast<int32_t>(v)));
+}
+
+int64_t get_u8_esc(Reader &r)
+{
+    const uint8_t b = r.u8v();
+    if (b != 0xff)
+        return static_cast<int64_t>(b);
+    return static_cast<int64_t>(static_cast<int32_t>(r.u32v()));
+}
+
+void put_i8_esc(Writer &w, int64_t v)
+{
+    if (v >= -127 && v <= 127) {
+        w.u8v(static_cast<uint8_t>(static_cast<uint64_t>(v) & 0xff));
+        return;
+    }
+    w.u8v(0x80);
+    w.u32v(static_cast<uint32_t>(static_cast<int32_t>(v)));
+}
+
+int64_t get_i8_esc(Reader &r)
+{
+    const uint8_t b = r.u8v();
+    if (b != 0x80)
+        return static_cast<int64_t>(static_cast<int8_t>(b));
+    return static_cast<int64_t>(static_cast<int32_t>(r.u32v()));
+}
+
+/*
+ * A pc-keyed loc side table in its DELTA-CODED on-disk form - FOUR bytes for
+ * the overwhelmingly common entry, where the fixed
+ * `{u32 pc, u32 line, u32 col, u32 line, u32 col}` record spent 20 (and ~19 of
+ * them zero: over bench/ + samples/, 969 entries, the pc delta never exceeded
+ * 19 and the widest column was 99).
+ *
+ *     pcd   u8  pc - prev_pc                      255  = escape
+ *     lined i8  start.line - prev_line            -128 = escape
+ *     col   u8  start.col                         255  = escape
+ *     ecol  u8  end.col, IMPLYING end.line == start.line
+ *                                                 255  = escape, and then
+ *               the FULL end Loc (i32 line, i32 col) follows
+ *
+ * A byte's reserved value means "did not fit": the value follows as a plain
+ * 4-byte int32 (put_u8_esc / put_i8_esc). So a 100k-line file or a 5000-column
+ * line round-trips EXACTLY - the byte form is an optimization for the common
+ * case, never a cap - at 8-12 bytes for those entries. (Measured: 97.7% of
+ * entries end on the line they start, so folding the end LINE into ecol's
+ * escape pays for itself; only 4 of 969 entries needed any escape at all.)
+ * Worst case, an entry escaping all four fields is 24 bytes vs the old 20 -
+ * unreachable in practice.
+ *
+ * ON-DISK ONLY: the loader rebuilds the same `vector<LocEntry>`, so `loc_at`'s
+ * binary search on the throw path is untouched. Shared by `locs` and
+ * `base_locs` (#127), which differ only in which caret they carry.
+ */
+void write_loc_table(Writer &w, const std::vector<Chunk::LocEntry> &tbl)
+{
+    w.u32v(static_cast<uint32_t>(tbl.size()));
+
+    int64_t prev_pc = 0, prev_line = 0;
+
+    for (const auto &l : tbl) {
+        put_u8_esc(w, static_cast<int64_t>(l.pc) - prev_pc);
+        put_i8_esc(w, static_cast<int64_t>(l.start.line) - prev_line);
+        put_u8_esc(w, l.start.col);
+
+        if (l.end.line == l.start.line
+                && l.end.col >= 0 && l.end.col <= 254) {
+            w.u8v(static_cast<uint8_t>(l.end.col));
+        } else {
+            w.u8v(0xff);
+            w.u32v(static_cast<uint32_t>(l.end.line));
+            w.u32v(static_cast<uint32_t>(l.end.col));
+        }
+
+        prev_pc = static_cast<int64_t>(l.pc);
+        prev_line = l.start.line;
+    }
+}
+
+void read_loc_table(Reader &r, std::vector<Chunk::LocEntry> &tbl,
+                    size_t code_size)
+{
+    const uint32_t n = r.countv();
+    tbl.reserve(n);
+
+    int64_t prev_pc = 0, prev_line = 0;
+
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::LocEntry l;
+
+        const int64_t pc = prev_pc + get_u8_esc(r);
+        const int64_t line = prev_line + get_i8_esc(r);
+
+        if (pc < 0 || line < 0)
+            bad_image("corrupt .myv (loc delta)");
+
+        l.pc = static_cast<uint32_t>(pc);
+        l.start = Loc(line, get_u8_esc(r));
+
+        const uint8_t ecol = r.u8v();
+
+        if (ecol != 0xff) {
+            l.end = Loc(line, ecol);
+        } else {
+            const int32_t el = static_cast<int32_t>(r.u32v());
+            const int32_t ec = static_cast<int32_t>(r.u32v());
+            l.end = Loc(el, ec);
+        }
+
+        if (l.pc > code_size)
+            bad_image("corrupt .myv (loc pc)");
+
+        prev_pc = pc;
+        prev_line = line;
+        tbl.push_back(l);
+    }
+}
+
+/*
+ * THE PER-ARGUMENT CARET TABLE (v16; RULE 2, 2026-09-20) - a user call op's
+ * THIRD caret, one span per argument, so a bind coercion can name the
+ * argument it rejected (docs/myv-format.txt 9.21). On disk each entry is
+ * SELF-CONTAINED - `u32 pc, u32 n, n x {loc start, loc end}` through the
+ * narrow pool codec - rather than the in-memory `{pc, first, n}` run over a
+ * flat pool: the reader rebuilds `first` itself as it appends, so there is
+ * no pool INDEX in the file for a hostile image to point past. The pc is
+ * bounded here like a loc table's; verify_chunk re-checks the run against
+ * the rebuilt pool before the JIT bakes its address.
+ */
+static void write_arg_locs(Writer &w, const Chunk &c)
+{
+    w.u32v(static_cast<uint32_t>(c.arg_locs.size()));
+    for (const auto &ae : c.arg_locs) {
+        w.u32v(ae.pc);
+        w.u32v(ae.n);
+        for (uint32_t k = 0; k < ae.n; k++) {
+            const ArgLoc &al = c.arg_loc_pool[ae.first + k];
+            w.locv(al.start);
+            w.locv(al.end);
+        }
+    }
+}
+
+static void read_arg_locs(Reader &r, Chunk &c, size_t code_size)
+{
+    const uint32_t n = r.countv();
+    c.arg_locs.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::ArgLocEntry ae;
+        ae.pc = r.u32v();
+        if (ae.pc > code_size)
+            bad_image("corrupt .myv (arg_locs pc)");
+        ae.n = r.countv();
+        ae.first = static_cast<uint32_t>(c.arg_loc_pool.size());
+        for (uint32_t k = 0; k < ae.n; k++) {
+            ArgLoc al;
+            al.start = r.locv();
+            al.end = r.locv();
+            c.arg_loc_pool.push_back(al);
+        }
+        c.arg_locs.push_back(ae);
+    }
+}
+
+void write_arglocs(Writer &w, const std::vector<ArgLoc> &v)
+{
+    w.u32v(static_cast<uint32_t>(v.size()));
+    for (const auto &a : v) { w.locv(a.start); w.locv(a.end); }
+}
+
+std::vector<ArgLoc> read_arglocs(Reader &r)
+{
+    const uint32_t n = r.countv();
+    std::vector<ArgLoc> v;
+    v.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        ArgLoc a;
+        a.start = r.locv();
+        a.end = r.locv();
+        v.push_back(a);
+    }
+    return v;
+}
+
+/* ------------------------------------------------------------------ */
+/* Chunks                                                               */
+/* ------------------------------------------------------------------ */
+
+/* dev-only byte accounting (env MYLANG_MYVSTATS=1): which sections the
+ * image's bytes actually go to - the ROI surface for shrinking the format. */
+void myv_stat(const char *what, size_t bytes)
+{
+    /* env_get, not getenv: MSVC deprecates getenv and the build is
+     * warnings-as-errors on all three compilers (CLAUDE.md) */
+    static bool on = env_get("MYLANG_MYVSTATS").has_value();
+    if (on)
+        fprintf(stderr, "MYVSTAT %-22s %8zu\n", what, bytes);
+}
+
+void myv_stat_ext(const char *what, size_t bytes) { myv_stat(what, bytes); }
+
+void write_chunk(Writer &w, const Chunk &c)
+{
+    size_t cm = w.buf.size();
+    const auto ct = [&](const char *what) {
+        myv_stat_ext(what, w.buf.size() - cm);
+        cm = w.buf.size();
+    };
+    /*
+     * code: FIELD-WISE (Instr has padding whose content is indeterminate) and
+     * COMPACT - see read_chunk for the paired decode. An instruction is
+     *
+     *     op:u8  flags:u16  [present fields, narrowest-first order]
+     *
+     * where `flags` says which of the 6 optional fields are stored and how
+     * wide each one is (width code 0 == "at its default, not stored"):
+     *
+     *     bits 0-2   pa       width code 0..4  (0 / 1 / 2 / 4 / 8 bytes)
+     *     bits 3-5   pb       width code 0..4
+     *     bits 6-7   target   width code 0..3  (0 / 1 / 2 / 4 bytes)
+     *     bits 8-9   target2  width code 0..3
+     *     bit  10    aop      stored (else Op::invalid)
+     *     bit  11    opflags  stored (else 0)
+     *     bits 12-15 RESERVED, must be zero (the reader refuses a nonzero:
+     *                a later version may spend them, and a v2 reader must
+     *                not silently misread such a file)
+     *
+     * WHY (measured over bench/ + samples/, 3483 instructions): the fixed
+     * 27-byte record was 37% of an image, yet `target` fits in ONE byte 97%
+     * of the time, `target2` and `pb` are at their default in ~half the
+     * instructions, and `pa` fits in one byte in two thirds. This is NOT
+     * in-format compression (the decision record against that stands): no
+     * dictionary, no entropy coding, no bit-level packing - each field is
+     * still a plain little-endian integer at a byte boundary, decoded in
+     * O(1) with no state, and two compiles stay byte-identical.
+     *
+     * NOTE the DEFAULT-vs-value subtlety: `pa == -1` means both "unset slot"
+     * and the literal -1, and that is FINE - the field is simply not stored
+     * and the reader's default restores exactly -1. `opflags` independently
+     * records whether the operand is a literal, so no information is lost.
+     */
+    w.u32v(static_cast<uint32_t>(c.code.size()));
+    for (const Instr &in : c.code) {
+
+        const unsigned wa = in.pa == -1 ? 0 : width_code(in.pa);
+        const unsigned wb = in.pb == -1 ? 0 : width_code(in.pb);
+        const unsigned wt = in.target == -1 ? 0 : width_code(in.target);
+        const unsigned wt2 = in.target2 == -1 ? 0 : width_code(in.target2);
+        const bool has_aop = in.aop != Op::invalid;
+        const bool has_flags = in.opflags != 0;
+
+        /* target/target2 are `int`: 4 bytes always suffice (code <= 3) */
+        ML_CHECK(wt <= 3 && wt2 <= 3);
+
+        const uint32_t flags = wa | (wb << 3) | (wt << 6) | (wt2 << 8)
+                               | (has_aop ? 1u << 10 : 0u)
+                               | (has_flags ? 1u << 11 : 0u);
+
+        w.u8v(static_cast<uint8_t>(in.op));
+        w.u8v(static_cast<uint8_t>(flags & 0xff));
+        w.u8v(static_cast<uint8_t>((flags >> 8) & 0xff));
+
+        if (has_aop)
+            w.u8v(static_cast<uint8_t>(in.aop));
+        if (has_flags)
+            w.u8v(in.opflags);
+        if (wt)
+            w.narrowv(in.target, wt);
+        if (wt2)
+            w.narrowv(in.target2, wt2);
+        if (wa)
+            w.narrowv(in.pa, wa);
+        if (wb)
+            w.narrowv(in.pb, wb);
+    }
+    ct("  code");
+    w.u32v(static_cast<uint32_t>(c.slot_count));
+    w.u32v(static_cast<uint32_t>(c.n_temps));
+    w.u32v(static_cast<uint32_t>(c.n_dict_iters));
+    w.u32v(static_cast<uint32_t>(c.n_dyn_iters));
+    w.u32v(static_cast<uint32_t>(c.n_trys));          /* #78 (v7) */
+
+    /* #78 step B (v8): the HANDLER TABLE - PRIMARY data (step D deletes the
+     * CatchTest/Reraise chain it could otherwise be derived from). Indexed
+     * by region id; a bailed try leaves an EMPTY entry (a hole). */
+    w.u32v(static_cast<uint32_t>(c.handler_sites.size()));
+    for (const auto &hs : c.handler_sites) {
+        w.u32v(static_cast<uint32_t>(hs.clauses.size()));
+        for (const auto &cl : hs.clauses) {
+            w.u32v(static_cast<uint32_t>(cl.types_idx));
+            w.u32v(static_cast<uint32_t>(cl.bind_slot));
+            w.u32v(static_cast<uint32_t>(cl.body_pc));
+        }
+        w.u32v(static_cast<uint32_t>(hs.fin_pc));
+        w.u32v(static_cast<uint32_t>(hs.chain));       /* v38 */
+    }
+
+    /* `ref_slots` is NOT written (v18): the loader derives it from the
+     * verified code - see the rebuild in myv_read. */
+
+    w.u32v(static_cast<uint32_t>(c.consts.size()));
+    for (const EvalValue &v : c.consts)
+        write_value(w, v);
+
+    ct("  consts+refslots");
+    write_loc_table(w, c.locs);   /* the DELTA-CODED form; see the fn */
+    ct("  locs");
+    /* #127: the store-BASE carets, same delta form (sparse - only a store
+     * whose base can be an unbound global records one). */
+    write_loc_table(w, c.base_locs);
+    ct("  base_locs");
+    /* v22: the COMPOUND-OPERATION carets, same delta form (sparse - only
+     * a store op running a compound assignment records one) */
+    write_loc_table(w, c.op_locs);
+    ct("  op_locs");
+    write_arg_locs(w, c);              /* v16: the per-argument carets */
+    ct("  arg_locs");
+    /*
+     * #97 E1: the NAMED CALLEE of each value-call site (sparse - only a
+     * CallValueV whose callee #116's analysis could name). Two u32s per
+     * entry; the `def` is an index into this chunk's closure_defs, which
+     * follows below, so the reader bounds it in vm_verify_program rather
+     * than here.
+     */
+    w.u32v(static_cast<uint32_t>(c.value_callees.size()));
+    for (const auto &e : c.value_callees) {
+        w.u32v(e.pc); w.u32v(static_cast<uint32_t>(e.def));
+    }
+    ct("  value_callees");
+    w.u32v(static_cast<uint32_t>(c.inline_frames.size()));
+    for (const auto &f : c.inline_frames) {
+        w.strv(f.callee_name);
+        w.u32v(static_cast<uint32_t>(f.params.size()));
+        for (const auto &p : f.params)
+            w.strv(p);
+        w.locv(f.call_site);
+        w.u32v(static_cast<uint32_t>(f.parent));
+    }
+    w.u32v(static_cast<uint32_t>(c.inline_ctxs.size()));
+    for (const auto &e : c.inline_ctxs) {
+        w.u32v(e.pc); w.u32v(static_cast<uint32_t>(e.frame));
+    }
+
+    ct("  inline_frames");
+    w.u32v(static_cast<uint32_t>(c.member_keys.size()));
+    for (const auto &m : c.member_keys) {
+        write_value(w, m.memId);
+        w.uidv(m.memUid);
+        w.boolv(m.optional);
+        w.locv(m.mstart); w.locv(m.mend);
+        w.locv(m.bstart); w.locv(m.bend);
+        auto it = w.struct_ids.find(m.bake_def);
+        w.u32v(!m.bake_def ? 0xffffffffu
+               : it != w.struct_ids.end() ? it->second
+               : native_sref(m.bake_def));
+        w.u32v(static_cast<uint32_t>(m.bake_slot));
+    }
+
+    ct("  member_keys");
+
+    /*
+     * `boxed_ops` is NOT STORED (v4): it is DERIVED - `build_boxed_ops`
+     * (codegen.h) recomputes it from the final code + the loc side table, so
+     * the loader calls that same function instead of reading 49 bytes per
+     * entry (931 of samples/shopping's bytes, 14% of the image). The read
+     * side is the build_boxed_ops call at the END of read_chunk, after `locs`
+     * (which it needs) has been read - the same rebuild-a-derived-twin shape
+     * `catch_keys` already uses.
+     */
+
+    w.u32v(static_cast<uint32_t>(c.ctor_plans.size()));
+    for (const auto &p : c.ctor_plans) {
+        w.u32v(static_cast<uint32_t>(p.f.size()));
+        for (const auto &f : p.f) {
+            w.u32v(static_cast<uint32_t>(f.off));
+            w.u32v(static_cast<uint32_t>(f.src));
+            w.u8v(f.act);
+        }
+    }
+
+    w.u32v(static_cast<uint32_t>(c.incdec_sites.size()));
+    for (const auto &s : c.incdec_sites) {
+        w.locv(s.lstart); w.locv(s.lend);
+        w.locv(s.istart); w.locv(s.iend);
+        w.locv(s.bstart); w.locv(s.bend);
+        write_value(w, s.memId);
+        w.uidv(s.memUid);
+    }
+
+    const auto wsteps = [&](const std::vector<Chunk::ChainStep> &v) {
+        w.u32v(static_cast<uint32_t>(v.size()));
+        for (const auto &s : v) {
+            w.boolv(s.is_member);
+            w.u32v(static_cast<uint32_t>(s.operand));
+            w.locv(s.lstart); w.locv(s.lend);
+        }
+    };
+    w.u32v(static_cast<uint32_t>(c.chain_steps.size()));
+    for (const auto &v : c.chain_steps)
+        wsteps(v);
+
+    w.u32v(static_cast<uint32_t>(c.incdec_chains.size()));
+    for (const auto &ch : c.incdec_chains) {
+        wsteps(ch.steps);
+        w.boolv(ch.tier2); w.boolv(ch.is_prefix);
+        w.locv(ch.id_start); w.locv(ch.id_end);
+        w.locv(ch.kstart); w.locv(ch.kend);
+    }
+
+    w.u32v(static_cast<uint32_t>(c.chain_locs.size()));
+    for (const auto &v : c.chain_locs) {
+        w.u32v(static_cast<uint32_t>(v.size()));
+        for (const auto &pr : v) { w.locv(pr.first); w.locv(pr.second); }
+    }
+
+    /* each name, then (v42, question 25) the struct it resolved to: a
+     * struct index, 0xFFFFFFFF for none */
+    w.u32v(static_cast<uint32_t>(c.catch_types.size()));
+    for (size_t i = 0; i < c.catch_types.size(); i++) {
+        const auto &v = c.catch_types[i];
+        w.u32v(static_cast<uint32_t>(v.size()));
+        for (size_t j = 0; j < v.size(); j++) {
+            w.strv(v[j]);
+            const StructTypeDef *d = c.catch_keys[i][j].def;
+            uint32_t si = 0xffffffffu;
+            if (d) {
+                auto it = w.struct_ids.find(d);
+                if (it == w.struct_ids.end())
+                    bad_image("unserializable image (catch struct)");
+                si = it->second;
+            }
+            w.u32v(si);
+        }
+    }
+
+    w.u32v(static_cast<uint32_t>(c.literal_objs.size()));
+    for (const auto &lo : c.literal_objs) {
+        write_value(w, lo.value);
+        w.boolv(lo.immutable);
+    }
+
+    w.u32v(static_cast<uint32_t>(c.closure_defs.size()));
+    for (const FuncDescriptor *d : c.closure_defs) {
+        auto it = w.desc_ids.find(d);
+        if (it == w.desc_ids.end())
+            bad_image("unserializable image (closure descriptor)");
+        w.u32v(it->second);
+    }
+    w.u32v(static_cast<uint32_t>(c.struct_defs.size()));
+    for (const StructTypeDef *d : c.struct_defs) {
+        auto it = w.struct_ids.find(d);
+        if (it == w.struct_ids.end())
+            bad_image("unserializable image (struct def ref)");
+        w.u32v(it->second);
+    }
+
+    w.u32v(static_cast<uint32_t>(c.boxed_ctors.size()));
+    for (const auto &bc : c.boxed_ctors) {
+        auto it = w.struct_ids.find(bc.def);
+        w.u32v(it != w.struct_ids.end() ? it->second : 0xffffffffu);
+        write_arglocs(w, bc.arg_locs);
+        w.boolv(bc.fit);                     /* v37 */
+    }
+
+    /* v37: CheckFitV's pool - the place's annotation, kind and name */
+    w.u32v(static_cast<uint32_t>(c.fit_specs.size()));
+    for (const auto &f : c.fit_specs) {
+        write_annot(w, f.annot.get());
+        w.u8v(static_cast<uint8_t>(f.place));
+        w.uidv(f.name);
+    }
+
+    /* v43: the creation ops' container types (Chunk::ctypes) */
+    w.u32v(static_cast<uint32_t>(c.ctypes.size()));
+    for (const TypeAnnot *t : c.ctypes)
+        write_annot(w, t);
+
+    /* v45: the casts' types (Chunk::cast_types) */
+    w.u32v(static_cast<uint32_t>(c.cast_types.size()));
+    for (const TypeAnnot *t : c.cast_types)
+        write_annot(w, t);
+
+    w.u32v(static_cast<uint32_t>(c.emplace_sites.size()));
+    for (const auto &es : c.emplace_sites) {
+        auto it = w.struct_ids.find(es.def);
+        w.u32v(it != w.struct_ids.end() ? it->second : 0xffffffffu);
+        w.uidv(es.bname);
+        w.locv(es.a0_start); w.locv(es.a0_end);
+        write_arglocs(w, es.field_locs);
+        w.boolv(es.ct_store);                /* v43: Q2 increment 2 */
+    }
+
+    w.u32v(static_cast<uint32_t>(c.throws.size()));
+    for (const auto &t : c.throws) {
+        w.u8v(static_cast<uint8_t>(t.kind));
+        w.locv(t.start); w.locv(t.end);
+        w.uidv(t.name);
+    }
+
+    w.u32v(static_cast<uint32_t>(c.unpack_targets.size()));
+    for (const auto &v : c.unpack_targets) {
+        w.u32v(static_cast<uint32_t>(v.size()));
+        for (int32_t s : v)
+            w.u32v(static_cast<uint32_t>(s));
+    }
+    w.u32v(static_cast<uint32_t>(c.unpack_coerce.size()));
+    for (const auto &v : c.unpack_coerce) {
+        w.u32v(static_cast<uint32_t>(v.size()));
+        for (unsigned char b : v)
+            w.u8v(b);
+    }
+
+    ct("  pools(mid)");
+    w.u32v(static_cast<uint32_t>(c.builtin_calls.size()));
+    for (const auto &bc : c.builtin_calls) {
+        w.uidv(bc.name);                 /* re-resolved at load */
+        w.locv(bc.start); w.locv(bc.end);
+        w.u8v(static_cast<uint8_t>(bc.arr_hint));
+        write_ctype(w, bc.ctype);            /* v43 */
+        w.boolv(bc.ct_store);                /* v43: Q2 increment 2 */
+        write_arglocs(w, bc.args);
+        w.uidv(bc.member);
+        wsteps(bc.steps);                /* v32 */
+    }
+
+    w.u32v(static_cast<uint32_t>(c.call_sites.size()));
+    for (const auto &cs : c.call_sites) {
+        w.locv(cs.start); w.locv(cs.end);
+        write_arglocs(w, cs.args);
+        w.u8v(static_cast<uint8_t>(cs.arr_hint));
+        write_ctype(w, cs.ctype);            /* v43 */
+        w.boolv(cs.ct_store);                /* v43: Q2 increment 2 */
+        w.u8v(static_cast<uint8_t>(cs.a0_form));
+        w.u32v(static_cast<uint32_t>(cs.a0_kind));
+        w.u32v(static_cast<uint32_t>(cs.a0_slot));
+        w.u32v(static_cast<uint32_t>(cs.a0_operand));
+        w.uidv(cs.a0_name);
+        wsteps(cs.a0_steps);             /* v32 */
+    }
+
+    ct("  builtin+callsites");
+    /* slot_names: DEBUG only (-vd); kept so a loaded image dumps identically */
+    w.u32v(static_cast<uint32_t>(c.slot_names.size()));
+    for (const auto &s : c.slot_names)
+        w.strv(s);
+    ct("  slot_names");
+}
+
+void read_chunk(Reader &r, Chunk &c)
+{
+    /* code: the COMPACT encoding - the flags word and the field order are
+     * documented at the write site in write_chunk (the pairing rule). Every
+     * absent field keeps the default a fresh Instr already carries. */
+    const uint32_t ncode = r.countv();
+    c.code.resize(ncode);
+    for (uint32_t i = 0; i < ncode; i++) {
+        Instr &in = c.code[i];
+
+        in.op = static_cast<OpCode>(
+            r.u8v());   /* range-checked below, against OpCount_ */
+        const uint32_t lo = r.u8v();
+        const uint32_t flags = lo | (static_cast<uint32_t>(r.u8v()) << 8);
+
+        if (flags & 0xf000u)
+            bad_image("incompatible .myv (instruction flags) - recompile");
+
+        const unsigned wa = flags & 7;
+        const unsigned wb = (flags >> 3) & 7;
+        const unsigned wt = (flags >> 6) & 3;
+        const unsigned wt2 = (flags >> 8) & 3;
+
+        if (wa > 4 || wb > 4)
+            bad_image("corrupt .myv (instruction width)");
+
+        if (flags & (1u << 10))
+            /* the SET valid for this opcode is per-op, so verify_chunk
+             * owns it; here only the enum's own range */
+            /* the highest Op value is valid aop content (the element/dict/
+             * member stores carry the COMPOUND Expr14 op) - derive the bound
+             * from the enum so a new operator cannot leave it stale */
+            in.aop = r.enumv(static_cast<Op>(
+                                 static_cast<int>(Op::op_count) - 1),
+                             "corrupt .myv (op)");
+        if (flags & (1u << 11))
+            in.opflags = r.u8v();
+        if (wt)
+            in.target = static_cast<int>(r.narrowv(wt));
+        if (wt2)
+            in.target2 = static_cast<int>(r.narrowv(wt2));
+        if (wa)
+            in.pa = r.narrowv(wa);
+        if (wb)
+            in.pb = r.narrowv(wb);
+
+        if (static_cast<size_t>(in.op) >= static_cast<size_t>(OpCode::OpCount_))
+            bad_image("corrupt .myv (opcode)");
+    }
+    /* the five STANDALONE counts - each sizes something the VM allocates
+     * per activation, so each is bounded by the file (Reader::sizev) */
+    c.slot_count = static_cast<int>(r.sizev("corrupt .myv (slot count)"));
+    c.n_temps = static_cast<int>(r.sizev("corrupt .myv (temp count)"));
+    c.n_dict_iters =
+        static_cast<int>(r.sizev("corrupt .myv (dict iterator count)"));
+    c.n_dyn_iters =
+        static_cast<int>(r.sizev("corrupt .myv (dyn iterator count)"));
+    c.n_trys = static_cast<int>(r.sizev("corrupt .myv (try region count)"));
+    /* DERIVED, never stored: the loader recomputes it from the three counts
+     * just read, the same rebuild-a-derived-twin shape catch_keys uses. */
+    c.set_plain_frame();
+
+    /* the HANDLER TABLE (write side: above) */
+    {
+        const uint32_t nh = r.countv();
+        c.handler_sites.resize(nh);
+        for (uint32_t i = 0; i < nh; i++) {
+            Chunk::HandlerSite &hs = c.handler_sites[i];
+            const uint32_t nc2 = r.countv();
+            hs.clauses.resize(nc2);
+            for (uint32_t j = 0; j < nc2; j++) {
+                hs.clauses[j].types_idx = static_cast<int32_t>(r.u32v());
+                hs.clauses[j].bind_slot = static_cast<int32_t>(r.u32v());
+                hs.clauses[j].body_pc = static_cast<int32_t>(r.u32v());
+            }
+            hs.fin_pc = static_cast<int32_t>(r.u32v());
+            hs.chain = static_cast<int32_t>(r.u32v());
+        }
+    }
+
+    /* `ref_slots` is DERIVED (v18) - rebuilt in myv_read after
+     * vm_verify_program, from the code, never read from the file. It
+     * stays EMPTY here, which the verifier's own bound accepts. */
+
+    uint32_t n = r.countv();
+    c.consts.reserve(n);
+    for (uint32_t i = 0; i < n; i++)
+        c.consts.push_back(read_value(r));
+
+    read_loc_table(r, c.locs, c.code.size());
+    read_loc_table(r, c.base_locs, c.code.size());     /* #127 */
+    read_loc_table(r, c.op_locs, c.code.size());       /* v22 */
+    read_arg_locs(r, c, c.code.size());                /* v16 */
+
+    n = r.countv();                                   /* #97 E1 */
+    c.value_callees.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::CalleeName e;
+        e.pc = r.u32v();
+        e.def = static_cast<int32_t>(r.u32v());
+        c.value_callees.push_back(e);
+    }
+
+    n = r.countv();
+    c.inline_frames.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::InlineFrame f;
+        f.callee_name = r.strv();
+        const uint32_t np = r.countv();
+        f.params.reserve(np);
+        for (uint32_t j = 0; j < np; j++)
+            f.params.push_back(r.strv());
+        f.call_site = r.locv();
+        f.parent = static_cast<int32_t>(r.u32v());
+        c.inline_frames.push_back(std::move(f));
+    }
+    n = r.countv();
+    c.inline_ctxs.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::InlineEntry e;
+        e.pc = r.u32v();
+        e.frame = static_cast<int32_t>(r.u32v());
+        c.inline_ctxs.push_back(e);
+    }
+
+    n = r.countv();
+    c.member_keys.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::MemberKey m;
+        m.memId = read_value(r);
+        m.memUid = r.uid_req("corrupt .myv (member key with no name)");
+        m.optional = r.boolv();
+        m.mstart = r.locv(); m.mend = r.locv();
+        m.bstart = r.locv(); m.bend = r.locv();
+        const uint32_t bd = r.u32v();
+        if (bd == 0xffffffffu)
+            m.bake_def = nullptr;
+        else if (bd >= SREF_NATIVE && bd <= SREF_NATIVE + 2)
+            m.bake_def = native_at(bd);
+        else if (bd < r.structs.size())
+            m.bake_def = r.structs[bd];
+        else
+            bad_image("corrupt .myv (bake def)");
+        m.bake_slot = static_cast<int>(static_cast<int32_t>(r.u32v()));
+        c.member_keys.push_back(std::move(m));
+    }
+
+    /* `boxed_ops` is DERIVED and NOT in the file - see the write side. It is
+     * rebuilt by build_boxed_ops at the end of this function (it needs the
+     * loc table, which is read further down). */
+
+    n = r.countv();
+    c.ctor_plans.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::CtorPlan p;
+        const uint32_t nf = r.countv();
+        p.f.reserve(nf);
+        for (uint32_t j = 0; j < nf; j++) {
+            Chunk::CtorPlanField f;
+            f.off = static_cast<int32_t>(r.u32v());
+            f.src = static_cast<int32_t>(r.u32v());
+            f.act = r.u8v();
+            p.f.push_back(f);
+        }
+        c.ctor_plans.push_back(std::move(p));
+    }
+
+    n = r.countv();
+    c.incdec_sites.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::IncDecSite s;
+        s.lstart = r.locv(); s.lend = r.locv();
+        s.istart = r.locv(); s.iend = r.locv();
+        s.bstart = r.locv(); s.bend = r.locv();
+        s.memId = read_value(r);
+        s.memUid = r.uidv();
+        c.incdec_sites.push_back(std::move(s));
+    }
+
+    const auto rsteps = [&]() {
+        std::vector<Chunk::ChainStep> v;
+        const uint32_t ns = r.countv();
+        v.reserve(ns);
+        for (uint32_t j = 0; j < ns; j++) {
+            Chunk::ChainStep s;
+            s.is_member = r.boolv();
+            s.operand = static_cast<int32_t>(r.u32v());
+            s.lstart = r.locv(); s.lend = r.locv();
+            v.push_back(s);
+        }
+        return v;
+    };
+    n = r.countv();
+    c.chain_steps.reserve(n);
+    for (uint32_t i = 0; i < n; i++)
+        c.chain_steps.push_back(rsteps());
+
+    n = r.countv();
+    c.incdec_chains.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::IncDecChain ch;
+        ch.steps = rsteps();
+        ch.tier2 = r.boolv(); ch.is_prefix = r.boolv();
+        ch.id_start = r.locv(); ch.id_end = r.locv();
+        ch.kstart = r.locv(); ch.kend = r.locv();
+        c.incdec_chains.push_back(std::move(ch));
+    }
+
+    n = r.countv();
+    c.chain_locs.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        std::vector<std::pair<Loc, Loc>> v;
+        const uint32_t m = r.countv();
+        v.reserve(m);
+        for (uint32_t j = 0; j < m; j++) {
+            const Loc a = r.locv(), b = r.locv();
+            v.emplace_back(a, b);
+        }
+        c.chain_locs.push_back(std::move(v));
+    }
+
+    n = r.countv();
+    c.catch_types.reserve(n);
+    c.catch_keys.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        std::vector<std::string> v;
+        std::vector<Chunk::CatchKey> u;
+        const uint32_t m = r.countv();
+        v.reserve(m); u.reserve(m);
+        for (uint32_t j = 0; j < m; j++) {
+            v.push_back(r.strv());
+            Chunk::CatchKey key;
+            const uint32_t si =
+                r.idx_opt(r.structs.size(), "corrupt .myv (catch struct)");
+            key.def = si == 0xffffffffu ? nullptr : r.structs[si];
+            /* the derived half (what codegen derives from the name) */
+            key.uid = UniqueId::get(v.back());
+            key.builtin = is_catchable_ex_name(v.back());
+            u.push_back(key);
+        }
+        c.catch_types.push_back(std::move(v));
+        c.catch_keys.push_back(std::move(u));
+    }
+
+    n = r.countv();
+    c.literal_objs.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::LiteralObjEntry lo;
+        lo.value = read_value(r);
+        lo.immutable = r.boolv();
+        c.literal_objs.push_back(std::move(lo));
+    }
+
+    n = r.countv();
+    c.closure_defs.reserve(n);
+    for (uint32_t i = 0; i < n; i++)
+        c.closure_defs.push_back(
+            r.descs[r.idx(r.descs.size(), "corrupt .myv (closure)")]);
+    n = r.countv();
+    c.struct_defs.reserve(n);
+    for (uint32_t i = 0; i < n; i++)
+        c.struct_defs.push_back(
+            r.structs[r.idx(r.structs.size(), "corrupt .myv (struct)")]);
+
+    n = r.countv();
+    c.boxed_ctors.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::BoxedCtor bc;
+        const uint32_t di = r.idx_opt(r.structs.size(), "corrupt .myv (ctor)");
+        bc.def = di == 0xffffffffu ? nullptr : r.structs[di];
+        bc.arg_locs = read_arglocs(r);
+        bc.fit = r.boolv();                  /* v37 */
+        c.boxed_ctors.push_back(std::move(bc));
+    }
+
+    n = r.countv();                          /* v37: fit_specs */
+    c.fit_specs.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        FitSpec f;
+        f.annot = read_annot(r, 0);
+        const uint8_t pl = r.u8v();
+        if (pl > static_cast<uint8_t>(FitSpec::Place::dict_key))
+            bad_image("corrupt .myv (fit place)");
+        f.place = static_cast<FitSpec::Place>(pl);
+        f.name = r.uidv();
+        c.fit_specs.push_back(std::move(f));
+    }
+
+    n = r.countv();                          /* v43: ctypes */
+    c.ctypes.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        std::shared_ptr<TypeAnnot> a = read_annot(r, 0);
+        if (!a || a->opt
+                || (a->kind != DeclType::arr && a->kind != DeclType::dict))
+            bad_image("corrupt .myv (ctype)");
+        c.ctypes.push_back(annot_intern(*a));
+    }
+
+    n = r.countv();                          /* v45: cast_types */
+    c.cast_types.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        std::shared_ptr<TypeAnnot> a = read_annot(r, 0);
+        if (!a || !annot_complete(a.get()))
+            bad_image("corrupt .myv (cast type)");
+        c.cast_types.push_back(annot_intern(*a));
+    }
+
+    n = r.countv();
+    c.emplace_sites.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::EmplaceSite es;
+        const uint32_t di = r.idx_opt(r.structs.size(), "corrupt .myv (emplace)");
+        es.def = di == 0xffffffffu ? nullptr : r.structs[di];
+        es.bname = r.uid_req("corrupt .myv (emplace callee with no name)");
+        es.a0_start = r.locv(); es.a0_end = r.locv();
+        es.field_locs = read_arglocs(r);
+        es.ct_store = r.boolv();             /* v43: Q2 increment 2 */
+        c.emplace_sites.push_back(std::move(es));
+    }
+
+    n = r.countv();
+    c.throws.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::ThrowSite t;
+        t.kind = r.enumv(Chunk::ThrowKind::bad_args,
+                         "corrupt .myv (throw kind)");
+        t.start = r.locv(); t.end = r.locv();
+        t.name = r.uidv();
+        if (t.kind == Chunk::ThrowKind::undefined_var && !t.name)
+            bad_image("corrupt .myv (undefined_var throw with no name)");
+        c.throws.push_back(t);
+    }
+
+    n = r.countv();
+    c.unpack_targets.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        std::vector<int32_t> v;
+        const uint32_t m = r.countv();
+        v.reserve(m);
+        for (uint32_t j = 0; j < m; j++)
+            v.push_back(static_cast<int32_t>(r.u32v()));
+        c.unpack_targets.push_back(std::move(v));
+    }
+    n = r.countv();
+    c.unpack_coerce.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        std::vector<unsigned char> v;
+        const uint32_t m = r.countv();
+        v.reserve(m);
+        for (uint32_t j = 0; j < m; j++)
+            v.push_back(r.u8v());
+        c.unpack_coerce.push_back(std::move(v));
+    }
+
+    n = r.countv();
+    c.builtin_calls.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::BuiltinCall bc;
+        bc.name = r.uidv();
+        if (!bc.name || !vm_lookup_builtin(bc.name, bc.builtin))
+            bad_image("corrupt or incompatible .myv (unknown builtin)");
+        bc.start = r.locv(); bc.end = r.locv();
+        bc.arr_hint = r.enumv(ArrHint::flat_c,
+                              "corrupt .myv (array hint)");
+        bc.ctype = read_ctype_any(r);        /* v43 */
+        bc.ct_store = r.boolv();             /* v43: Q2 increment 2 */
+        bc.args = read_arglocs(r);
+        bc.member = r.uidv();
+        bc.steps = rsteps();
+        c.builtin_calls.push_back(std::move(bc));
+    }
+
+    n = r.countv();
+    c.call_sites.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::CallSite cs;
+        cs.start = r.locv(); cs.end = r.locv();
+        cs.args = read_arglocs(r);
+        cs.arr_hint = r.enumv(ArrHint::flat_c,
+                              "corrupt .myv (array hint)");
+        cs.ctype = read_ctype_any(r);        /* v43 */
+        cs.ct_store = r.boolv();             /* v43: Q2 increment 2 */
+        cs.a0_form = r.enumv(Chunk::CallSite::A0::chain,
+                             "corrupt .myv (call site arg0 form)");
+        cs.a0_kind = static_cast<unsigned char>(r.u32v());
+        cs.a0_slot = static_cast<int32_t>(r.u32v());
+        cs.a0_operand = static_cast<int32_t>(r.u32v());
+        cs.a0_name = r.uidv();
+        cs.a0_steps = rsteps();
+        if (cs.a0_form == Chunk::CallSite::A0::undef && !cs.a0_name)
+            bad_image("corrupt .myv (undefined call argument with no name)");
+        c.call_sites.push_back(std::move(cs));
+    }
+
+    n = r.countv();
+    c.slot_names.reserve(n);
+    for (uint32_t i = 0; i < n; i++)
+        c.slot_names.push_back(r.strv());
+
+    /*
+     * REBUILD the derived pools, LAST - both need data read above. The
+     * loader calls the codegen's OWN function (codegen.h), never a private
+     * copy, so what a load produces cannot drift from what a compile did.
+     * (`catch_keys`' uid and builtin are rebuilt where catch_types is read;
+     * boxed_ops needs the loc table, hence here.)
+     */
+    build_boxed_ops(c);
+    /* #106 phase 2's `nonneg_slots` is DERIVED too, but it is rebuilt in
+     * myv_read AFTER vm_verify_program, not here - see the note there. */
+}
+
+}  /* anon namespace */
+
+/*
+ * Read a whole file; false if it cannot be opened OR read. A DIRECTORY is
+ * refused up front: it opens fine on POSIX and then fails every read with
+ * EISDIR, and the two C++ libraries disagree about what that means -
+ * libstdc++'s filebuf THROWS from underflow (past every istream's error
+ * state, since an istreambuf_iterator calls the buffer directly), libc++'s
+ * just reports end of file, an EMPTY file. An image whose source reference
+ * named a directory (myv_fuzz, a mutated path) and `mylang -c DIR` ended
+ * in std::terminate on Linux, while macOS read the directory as an empty
+ * script. A read error past the open still answers "cannot read"; out of
+ * memory is still out of memory.
+ */
+static bool is_directory(const std::string &path)
+{
+#ifdef _WIN32
+    struct _stat64 st;
+    return _stat64(path.c_str(), &st) == 0 && (st.st_mode & _S_IFDIR);
+#else
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+bool read_file(const std::string &path, std::string &out)
+{
+    if (is_directory(path))
+        return false;
+
+    std::ifstream f(path, std::ios::binary);
+
+    if (!f)
+        return false;
+
+    try {
+        out.assign((std::istreambuf_iterator<char>(f)),
+                   std::istreambuf_iterator<char>());
+    } catch (const std::bad_alloc &) {
+        throw;
+    } catch (const std::exception &) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* The whole image                                                      */
+/* ------------------------------------------------------------------ */
+
+void myv_write(const VmProgram &prog, const std::string &path,
+               const MyvSourceRef &src)
+{
+    Writer w;
+    size_t mark = 0;
+    const auto tick = [&](const char *what) {
+        myv_stat(what, w.buf.size() - mark);
+        mark = w.buf.size();
+    };
+
+    /*
+     * #137: ONLY PRE-JIT BYTECODE IS STORABLE. The native tier rewrites the
+     * code in place - it inserts EnterNative ops naming byte offsets into an
+     * mmap'd buffer and DELETES the interpreted originals - and fragments are
+     * deliberately not serialized (an image must stay portable). So an image
+     * written after the JIT ran holds EnterNative ops whose fragment does not
+     * exist in the file; the loader's verifier now refuses such an image,
+     * which is a load-time diagnosis of a WRITE-time mistake. Say it here,
+     * where the mistake is made. `-c` always compiles with jit=false, so this
+     * only guards an internal caller.
+     *
+     * A THROW, not an ML_CHECK, and always on: myv_write's contract already
+     * says it throws on "an unserializable value (loud, never silent)", and
+     * a jitted program is exactly that. An assert would also vanish under
+     * ASSERTS=0 - the one build where writing a silently unloadable file
+     * would go unnoticed.
+     */
+    const auto refuse_if_jitted = [](const Chunk &ck) {
+        for (const Instr &in : ck.code)
+            if (in.op == OpCode::EnterNative)
+                throw Exception("MyvError",
+                                "the program has been JIT-compiled; only "
+                                "PRE-jit bytecode is storable");
+    };
+    refuse_if_jitted(prog.root);
+    for (const auto &d : prog.funcs)
+        if (d->vm_chunk)
+            refuse_if_jitted(*static_cast<const Chunk *>(d->vm_chunk));
+
+    /* Index tables FIRST: values and pools reference defs/descs by index,
+     * and the writer must be able to resolve any of them (dependency order
+     * is guaranteed by construction - inline struct fields only reference
+     * EARLIER defs, a parser invariant). */
+    for (size_t i = 0; i < prog.structs.size(); i++)
+        w.struct_ids.emplace(prog.structs[i].get(),
+                             static_cast<uint32_t>(i));
+    for (size_t i = 0; i < prog.funcs.size(); i++)
+        w.desc_ids.emplace(prog.funcs[i].get(), static_cast<uint32_t>(i));
+
+    /*
+     * THE TABLE OF CONTENTS (#52, v20): every table's COUNT, before any
+     * table's content, so the reader can construct an empty shell for
+     * every struct AND every descriptor before it reads a single record -
+     * identity, then content, then wiring (plans/myv-table-ordering.md).
+     * Any cross-table index is then resolvable wherever it appears: a
+     * struct's const member may name a function (`const F = pure func(a,
+     * b) => a < b;`), which a single forward pass could not read back
+     * because the descriptor table came second.
+     */
+    w.u32v(static_cast<uint32_t>(prog.structs.size()));
+    w.u32v(static_cast<uint32_t>(prog.funcs.size()));
+
+    /* structs (the count is in the table of contents) */
+    for (const auto &sd : prog.structs) {
+        w.uidv(sd->name);
+        w.boolv(sd->is_class);                                  /* v33 */
+        w.u32v(static_cast<uint32_t>(sd->fields.size()));
+        for (const FieldDef &f : sd->fields) {
+            w.uidv(f.name);
+            w.u8v(static_cast<uint8_t>(f.kind));
+            w.uidv(f.struct_ty);
+            auto it = w.struct_ids.find(f.struct_def);
+            w.u32v(f.struct_def && it != w.struct_ids.end() ? it->second
+                                                            : 0xffffffffu);
+            w.boolv(f.is_opt);
+            w.u32v(static_cast<uint32_t>(f.slot));
+            write_annot(w, f.annot.get());       /* v37 */
+        }
+        w.u32v(static_cast<uint32_t>(sd->consts.size()));
+        for (const auto &kv : sd->consts) {
+            w.uidv(kv.first);
+            w.holder = "the constant '"
+                       + (sd->name ? sd->name->val : std::string("?"))
+                       + "." + (kv.first ? kv.first->val : std::string("?"))
+                       + "'";
+            write_value(w, kv.second);
+        }
+    }
+
+    tick("structs");
+
+    /* descriptors (their chunks follow, same order; the count is in the
+     * table of contents) */
+    for (const auto &d : prog.funcs) {
+        w.uidv(d->name);
+        w.strv(d->display_name);
+        w.u32v(static_cast<uint32_t>(d->params.size()));
+        for (const auto &p : d->params) {
+            w.uidv(p.name);
+            w.boolv(p.opt); w.boolv(p.cnst); w.boolv(p.dyn_mod);
+            w.u8v(static_cast<uint8_t>(p.decl_type));
+            w.u8v(static_cast<uint8_t>(p.proven_type));   /* C3, v11 */
+            w.uidv(p.sig_type);                  /* v36, may be null */
+            write_annot(w, p.fit.get());         /* v37 */
+        }
+        w.u32v(static_cast<uint32_t>(d->captures.size()));
+        for (const auto &cp : d->captures) {
+            w.uidv(cp.name);
+            w.u8v(static_cast<uint8_t>(cp.kind));
+            w.u32v(static_cast<uint32_t>(cp.slot));
+            w.locv(cp.start);           /* v12: the capture's own caret */
+            w.locv(cp.end);
+        }
+        w.boolv(d->resolved);
+        w.u32v(static_cast<uint32_t>(d->frame_size));
+        w.u32v(static_cast<uint32_t>(d->min_args));
+        w.boolv(d->explicit_pure); w.boolv(d->effective_pure);
+        w.boolv(d->cache_results); w.boolv(d->pure_ctx);
+        w.boolv(d->is_template_base);
+        w.boolv(d->fast_bind);
+        /* v17: the parameter ESCAPE bits (#93) - a resolver-time analysis
+         * over the AST, so a loaded image cannot recompute them; without
+         * them an image never BORROWED a reference argument (#94), and
+         * since W5 the frameless site's emitted code depends on them, so
+         * a fresh compile and its image would disassemble differently */
+        w.i64v(static_cast<int64_t>(d->noescape_params));
+        /* has a chunk? (a dead template base has none) */
+        w.boolv(d->vm_chunk != nullptr);
+    }
+
+    tick("descriptors");
+
+    /* chunks: the root, then one per descriptor that has one */
+    w.holder = "a constant at the top level";
+    write_chunk(w, prog.root);
+    tick("chunk:root");
+    for (const auto &d : prog.funcs)
+        if (d->vm_chunk) {
+            const std::string fn = !d->display_name.empty()
+                                       ? d->display_name
+                                       : d->name ? d->name->val
+                                                 : std::string();
+            w.holder = fn.empty() ? std::string("a constant in a lambda")
+                                  : "a constant in function '" + fn + "'";
+            write_chunk(w, *static_cast<const Chunk *>(d->vm_chunk));
+            tick("chunk:func");
+        }
+
+    /* globals */
+    w.u32v(static_cast<uint32_t>(prog.global_slot_reassigned.size()));
+    for (char c : prog.global_slot_reassigned)
+        w.u8v(static_cast<uint8_t>(c));
+    /* `root_slot_count` IS the root chunk's `slot_count` - written a
+     * SECOND time on purpose, as the function chunks' `frame_size` is: a
+     * primary fact with no derivation, so the redundancy is what lets the
+     * loader DETECT a mutated copy (vm_verify_program, v19). */
+    w.u32v(static_cast<uint32_t>(prog.root_slot_count));
+    w.u32v(static_cast<uint32_t>(prog.global_func_names.size()));
+    for (const UniqueId *u : prog.global_func_names)
+        w.uidv(u);
+    /* compiled with type inference: containers take types (v44) */
+    w.boolv(prog.typed);
+
+    tick("globals");
+
+    /* The header + string table go in FRONT: the body's writes populated
+     * the table, so it can only be emitted now (the loader reads it first
+     * and every later index resolves). */
+    Writer h;
+    h.buf.append(MYV_MAGIC, 4);
+    h.u32v(MYV_FORMAT_VERSION);
+    h.u32v(MYV_ENDIAN_MARK);
+    h.i64v(static_cast<int64_t>(builtin_set_fingerprint()));
+
+    /* the SOURCE REFERENCE (v2): where the text WAS + a CRC32 to prove the
+     * file on disk is still it. NOT the text itself. Read side: myv_read. */
+    const size_t ref_mark = h.buf.size();
+    h.raw(src.root);
+    h.raw(src.rel);
+    h.raw(src.abs);
+    h.u32v(src.crc);
+    h.i64v(static_cast<int64_t>(src.size));
+    const size_t ref_bytes = h.buf.size() - ref_mark;
+
+    h.u32v(static_cast<uint32_t>(w.strs.size()));
+    for (const std::string &s : w.strs)
+        h.raw(s);
+
+    myv_stat("header+strings", h.buf.size());
+    myv_stat("source-ref", ref_bytes);
+    myv_stat("TOTAL", h.buf.size() + w.buf.size());
+
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f)
+        throw Exception("MyvError", "cannot open the output file");
+    f.write(h.buf.data(), static_cast<long>(h.buf.size()));
+    f.write(w.buf.data(), static_cast<long>(w.buf.size()));
+    if (!f)
+        throw Exception("MyvError", "cannot write the .myv image");
+}
+
+MyvSourceRef myv_source_ref(const std::string &path)
+{
+    MyvSourceRef ref;
+    std::string text;
+
+    if (!read_file(path, text))
+        return ref;                       /* empty ref: no reference stored */
+
+    ref.crc = crc32_of(text);
+    ref.size = text.size();
+    ref.abs = is_absolute(path) ? path : join_path(cwd_path(), path);
+
+    /*
+     * The ROOT is the compile-time CWD when the source lives under it (the
+     * usual `mylang -c samples/phonebook` run from the project root), else
+     * the source's OWN directory. Either way `rel` ends up non-empty, which
+     * is what lets `--source ROOT` relocate the image: a `rel` full of ".."
+     * hops would not survive relocation, so we never build one.
+     */
+    const std::string cwd = cwd_path();
+    const std::string under = join_path(cwd, "");
+
+    if (!cwd.empty() && ref.abs.size() > under.size()
+            && ref.abs.compare(0, under.size(), under) == 0) {
+
+        ref.root = cwd;
+        ref.rel = ref.abs.substr(under.size());
+
+    } else {
+
+        size_t slash = std::string::npos;
+
+        for (size_t i = ref.abs.size(); i-- > 0; )
+            if (is_sep(ref.abs[i])) { slash = i; break; }
+
+        if (slash == std::string::npos) {
+            ref.root = ".";
+            ref.rel = ref.abs;
+        } else {
+            /* keep the root's leading separator when it IS the root dir */
+            ref.root = ref.abs.substr(0, slash ? slash : 1);
+            ref.rel = ref.abs.substr(slash + 1);
+        }
+    }
+
+    return ref;
+}
+
+bool myv_is_image(const std::string &path)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f)
+        return false;
+    char m[4] = { 0, 0, 0, 0 };
+    f.read(m, 4);
+    return f.gcount() == 4 && memcmp(m, MYV_MAGIC, 4) == 0;
+}
+
+/*
+ * Every chunk's `ref_slots` (see myv_read), with the ONE input it reads off
+ * an instruction that the code beside it cannot vouch for: a call's
+ * SCALAR-RESULT CLAIM (Instr::ret_scalar, CallV / CachedCallV). The claim
+ * keeps the call's dst out of ref_slots, and the JIT writes a slot outside
+ * ref_slots with two raw stores - so a FALSE claim copies a returned
+ * reference without a retain, and the callee's frame frees it under the
+ * caller: myv_fuzz small-390 (2026-10-06), one byte making `f` return its
+ * struct `p` instead of `p.x + 1`, a double free at teardown. (A wrong
+ * ref_slots is not "only a leak" - the JIT's raw writes rest on it.)
+ *
+ * The claim is a fact about the CALLEE, and a load can check it: honored
+ * only for a WRITE-ONCE global whose function returns, at every ReturnV,
+ * a literal or a slot its own derived ref_slots proves scalar. A GREATEST
+ * fixpoint: every claim whose callee is such a global is kept to start
+ * with, and one is dropped as soon as its callee's derived ref_slots list
+ * a slot that callee returns; dropping one can only grow ref_slots, so the
+ * loop ends, and what survives is consistent. That is sound because a
+ * returned reference must have been WRITTEN by some op other than a kept
+ * call (by induction over the calls that have returned), and every such
+ * write puts its slot in ref_slots. It had to be the greatest: the least
+ * one (restore a claim once justified, from none) can never restore a
+ * claim on a cycle - `ev` returning `od(n - 1)` and `od` returning
+ * `ev(n - 1)` (tests/functional/55_regcall) - so the loaded image ran the
+ * reference-checking code the compile had proven unneeded, and its native
+ * code differed from a fresh compile's in 30 of 112 functional programs.
+ * A valid image keeps every claim its compile made (the round trip stays
+ * identical); a false one costs the optimization, never memory.
+ */
+static void myv_derive_ref_slots(VmProgram &prog)
+{
+    std::vector<std::pair<Chunk *, const FuncDescriptor *>> chunks;
+    chunks.push_back({ &prog.root, nullptr });
+    for (const auto &d : prog.funcs)
+        if (d->vm_chunk)
+            chunks.push_back({ static_cast<Chunk *>(
+                                   const_cast<void *>(d->vm_chunk)),
+                               d.get() });
+
+    /* global slot -> the function a write-once slot holds (as the JIT's
+     * own slot map, vm_jit_loaded_image) */
+    std::vector<const Chunk *> callee(prog.global_func_names.size(),
+                                      nullptr);
+    for (size_t s = 0; s < callee.size(); s++) {
+        const UniqueId *nm = prog.global_func_names[s];
+        if (!nm || (s < prog.global_slot_reassigned.size()
+                    && prog.global_slot_reassigned[s]))
+            continue;
+        for (const auto &d : prog.funcs)
+            if (d->name == nm && d->vm_chunk) {
+                callee[s] = static_cast<const Chunk *>(d->vm_chunk);
+                break;
+            }
+    }
+
+    struct Claim { Chunk *ck; size_t pc; const Chunk *callee; };
+    std::vector<Claim> claims;
+    for (auto &c : chunks)
+        for (size_t pc = 0; pc < c.first->code.size(); pc++) {
+            Instr &in = c.first->code[pc];
+            if ((in.op != OpCode::CallV && in.op != OpCode::CachedCallV)
+                    || !in.ret_scalar())
+                continue;
+            const int64_t s = in.target2;
+            const Chunk *g = s >= 0 && static_cast<size_t>(s) < callee.size()
+                ? callee[s] : nullptr;
+            if (!g) {
+                in.opflags &= static_cast<uint8_t>(~0x80u);   /* unprovable */
+                continue;
+            }
+            claims.push_back({ c.first, pc, g });
+        }
+
+    const auto derive = [&](Chunk &ck, const FuncDescriptor *d) {
+        if (!d) {
+            compute_ref_slots(ck, nullptr);
+            return;
+        }
+        std::vector<int32_t> seeds;
+        ref_seeds_of(*d, seeds);
+        compute_ref_slots(ck, &seeds);
+    };
+    for (auto &c : chunks)
+        derive(*c.first, c.second);
+
+    const auto returns_scalar = [](const Chunk &g) {
+        for (const Instr &in : g.code)
+            if (in.op == OpCode::ReturnV && !in.a_is_lit()
+                    && std::binary_search(g.ref_slots.begin(),
+                                          g.ref_slots.end(),
+                                          static_cast<int32_t>(
+                                              in.a_slot())))
+                return false;
+        return true;
+    };
+
+    for (bool dropped = true; dropped; ) {
+        dropped = false;
+        std::vector<Chunk *> dirty;
+        for (Claim &cl : claims) {
+            Instr &in = cl.ck->code[cl.pc];
+            if (!in.ret_scalar() || returns_scalar(*cl.callee))
+                continue;
+            in.opflags &= static_cast<uint8_t>(~0x80u);   /* refuted */
+            dirty.push_back(cl.ck);
+            dropped = true;
+        }
+        for (auto &c : chunks)
+            if (std::find(dirty.begin(), dirty.end(), c.first)
+                    != dirty.end())
+                derive(*c.first, c.second);
+    }
+}
+
+VmProgram myv_read(const std::string &path, MyvSource &out_src,
+                   const MyvLoadOpts &opts)
+{
+    std::string data;
+    if (!read_file(path, data))
+        throw Exception("MyvError", "cannot open the .myv file");
+    Reader r(data);
+
+    r.need(4);
+    if (memcmp(data.data(), MYV_MAGIC, 4) != 0)
+        bad_image("not a .myv image (bad magic)");
+    r.p = 4;
+    if (r.u32v() != MYV_FORMAT_VERSION)
+        bad_image("incompatible .myv version - recompile from source");
+    if (r.u32v() != MYV_ENDIAN_MARK)
+        bad_image("incompatible .myv endianness - recompile from source");
+    if (static_cast<uint64_t>(r.i64v()) != builtin_set_fingerprint())
+        bad_image("incompatible .myv (builtin set) - recompile from source");
+
+    /* the SOURCE REFERENCE (write side: myv_write's header block) */
+    MyvSourceRef ref;
+    ref.root = r.raw();
+    ref.rel = r.raw();
+    ref.abs = r.raw();
+    ref.crc = r.u32v();
+    ref.size = static_cast<uint64_t>(r.i64v());
+
+    out_src = MyvSource();
+    resolve_source(ref, opts, out_src);
+
+    /* strings -> interned uids */
+    uint32_t n = r.countv();
+    r.strs.reserve(n);
+    r.uids.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        r.strs.push_back(r.raw());
+        r.uids.push_back(UniqueId::get(r.strs.back()));
+    }
+
+    VmProgram prog;
+
+    /*
+     * PHASE 1 - IDENTITY (#52, v20): the table of contents gives every
+     * table's count up front, and an empty SHELL is constructed for every
+     * struct and every descriptor before any record is read, so every
+     * cross-table index in the file resolves wherever it appears
+     * (plans/myv-table-ordering.md). Nothing may READ a shell's fields
+     * until PHASE 2 has filled it - see read_value's `func` case.
+     *
+     * The counts no longer sit right before their records, so countv's
+     * "no more entries than bytes remaining" is replaced by a per-record
+     * MINIMUM SIZE bound (#137: a count is an allocation an attacker
+     * controls): a struct record is at least 12 bytes (name, field count,
+     * const count), a descriptor record at least 40.
+     */
+    const uint32_t n_structs = r.u32v();
+    const uint32_t n_descs = r.u32v();
+    {
+        const uint64_t need = uint64_t(n_structs) * 12
+                              + uint64_t(n_descs) * 40;
+        if (need > r.buf.size() - r.p)
+            bad_image("corrupt .myv (table of contents exceeds the file)");
+    }
+    for (uint32_t i = 0; i < n_structs; i++)
+        prog.structs.push_back(std::unique_ptr<StructTypeDef>(
+            new StructTypeDef()));
+    for (uint32_t i = 0; i < n_structs; i++)
+        r.structs.push_back(prog.structs[i].get());
+    for (uint32_t i = 0; i < n_descs; i++)
+        prog.funcs.push_back(std::unique_ptr<FuncDescriptor>(
+            new FuncDescriptor()));
+    for (uint32_t i = 0; i < n_descs; i++)
+        r.descs.push_back(prog.funcs[i].get());
+
+    /* PHASE 2 - CONTENT: the struct records (a const member may name a
+     * descriptor, which is a shell until the loop below it) */
+    n = n_structs;
+    for (uint32_t i = 0; i < n; i++) {
+        StructTypeDef &sd = *prog.structs[i];
+        sd.name = r.uid_req("corrupt .myv (struct with no name)");
+        sd.is_class = r.boolv();                                /* v33 */
+        const uint32_t nf = r.countv();
+        sd.fields.reserve(nf);
+        for (uint32_t j = 0; j < nf; j++) {
+            FieldDef fd;
+            fd.name = r.uid_req("corrupt .myv (field with no name)");
+            fd.kind = r.enumv(FieldKind::f_box,                 /* v35 */
+                              "corrupt .myv (field kind)");
+            fd.struct_ty = r.uidv();
+            const uint32_t si = r.idx_opt(n, "corrupt .myv (field struct)");
+            fd.struct_def = si == 0xffffffffu ? nullptr : r.structs[si];
+            fd.is_opt = r.boolv();
+            fd.slot = static_cast<int>(static_cast<int32_t>(r.u32v()));
+            fd.annot = read_annot(r, 0);         /* v37 */
+            /* v46: a container or box field names its whole type and
+             * no other field has one - rule 5 makes a bare container
+             * field a compile error, and every pass reads a container
+             * field's type from this annot */
+            if (!fd.annot != !field_kind_has_annot(fd.kind))
+                bad_image(fd.annot
+                    ? "corrupt .myv (a scalar field with a type annotation)"
+                    : "corrupt .myv (a container field with no type)");
+            sd.fields.push_back(std::move(fd));
+        }
+        const uint32_t nc = r.countv();
+        sd.consts.reserve(nc);
+        for (uint32_t j = 0; j < nc; j++) {
+            const UniqueId *cn =
+                r.uid_req("corrupt .myv (struct const with no name)");
+            sd.consts.emplace_back(cn, read_value(r));
+        }
+    }
+
+    /* ... then the descriptor records */
+    n = n_descs;
+    std::vector<bool> has_chunk(n, false);
+    for (uint32_t i = 0; i < n; i++) {
+        FuncDescriptor &d = *prog.funcs[i];
+        d.name = r.uidv();
+        d.display_name = r.strv();
+        const uint32_t np = r.countv();
+        d.params.reserve(np);
+        for (uint32_t j = 0; j < np; j++) {
+            FuncDescriptor::ParamDesc p;
+            p.name = r.uid_req("corrupt .myv (parameter with no name)");
+            p.opt = r.boolv(); p.cnst = r.boolv(); p.dyn_mod = r.boolv();
+            p.decl_type = r.enumv(DeclType::box,                /* v35 */
+                                  "corrupt .myv (param type)");
+            p.proven_type = r.enumv(DeclType::box,   /* C3, v11 */
+                                    "corrupt .myv (param type)");
+            p.sig_type = r.uidv();               /* v36, may be null */
+            p.fit = read_annot(r, 0);            /* v37 */
+            d.params.push_back(p);
+        }
+        const uint32_t ncp = r.countv();
+        d.captures.reserve(ncp);
+        for (uint32_t j = 0; j < ncp; j++) {
+            FuncDescriptor::CaptureDesc cp;
+            cp.name = r.uid_req("corrupt .myv (capture with no name)");
+            cp.kind = r.enumv(SymKind::builtin,
+                              "corrupt .myv (capture kind)");
+            cp.slot = static_cast<int>(static_cast<int32_t>(r.u32v()));
+            cp.start = r.locv();        /* v12 */
+            cp.end = r.locv();
+            d.captures.push_back(cp);
+        }
+        d.resolved = r.boolv();
+        /* frame_size is the OTHER half of the frame the VM allocates (the
+         * chunk contributes n_temps), so it gets the same file bound. */
+        d.frame_size = static_cast<int>(r.sizev("corrupt .myv (frame size)"));
+        d.min_args = static_cast<int>(static_cast<int32_t>(r.u32v()));
+        d.explicit_pure = r.boolv(); d.effective_pure = r.boolv();
+        d.cache_results = r.boolv(); d.pure_ctx = r.boolv();
+        d.is_template_base = r.boolv();
+        d.fast_bind = r.boolv();
+        d.noescape_params = static_cast<uint64_t>(r.i64v());    /* v17 */
+        has_chunk[i] = r.boolv();
+        d.decl = nullptr;                      /* compile-only back-pointer */
+    }
+    r.descs_filled = true;
+
+    /*
+     * PHASE 3 - WIRING: what DERIVES from filled records.
+     *
+     * The struct LAYOUT is RECOMPUTED, never stored (deterministic from
+     * the field kinds; storing it would only add drift surface) - in
+     * table order, since an inline struct field only ever names an
+     * EARLIER struct, whose layout is then already computed.
+     */
+    for (auto &sdp : prog.structs)
+        sdp->compute_layout();
+    r.layouts_done = true;
+    for (const auto &c : r.deferred_struct_vals)
+        r.check_struct_val(c.def, c.cls, c.pod, c.n);
+    r.deferred_struct_vals.clear();
+
+    /* The pool closures read while the descriptors were shells: the
+     * capture-free rule (read_value's `func` case) on the real record. */
+    for (const FuncDescriptor *fd : r.deferred_funcs)
+        if (!fd->captures.empty())
+            bad_image("corrupt .myv (capturing closure in a pool)");
+    r.deferred_funcs.clear();
+
+    for (uint32_t i = 0; i < n; i++) {
+        FuncDescriptor &d = *prog.funcs[i];
+        /*
+         * Rebuild the bind plan from the params just read: bind_req is
+         * DERIVED and not stored, and recomputing fast_bind beside it makes
+         * the stored flag a free cross-check of the params round trip.
+         *
+         * #137: a MISMATCH is an image problem, not an interpreter bug, so
+         * it is `bad_image` and not an ML_CHECK - a mutated param flag is
+         * ordinary hostile input, and asserting on input aborts the process
+         * where it should be reporting a corrupt file.
+         */
+        {
+            const bool stored = d.fast_bind;
+            compute_bind_flags(&d);
+            if (d.fast_bind != stored)
+                bad_image("corrupt .myv (descriptor bind flags)");
+        }
+    }
+
+    /* chunks: root, then the descriptors' (same order as written) */
+    read_chunk(r, prog.root);
+    for (uint32_t i = 0; i < n; i++) {
+        if (!has_chunk[i]) {
+            /*
+             * #122 TIER 1: a chunk-less descriptor is legal for EXACTLY one
+             * reason - a DEAD BASE TEMPLATE, which codegen_func_body skips
+             * because every call to it was redirected to an instance (that
+             * is the ONLY compiled-set exclusion; see its comment). So
+             * `no chunk` implies `is_template_base`, and both are stored
+             * bits sitting next to each other in the descriptor record.
+             *
+             * Flip the has-chunk bit on an ordinary function and the loader
+             * used to accept it happily: the descriptor then has NO chunk
+             * and - after the -vm AST teardown - no `decl` either, so the
+             * first call to it walked do_func_call's tree-walker arm into a
+             * null dereference. A debug build caught it on the ML_CHECK
+             * there; an ASSERTS=0 release, where that check is compiled
+             * away, SEGFAULTED. Found by tests/myv_fuzz, and it is
+             * precisely the failure #137's hardening exists to make
+             * impossible: a corrupt image must be REFUSED, never obeyed.
+             *
+             * Statically decidable from the image alone, so it belongs
+             * here at zero runtime cost rather than in the provenance
+             * tier - which still guards the residue a two-bit mutation
+             * could reach (both flags flipped together), in do_func_call.
+             */
+            if (!prog.funcs[i]->is_template_base)
+                bad_image("corrupt .myv (a callable descriptor has no "
+                          "chunk)");
+            prog.funcs[i]->vm_chunk_tried = true;   /* a dead template base */
+            continue;
+        }
+        Chunk ck;
+        read_chunk(r, ck);
+        vm_install_func_chunk(prog.funcs[i].get(), std::move(ck));
+    }
+
+    uint32_t nre = r.u32v();
+    prog.global_slot_reassigned.reserve(nre);
+    for (uint32_t i = 0; i < nre; i++)
+        prog.global_slot_reassigned.push_back(static_cast<char>(r.u8v()));
+
+    /*
+     * v19: main's half of the frame, stored TWICE - here and as the root
+     * chunk's `slot_count` - and CHECKED against each other in
+     * vm_verify_program, the rule the function chunks already had
+     * (slot_count == frame_size). It is a PRIMARY fact with no
+     * derivation, so a second copy is the only way to detect a mutated
+     * one: myv_fuzz fat-316 mutated the chunk's copy (26 -> 145) while
+     * the frame was pushed from this one and the JIT baked main's frame
+     * size from the chunk's - a leaked reference on the exception path -
+     * and, with the two made one record instead (the first v19 attempt),
+     * fat-311 mutated the chunk's copy (22 -> 101) undetected and the
+     * register cache pinned a TEMP it now took for a local: a leak again.
+     * Either copy mutated is a refusal now.
+     */
+    prog.root_slot_count =
+        static_cast<int>(r.sizev("corrupt .myv (root slot count)"));
+    n = r.countv();
+    prog.global_func_names.reserve(n);
+    for (uint32_t i = 0; i < n; i++)
+        prog.global_func_names.push_back(
+            r.uid_req("corrupt .myv (global slot with no name)"));
+    prog.typed = r.boolv();
+
+    /*
+     * #137: VERIFY BEFORE ANYTHING INDEXES IT. Every check above bounds a
+     * field against the BYTES it was read from; this one bounds each
+     * instruction operand against the TABLE it will index. It has to come
+     * first: the JIT below bakes pool ENTRY ADDRESSES into machine code
+     * (`&struct_defs[target2]`), which is where a mutated operand crashed.
+     */
+    vm_verify_program(prog);
+
+    /*
+     * #106 phase 2: the `nonneg_slots` rebuild, HERE and not in
+     * read_chunk beside the other derived pools - because it is the
+     * first loader-side pass to walk instruction OPERANDS through
+     * `visit_use_def`, whose `run(base, cnt)` iterates a count taken
+     * straight from the file. On unverified bytecode that count is
+     * attacker-chosen; after vm_verify_program every operand is bounded
+     * against the table it indexes, so the walk is finite and in range.
+     * The same "VERIFY BEFORE ANYTHING INDEXES IT" rule the JIT below
+     * obeys, for the same reason - and still before the JIT, which is
+     * what BAKES the fact into emitted machine code.
+     */
+    compute_nonneg_slots(prog.root);
+    for (const auto &d : prog.funcs)          /* vm.cpp's own idiom for a
+                                               * MUTABLE loaded chunk */
+        if (d->vm_chunk)
+            compute_nonneg_slots(*static_cast<Chunk *>(
+                                     const_cast<void *>(d->vm_chunk)));
+    /*
+     * v18: `ref_slots` is derived here too, for the strongest reason a
+     * pool has had - it decides what a frame pop RELEASES. Read from the
+     * file, one mutated entry (myv_fuzz small-1305: one bit, `[1, 2]` ->
+     * `[0, 2]`) made the release scan skip the temp two closures were
+     * built in, and the image ran to the right answer while leaking them.
+     * Derived from the verified code with the seeds the compile used
+     * (`ref_seeds_of`, the descriptor's non-scalar params), the list
+     * cannot disagree with the code beside it. Same placement rule as
+     * nonneg_slots: after the verifier bounded every operand the walk
+     * reads, before the JIT bakes the list into its release arms.
+     */
+    myv_derive_ref_slots(prog);
+
+    /*
+     * #137 tier 2: from here on this process is running UNTRUSTED bytecode.
+     * Everything verify_chunk could decide from the image alone is already
+     * decided; what is left is value-dependent (a slot's storage kind, a
+     * field index against the def a slot actually holds), and those sites
+     * now check. Never cleared: once an untrusted image is loaded, the rest
+     * of the run is untrusted too.
+     */
+#if ML_UNTRUSTED_CHECKS
+    g_untrusted_bytecode = true;
+#endif
+
+    /* the AOT native tier, re-run at LOAD over the WHOLE image (only the
+     * VM image is stored) - the same two passes a fresh compile runs. */
+    vm_jit_loaded_image(prog);
+    return prog;
+}

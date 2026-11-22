@@ -1,0 +1,33 @@
+# Operands are evaluated LEFT TO RIGHT in every engine, and an event log
+# is the only way to see it - a value assertion cannot. Until 2026-10-05
+# the tree-walker built by GCC evaluated two operands RIGHT TO LEFT in
+# two places, where each was passed as two arguments of one C++ call
+# (whose order C++ leaves unspecified): a typed comparison `a() < b()`
+# and a slice's bounds `x[f():g()]`. The VM, the JIT and a clang-built
+# tree-walker went left to right; corpus_diff compares them.
+
+var events = [];
+func ev(str what, int v) {
+    append(events, what);
+    return int(runtime(v));
+}
+func fv(str what, float v) {
+    append(events, what);
+    return float(runtime(v));
+}
+
+var lt = ev("l1", 1) < ev("r1", 2);
+var ge = fv("l2", 1.0) >= fv("r2", 2.0);
+var eq = ev("l3", 3) == ev("r3", 3);
+var dyn d = runtime([10, 20, 30, 40]);
+var a = [1, 2, 3, 4];
+var s1 = a[ev("s1", 1):ev("e1", 3)];
+var dyn s2 = d[ev("s2", 0):ev("e2", 2)];
+var s3 = str(runtime("abcd"))[ev("s3", 1):ev("e3", -1)];
+
+print(events);
+print(lt, ge, eq, s1, s2, s3);
+assert(events == ["l1", "r1", "l2", "r2", "l3", "r3",
+               "s1", "e1", "s2", "e2", "s3", "e3"]);
+assert(lt && !ge && eq);
+assert(s1 == [2, 3] && s2 == [10, 20] && s3 == "bc");

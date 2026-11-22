@@ -6,11 +6,13 @@
 #include <new>
 
 /*
- * A single-threaded NODE POOL allocator for std::unordered_map (H2 v2,
- * plans/vm-performance-roadmap.md - the maintainer-approved alternative to
- * a flat open-addressing map, which was REJECTED: it would break the
- * element-pointer stability the runtime relies on - dict values are LValues
- * written through held LValue* - for a modest lookup win).
+ * A single-threaded NODE POOL allocator for the node-based std containers
+ * (H2 v2, plans/archived/vm-performance-roadmap.md - the maintainer-approved
+ * alternative to a flat open-addressing map, which was REJECTED: it would
+ * break the element-pointer stability the runtime relies on - dict values
+ * are LValues written through held LValue* - for a modest lookup win). The
+ * dict's own map (orderedmap.h, #50) pools its nodes through
+ * ML_POOL_NEW_DELETE, the same free lists.
  *
  * The measured cost it removes: a chained unordered_map heap-allocates a
  * ~96-byte node PER INSERT (hash + the 32-byte EvalValue key + 48-byte
@@ -41,11 +43,53 @@
 #  endif
 #endif
 
-/* The pool core (defined in types.cpp - the global-mutable-state home).
- * Size classes: 16-byte steps up to ML_POOL_MAX; larger sizes fall back to
- * operator new inside pool_alloc_one itself, so callers never branch. */
-void *pool_alloc_one(size_t size);
-void pool_free_one(void *p, size_t size) noexcept;
+/* The pool STATE lives in types.cpp (the global-mutable-state home); the
+ * single-element FAST PATHS are inline here (#74's per-throw-allocation
+ * increment): every ML_POOL_NEW_DELETE call site passes a COMPILE-TIME
+ * size, so the size class folds to a constant and the hot alloc/free is
+ * 4-5 instructions (freelist pop/push) instead of an out-of-line call +
+ * a runtime class computation (~45 Ir round trip, measured on the
+ * per-throw exception objects; the dict-node and PureCache paths gain
+ * identically). The refill and the out-of-range sizes stay out-of-line
+ * (pool_alloc_slow / pool_free_slow, types.cpp). */
+struct PoolFreeNode { PoolFreeNode *next; };
+constexpr size_t ML_POOL_CLASS_STEP = 16;
+constexpr size_t ML_POOL_NCLASSES = 16;   /* classes: 16..256 bytes */
+extern PoolFreeNode *g_pool_free[ML_POOL_NCLASSES];   /* types.cpp */
+void *pool_alloc_slow(size_t size);            /* refill / out-of-range */
+void pool_free_slow(void *p, size_t size) noexcept;   /* out-of-range */
+
+inline void *pool_alloc_one(size_t size)
+{
+#ifdef ML_POOLALLOC_PASSTHROUGH
+    return ::operator new(size);     /* ASan: keep full UAF coverage */
+#else
+    const size_t cls = (size + ML_POOL_CLASS_STEP - 1) / ML_POOL_CLASS_STEP;
+    if (cls == 0 || cls > ML_POOL_NCLASSES)
+        return pool_alloc_slow(size);     /* out-of-range: plain heap */
+    PoolFreeNode *n = g_pool_free[cls - 1];
+    if (!n)
+        return pool_alloc_slow(size);     /* refill (cold) */
+    g_pool_free[cls - 1] = n->next;
+    return n;
+#endif
+}
+
+inline void pool_free_one(void *p, size_t size) noexcept
+{
+#ifdef ML_POOLALLOC_PASSTHROUGH
+    ::operator delete(p);
+#else
+    const size_t cls = (size + ML_POOL_CLASS_STEP - 1) / ML_POOL_CLASS_STEP;
+    if (cls == 0 || cls > ML_POOL_NCLASSES) {
+        pool_free_slow(p, size);
+        return;
+    }
+    auto *n = static_cast<PoolFreeNode *>(p);
+    n->next = g_pool_free[cls - 1];
+    g_pool_free[cls - 1] = n;
+#endif
+}
 
 /*
  * Class-scope pooled allocation (top-10 #6): the runtime's small, fixed-size
@@ -59,6 +103,34 @@ void pool_free_one(void *p, size_t size) noexcept;
  * placement forms are re-declared because a class operator new hides them.
  */
 #define ML_POOL_NEW_DELETE                                                      static void *operator new(size_t sz) { return pool_alloc_one(sz); }         static void operator delete(void *p, size_t sz) noexcept {                      pool_free_one(p, sz);                                                   }                                                                           static void *operator new(size_t, void *p) noexcept { return p; }           static void operator delete(void *, void *) noexcept {}
+
+/*
+ * #107 P4 - THE OBJECT CENSUS. The same allocation counted per KIND in an
+ * INT_TESTS build, so a test can ask how many of each runtime heap object
+ * are alive (`int_live(kind)`) and the runner can require a program to end
+ * with every count back where it started. Pooled objects are reachable
+ * from the pool's free lists, so LeakSanitizer cannot see one leak; this
+ * can. Outside INT_TESTS the counted form IS the plain one.
+ */
+enum IntObjKind { IOK_STR, IOK_ARR, IOK_DICT, IOK_STRUCT, IOK_FUNC, IOK_EXC,
+                  IOK_BOX, IOK_N };
+#ifdef INT_TESTS
+extern long long g_int_live[IOK_N];
+#define ML_POOL_NEW_DELETE_K(kind)                                             \
+    static void *operator new(size_t sz)                                       \
+    {                                                                          \
+        ++g_int_live[kind];                                                    \
+        return pool_alloc_one(sz);                                             \
+    }                                                                          \
+    static void operator delete(void *p, size_t sz) noexcept {                 \
+        --g_int_live[kind];                                                    \
+        pool_free_one(p, sz);                                                  \
+    }                                                                          \
+    static void *operator new(size_t, void *p) noexcept { return p; }          \
+    static void operator delete(void *, void *) noexcept {}
+#else
+#define ML_POOL_NEW_DELETE_K(kind) ML_POOL_NEW_DELETE
+#endif
 
 template <typename T>
 struct PoolAlloc {

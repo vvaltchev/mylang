@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# A PROGRESS MONITOR FOR A SHELL TOOL (tests/lib/testrun.py's Monitor, served
+# from outside the process doing the work).
+#
+#   tests/testmon NAME TOTAL DIR GLOB --pid PID [--phase P]
+#                    [--heartbeat S]
+#
+# Serves NAME's status socket - so `tests/testctl` lists it with its
+# percentage - where `done` is the number of files in DIR matching GLOB:
+# a tool that writes one result file per finished unit of work (as
+# tests/corpus_diff does) gets progress without knowing Python. It
+# exits on its own when PID (the tool) is gone, so a tool killed
+# mid-run leaves no monitor behind; the tool should still kill it when
+# done.
+
+import argparse
+import glob
+import os
+import signal
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "lib"))
+from testrun import Monitor  # noqa: E402
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+DESCRIPTION = """\
+Serve the progress of a SHELL test tool, so tests/testctl lists it with a
+percentage like any Python tool.
+
+A Python tool reports its own progress through tests/lib/testrun.py. A
+shell tool cannot, so it starts testmon beside itself: testmon counts the
+files in DIR that match GLOB - one result file per finished unit of work -
+and serves NAME's status socket with that count as `done` out of TOTAL. It
+exits by itself when the watched process (--pid) is gone; the tool should
+still kill it when it finishes."""
+
+EPILOG = """\
+testmon serves progress; tests/testctl reads it. testctl is the one you
+run by hand (it lists every tool, testmon's included); testmon is started
+by a shell tool, never by a person.
+
+example (from tests/corpus_diff, which leaves one .rc file per unit):
+  tests/testmon corpus_diff "$TOTAL" "$RES" '*.rc' --pid $$ --phase runs &
+  MON=$!
+  ...                              # the work
+  kill $MON"""
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="testmon", description=DESCRIPTION, epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("name", metavar="NAME",
+                    help="the tool's name, as testctl shows it")
+    ap.add_argument("total", type=int, metavar="TOTAL",
+                    help="how many result files mean 100%%")
+    ap.add_argument("dir", metavar="DIR",
+                    help="the directory the result files appear in")
+    ap.add_argument("pattern", metavar="GLOB",
+                    help="which files in DIR count (quote it: '*.rc')")
+    ap.add_argument("--pid", type=int, required=True,
+                    help="the tool's pid: testctl shows it, and testmon "
+                         "exits when it is gone")
+    ap.add_argument("--phase", default=None,
+                    help="a phase name for testctl's PHASE column")
+    ap.add_argument("--heartbeat", type=float, default=60.0, metavar="S",
+                    help="print a progress line to stderr every S seconds "
+                         "(default 60)")
+    args = ap.parse_args()
+    # `kill` from the tool must still remove the socket (the with below)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    # named for the TOOL's pid, so testctl shows the pid a user would kill
+    mon = Monitor(args.name, total=args.total, phase=args.phase,
+                  heartbeat=args.heartbeat, pid=args.pid)
+    with mon:
+        while alive(args.pid):
+            n = len(glob.glob(os.path.join(args.dir, args.pattern)))
+            with mon.lock:
+                mon.done = n
+            time.sleep(1)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

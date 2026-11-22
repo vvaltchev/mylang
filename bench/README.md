@@ -69,7 +69,38 @@ python3 bench/run.py --filter fib,sort  # several (comma-separated)
 python3 bench/run.py --repeat 5 --csv bench/results.csv
 python3 bench/run.py --baseline OLD   # before/after: also time a 2nd mylang
                                       # binary, report cur/base (speedup)
+python3 bench/run.py -cl cpp          # compare vs C++ instead of Python
+python3 bench/run.py -cl py --recompute  # (re)populate the Python cache
+python3 bench/run.py --pure-call-cache   # re-enable the per-frame pure-call
+                                      # cache (OFF by default - see below)
 ```
+
+**The per-frame pure-call cache is DISABLED by default (`-npc`)** — on the
+current binary *and* on `--baseline` — because no comparison language has it.
+MyLang memoizes a pure call's result within one frame; C++, CPython, Ruby and
+Lua all re-execute the call, so leaving the cache on measures MyLang's memo
+table against the other language's real work. It also breaks the `scale` knob
+on any bench that repeats a pure call: `09_fib_recursive`'s
+`for (k...) r = fib(29);` costs **93.1M instructions at scale 1 and 93.1M at
+scale 3** with the cache on, because iterations 2..N are hits — with `-npc` it
+is the linear 235M → 561M. That silently invalidated a startup correction (a
+scale3−scale1 delta made of nothing but cache hits) and produced a recorded
+"09_fib_recursive is faster than C++" that was pure artifact. Pass
+`--pure-call-cache` only when the cache's own contribution is what you are
+measuring; the header line always says which way the run went.
+
+**The comparison language is cached; a measure run is cache-only.** MyLang is
+timed on every run, but the comparison language (`-cl python` by default, or
+`cpp`/…) is timed **once** and cached in a git-ignored
+`bench/.bench_cache/<lang>.json`, keyed by *(scale, sha1 of the comparison
+source)* — so a MyLang edit never re-times it; only a scale change or a real
+`.py`/`.cpp` change does. A normal run reads that cache **read-only** and
+**fails fast** if any selected bench's comparison is stale/missing (it never
+re-times a comparison mid-measurement — that would perturb MyLang's timing).
+Re-timing is the separate `--recompute` step:
+`bench/run.py -cl <lang> --recompute [--filter …]` re-caches the stale entries
+(or all, with `--force`) and exits. You rarely need it — the comparison
+sources almost never change.
 
 `--baseline` is the way to measure whether a change actually helped: build the
 *old* binary (e.g. in a `git worktree` at the parent commit), then run with
@@ -85,6 +116,44 @@ time of `--repeat` runs for each side and the `my/py` ratio, and verifies the
 two implementations printed matching results (numeric tokens are compared with
 a tolerance so cosmetic float-formatting differences don't register as
 mismatches).
+
+### Per-bench scale, the variance gate, and the reps baseline
+
+Each bench runs at its own **scale** from `bench/scales.txt` (a committed
+`name scale` table; a bench absent from it runs at scale 1), so a too-short,
+noisy bench can be made reliable by raising just ITS scale — a longer run
+shrinks the fixed-overhead / scheduling-noise fraction — without touching the
+others. `bench/tune_scales.py` fine-tunes the table automatically.
+
+A normal run uses an **adaptive** rep count: 3 reps, and if the two fastest
+runs haven't converged (their gap exceeds `--var-threshold`, default 5%) it
+escalates **3 → 5 → 8 → 13 → 21**. It always reports the **min** (so a
+preemption spike, which only makes a run slower, can't hurt the number).
+Needing more reps to settle is **not** a problem — it just buys more best-of
+samples — so it is not reported. The **only** volatility warning is a bench
+whose variance is *still* over the threshold after the last rep step: its min
+can't be trusted. Such a bench does **not** abort the run — it keeps its min,
+is flagged `NOISY[Nr]` on its row and in a closing WARNING, and the run
+continues.
+
+The common case is unchanged (3 → 5 → 8); the **13 / 21 tail** rides out a
+transient scheduling burst before flagging a bench. On a noisy box such a burst
+can make a perfectly-scaled bench miss the gate at 8 reps, and across all 76
+benches that near-miss lands on *some* random bench most runs — so a hard abort
+there would be a false positive most of the time. Instead the extra best-of
+steps give a jittery bench more chances to settle; a bench *still* over the gate
+at 21 is only flagged, never aborted. A settled bench never reaches the tail, so
+it costs time only on a genuinely noisy one.
+
+A **few** benches can't be lengthened by scale — their runtime is flat and
+startup-dominated (e.g. `52_cse_dedup` is const-folded to a ~2 ms loop no scale
+can grow; the real work is parse-time CSE), so the min stays short enough to be
+jittery at 3 reps. Such a bench gets a **starting rep count** in
+`bench/reps.txt` (same `name reps` format): its adaptive schedule begins there
+(then still escalates), giving its min more best-of samples from the start so it
+settles without ever tripping the WARNING above. Prefer scale; `reps.txt` is
+only for the genuinely scale-immune benches (a handful today — e.g.
+`52_cse_dedup` and `09_fib_recursive`, both const-folded to a flat ~ms loop).
 
 Python is run with **`-B`** (don't read or write `__pycache__`). MyLang has no
 bytecode cache — it re-parses its source on every run — so letting CPython
@@ -113,12 +182,14 @@ Python slices semantically — they just don't copy eagerly.**
 - **Array slices.** `a[i:j]` in Python eagerly copies the `j-i` elements into a
   brand-new list. In MyLang it returns an **O(1) view** that shares storage
   with `a` via a reference count plus a registered "slice" record. The copy is
-  deferred: the moment you *write* through either the slice or the original, the
-  affected storage is cloned (`get_value_for_put` → `clone_aliased_slices` /
-  `clone_internal_vec`) so the write never bleeds across the two. **The net
-  effect a script can observe is identical to Python's** — writing to a slice
-  never changes the parent and vice-versa (verified in
-  `verify_semantics.my`). Only the performance differs:
+  deferred: the moment you *write* through the slice (by any name holding it)
+  or through the original, the affected storage is cloned
+  (`materialize_slice` / `clone_aliased_slices`) so the write never bleeds
+  across the two. **The net effect a script can observe is identical to
+  Python's** — writing to a slice never changes the parent and vice-versa,
+  and, as in Python, a slice once taken is an ordinary array: assigning it or
+  passing it to a function shares it rather than copying it again (both
+  verified in `verify_semantics.my`). Only the performance differs:
   - `15_array_slice_readonly` — take a slice and only read it. MyLang does O(1)
     work, Python pays the full O(k) copy every time. **MyLang wins big here**,
     and it's not because it's a faster interpreter — it's doing asymptotically
@@ -195,9 +266,10 @@ both languages on the inputs used. These are straight speed comparisons.
   aliased; the always-safe, idiomatic fast path in both languages is
   "collect parts in an array, then `join`" — that's `32_str_build_join`.
 
-- **Dictionary ordering.** MyLang dicts are `unordered_map` (no defined order);
-  Python dicts preserve insertion order. The dict-iteration benchmarks use
-  order-independent checksums (sum of values) so the results still match.
+- **Dictionary ordering.** Both languages keep a dict's insertion order
+  (MyLang since 2026-10-12; it used to be the hash map's own order). The
+  dict-iteration benchmarks still use order-independent checksums (sum of
+  values), which they adopted when the orders differed.
 - **Nullable dict reads.** A MyLang dict read (`d[k]` / `d.k`) is statically
   *nullable* (`opt V`, since the key might be absent), so the dict-lookup /
   member benchmarks narrow each read (`var v = d[k]; if (v != none) ...`) before
@@ -323,7 +395,7 @@ blow-out is per-iteration *genuine* exceptions (`42` ~22×).
 - **`15_array_slice_readonly` (0.37×), `39_find_builtin` (0.52×),
   `26_dict_iterate` (0.74×):** MyLang does less or tighter work — an O(1)
   copy-on-write view instead of an O(k) list copy; a C++ `std::find`/`==` scan
-  and `unordered_map` walk instead of per-element Python object dispatch.
+  and hash-map walk instead of per-element Python object dispatch.
 - **Exceptions (`42`, `69`–`72`) — the remaining weak spot, measured as a full
   suite so the cost picture is complete (not just one case):**
   - `42_exceptions` (~24×): a **same-frame** `throw`/`catch` per iteration.
@@ -339,7 +411,8 @@ blow-out is per-iteration *genuine* exceptions (`42` ~22×).
     nothing until something is thrown.
   Root cause of the throw-heavy cases: every `throw` heap-allocates + unwinds
   the C++ stack via DWARF tables (~1.6µs, irreducible by build flags). The VM
-  exception work (`plans/vm-exceptions.md`) targets these — same-frame first,
+  exception work (`plans/archived/vm-exceptions.md`) targets these —
+  same-frame first,
   then cross-frame (return-value propagation), then VM-detected runtime errors —
   and this suite is the scoreboard for all three.
 - **`09_fib_recursive` (3.5×), `44_primes_sqrt` (2.5×):** these were ~31× and

@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# THE INTRUSIVE-TEST RUNNER (#107, plans/intrusive-tests.md).
+#
+#   tests/int_run BINARY [--no-rt] [--gcov [--require-floor] [--report F]]
+#
+# 1. REFUSES a binary whose `mylang -v` does not say `int_tests 1`: every
+#    check below would be vacuous on an ordinary build.
+# 2. Runs the TEST UNITS, each one an oracle:
+#      `-rt`                  the C++ half (it exits non-zero on a failure);
+#      every tests/int/*.my   under each configuration of its
+#                             `# INT-CONFIGS:` header (default: none) and
+#                             each engine of `# INT-ENGINES:` (default: the
+#                             default engine AND the tree-walker) - each
+#                             run must exit 0 (the programs self-assert),
+#                             and the engines of one configuration must
+#                             print the same stdout;
+#      tests/int/repl/*.session  fed to --repl (exactly its .expected);
+#      tests/driver_checks    the CLI driver's flags, which -rt cannot
+#                             reach (it exits non-zero on a failure).
+# 3. THE SITE CENSUS: every process appends `site hits queries` to one file
+#    (MYLANG_INT_OUT, src/inttest.cpp). A site of src/intsites.h that no
+#    test CHECKED (read through int_hits / int_events) fails - reaching a
+#    site and asserting nothing about it verifies nothing. The same file
+#    carries `vc <class> <hits>` per VALUE CLASS (intsites.h: a declared
+#    boundary - shift by 64, index -1, INT_MIN / -1, an empty array): one
+#    no run exercised fails too.
+# 4. --gcov (a GCOV=1 INT build): the COVERAGE UNIVERSE of plan section 9.
+#    Each unit runs with the gcov counters cleared first, so it yields its
+#    own coverage vector of
+#        br:   each non-exception branch outcome in src/
+#        mcdc: each condition of each decision, shown TRUE and FALSE on its
+#              own (GCC >= 14, -fcondition-coverage)
+#        site: each intrusive-test site the unit checked
+#        vc:   each value class the unit's runs exercised
+#    named `kind:file:function:+line-offset:...` so an edit elsewhere in a
+#    file does not rename them. The universe is the PRODUCT: the test
+#    harness (tests.cpp), the INT core and every INT helper function (named
+#    int_* / jit_int_* / bc_int_*) are outside it, as are the lines of an
+#    ML_INT(...) / ML_INT_ONLY(...) call inside a product function, every
+#    test-only `#ifdef TESTS` / `#ifdef INT_TESTS` region (selftests,
+#    oracles, counter bumps: no shipped build compiles them) and a line
+#    marked `INT-COV-EXEMPT: reason`. Two checks, as in SQLite's discipline:
+#      - every unit OWNS at least one element no other unit covers
+#        (otherwise it is redundant and must go - the suite is minimal);
+#      - uncovered elements <= the FLOOR (a ratchet: it may only go down).
+#        Branch and condition counts depend on the COMPILER, so the floor
+#        file (--floor-file, default tests/int/coverage-floor.txt) holds one
+#        `<compiler> <N>` line per compiler `mylang -v` can report; with
+#        --require-floor a compiler with no line fails, naming the count to
+#        record.
+#
+# 5. THE OBJECT CENSUS and THE VM STATE CHECKER (P4): every tests/int run,
+#    and every program of the corpus (tests/functional + the
+#    non-interactive samples) under the default engine, -nj and the
+#    tree-walker, runs with MYLANG_INT_CENSUS=1 (the state checker runs on
+#    every op of every INT run, -rt included) and fails on a `census LEAK`
+#    line - a runtime heap object (str, arr,
+#    dict, struct, func, exc) still alive after the program, which
+#    LeakSanitizer cannot see for a POOLED object - or an `INT-VMSTATE`
+#    abort (a frame slot contradicting what the compiler proved, at the op
+#    boundary where it happened). `-rt` is exempt: the harness retains its
+#    programs on purpose.
+#
+# Deterministic: no seeds, no sampling, a fixed unit order. The random-
+# program fuzzers never run an INT binary (plan section 7).
+
+import argparse
+import codecs
+import glob
+import gzip
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCRIPT = ["<script>"]       # a unit command that is a script, not a flag list
+TTY = ["<tty>"]             # a unit typed on a pseudo-terminal (tests/int/tty)
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, os.path.join(HERE, "lib"))
+from testrun import Monitor  # noqa: E402
+from intcov import (CENSUS_SAMPLES, PROBE_LINE, build_config,  # noqa: E402
+                    collect, engine_flags, gcov_tool, int_configs, int_header,
+                    int_engines, run, run_tty, vdj_mask)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("binary")
+    ap.add_argument("--no-rt", action="store_true",
+                    help="skip the -rt unit (iterating on tests/int only;"
+                         " the whole-suite checks are then skipped)")
+    ap.add_argument("--gcov", action="store_true",
+                    help="measure the coverage universe (a GCOV=1 build)")
+    ap.add_argument("--floor-file",
+                    default=os.path.join(HERE, "int", "coverage-floor.txt"),
+                    help="--gcov: `<compiler> <max uncovered>` lines")
+    ap.add_argument("--require-floor", action="store_true",
+                    help="--gcov: fail when the floor file has no line for "
+                         "this binary's compiler")
+    ap.add_argument("--report", default=None,
+                    help="--gcov: write the ownership table and the "
+                         "uncovered list here (with --only: what each "
+                         "unit run covered)")
+    ap.add_argument("--timeout", type=float, default=3600.0)
+    ap.add_argument("--list", action="store_true",
+                    help="print every unit's name and stop")
+    ap.add_argument("--only", default=None, metavar="REGEX",
+                    help="run only the units whose name the regex finds "
+                         "(the whole-suite checks - ownership, the floor, "
+                         "the site census - are then skipped)")
+    ap.add_argument("--update-repl", action="store_true",
+                    help="rewrite tests/int/repl/*.expected from this binary")
+    args = ap.parse_args()
+    binary = os.path.abspath(args.binary)
+    build_dir = os.path.dirname(binary)
+
+    units = []
+    if not args.no_rt:
+        units.append(("-rt", [[(["-rt"], {}, None)]]))
+    progs = sorted(glob.glob(os.path.join(HERE, "int", "*.my")))
+    for prog in progs:
+        # `# INT-SOURCE: PATH` (relative to the unit): the unit RUNS that
+        # program - a tests/functional program counted as a coverage unit
+        # with no second copy of it. The unit's own headers pick the runs;
+        # its name is the unit's, so ownership reads as usual.
+        src = int_header(prog, "INT-SOURCE")
+        target = (os.path.normpath(os.path.join(os.path.dirname(prog), src))
+                  if src else prog)
+        if not os.path.isfile(target):
+            print("int_run: %s: INT-SOURCE %s does not exist"
+                  % (os.path.relpath(prog, ROOT), src), file=sys.stderr)
+            return 2
+        groups = []          # one per configuration: [(cmd, env-extra)]
+        for conf in int_configs(prog):
+            groups.append([(engine_flags(eng) + [target], conf, None)
+                           for eng in int_engines(prog)])
+        units.append((os.path.relpath(prog, ROOT), groups))
+    # REPL SESSIONS (tests/int/repl/*.session): the interactive front end
+    # - the input loop, history, the line editor's off-TTY path, error
+    # rendering - which `-rt`'s REPL tests never reach (they drive
+    # ReplEngine directly). Each is fed on stdin under a fresh HOME (the
+    # history file) and must print exactly its `.expected`, nothing on
+    # stderr, exit 0. Found by repl_fuzz; kept because each owns
+    # coverage nothing else has. --update-repl rewrites the `.expected` files.
+    for sess in sorted(glob.glob(os.path.join(HERE, "int", "repl",
+                                              "*.session"))):
+        with open(sess, errors="surrogateescape") as f:
+            text = f.read()
+        units.append((os.path.relpath(sess, ROOT),
+                      [[(["--repl"], {}, (text, sess[:-8] + ".expected"))]]))
+    # TERMINAL SESSIONS (tests/int/tty/*.keys): the line editor ON a
+    # terminal - raw mode, the repaint, syntax colour, the ghost
+    # suggestion, completion, the Ctrl-R pane, bracketed paste - which
+    # every other unit reaches only off a TTY. Each line of a .keys file
+    # is ONE input, in Python string-literal escapes (`\r` is Enter,
+    # `\x1b[A` the up arrow); it is typed on a 24x80 pseudo-terminal (or
+    # the TTY-SIZE below) once the REPL has read the line before it and
+    # waits in raw mode again (intcov.run_tty), and everything the
+    # terminal shows must equal NAME.expected byte for byte - the output
+    # is a function of the bytes typed, so it is the same on every run
+    # and every build. Linux only: the waiting test reads /proc.
+    for keys in sorted(glob.glob(os.path.join(HERE, "int", "tty",
+                                              "*.keys"))):
+        if not sys.platform.startswith("linux"):
+            print("int_run: %s skipped (a terminal session needs Linux's "
+                  "/proc)" % os.path.relpath(keys, ROOT))
+            continue
+        # A `# TTY-SIZE: ROWSxCOLS` line picks another terminal size and
+        # a `# TTY-ENV: K=V ...` line adds environment variables (a UTF-8
+        # locale for the pane's rounded borders, NO_COLOR) - both are
+        # inputs of the session, so they live in the file it is read from.
+        chunks, size, tty_env = [], (24, 80), {}
+        with open(keys, encoding="latin-1") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                m = re.match(r"# TTY-SIZE: (\d+)x(\d+)\s*$", line)
+                if m:
+                    size = (int(m.group(1)), int(m.group(2)))
+                    continue
+                m = re.match(r"# TTY-ENV:(.*)$", line)
+                if m:
+                    for kv in m.group(1).split():
+                        k, _, v = kv.partition("=")
+                        tty_env[k] = v
+                    continue
+                if line and not line.startswith("#"):
+                    chunks.append(codecs.decode(line, "unicode_escape")
+                                  .encode("latin-1"))
+        units.append((os.path.relpath(keys, ROOT),
+                      [[(TTY, tty_env,
+                         (chunks, keys[:-5] + ".expected", size))]]))
+    # THE DRIVER UNIT: tests/driver_checks runs the binary under the CLI
+    # flags -rt cannot reach (it runs in-process, past mylang.cpp's
+    # argument handling): -nr, -vd/-vdj, -c and a .myv load, -dti, -a, the
+    # depth cap ... A unit like any other - pass is its exit code - so
+    # the driver's code is measured by the test that checks it.
+    units.append(("tests/driver_checks",
+                  [[(SCRIPT, {"MYLANG_EXPECT_INT_TESTS": "1"},
+                     os.path.join(HERE, "driver_checks"))]]))
+
+    # the two corpus-wide passes are cases too, so --only can pick them
+    CENSUS, INVIS = "corpus: object census", "corpus: probe invisibility"
+    names = [n for n, _ in units] + [CENSUS, INVIS]
+    only = re.compile(args.only) if args.only else None
+    # -rt is a unit too, so a run without it is a SUBSET like --only: the
+    # whole-suite checks (the site and value-class censuses, ownership,
+    # the floor) are skipped - see the census below for why it matters
+    partial = bool(only) or args.no_rt
+    why = "--only" if only else "--no-rt"
+    if args.list:
+        for n in names:
+            if not only or only.search(n):
+                print(n)
+        return 0
+    cfg = build_config(binary)
+    if cfg.get("int_tests") != "1":
+        print("int_run: %s is not an INT_TESTS build (-v says int_tests=%s);"
+              " build it with `make INT_TESTS=1`" % (binary,
+                                                     cfg.get("int_tests")),
+              file=sys.stderr)
+        return 2
+    if args.gcov and not glob.glob(os.path.join(build_dir, "**", "*.gcno"),
+                                   recursive=True):
+        print("int_run: --gcov needs a GCOV=1 build (no .gcno files next "
+              "to %s)" % binary, file=sys.stderr)
+        return 2
+
+    # The universe's MC/DC conditions (gcov --conditions) exist from GCC
+    # 14 on: an older gcc's gcov refused the option with a usage dump,
+    # after the whole -rt run (tests/run's int-gcov lane builds with the
+    # default g++, which is older on some machines)
+    comp = cfg.get("compiler", "")
+    if args.gcov and comp.startswith("gcc ") and \
+            int(comp.split()[1].split(".")[0]) < 14:
+        print("int_run: --gcov needs GCC 14 or later (MC/DC conditions); "
+              "%s is %s - build it with CXX=g++-14 (from clean)"
+              % (binary, comp), file=sys.stderr)
+        return 2
+
+    tool = gcov_tool(cfg) if args.gcov else None
+    if tool:
+        print("  gcov: %s" % tool)
+
+    if only:
+        units = [(n, c) for n, c in units if only.search(n)]
+        run_census = bool(only.search(CENSUS))
+        run_invis = bool(only.search(INVIS))
+        if not units and not run_census and not run_invis:
+            print("int_run: --only '%s' matches no unit" % args.only,
+                  file=sys.stderr)
+            return 2
+    else:
+        run_census = run_invis = True
+
+    failures = []
+    if not progs:
+        failures.append("no tests/int/*.my programs")
+    covered_by = {}
+    universe = {}
+    ex_cache = {}
+    # progress: tests/testctl lists this run with its percentage
+    mon = Monitor("int_run", total=len(units), phase="units")
+    with mon, tempfile.TemporaryDirectory(prefix="mylang-int-") as tmp:
+        census = os.path.join(tmp, "census.txt")
+        scratch = os.path.join(tmp, "gcov")
+        os.mkdir(scratch)
+        env = dict(os.environ, MYLANG_INT_OUT=census, TMPDIR=tmp)
+
+        for name, cmds in units:
+            mon.set_current(name)
+            if args.gcov:
+                for g in glob.glob(os.path.join(build_dir, "**", "*.gcda"),
+                                   recursive=True):
+                    os.remove(g)
+            before = os.path.getsize(census) if os.path.exists(census) else 0
+            ok = True
+            fails = []
+            for group in cmds:
+                results = []
+                for c, extra, repl in group:
+                    if c is SCRIPT:
+                        # a script unit: it runs the binary itself
+                        results.append(run([repl, binary], dict(env, **extra),
+                                           args.timeout))
+                        continue
+                    if c is TTY:
+                        # a fresh HOME (no history), ASCII borders, colour
+                        # on: what a terminal session needs to repeat
+                        home = tempfile.mkdtemp(dir=tmp)
+                        tenv = {k: v for k, v in env.items()
+                                if k not in ("NO_COLOR", "COLUMNS", "LINES",
+                                             "LANG", "LANGUAGE")}
+                        tenv.update(HOME=home, TERM="xterm", LC_ALL="C")
+                        tenv.update(extra)
+                        rows, cols = repl[2]
+                        results.append(run_tty([binary], tenv, repl[0],
+                                               args.timeout, rows, cols))
+                        continue
+                    if repl:
+                        # the REPL retains its inputs' programs, like -rt:
+                        # no object census; a fresh HOME per session
+                        home = tempfile.mkdtemp(dir=tmp)
+                        results.append(run([binary] + c,
+                                           dict(env, HOME=home),
+                                           args.timeout, stdin=repl[0]))
+                        continue
+                    results.append(run(
+                        [binary] + c,
+                        dict(env, **extra,
+                             **({} if name == "-rt"
+                                else {"MYLANG_INT_CENSUS": "1",
+                                      "MYLANG_INT_PROBE": "1"})),
+                        args.timeout))
+                for (c, extra, repl), r in zip(group, results):
+                    if not repl or c is SCRIPT:
+                        continue
+                    if args.update_repl:
+                        with open(repl[1], "w", newline="",
+                                  errors="surrogateescape") as f:
+                            f.write(r[1])
+                    want = None
+                    if os.path.exists(repl[1]):
+                        # newline="": a terminal's output holds \r
+                        with open(repl[1], newline="",
+                                  errors="surrogateescape") as f:
+                            want = f.read()
+                    if want is None:
+                        ok = False
+                        fails.append("no %s (--update-repl writes it)"
+                                     % os.path.relpath(repl[1], ROOT))
+                    elif r[1] != want:
+                        ok = False
+                        fails.append("the REPL printed something other "
+                                     "than %s"
+                                     % os.path.relpath(repl[1], ROOT))
+                    if r[2]:
+                        ok = False
+                        fails.append("stderr: " + r[2][-2000:])
+                for (c, extra, _repl), r in zip(group, results):
+                    for l in r[2].splitlines():
+                        if l.startswith(("census LEAK", "INT-VMSTATE",
+                                         "INT-JITSTATE")):
+                            ok = False
+                            fails.append("`%s`: %s" % (" ".join(c), l))
+                if name == "-rt":
+                    for l in results[0][1].splitlines():
+                        if l.startswith(("Tests passed", "Differential")):
+                            print("  -rt  " + l)
+                if any(r[0] != 0 for r in results):
+                    ok = False
+                if len(results) >= 2 and any(r[1] != results[0][1]
+                                             for r in results[1:]):
+                    ok = False
+                    fails.append("stdout differs between the engines (%s)"
+                                 % (" ".join("%s=%s" % kv for kv in
+                                             group[0][1].items())
+                                    or "default"))
+                for (c, extra, _repl), r in zip(group, results):
+                    if r[0] != 0:
+                        fails.append("`%s%s` rc=%d\n%s" % (
+                            "".join("%s=%s " % kv for kv in extra.items()),
+                            _repl + " BINARY" if c is SCRIPT
+                            else " ".join(c), r[0],
+                            (r[1] + r[2])[-2000:]))
+            print("  %s  %s" % ("ok  " if ok else "FAIL", name))
+            for f in fails:
+                print("        " + f)
+            if not ok:
+                failures.append(name)
+            mon.advance(failed=not ok)
+
+            if args.gcov:
+                try:
+                    elems = collect(build_dir, scratch, ex_cache, tool)
+                except RuntimeError as err:
+                    print("int_run: %s" % err, file=sys.stderr)
+                    return 2
+                # THE VACUITY GUARD: a coverage pass that measured nothing
+                # must not pass (a gcov of the wrong version once returned
+                # nothing here, silently, and every check was green).
+                if not any(e.startswith(("br:", "mcdc:")) for e in elems):
+                    print("int_run: gcov reported no src/ branch at all for "
+                          "%s - the coverage pass measured nothing" % name,
+                          file=sys.stderr)
+                    return 2
+                cov = {e for e, c in elems.items() if c}
+                for e in elems:
+                    universe.setdefault(e, True)
+                # the sites this unit CHECKED are elements too, and so
+                # are the value classes its runs exercised
+                with open(census) as f:
+                    f.seek(before)
+                    for line in f:
+                        parts = line.split()
+                        if parts[0] == "vc":
+                            universe.setdefault("vc:" + parts[1], True)
+                            if int(parts[2]) > 0:
+                                cov.add("vc:" + parts[1])
+                            continue
+                        site, _hits, queries = parts
+                        universe.setdefault("site:" + site, True)
+                        if int(queries) > 0:
+                            cov.add("site:" + site)
+                covered_by[name] = cov
+
+        # the corpus census (5): not a coverage unit - an oracle pass
+        corpus = sorted(glob.glob(os.path.join(HERE, "functional", "*.my")))
+        corpus += [os.path.join(ROOT, "samples", s) for s in CENSUS_SAMPLES]
+        leaks = 0
+        probes = 0
+        mon.phase("census", total=len(corpus))
+        for prog in (corpus if run_census else []):
+            mon.set_current(os.path.relpath(prog, ROOT))
+            mon.advance()
+            outs = {}
+            for eng in (["-tw"], [], ["-nj"]):
+                r = run([binary] + eng + [prog],
+                        dict(env, MYLANG_INT_CENSUS="all",
+                             MYLANG_INT_PROBE="1"), args.timeout)
+                # the probed engines print what the tree-walker prints
+                # (a stub that failed to restore a register would not)
+                outs[" ".join(eng)] = (r[0], r[1])
+                if eng and outs[" ".join(eng)] != outs["-tw"]:
+                    leaks += 1
+                    failures.append("probe: %s %s: the output differs from "
+                                    "the tree-walker's"
+                                    % (" ".join(eng) or "default",
+                                       os.path.relpath(prog, ROOT)))
+                for l in r[2].splitlines():
+                    if l.startswith("census probes "):
+                        probes += int(l.split()[2])
+                    if l.startswith(("census LEAK", "INT-VMSTATE",
+                                     "INT-JITSTATE")):
+                        leaks += 1
+                        failures.append("census: %s %s: %s" % (
+                            " ".join(eng) or "default",
+                            os.path.relpath(prog, ROOT), l))
+        if run_census:
+            print("  object census + VM state + JIT probes: %d corpus "
+                  "program(s) x 3 engines, %d finding(s), %d probe(s) run"
+                  % (len(corpus), leaks, probes))
+        else:
+            print("  object census + VM state + JIT probes: skipped "
+                  "(--only)")
+        if probes == 0 and run_census:
+            failures.append("the JIT probe never ran (MYLANG_INT_PROBE) - "
+                            "the JIT half of the state checker is vacuous")
+        # (6) THE PROBE IS INVISIBLE: the emitted code with probes, the
+        # probe calls dropped and byte offsets masked, is the emitted code
+        # without them - instruction for instruction
+        invis = 0
+        mon.phase("probe-invisible", total=len(corpus))
+        for prog in (corpus if run_invis else []):
+            mon.set_current(os.path.relpath(prog, ROOT))
+            mon.advance()
+            plain = run([binary, "-vdj", prog], env, args.timeout)[1]
+            probed = run([binary, "-vdj", prog],
+                         dict(env, MYLANG_INT_PROBE="1"), args.timeout)[1]
+            if PROBE_LINE.search(plain):
+                failures.append("probe-strip: %s's plain -vdj already "
+                                "holds a `call [<addr>]` - a probe line "
+                                "would be ambiguous"
+                                % os.path.relpath(prog, ROOT))
+                continue
+            n_probe = len(PROBE_LINE.findall(probed))
+            if "enter.nat" in plain and n_probe == 0:
+                failures.append("probe-strip: %s has native code and no "
+                                "probe" % os.path.relpath(prog, ROOT))
+            if vdj_mask(plain) != vdj_mask(probed, strip=True):
+                invis += 1
+                failures.append("probe-strip: %s - the probes changed "
+                                "the emitted code"
+                                % os.path.relpath(prog, ROOT))
+        if run_invis:
+            print("  probe invisibility: %d corpus program(s), %d differ"
+                  % (len(corpus), invis))
+        else:
+            print("  probe invisibility: skipped (--only)")
+
+        totals = {}
+        vc_totals = {}
+        if os.path.exists(census):
+            with open(census) as f:
+                for line in f:
+                    parts = line.split()
+                    if parts[0] == "vc":
+                        vc_totals[parts[1]] = (vc_totals.get(parts[1], 0)
+                                               + int(parts[2]))
+                        continue
+                    site, hits, queries = parts
+                    h, q = totals.get(site, (0, 0))
+                    totals[site] = (h + int(hits), q + int(queries))
+        if not totals and not only:
+            failures.append("no census was written (MYLANG_INT_OUT)")
+        # a subset of the units cannot check every site: the site census
+        # is a whole-suite check. -rt is a unit too, so --no-rt is a
+        # subset: three literal value classes are exercised by -rt alone
+        # (an out-of-range literal is a compile error, which no tests/int
+        # program can hold), and tests/mutate's `int` stage, which runs
+        # --no-rt, failed its pristine build on them from 2026-10-05 on
+        unchecked = [] if partial else \
+            sorted(s for s, (h, q) in totals.items() if q == 0)
+        if partial:
+            print("  site census: skipped (%s - a whole-suite check)" % why)
+        else:
+            print("  census: %d site(s), %d not checked by any test"
+                  % (len(totals), len(unchecked)))
+        for s in unchecked:
+            print("    UNCHECKED  %s  (%d event(s) recorded)"
+                  % (s, totals[s][0]))
+            failures.append("site %s checked by no test" % s)
+        # the value classes (intsites.h): a declared boundary no run
+        # exercised is a boundary no test checks
+        unhit = [] if partial else \
+            sorted(c for c, h in vc_totals.items() if h == 0)
+        if partial:
+            print("  value classes: skipped (%s - a whole-suite check)"
+                  % why)
+        else:
+            print("  value classes: %d declared, %d exercised by no test"
+                  % (len(vc_totals), len(unhit)))
+        for c in unhit:
+            print("    UNEXERCISED  %s" % c)
+            failures.append("value class %s exercised by no test" % c)
+
+    if args.gcov and partial:
+        print("  coverage: %s ran a subset - ownership and the floor "
+              "are whole-suite checks, skipped" % why)
+        if args.report:
+            # what each unit run covered: against a whole run's uncovered
+            # list it says what a new unit adds, in minutes. The elements
+            # these units met follow, so several subset runs that together
+            # run every unit (one per restartable chunk) give a whole
+            # run's totals: the universe is the union of what each run met
+            with open(args.report, "w") as f:
+                for name in sorted(covered_by):
+                    cov = sorted(covered_by[name])
+                    f.write("== %s covers %d\n" % (name, len(cov)))
+                    for e in cov:
+                        f.write("  %s\n" % e)
+                f.write("== universe %d\n" % len(universe))
+                for e in sorted(universe):
+                    f.write("  %s\n" % e)
+    elif args.gcov:
+        all_cov = set().union(*covered_by.values()) if covered_by else set()
+        uncovered = sorted(e for e in universe if e not in all_cov)
+        print("  coverage: %d element(s), %d covered, %d uncovered"
+              % (len(universe), len(all_cov), len(uncovered)))
+        for kind in ("br", "mcdc", "site", "vc"):
+            tot = sum(1 for e in universe if e.startswith(kind + ":"))
+            cov = sum(1 for e in all_cov if e.startswith(kind + ":"))
+            print("    %-5s %7d / %7d" % (kind, cov, tot))
+        owned = {}
+        for name, cov in covered_by.items():
+            others = set().union(*(c for n, c in covered_by.items()
+                                   if n != name))
+            owned[name] = sorted(cov - others)
+            print("    owns %7d  %s" % (len(owned[name]), name))
+            if not owned[name]:
+                failures.append("%s owns no element - redundant" % name)
+        comp = cfg.get("compiler", "?")
+        floor = None
+        if os.path.exists(args.floor_file):
+            with open(args.floor_file) as f:
+                for line in f:
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    key, _, n = line.rpartition(" ")
+                    if key == comp:
+                        floor = int(n)
+        if floor is None:
+            msg = ("no coverage floor for `%s` in %s - record `%s %d`"
+                   % (comp, os.path.relpath(args.floor_file, ROOT), comp,
+                      len(uncovered)))
+            print("  " + msg)
+            if args.require_floor:
+                failures.append(msg)
+        elif len(uncovered) > floor:
+            failures.append("%d uncovered elements, over the %s floor of %d"
+                            % (len(uncovered), comp, floor))
+        elif len(uncovered) < floor:
+            print("  note: %d uncovered, below the %s floor of %d - lower "
+                  "it in %s" % (len(uncovered), comp, floor,
+                                os.path.relpath(args.floor_file, ROOT)))
+        if args.report:
+            with open(args.report, "w") as f:
+                for name in sorted(owned):
+                    f.write("== %s owns %d\n" % (name, len(owned[name])))
+                    for e in owned[name]:
+                        f.write("  %s\n" % e)
+                f.write("== uncovered %d\n" % len(uncovered))
+                for e in uncovered:
+                    f.write("  %s\n" % e)
+
+    if failures:
+        print("int_run: FAIL (%d)" % len(failures))
+        for f in failures:
+            print("  - " + f)
+        return 1
+    print("int_run: PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

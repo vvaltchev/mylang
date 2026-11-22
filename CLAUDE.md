@@ -13,6 +13,14 @@ code in this repository.
 > CLAUDE.md covers the *C++
 > implementation*; the README covers the *language*. You need both in your head
 > before making changes.
+>
+> **`docs/` is the on-demand half.** CLAUDE.md keeps what you must know
+> before you start: the rules, the invariants, the traps, the map of what
+> lives where. The detail that only helps once you are already inside a
+> subsystem lives in `docs/` and is named at the point where you would need
+> it — `docs/jit-optimizations.md` (the JIT/VM per-change record) and
+> `docs/myv-format.txt` (the stored-bytecode byte spec). A pointer to one of
+> those is an instruction to READ IT, not a footnote.
 
 > **KEEP THE DOCS IN SYNC WITH THE SOURCE — IN THE SAME CHANGE.** `README.md`
 > and this `CLAUDE.md`
@@ -31,9 +39,412 @@ code in this repository.
 >   a sentence in this file wrong. After editing code, reread the relevant
 >   CLAUDE.md section and fix any
 >   statement the change just falsified.
+> - **`docs/jit-optimizations.md`** whenever you change the JIT or the VM's
+>   op set — it holds the per-change record (what each optimization does,
+>   what it measured, which guard makes it sound, which sabotage was watched
+>   failing). Add your entry there, not here; only a RULE that a future
+>   reader must obey *before* knowing they are in that area belongs in
+>   CLAUDE.md.
+> - **⛔ `docs/myv-format.txt` IS ALWAYS UP TO DATE — HARD RULE
+>   (maintainer-set, 2026-08-09).** It is not "documentation of" the format,
+>   it IS the format's specification: it describes every record, in order,
+>   with its exact byte encoding, and a third party must be able to write a
+>   reader from it ALONE. So any change to what `myv_write` emits or
+>   `myv_read` accepts — a new field, a changed width, a new pool, a bumped
+>   `MYV_FORMAT_VERSION`, a new validation rule — updates this file in the
+>   SAME commit. There is no "I'll sync the doc later": later means a reader
+>   who trusts it produces a corrupt image.
+>
+>   **IT HAS A MACHINE CHECK, SO "I THINK IT'S FINE" IS NEVER THE ANSWER:**
+>
+>       make -j BUILD_DIR=build-claude/dbg TESTS=1 OPT=0
+>       ./build-claude/dbg/mylang -c samples/gcd -o /tmp/gcd.myv
+>       tests/myv_doc_check /tmp/gcd.myv
+>
+>   That script is written from the DOCUMENT and deliberately not from
+>   `serialize.cpp`; consuming an image to exactly EOF is what proves the doc
+>   complete. **RUN IT after any serializer change** — and note it was found
+>   FAILING on 2026-08-09, the doc stale at v10 while the format was at v13
+>   (v11 `proven_type`, v12 capture Locs, v13 `base_locs` had all landed
+>   without it). That is the failure this rule exists to prevent.
 >
 > A change that alters behavior or architecture but leaves the docs stale is
 > incomplete.
+
+## ⛔ TERMINOLOGY: "BYTECODE INLINING", NEVER "SPLICE" (maintainer-set,
+## 2026-10-02 - a HARD RULE)
+
+Say **"bytecode inlining"** for the transform and **"the bytecode
+inliner"** for the pass - in replies, reports, commit messages, comments
+and docs. **Never "splice", "spliced" or "splicing" for it.** MyLang has
+TWO inliners (the AST inliner, which rewrites the tree before any
+bytecode exists, and the bytecode inliner, which pastes a callee's
+compiled bytecode into its caller's chunk), and a private word for one of
+them confused the maintainer about which one a finding was about. When
+both could be meant, name the one you mean: "the AST inliner" / "the
+bytecode inliner".
+
+Existing identifiers and old text still say splice - `bc_inline_chunk_splice`,
+the `splice_choice` INT site, `-nbi`'s "splice ON/OFF" mode names,
+`ValueSpliceOff`, older paragraphs of this file. They are not renamed by
+this rule; read "splice" in them as "bytecode inlining", and do not write
+the word in anything new.
+
+## ⛔ WHAT A PUSH NEEDS (maintainer-set, 2026-11-06)
+
+**A change to anything that is built, run or read by a test** -
+`src/`, `tests/`, `samples/`, `bench/`, `scripts/`, `Makefile`,
+`CMakeLists.txt`, `.github/` - is pushed only after the FULL catalog is
+green on that exact commit:
+
+    cmake -S . -B build-claude/ci-int -DINT_TESTS=ON -DGCOV=ON \
+          -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug     # once
+    cmake --build build-claude/ci-int -j8
+    tests/run --build-root build-claude -t long \
+              --bin int-gcov=build-claude/ci-int/mylang
+
+**A DOCS-ONLY change needs no test run and is pushed directly**: every
+file it touches is prose that nothing compiles, executes or reads -
+`README.md`, `CLAUDE.md`, `tests/CLAUDE.md`, `tests/README.md`,
+`plans/`, the Markdown under `docs/`. (Checked 2026-11-06: no test,
+tool or build step opens any of them.) One exception:
+`docs/myv-format.txt` is a SPEC with a machine check, so a change to it
+runs `tests/myv_doc_check` first (seconds; see the format rule above).
+A commit that mixes docs with anything else is a code change.
+
+**A change to the CI workflows only (`.github/`, maintainer-set
+2026-11-06) is verified by the CI run it triggers**, not by the local
+catalog, which never runs a workflow file: push it and watch every
+workflow it touches go green. A commit mixing `.github/` with code is a
+code change.
+
+## ⛔ NO NEW LANGUAGE FEATURES UNTIL THE TESTS AND THE JIT ARE DONE
+## (maintainer-set, 2026-11-02)
+
+The work order, and nothing jumps it:
+
+ 1. **STABILIZE THE LANGUAGE** - bugs, crashes, and conflicting behavior
+    between engines (RULE 1, RULE 2). Every open language question asked
+    so far came from exactly that, not from a wish for a feature.
+ 2. **FINISH THE INTRUSIVE TESTS (#107, `plans/intrusive-tests.md`)** -
+    super powerful tests that are DETERMINISTIC and FAST because each
+    one targets a specific code path, not a fuzzer's lucky draw. Return
+    to them first after any detour.
+ 3. **FINISH THE SUSPENDED JIT OPTIMIZATION WORK (#97)**.
+ 4. Only THEN resume introducing language features.
+
+A language decision the maintainer has taken but that ADDS a feature is
+SAVED, not built: it waits in `plans/open-language-questions.md` (with
+its sketch in `plans/language-deferred.md`) until step 4. Today that is
+question 13 (builtin arity checked at compile time - decided A) and
+question 14 (struct methods, class inheritance). Do not start one
+because it looks small.
+
+**STRUCT vs CLASS - the line the language keeps (maintainer, 2026-11-02).**
+A `struct` is a value type for DATA CONTAINERS and stays super
+efficient: explicit field types only (no `var` fields), `opt` only where
+it is today (dyn / array / dict / class fields - an `opt` scalar field
+would be a nightmare to optimize in the JIT), at most BASIC methods and
+nothing more, and never inheritance. A `class` is a proper object, like
+C#'s: always heap-allocated, reference-counted, MANAGED and boxed, like
+strings and arrays - so inheritance, when it comes, goes there.
+
+## ⛔ INFRASTRUCTURE FIRST, TESTS SECOND, FEATURES/OPTIMIZATIONS LAST
+## (maintainer-set, 2026-08-18)
+
+The priority order, always. **Fixing a tool, a script or a test needs
+NO approval** — do not ask, do not offer it as an option, do not defer
+it to a follow-up task. Fix it, then continue.
+
+**THE INSTRUMENTS IN THIS REPO — the things whose output is treated as
+fact, and which must therefore be correct before anything built on
+them means anything:**
+
+- **`-vdj`** (disasm.cpp) - what machine code was emitted. Oracle:
+  **`scripts/disasmcheck`**, which cross-checks EVERY emitted
+  instruction against **objdump** - both the BOUNDARIES (a wrong length
+  desynchronises the rest of the fragment), the mnemonics, and EVERY
+  OPERAND - register names (GP and xmm) at their encoded width, memory
+  base/index/scale/displacement, immediates, targets - read from a
+  second dump under **`MYLANG_VDJ_RAW=1`**, which renders operands as
+  objdump does (a slot as `[rbx+0x30]`, a temp's real register, digits
+  for baked addresses). That is the TOOL rendering differently, not a
+  regex in the checker; it is non-reproducible by construction like
+  `MYLANG_VDJ_HEX`. The default dump spells a GP register at its
+  ENCODED width too (`eax`, `r11d`, `al`, since 2026-10-02 - it used
+  to print `rax` for all of them, and `e8` for `r8d`). Its first run
+  found the SIB arm dropping an r12 INDEX (100b + REX.X) - right
+  mnemonic, wrong address - which every earlier layer passed; plus the
+  self-report `DUMP IS UNRELIABLE` and the `-rt` entry
+  `jit: -vdj decodes every emitted form, address-free`.
+  **⛔ THE SELF-REPORT IS NOT ENOUGH AND CANNOT BE.** It counts `.byte`
+  lines - bytes we KNOW we failed on - and says nothing about a
+  sequence decoded CONFIDENTLY AND WRONGLY, which is the failure that
+  cost weeks (the SIB displacement bug). A decoder cannot check itself.
+  On 2026-08-19 the objdump oracle found `F7 /3` (neg) and `F7 /5`
+  (imul) missing on 284 corpus sites, printing a placeholder `f7/? rdx`
+  that was neither a mnemonic nor a `.byte` - silent to the banner AND
+  claiming a length it had not earned. **Every "I do not know" path in
+  `decode_one` must end at the single `undecoded:` label**; adding a
+  new one that prints a placeholder re-opens the hole. Current status:
+  13,268,805 instructions (21,571,485 operands) over the corpus x both
+  arenas x 16 pin rotations x 5 pin budgets, ZERO disagreements;
+  `--env K=V` adds a configuration (a forced `MYLANG_INT_CHOOSE` pick is
+  the only way to reach the xmm8-15 SSE forms - `pxor` was undecoded
+  there and in the default run alike until 2026-10-02; the int-enum CI
+  job runs three such picks, guarded to still land in r8-r15/xmm8-15).
+  `MYLANG_VDJ_HEX=1` puts the raw bytes in the dump, which is what
+  makes the check possible.
+  **⛔ THE SAME DECODER IS NOW REGTRACK's GROUND TRUTH (2026-10-02):**
+  every ASSERTS build decodes every byte the JIT emits
+  (`Emitter::trk_scan_writes`) and aborts on an undecodable byte or
+  on a general-register write no `wrote()` declared. So a new emitted
+  form must be taught to `decode_one` (and `decoded_gp_writes`, if it
+  writes implicitly) before any checked build can emit it, and a
+  GP-writing raw-byte sequence must call `wrote()` - see
+  docs/jit-optimizations.md, *REGTRACK DECODES EVERY EMITTED BYTE*.
+  **The tracker's own checks are tested by watching them fire:** a new
+  `decoded_gp_writes` row gets an ISA-derived case in
+  `regtrack_gp_write_classifier`, and a new `trk_fail` arm a scenario
+  in `jit_test_regtrack` plus an expectation row in
+  `regtrack_failure_arms` (tests.cpp) - the verdict goes through the
+  TESTS sink `g_jit_trk_verdict`, so no correct run reaches it.
+- **`-vd`** (disasm.cpp) - what bytecode was emitted. Oracle:
+  `myv_round_trip` (a loaded image vs a fresh compile).
+- **`-s` / `-a` / `-dti`** - what the optimizers did to the tree.
+  Oracle: the `analyze:` `-rt` entry.
+- **`scripts/vdjcmp`** - "is my JIT change a pure restructuring?"
+  Oracle: a SELF-TEST - one binary against itself must be 124/124.
+  **⛔ IT RUNS IN CI NOW (`nets.yml`, the differential job), because
+  for one day it was correctly REFUSING every comparison and nobody
+  invoked it** (see the `-vdj` reproducibility note below). Two more
+  layers cover the same property: `-rt`'s address-free invariant (which
+  a new OPERAND FORM once walked straight past) and
+  `driver_checks`'s two-process dump comparison.
+- **`scripts/regcensus.py`** - how much work is left to free a
+  register. Oracle: it DERIVES its accessor list from the source.
+- **`bench/run.py`** - is it faster. Oracle: RULE B1, the build-config
+  gate, and the machine-speed marker.
+- **`MYLANG_JIT_MAXPINS=N`** - cap the JIT's pin budget, so the
+  MARGINAL value of one register is a measured number. Oracle: a
+  NON-BINDING cap must be a no-op - `N >= jit_pin_budget()` has to
+  emit byte-identical code to unset, over the whole corpus. (It is
+  NOT the same as `MYLANG_JIT_OFF=cache`, which clears the picks
+  AFTER the pick and so leaves the C3/C4a side-outputs derived from
+  a full budget.)
+- **`MYLANG_JITSTATS`** - which TIER a program's calls actually took.
+  Oracle: the counters are bumped from EMITTED code only.
+- **`MYLANG_JIT_SPCHECK=1`** (TESTS) - is every emitted CALL reached
+  with `rsp % 16 == 0`, as System V requires? It emits `test rsp, 15`
+  before each one and reports through `jit_sp_misaligned` with the REAL
+  rsp. Oracle: it needs NO MODEL - which is the whole point, since the
+  emitter's own `sp_depth`/`sp_mod` model is complete only while every
+  rsp-moving emission goes through a `sp_move` seam, and a MISSING seam
+  would silence the very check it feeds. `corpus_diff --spcheck` is
+  its lane, and it belongs on an **`OPT=1 ASSERTS=0`** build as much as
+  a debug one: the first bug it caught was invisible to every checked
+  build (see *THE 16-ALIGNMENT RULE* below).
+- **`tests/corpus_diff`** - do the engines agree. Oracle: the
+  `--levers` / `--cold` / `--xrot` / `--nolowmem` / `--spcheck`
+  matrices (several may be given in ONE run; the plain part and the
+  tree-walker references then run once).
+  **IT IS PARALLEL, AND ITS REPORT IS THE SERIAL ONE (2026-09-27).**
+  Every (configuration x program) run is its own process, run up
+  front `tests/jobs count` at a time; the report is then printed
+  from the saved outputs in the serial order, BYTE-IDENTICAL to the
+  one-at-a-time script (checked for every mode on the debug binary:
+  `--levers` 419 s -> 30 s). The tree-walker reference runs ONCE per
+  flag set, since the serial script never passed the configuration's
+  env to it.
+  **⛔ IT COMPARED ONLY `tail -3` UNTIL 2026-08-26** - the last THREE
+  LINES of each program - so a divergence anywhere earlier was
+  INVISIBLE, and the tool answered "28/28 agree" for a binary that
+  printed `1 0` where the tree-walker printed `true false`. The
+  truncation was only ever meant to keep the DIFF MESSAGE short; it
+  compares the WHOLE output now and truncates the printed `diff`
+  instead. The re-run over every matrix found nothing else hidden -
+  the corpus was clean, the tool simply could not have proved it.
+  **A comparison oracle must compare everything it claims to.**
+  **⛔ AND THE SAME LESSON HAD A SECOND SHAPE, FOUND 2026-08-28: A
+  PROGRAM THAT STOPS COMPILING "AGREES" WITH ITSELF.** The comparison
+  is between two ENGINES, and a COMPILE-TIME refusal happens before
+  either one runs - so it prints the identical message on both sides
+  and reads as perfect agreement. Watched: reopening #115's multi-site
+  hole made `tests/functional/25_factory_closure_param.my` fail to
+  compile ENTIRELY, and the script still reported 33/33. There is a
+  **`compile gate`** now - `-nr` per program, reported and failing on
+  its own line. Exit CODE would not have done it: `samples/gcd`
+  legitimately exits 1 with a usage message when given no arguments.
+  **⛔ AND A THIRD (2026-10-05): A SELF-ASSERTING PROGRAM THAT FAILS IN
+  EVERY ENGINE AGREES TOO.** A failed `assert` prints the same error
+  and exits 1 everywhere: 58_flit_pinned_rcx asserted a sum built on
+  an undefined `int()` and stayed green. A `tests/functional` program
+  must now exit 0 in the tree-walker (`FAIL [..] path`, a `samples/`
+  program is exempt for gcd's reason). Its first run caught
+  `d[0]++` on a dyn int array raising NotLValueEx in every engine
+  (63_dyn_incdec.my).
+- **`MYLANG_NO_LOWMEM=1`** - refuse the low-address arena, so the
+  JIT's REGISTER-form type tags (the shipping configuration wherever
+  `MAP_32BIT` is unavailable or fails) are reachable by a test.
+  Oracle: `mylang -v` reports `lowmem 0/1`, which the `nolowmem` CI
+  lane ASSERTS in both directions before it tests anything - a lane
+  that cannot prove it is in the configuration it tests goes vacuous
+  the day a default moves.
+
+- **`-dcs`** (calleeset.cpp.h) - WHICH FUNCTION does this call site
+  reach. The CALLEE-SET analysis's only possible oracle: the analysis
+  changes no answer any program computes, so the five-mode
+  differential, `corpus_diff` and every fuzzer are blind to it BY
+  CONSTRUCTION (the *Testing an AST TRANSFORM* gap) - the SET is what
+  a test must assert, which is why the dump was built in the same
+  increment as the analysis and before any consumer. Oracle: the
+  `infer: the CALLEE-SET analysis` `-rt` entry, one case per
+  constraint form and one per ⊤ SINK, each watched failing against a
+  sabotage build. Note ⊥ ("nothing can reach here") and ⊤ ("I do not
+  know") are DIFFERENT answers and both are pinned - collapsing them
+  is the flaw in `StaticType::finfos` that this replaces.
+- **`tests/myv_doc_check`** - is `docs/myv-format.txt` still the
+  spec. Oracle: it is written from the DOC, not from serialize.cpp.
+- **`scripts/jitprofile.py` + `MYLANG_JIT_MAP=<path>`** - WHICH
+  EMITTED INSTRUCTION does the JIT spend its instructions on. It joins
+  a per-fragment instruction map, written AT RUNTIME BY THE PROFILED
+  PROCESS (so the addresses are the real ones - ASLR and where mmap
+  lands make a separate `-vdj` run useless for this), against a
+  callgrind `--dump-instr=yes` profile. `--listing` prints a fragment
+  in ADDRESS order with each instruction's Ir and a blank line at every
+  not-executed gap, which is how you read a hot PATH rather than a hot
+  instruction.
+  **⛔ IT EXISTED FOR NOBODY UNTIL 2026-08-27, AND THE WHOLE #97 CALL
+  ARC WAS COSTED WITHOUT IT** - by counting the emitted sequence BY
+  HAND out of `-vdj` and hoping the counted path was the one that ran.
+  JIT code lives in an anonymous mapping with no symbols, so callgrind
+  put every emitted instruction in one nameless blob; `-vdj` says what
+  was EMITTED, never what EXECUTED. Its first run answered in seconds a
+  question three sessions had estimated: of 142 Ir per call, 28 are the
+  ARGUMENT round trip and 71 are ACTIVATION BOOKKEEPING.
+  Oracle: a mandatory join SELF-TEST - mapped + unmapped Ir must equal
+  the run's own `summary:` line, and it EXITS 3 when it does not.
+  Watched failing: dropping the `calls=` skip (which charges a call
+  site its callee's whole subtree) inflates the profile 8x and is
+  otherwise completely plausible and completely silent.
+
+**FIX THE TOOL, NOT THE SCRIPT THAT READS IT.** Three cases from this
+repo, all found in one week, all the same shape:
+
+ - **the disassembler (2026-08-17/18).** `-vdj` could not decode **5543
+   bytes** corpus-wide — six missing opcodes and a SIB decoder that
+   never consumed its displacement — and printed confident wrong
+   mnemonics rather than admitting it. The first response was to mask
+   the symptoms in `vdjcmp` with a sed pipeline plus `setarch -R`.
+   The mask was hex-only, #96 step 3 made the values decimal, and from
+   that day the script reported **0 identical / 108 differing for every
+   comparison** — it had stopped being an oracle and looked exactly
+   like a catastrophic change. It also reported a binary as differing
+   from ITSELF (31 of 108), which no regex could ever have fixed. The
+   fix belonged in `disasm.cpp`; afterwards the comparison script is a
+   plain `cmp`;
+ - **the register census (2026-08-17).** `regcensus.py`, written
+   expressly to count hardcoded register uses, reported **14** for r9
+   where the truth is **87** — it could not see `movabs_r9`,
+   `cmp_r9_rdx`, `lea_rdi`, `slots_to_arg0`, `store_elem_byte_dil`,
+   because the register is in the METHOD NAME. Acting on that number
+   put an unsafe register in the JIT pin pool and shipped a wrong
+   answer for a day;
+ - **`bench/run.py` defaulting to the maintainer's binary** (RULE B1) —
+   the same class: a plausible number measured from the wrong subject.
+
+**THE THREE PROPERTIES a MyLang instrument must have**, and where each
+already exists so a new one can copy it:
+
+ 1. **REPRODUCIBLE.** `-vdj` prints `<int-tag>`/`<addr>`/`<helper>`
+    instead of baked pointers, so two runs and two separately-linked
+    binaries give identical text (`MYLANG_VDJ_ADDRS=1` for the digits;
+    it is a VALUE check, so `=0` means OFF - it was a PRESENCE check
+    until 2026-08-29, which made `MYLANG_VDJ_ADDRS=0` turn the masking
+    off and read as "the dump is not reproducible", the exact wrong
+    conclusion the masking exists to prevent. `MYLANG_VDJ_HEX` too).
+    Before that it was not comparable at all.
+ 2. **IT SAYS WHEN IT DOES NOT KNOW.** `-vdj` counts undecoded bytes
+    AND skipped op marks (a mark is an offset the JIT recorded at a
+    real instruction boundary, so stepping past one proves the decode
+    drifted) and prints a banner. `run.py` prints its
+    `mylang : <path>` header and refuses a wrong build config.
+ 3. **IT SELF-TESTS.** `vdjcmp` compares a binary with ITSELF and
+    exits 2 if that is not identical — otherwise it cannot distinguish
+    "your change altered the code" from "the tool broke", and it
+    reported the second as the first for weeks.
+
+**And the corollary for TESTS of an instrument: watch it fail.** The
+`-vdj` coverage check was VACUOUS THREE TIMES before it caught
+anything — it counted a bytecode op NAME for its vacuity guard;
+`-vdj` is `g_jit_annotate`, not a dump flag, so the dump had no native
+section at all; and its programs were all statically typed while the
+missing opcode lives in a boxed TYPE CHECK. See *THE VACUOUS-TEST
+TRAP*.
+
+**⛔ AND A SABOTAGE HARNESS MUST REBUILD AFTER IT RESTORES — RESTORING
+THE SOURCE IS NOT RESTORING THE SUBJECT (2026-08-29).** The
+watch-it-fail rule means running a build with the defect reintroduced,
+so every such harness ends by putting the source back. That is only
+half the job: the BINARY it left behind is still the sabotaged one, and
+the next command run against it measures the sabotage.
+
+Watched, and it cost half an hour: a `trap restore EXIT` put
+`src/vm.cpp` back after three #121 sabotages and did not rebuild, so
+`build-claude/t121/mylang` stayed built from *"the old closure is not
+released"*. `corpus_diff` was the next thing run and duly reported
+`32/34 agree` with LeakSanitizer traces on the two closure programs —
+a completely convincing leak, in a tree that was clean. The tell that
+should have come first: `git diff` showed nothing wrong, and a
+BASELINE worktree build did not reproduce it.
+
+**Put the rebuild INSIDE the restore function**, not after the last
+case, so an early `set -e` exit or an interrupt cannot skip it. Same
+family as [[stale-build-lane-wrong-subject]] and RULE B1: before asking
+what a measurement means, ask what BINARY produced it.
+
+**⛔ AND A RESTORE THAT KEEPS THE OLD MTIME REBUILDS NOTHING
+(2026-10-06).** Restoring from a copy with `cp -p` / Python's
+`shutil.copy2` puts back the backup's OLD modification time, older than
+the sabotaged object - so `make` sees the object as up to date, the
+"restore rebuild" is a no-op, and the sabotage stays in the binary. Every
+later case then runs on a binary carrying the earlier ones: a 14-case run
+reported 13 caught, and at least three of those verdicts were caused by a
+leftover from a previous case, not their own defect. Restore with a plain
+copy and touch the file. **And give the harness a CONTROL**: after the
+restore rebuild, run the same check again and require it to PASS - that
+is the only proof the restore reached the binary, and it is what exposed
+this one (a tree-walker failure after a codegen-only edit).
+
+**⛔ AND AN ABORT IS A FAILURE THE SUMMARY LINES NEVER PRINT
+(2026-10-08).** A harness that decides "caught" by counting the suite's
+`FAIL` summary lines reads a sabotage that ABORTS the run (an
+`ML_CHECK`, an `ML_VM_CHECK`, a SIGSEGV) as zero failures - the suite
+never reached its summary. Two of a step-3 run's sabotages were
+reported "not caught" that way while both aborted with rc 134. Record
+the EXIT CODE beside the count, and treat a non-zero one as caught.
+
+**⛔⛔ AND `git checkout -- <file>` IN A HARNESS DESTROYS THE
+UNCOMMITTED WORK IN THAT FILE. COMMIT BEFORE YOU SABOTAGE (2026-08-29,
+the same day, in the same session).** Every such harness restores with
+`git checkout --`, which is correct only if the file was CLEAN when it
+started. During #123 it was not: `src/jit.cpp` held the whole
+uncommitted GP change, the harness's `trap restore EXIT` fired when the
+run timed out, and one command erased it. It was recoverable only
+because every edit happened to be replayable from this session's
+transcript — the exact luck the FORBIDDEN-COMMANDS rule says not to
+rely on.
+
+`git checkout --`, `git restore`, `git reset --hard` and
+`git stash drop` are already FORBIDDEN as a way to "get back to green";
+what this adds is that a HARNESS runs them too, at a moment you are not
+watching. So the order is not optional:
+
+    1. commit the work (broken is fine — that is the whole point)
+    2. THEN run the harness that sabotages and restores
+
+A harness may also `cp` the file aside and restore from the copy
+instead, which removes the hazard entirely and costs one line.
 
 ## What this is
 
@@ -58,17 +469,146 @@ make -j BUILD_DIR=other    # out-of-tree build
 make clean
 ```
 
+> **⛔ CLAUDE BUILDS ONLY UNDER `build-claude/` (maintainer rule,
+> 2026-07-26).** Every build Claude makes goes in a subdirectory of
+> `build-claude/` — e.g. `make -j BUILD_DIR=build-claude/release`,
+> `BUILD_DIR=build-claude/dbg`, `BUILD_DIR=build-claude/meas-<sha>` — NEVER
+> in `build/`, `build-rel/`, or any other top-level directory. The
+> maintainer's own build dirs (whatever he creates: `build`, `build-rel`,
+> ...) are OFF-LIMITS: never build into or measure with them (for
+> DELETING `build/`, see the mandatory pre-benchmark step below — the
+> maintainer's 2026-08-12 instruction, which overrides the older
+> "never delete" wording for that one case).
+>
+> ## ⛔⛔ RULE B1 — NEVER BENCHMARK THE MAINTAINER'S BINARY ⛔⛔
+> ### (maintainer-set 2026-08-12, after it produced two invalid runs)
+>
+> **`bench/run.py` DEFAULTS `--mylang` TO `build/mylang` — THE
+> MAINTAINER'S BINARY, NOT YOURS.** A bare `python3 bench/run.py` does
+> NOT measure your change. It silently measures HIS build, at whatever
+> commit he last compiled, and prints a plausible geomean you will then
+> report as your result. That happened on 2026-08-12: two full-suite
+> runs and a reported "post-flip 2.514x" were all his binary. The
+> maintainer's words: *"it's truly unacceptable."*
+>
+> **THE TWO MANDATORY STEPS, BOTH REQUIRED, EVERY TIME:**
+>
+> 1. **DELETE `build/` BEFORE ANY PERFORMANCE RUN** — `rm -rf build`.
+>    This is the maintainer's explicit instruction and it OVERRIDES the
+>    "never delete his build dirs" clause above for this one purpose.
+>    The point is FAIL-FAST: with `build/` gone, a forgotten `--mylang`
+>    makes run.py die immediately instead of quietly timing the wrong
+>    program. He rebuilds his own tree when he wants it; a silent wrong
+>    number costs far more than his rebuild.
+> 2. **PASS `--mylang build-claude/<lane>/mylang` EXPLICITLY** (and
+>    `--baseline` likewise, when comparing). Never rely on the default.
+>
+> **AND CHECK THE HEADER.** run.py prints one line - `mylang : <path>` -
+> as its first output. READ IT before quoting any number from that run.
+> If it does not name a `build-claude/` path, the run is INVALID: throw
+> the numbers away, do not "sanity-check" them, do not report them.
+>
+> This is restated at the benchmark sections below on purpose. It is the
+> easiest mistake in the repo to make and the hardest to notice, because
+> the wrong answer looks exactly like the right one.
+> Name the lanes descriptively and DELETE throwaway measurement lanes when
+> the measurement is done — 40+ stale `build-meas*` dirs once littered the
+> repo root, which is what triggered this rule. Standard lanes:
+> `build-claude/release` (plain `make OPT=1` — the ONLY binary to
+> benchmark), `build-claude/dbg` (gcc `TESTS=1 OPT=0`, ASan+UBSan),
+> `build-claude/clang` (`CXX=clang++ TESTS=1 OPT=0`),
+> `build-claude/rel-hard` (`TESTS=1 OPT=1 VM_HARDENING=1` — tests only,
+> never benchmarked). **`tests/run` builds too, and its default root is
+> `build-tests/` (the maintainer's): Claude runs it with
+> `--build-root build-claude`.**
+
 `OPT` defaults to 1 (`-O3`); `OPT=0` drops it. `TESTS=1` adds `-DTESTS`, which
 is what compiles the
 `-rt` suite into the binary. Base flags:
-`-std=c++17 -ggdb -Wall -Wextra -Wno-unused-parameter
--fwrapv`. The Makefile auto-generates header dependencies under `.d/`.
+`-std=c++17 -Wall -Wextra -Wno-unused-parameter
+-fwrapv`. The Makefile auto-generates header dependencies under
+`$(BUILD_DIR)/.d/` - PER BUILD DIR since 2026-09-27: a shared top-level
+`.d/` was rewritten by every lane, so two lanes building at once
+(`tests/run` does exactly that) raced on the `.Td` temp file and left
+each other's object named in the surviving `.d`, silently dropping a
+lane's header dependencies. **And each `.d` names its object under
+EVERY spelling of the path - as given, absolute, and relative to the
+repo (`DEPFLAGS`, 2026-09-28; the first fix named only two, and a .d
+an absolute build wrote then held the absolute form alone):**
+`tests/run` builds a lane with an ABSOLUTE `BUILD_DIR`, a hand build of the
+same lane passes a relative one, and a `.d` whose target string differs
+from the object make is asked for matches nothing - every header change
+was silently ignored for that lane, and a stale `serialize.o` kept the
+old opcode count and refused every image holding a new opcode as
+"corrupt". **And the Makefile makes `BUILD_DIR` absolute before using
+it (2026-10-10):** "relative to the repo" means relative to make's
+CURDIR, so a `.d` written by a build run from ANOTHER directory (a copy
+of the tree building into this lane) held only absolute spellings, and
+the next relative build missed every header again - a stale
+`backtrace.o` against a grown `ParamDesc`, an ASan heap-buffer-overflow
+in every compile. Every target is now requested by its absolute name,
+which every `.d` holds. After a header change, a surprising result from
+a lane `tests/run` also builds is still a reason to `make clean` that
+lane first.
+
+**⛔ DEBUG INFO IS OFF BY DEFAULT — `DEBUG_INFO` (default 0, EVERY build
+type, both build systems; maintainer-set 2026-08-26).** The `-ggdb` that
+used to sit in the base flags multiplied the binary's size >10x
+(a debug+TESTS build: 155MB -> 12MB) for information unused in most
+builds — pure disk wear. `make DEBUG_INFO=1` (CMake `-DDEBUG_INFO=ON`)
+restores it; pass it whenever you want a debugger, a SYMBOLIZED
+sanitizer report, or line-accurate callgrind attribution (a bare
+address-only ASan trace is the tell that you forgot). On the CMake side
+the OFF default also strips the `-g`/`/Zi` that CMake's own
+Debug/RelWithDebInfo per-config defaults inject. The `dbginfo` CI lane
+(linux.yml) builds `DEBUG_INFO=1` on both build systems and asserts the
+ELF's `.debug_info` in BOTH directions (present with the flag, absent
+without), so neither configuration can rot.
 
 **LTO is on by default for optimized builds.** `LTO` defaults to `OPT`, so a
 release build links with `-flto=auto` (added to `BASE_FLAGS`, which the link
 line passes too) — ~7% smaller binary and ~8-9% faster on `bench/`. It works on
 both GCC and clang and is verified to keep `-rt` green. Build with `LTO=0` to
 disable (e.g. for a faster/debuggable link); an `OPT=0` build is non-LTO anyway.
+
+**⛔ `LTO=0` IS A LANE, NOT A FOOTNOTE — AND IT CARRIES DIAGNOSTICS LTO
+CANNOT (2026-08-17).** Because `LTO` defaults to `OPT`, every optimized
+build anywhere — CI included — was an LTO build, so `make OPT=1 LTO=0` was
+compiled by nobody and had been BROKEN for a day before anyone tried it.
+The break was not cosmetic: **GCC's `-Wclobbered` needs the ordinary
+per-TU pipeline to see a whole function at compile time, so an LTO build
+is SILENT about it**, and what it was silent about was real UB —
+`jit_str_probe_verify` read a non-`volatile` local after `siglongjmp`
+(indeterminate per C17 7.13.2.1p3), so a faulting probe could have
+reported SUCCESS and the JIT would have baked a `std::string` layout the
+toolchain does not have. The `lto0` job in `.github/workflows/linux.yml`
+(both compilers, Makefile + CMake, `-rt` + `driver_checks` +
+`system_smoke`) exists to keep that closed. It ASSERTS `mylang -v`
+reports `lto 0` before testing, so the lane cannot go vacuous if a
+default changes — and for that to be possible on the CMake side,
+**CMake now defines `ML_LTO` too** (a per-config generator expression
+tracking the OUTCOME of `check_ipo_supported`, not the request; a CMake
+build used to answer `lto unknown`). **A warning that only one build
+configuration can see is a warning nobody sees.**
+
+**⛔ AND IT CUTS BOTH WAYS: THE LTO BUILD SEES WARNINGS THE PER-TU ONE
+CANNOT, SO A GREEN `make -c` DOES NOT MEAN A GREEN LINK (2026-08-25).**
+`-Werror` fires at **lto1**, i.e. during the LINK, on code the LTRANS
+inliner assembled — so the failure names a line in a file that compiled
+silently minutes earlier. The first instance: `TypeFunc::clone` read
+`func.capture_slots.empty()` through a handle obtained from
+`EvalValue::get<T>() const`, which returns a **COPY** — the temporary's
+`~intrusive_ptr` inlines `release()` -> `delete` -> the POOLED
+`operator delete`, which writes the freelist link over the object's
+first 8 bytes and ends its lifetime. GCC cannot prove the count never
+reaches 0, so the read after it is "may be used uninitialized"; the
+plain `-O3` compile of types.cpp inlines the free differently and says
+nothing. **The idiom, not a suppression: read a handle you only borrow
+with `get_ref<T>()`** (no retain/release pair, no phantom free before
+the read — `TypeDict::clone` already did). When a link-only warning
+appears, reproduce it with the LINK STEP ALONE (the objects are already
+built: ~3 min vs a full rebuild) and add `-Wno-error
+-fopt-info-inline-optimized=FILE` to see what the inliner put there.
 
 **Sanitizers default on for debug builds.** `ASAN` and `UBSAN` (AddressSanitizer
 / UndefinedBehaviorSanitizer) both default to **on when `OPT=0`** and **off when
@@ -81,6 +621,298 @@ overflow is *defined* here, not a bug); it also runs with
 instead of diagnose-and-continue — otherwise a real UB could print and still
 exit 0 past CI's exit-code check. `-fno-omit-frame-pointer` is added whenever
 either sanitizer is on. `-rt` is verified green under both.
+
+**Intrusive tests: `INT_TESTS` (default 0; CMake `-DINT_TESTS=ON`, #107).**
+The test build that may instrument EVERY pipeline stage - observers,
+per-site forcing switches, decision perturbers, test-only builtins - all
+behind `#ifdef INT_TESTS`, so a shipping or a plain `TESTS=1` build is
+unchanged. It IMPLIES `TESTS` (defs.h `#error`s on a hand-rolled
+`-DINT_TESTS` without it). **It is never a measurement subject:**
+`mylang -v` reports `int_tests 0/1` in every build, `bench/run.py`
+REFUSES a binary reporting `int_tests 1`, and the intrusive runner will
+refuse one reporting `0` (`driver_checks` pins the line; set
+`MYLANG_EXPECT_INT_TESTS=1` when running it on an INT lane). Design and
+phases: `plans/intrusive-tests.md` - READ IT before adding a hook.
+**A site is one row of `src/intsites.h` plus one `ML_INT(site, ...)`
+line**, its payload typed and pointer-free (an event must print the same
+on every run); `tests/int_run BIN` runs `-rt`, every `tests/int/*.my`
+under both engines, and the SITE CENSUS - a site no run reaches FAILS, so
+add a site together with the test that reaches it (a site counts only when
+a test READS it through `int_*` - reaching it and asserting nothing checks
+nothing). **`--gcov` (a `GCOV=1` INT build) measures the coverage
+universe** (plan section 9): branch outcomes + MC/DC conditions (GCC >= 14,
+`-fcondition-coverage`) + sites, per TEST UNIT (`-rt`, each `tests/int`
+program), named `file:function:+offset` so an edit elsewhere renames
+nothing. Two checks: every unit OWNS an element no other covers (else it
+is redundant and goes), and uncovered elements stay under the per-compiler
+floor in `tests/int/coverage-floor.txt` - a ratchet, lowered when tests
+cover more, NEVER raised to let a change land. Mark a genuinely
+unreachable line `INT-COV-EXEMPT: reason`. **A coverage build defaults
+UBSan OFF** (both build systems): its check on every variable shift and
+bounded access is a branch gcov counts and no input can take - 5,198
+such edges were in the universe until 2026-10-02. **And it compiles the
+assertions out** (`ML_COVERAGE=1`, both build systems, 2026-11-07):
+`ML_CHECK` / `ML_CHECK_MSG` / `ML_VM_CHECK` name their condition in an
+unevaluated `sizeof` - no code, no branch - while NDEBUG stays off, so
+REGTRACK, the teardown proof and the verifier still run and are still
+measured. A failure arm no correct run may take is the same kind of edge,
+and an always-inline helper's check (`Frame::at`'s bounds) charged one to
+every call site: 8,385 elements left the universe (123,177 -> 114,792).
+**And it emits every `ML_ALWAYS_INLINE` helper once, out of line**
+(defs.h, 2026-11-07): forced inline, each caller had its own copy of the
+helper's branches, so a decision reached through one opcode's handler was
+uncovered in the eighty others (`read_int_slot`'s bool arm alone was 87
+elements) - about 4,600 more left the universe (114,835 -> 110,154,
+uncovered 19,891 -> 17,363 with that day's units).
+`mylang -v` says `coverage 1` and `asserts 0`. `ML_UNTRUSTED_CHECK` stays
+in (a hostile image takes its failure arm), and so does a raw `assert` -
+product code uses ML_CHECK. **`tests/driver_checks` is a unit too**
+(2026-11-07): the CLI driver's code is measured by the test that checks
+it. The universe is the PRODUCT: `tests.cpp`, the INT core and every INT
+helper (NAME IT `int_*` / `jit_int_*` / `bc_int_*`, or its branches
+count) are outside it, and so
+are the lines of an `ML_INT(...)` / `ML_INT_ONLY(...)` call inside a
+product function (keep an INT-only condition INSIDE the macro) and
+every test-only `#ifdef TESTS` / `#ifdef INT_TESTS` region of a product
+file (since 2026-11-11 - selftests, oracles and counter bumps no shipped
+build compiles were 512 uncovered elements; `tests/mutate` already
+skipped them), and the second outcome of a `catch (Exception &)`
+handler's type test - an exception that is not an `Exception`, which
+the product never throws: gcov counts it as an ordinary branch, and 106
+uncovered elements were nothing else (`root_catch_lines`, 2026-11-13).
+A test
+program's header picks its runs: `# INT-ENGINES: default` for a codegen or
+JIT decision (the tree-walker never runs those passes),
+`# INT-CONFIGS: default ; MYLANG_JIT_OFF=lsra` for several environments.
+An engine is a name from `ENGINE_FLAGS` (int_run: `default`, `tw`,
+`nj`, `vm`, `nbi`, `noopt` = `--no-opt all`, `nc` = `-nc`, `ni` = `-ni`),
+two joined with `+` (`nbi+nj`); the engines of one configuration must
+print the same stdout.
+A unit whose header says `# INT-SOURCE: ../functional/NAME.my` RUNS that
+program under its own headers: a functional test counted as a coverage
+unit without a second copy (the census pass runs tests/functional too, but
+only units count toward the universe). `driver_checks` compiles every
+functional program (the image round trip), so such a unit must own what
+RUNNING the program reaches.
+**`tests/int/repl/*.session` are REPL units:** each is fed to `--repl`
+on stdin under a fresh `HOME` and must print exactly its `.expected`, nothing
+on stderr - the interactive front end (input loop, history, the line
+editor's off-TTY path), which `-rt`'s REPL tests never reach because
+they drive `ReplEngine` directly. They came from `repl_fuzz`
+(2026-10-04: 24 of its CI sessions reached 365 elements nothing else
+did); `int_run --update-repl` rewrites the `.expected` files (not
+`.out`: .gitignore drops that extension).
+**`tests/int/tty/*.keys` are TERMINAL units:** the same REPL typed on
+a pseudo-terminal, one input per line, once the REPL waits for a key in
+raw mode, and compared byte for byte with `.expected` - the line editor's
+TTY half (raw mode, repaint, completion, the Ctrl-R pane, paste), which
+nothing else can reach. Linux only; tests/CLAUDE.md has the rules.
+**A pass that may discard and redo its work records inside an
+`ML_INT_DEFER` scope** (the JIT's retry label has one): a discarded
+attempt then records nothing. The `int_*` builtins
+sort AFTER every other builtin, so an INT build moves no builtin slot;
+the `int` job in `nets.yml` checks the INT build emits byte-identical
+`-vdj` to a `TESTS` build (`vdjcmp`) - an instrumented point may only
+READ the state it reports.
+**THE DECISION ENUMERATOR (P3, `tests/int_enum`).** A heuristic with
+several LEGAL answers asks `int_choose(key, n, dflt)` (inttest.h) and
+records a `reg_choice` instance; `MYLANG_INT_CHOOSE=key=idx` forces an
+alternative, and tier 1 re-runs every program once per alternative of
+every instance, requiring the tree-walker's stdout, stderr AND exit
+code (RULE 2 - a caret or backtrace is observable). Ten sites today:
+`reg_choice` (every register pick), `pin_budget` (a run's pin cap),
+`spill_choice` (which piece loses its register in the linear scan's
+pressure contest) and `flit_choice` (the float literal pool: its cost
+gate, and each literal it would hold), keyed by RUN (`<fn>@<begin
+pc>/...`); `splice_choice` (the bytecode inlining of a site) and
+`inline_choice` (an AST inline), keyed by CALL SITE
+(`<caller>/splice@L:C`, `<caller>/inline@L:C`) - declining is always
+legal, so each decline is RULE 2 checked at that one site; and
+`unroll_choice` (a pure tree-recursive function's unroll depth, any of
+0..REC_UNROLL_MAX, keyed `<fn>/unroll` - the instance, `fib$0`, is the
+one that runs); and `frameless_choice` (a call site the JIT would make
+frameless takes the general push instead, keyed `frameless@L:C`, asked
+inside `jit_frameless_candidates` so every consumer of that predicate
+gets the same answer); and `decline_choice` (P7, THE PER-SITE FORCING
+SWEEP: every guarded tier's decline - each `decline_jump`, each
+reference check's helper arm, an inline-cache guard's miss - can be forced for ONE site, keyed
+`<run>/<guard>@<pc>#<k>`; a forced `jcc` is followed by its inverse to
+the same pad, so the emitter still sees a conditional jump). 33 of the
+50 decline reasons are taken by no corpus program on its own; the
+sweep is the only thing that runs those slow tiers; and `island_choice`
+(a function body's model-flip CONTAINER, keyed `island:<fn>/all`: every
+op the island list admits runs as an interpreted island inside one
+native container - dead on real code since every such op went native,
+so this is the only thing that runs `jit_try_container` and
+`jit_exec_block`; its first run found that a container cannot hold a
+try region, which it declines now). Every enumerator
+run has the OBJECT CENSUS on, so a leak is a stderr difference. Watched:
+a retain before the slice-element decline (balanced on the fast path)
+leaks on 10 forced declines in 6 programs, with `-rt` and every
+default run green. **Correctness must
+not depend on which legal register the allocator picks** - its first
+run found five JIT bugs the default picks never reach. Tiers 2 and 3
+run TWO decisions at once within a SCOPE (keys sharing the prefix before
+the last `/`): `--tier 2` every combination of each scope with at most
+512 of them (~3k runs, seconds - CI, every push), `--tier 3` a
+deterministic greedy covering array of every non-default value pair of
+each larger scope (~110k runs, ~6 min here, ~10x on a hosted runner -
+`int-deep.yml`, on demand); a failing row is reduced to a minimal
+vector. Watched: without the call epilogue's float-pool restore, tier 1
+fails 4 corpus programs, tier 2 one, tier 3 eleven (most invisible to
+tier 1), each reduced to a 2-4 decision vector. Run it on the
+FAST lane: `make OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1
+BUILD_DIR=build-claude/int-rel` (the whole functional corpus in ~40 s).
+A hook in a product function must be `noexcept` and allocate nothing
+the product sees: `int_enumerate` added an exception edge to every
+`take()` caller and the coverage gate counted it as a new branch.
+**VALUE CLASSES (plan 9.1, 2026-10-04).** A declared BOUNDARY of an
+operation - a shift by 64, an index of -1 or of len, INT_MIN / -1, an
+empty array - is a row of `ML_INT_VCLASSES` (intsites.h), counted by a
+noexcept `int_vc_*` classifier (through `ML_INT_ONLY`) where the
+operation is defined for the reference engine: the shared helper when
+there is one, else the tree-walker. `int_run` fails on a class no run
+exercises and, with `--gcov`, counts each as a `vc:` coverage element.
+A new class comes with its recording point AND a `tests/int` assertion
+of its result FROM THE README; if the README is silent on that
+boundary it gains the rule first - the spec is the oracle, and a
+boundary it does not state cannot be checked (rules added that way:
+the sign of `/` and `%`, negative indexes, `pop`/`top`/`join` on an empty
+array, slice clamping for arrays, float division by zero, how a NaN and
+-0.0 print, `int()` of a float with no int value, `range()`'s elements,
+what string `int()` / `float()` accept, `str(f, d)`'s digit range and
+tie rounding, the literal limits). The float family's
+first run found three real defects: `-x` of 0.0 was +0.0 in the VM and
+JIT (codegen lowered it to `0.0 - x`; it is `-0.0 - x` now), `int()` of
+NaN / inf / an out-of-range float was an undefined C++ cast (it throws
+`InvalidValueEx` - two tests had asserted the x86 result), and a NaN
+printed `-nan` or `nan` by platform (always `nan` now). The range /
+text / literal families (2026-10-05, 127 classes) found four more:
+`range()` stepped `i += step` past the end, so a step that carried the
+value past an int limit WRAPPED below the end again and never stopped (it
+counts its elements first now); `int(s)` / `float(s)` read a C PREFIX
+(`int("3.7")` was 3) - the whole string is the number now, InvalidValueEx
+otherwise; glibc's strtod reports a subnormal as a range error, so the
+smallest double was an unwritable literal; and `1E5` was an invalid token
+while `float("1E5")` read it. **`numtext.h` is the ONE reading of a number
+as text** - the parser's literals and `int()` / `float()` share it, so
+the two cannot drift again. Its float range rule is the maintainer's
+hybrid: out of range is a compile error when the value is known at
+compile time (a literal, or `float()` const-evaluated - the builtin asks
+`ctx->in_const_eval()`) and rounds to inf / a signed zero at run time.
+**THE OBJECT CENSUS (P4, 2026-10-03).** Each pooled heap object kind
+(str, arr, dict, struct, func, exc, box) is counted at its class `operator
+new/delete` in an INT build (`ML_POOL_NEW_DELETE_K`, poolalloc.h - the
+plain macro elsewhere); `int_live(kind)` reads a count, and with
+`MYLANG_INT_CENSUS=1` a process prints `census LEAK <kind> base B end E`
+for any kind not back at its baseline (marked in `main` after
+`parse_args`; checked after `main`'s locals die, before any static
+destructor; an `exit()` ending prints `census skipped (exit)`).
+`int_run` fails on a LEAK line in every tests/int run and over the
+corpus under both engines. Pooled memory is reachable from the pool's
+free lists, so LeakSanitizer cannot see such a leak - this can (watched:
+a frame release that dropped closures without releasing them). A
+`VmProgram` now erases its function chunks from the process-global
+chunk map when destroyed (they kept their constants alive past the
+program). **THE VM STATE CHECKER runs on EVERY op of EVERY INT run**
+(`int_vm_state_check`, at each dispatch in vm.cpp - no switch, since a
+runtime switch would leave a never-taken branch at every `VM_NEXT`): a
+slot not in the chunk's `ref_slots` holding a reference, or a `borrowed`
+slot holding no reference or a slice, aborts with `INT-VMSTATE: <fn>, pc
+N, slot S: ...` at the op that caused it. Watched: removing the catch
+bind slots from `ref_slots` (the #78 step D gap) is caught at its pc,
+where an assert-on, hardening-off run printed the right answer. It also
+checks PROVEN TYPES (our own bytecode only - a loaded image's proofs are
+input): a typed or C3-proven parameter holds its scalar (or `none` when
+`opt`) at every op of its body (`Chunk::int_param_kinds`, INT-only, last
+in the struct, stamped by both drivers), and the dst of the op just run
+holds the one kind that op writes (`int_op_result_kind`, a short list;
+read at the fall-through successor in the same frame, since an op that
+raised skipped its write). Watched: a bind that stops widening an int
+into a `float` param, and CmpIntV writing an int, each abort by name.
+And SLICES (`SharedArrayObj::int_slice_fault`): a slice in a slot is
+registered in its storage's set with its window inside the storage, the
+`has_slices` mirror matches the set, and every registered view is a
+slice of that storage. Watched: a copy-assign that skips the
+registration, and an overwrite that skips the unregistration, each
+abort at their op. And REFCOUNTS: no object counts fewer handles than
+the owning (non-borrowed) slots of the frame holding it - watched: a
+MoveV that copies a reference without a retain. (The borrowed byte is
+checked on listed slots only: a frameless window leaves a scalar
+parameter's tail unwritten, W5, and only release scans read it.) A
+hook in the dispatch loop must be `noexcept` (an exception edge per
+dispatch is a coverage-universe branch) and named `int_*`.
+**THE JIT PROBE (P5): with `MYLANG_INT_PROBE=1` the same slot checks
+(`int_slots_fault`, vm.h) run INSIDE NATIVE CODE, at every op boundary
+of every fragment.** The emitter puts a 7-byte `call [abs32]` there (the
+cell is in the low arena; no arena, no probes); `jit_int_probe_stub`
+saves all 15 GPRs, the flags and xmm0-15, aligns the stack and calls
+`jit_int_probe_check`, which finds the probe's record by its return
+address and checks the slots whose memory is authoritative at that pc -
+a pin, a spill home, a type-elided slot, a `ret_unflushed` slot and a
+W3-poisoned one are skipped. The call goes AROUND every self-accounting
+seam (the call seam, the rsp model, the bets, `wrote()`), so it changes
+no decision, and `int_run` checks exactly that: the probed `-vdj`, its
+`call [<addr>]` lines dropped and every byte offset masked, must equal
+the plain `-vdj` (a plain dump holding such a line fails as ambiguous).
+`int_run` turns the probe on for every tests/int run and the corpus
+pass (whose probed engines must also print what `-tw` prints), and
+fails if no probe ran; `-rt` runs without it (its shape tests read the
+dump). No emitted code addresses below `rsp` (`load_rsp_disp` asserts
+it), so the probe's return address clobbers nothing. Watched: the stub
+clobbering xmm3 changes 8 corpus outputs; one extra emitted byte per
+probe fails the invisibility check on 63 programs; a frameless site
+borrowing a SLICE (the W5 decline removed) aborts 55_regcall at the
+callee's entry, where the unprobed run and the VM checker see nothing.
+NOT done: comparing a pinned register with what its slot would hold -
+there is no shadow value to compare it with.
+**THE CHUNK HOOK (P6, inttest.h): `IntHookScope h(IntStage::pre_splice,
+fn)` hands a C++ `-rt` test every chunk codegen produced, by function
+name, before the bytecode inliner snapshots any of them; `post_splice`
+hands it the inliner's output before the JIT.** A test EDITS a real
+compiled chunk to build a shape codegen never emits - prefer
+retargeting an operand over inserting an instruction, which would shift
+every pc-keyed table - and READS the verdict off `post_splice` rather
+than off a counter (a counter also counts the program's other sites).
+`int_splice_gates` reaches the three step-1 gates no program can (a
+staging temp live after the call, a body reading its returned slot
+first, a call whose dst is its callee slot); removing any one gate now
+fails it, and nothing else.
+**SELECTION AND REDUCTION (P8, `tests/int_select`, offline - not
+CI):** on a GCOV INT build, every candidate (program x configuration,
+`-rt` with `--with-rt`) runs once - in parallel, each under its own
+`GCOV_PREFIX` tree with the objects symlinked beside its counters - and
+is EXCLUDED unless it prints what `-tw` prints; then a greedy +
+removal-pass IRREDUNDANT cover of everything reached, with the
+ownership table (each selected test owns an element no other covers,
+checked). `--shrink NAME` ddmin-reduces a selected `.my` while it keeps
+its owned elements, its exit code and its agreement with `-tw` (so a
+program's own asserts may go - the tree-walker is the oracle); NAME may
+be a PROGRAM, which then keeps what it owns under EVERY configuration it
+was selected for, and several shrink side by side. The default
+configurations include the four `nested_fuzz` runs (`-nbi`, `-nbi -nj`,
+`--no-opt all`, `-tw --no-opt all`) - the only route to the code behind
+those flags. Coverage is collected in worker PROCESSES: parsing gcov's
+JSON is pure Python, and on the candidate threads the GIL made the pass
+~10x slower. First run (2026-10-03): 521 candidates reach 81,332
+elements; 64 tests cover them all, 83 s of runs against 210 s, and
+`-rt` alone owns 25,962.
+**EVERY TEST TOOL THAT CAN RUN FOR MORE THAN A MINUTE SERVES ITS
+PROGRESS (maintainer-set, 2026-10-04), and `tests/testctl` with no
+arguments lists them all**, one row each: the PERCENTAGE, done/total,
+phase, elapsed, ETA, failures, what it is on now (`testctl watch`
+refreshes it; `status [RUN]` is the full JSON, whose `percent` field is
+the obvious one). Two server kinds in `tests/lib/testrun.py`: a `Run`
+(independent ordered items: heartbeat, the control socket, stop / pause
+/ `jobs N`, resume by a low-water-mark token - int_enum, int_select's
+exploration, mutate) and a `Monitor` (sequential phases or a loop: the
+same socket, heartbeat line and status fields, fed by the tool's
+`advance()` / `phase()`, `status` only - int_run, nested_fuzz, myv_fuzz,
+repl_fuzz, norec_enum, norec_sweep, bt_oracle, disasmcheck,
+int_select's shrink, mutate's setup, tests/run). A SHELL tool runs
+`tests/testmon` beside it, which counts its result files
+(corpus_diff). A new long tool gets one of the three; the heartbeat
+lines are the CI log's view of the same numbers.
 
 **Assertions: `ASSERTS` (default 1).** The C `assert()` + the project's
 `ML_CHECK()` invariant net (see *Invariants & hazards*) are **on for every build
@@ -116,279 +948,1286 @@ a mystery segfault. Still gated by `ASSERTS` (a no-op under `NDEBUG`). CMake:
 `-DVM_HARDENING=ON/OFF` (default follows the build type). See *Invariants &
 hazards*.
 
-**THE NATIVE IN-VM CALL STACK (plans/vm-native-call-stack.md, phases A-F
-complete).** A VM->VM call (`CallV`/`CachedCallV`/`CallValueV` with a
-chunked callee) is a STATE CHANGE inside the dispatch loop, not a C++
-call: `vm_enter_call` pushes a **call record** + a frame **window** on the
-activation's SEGMENTED slot stack (segments never move - C++ builtins hold
-frame pointers across user callbacks, so windows must be address-stable),
-binds args with a `fast_bind` copy loop (or the coercing loop for typed
-params), switches `chunk`/`pc`/`captures`, and dispatches; `ReturnV`/`Halt`
-pop the record and write the parent's result slot directly (FlowState is
-gone from in-VM returns; the deleted `LoopBackEdge` was its last reader).
-Per-frame state (handler stack, dict/dyn iterator pools, in-flight caught
-exception, finally-pend, the per-frame `PureCache` - stashed/restored so
-the shared view Frame can't leak it into global memoization) lives in the
-records as watermarked slices of shared stacks. The exceptional path is a
-FRAME WALK at the activation's single landing pad: dispatch to a handler in
-the current frame, else capture that record's backtrace frame (descriptor
-name/params + `loc_at(ret_chunk, ret_pc-1)` + the pure tag), pop, flush the
-call op's inlined frames, continue - byte-identical backtraces
-(differential-pinned). Boundary frames (main, `do_func_call` entries)
-convert to the `g_vm_exc_pending` signal as before. Builtin->callback loops
-(map/filter/sort's comparator/make_dict/find/make_array) use
-**`VmInvoker`** (vm.h): the callee frame is pushed ONCE per loop and each
-element just rebinds the param slots through the activation's reusable
-invoke context (its OWN FlowState - reusing the caller's would let a
-callback's boundary return corrupt the enclosing frame's flow); single-shot
-callbacks use `vm_try_invoke` (eval_func's gate). Runaway recursion throws
-the CATCHABLE **`StackOverflowEx`** at the `MYLANG_VM_STACK` slot cap
-(default 1M; README) instead of exhausting the C stack. The `code` pointer
-is cached LOOP STATE (making `chunk` reseatable killed the compiler's hoist
-of `chunk->code.data()` - a double-load per dispatch, front-end-amplified;
-refreshed only at the four chunk-change sites). Zero-copy arg binding was
-MEASURED AND DECLINED (the bind is ~2 instructions per 1-arg call; the
-protocol around it is what costs - see the plan's Phase E verdict).
-**`Chunk::ref_slots` (2026-07-18 profile #2):** the audited list of frame
-slots that can EVER hold a >= t_str value (non-coerced params + every dst
-of a non-`op_writes_scalar` op; a chunk with a use-def BARRIER op lists
-all slots). `pop_window`'s and `VmInvoker::invoke`'s reference-release
-scans iterate ONLY these — the fib-class all-scalar frame and the
-per-element comparator skip the O(nslots) walk; a VM_HARDENING build
-re-scans the full window and ASSERTS the list missed nothing (the audit
-net, green across the differential). A NEW op that writes a frame slot
-must join `visit_use_def` AND be classified in `op_writes_scalar`.
-Net (interleaved full-suite A/B): suite parity with the pre-C1 baseline
-plus recursion 0.68x, sort/map 0.85x, make_dict 0.88x, fib 0.86x.
+**THE JIT / VM OPTIMIZATION RECORD LIVES IN `docs/jit-optimizations.md`.**
+Everything the native tier and the VM's op set are made of - the register
+pools (N5/C2a/C2b) and the literal pool, the forwarding levers (A, C4a-ii,
+C4b), the type-store elisions (C3), the loop hoisting and versioning family
+(C1a-e), the struct baked layout and its guard elisions (C4d/C4e/C5), the
+call protocol (lever 1, M5a/b/c), delete-originals (#56), the exception path
+(#74/#78/#80/#82/#88), the element-store tiers (#92-#96), the specialized
+arithmetic (B1/B2) and the fusions (E4, #9) - is recorded there, one entry
+per change, with its measurement, its soundness guard, and its sabotage
+result. **READ THE RELEVANT ENTRY BEFORE CHANGING ITS SUBSYSTEM**; each one
+documents a trap that cost real time to find. The `-vd`/`-vdj` dumps and the
+lever kill switches (`MYLANG_JIT_OFF`, `MYLANG_JIT_FORCE`, `MYLANG_JIT_COLD`)
+are described there too.
 
-**B1/B2 SPECIALIZED ARITHMETIC (`specialize_arith_ops`, codegen.cpp).** 23
-per-operator, per-shape variants of `IntBin`/`FloatBin` (Int Add/Sub/Mul/
-And/Or/Xor/Shl/Shr x RR/RI, IntModRI nonzero-imm only, Float Add/Sub/Mul x
-RR/RI - see the enum comment in bytecode.h), selected by an IN-PLACE
-post-codegen rewrite run AFTER `extract_locs` (opcode swap + a lit-first
-commutative op's operand swap into RI; no pc shifts, no loc/pool
-interaction). Each removes IntBin's inner 11-way `aop` switch AND both
-`is_lit` operand-decode branches. Div/mod-by-reg keep the checked IntBin
-path; shifts call `bit_shl`/`bit_shr`. Measured: VM-wall geomean -6.3%,
-suite 4.09-4.17x -> **4.45-4.48x vs CPython** (01_while_loop -25%,
-03_int_arith -20%, mandelbrot -19%, bit benches -18%).
+**`MYLANG_JITSTATS=1` answers "which TIER did this program's calls actually
+take?"** — the emitted-code counters, printed after a script run (a
+**`TESTS=1` build only**; the bumps are `#ifdef TESTS`, and it says so
+rather than print zeros in a release). It exists because the counters were
+readable only from inside `-rt`, so that question could be asked of a
+hand-written probe and of nothing else — which is exactly how a per-call
+cost came to be quoted for a path most real calls turned out to skip, and
+then how the OPPOSITE error was caught: the recorded finding "recursion
+never reaches the inline push" stayed in the plan for two days after the
+increments that made it false. **Re-measure reach after any change to a
+tier's GATES, not just its body.**
 
-**D1 - `AppendV` (the append/push fast op).** `append(a, x)`/`push(a, x)`
-with one value arg emits `AppendV` (CallBuiltinLV's operand layout: the
-builtin_calls pool idx, arg0's kind+slot, the value's slot) instead of
-`CallBuiltinLV`+rest-run: the handler forms arg0's `LValue*` from the slot
-and runs **`arr_append_fast`** (arr.cpp.h) inline - the shared
-NEVER-THROWING append core (flat int/float/bool/POD-struct-match/general +
-`arr_append_maintain_hash`; returns false for null/non-array/const/
-readonly/slice/flat-mismatch) that `builtin_append` itself now uses after
-its slice-clone step, so both engines share ONE append implementation. Any
-decline falls back to the full `vm_call_builtin_lv_rest`, byte-identical
-(the flat-mismatch TypeErrorEx, COW, carets). Measured: VM-wall 0.983,
-13_array_append 0.82x, suite 4.49-4.50x.
+**⛔ AND MEASURE REACH IN THE CONFIGURATION YOU MEASURE IN — A LEVER A/B
+CANNOT TELL "THIS TIER IS SLOWER" FROM "THIS TIER NEVER RAN" (#97
+increment 0, 2026-09-02).** `MYLANG_JIT_OFF=norec` said the record-less
+call tier COST 09_fib_recursive 4.75%, on the one bench the whole call
+arc exists for. It was not the tier: 555,823 gates, ZERO pushes. The
+gate `norec_had_cached` refuses a body containing `CachedCallV`, whose
+hazard — a live vframe pure cache a record-less return cannot stash —
+**can only exist when the pure-call cache is ON, and every measurement
+here runs `-npc`.** So the number was an honest measurement of a tier
+that never executed, and it sat in a plan for days directing the work.
+One conjunct (`&& g_pure_cache_enabled`) is **-20.7% Ir** there.
+**A gate must name the hazard's PRECONDITION, not just its SHAPE** —
+`norec_had_cached` describes *this body contains a cached call*, which
+was read as *a cache may be live*; the two differ by one runtime flag.
+And when the fix makes a runtime flag a soundness precondition of
+EMITTED CODE, state it as an `ML_CHECK` at the site that would violate
+it (`Frame::ensure_pure_cache`), not as an audit — an audit is a
+snapshot. Record: `docs/jit-optimizations.md`, *#97 increment 0*.
 
-**F1 - `MathFnV` (typed math-builtin calls).** A float-proven math-builtin
-call (`sqrt`/`cbrt`/`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`exp`/`exp2`/
-`log`/`log2`/`log10`/`ceil`/`floor`/`trunc`/`float`/`abs`-on-float +
-2-arg `pow`) whose args compile as float expressions lowers to `MathFnV`
-(`target2` = a `MathFn` selector, bytecode.h): raw operand read
-(`read_float_operand` - an int arg promotes), a direct libm call in the
-ML_NOINLINE `vm_math_fn` (loop-body text rule), raw `write_float_slot` -
-the whole `CallBuiltinV` marshal (per-arg boxed moves into the run, the
-arg-buffer copy, ArgLocs, the builtin fn-pointer call, the boxed store)
-is deleted. Selected by `try_math_fn` (codegen.cpp) ahead of the generic
-lowering; gated on an unshadowed builtin, EXACT arity (a wrong-arity call
-must throw -> generic path), and `th == f` on the call node (so
-`abs(int)` -> int result and `float("str")` -> parse stay generic). The
-op NEVER THROWS (the float builtins have no domain checks - libm NaN/inf
-semantics - and arity/type errors are compile-time-excluded), so it is
-loc- AND node-free. Measured: 40_math_builtins 0.50x VM-wall (my/py
-0.42x -> 0.19-0.20x, ~5x CPython), suite VM-wall geomean 0.999.
+The RULES that came out of that work stay HERE, because a rule must be
+obeyed before you know you are in the area it governs:
 
-**H2 v2 - THE unordered_map NODE POOL (`PoolAlloc`, poolalloc.h; the
-core in types.cpp - the global-mutable-state home).** A chained
-`unordered_map` heap-allocates a ~96-byte node PER INSERT (hash + the
-32-byte EvalValue key + 48-byte LValue + next) and frees it on erase.
-`PoolAlloc` serves single-element allocations from PROGRAM-LIFETIME
-per-size-class free lists over chunked arenas (single-threaded, no
-locks; multi-element allocations - the bucket-pointer arrays - pass
-through to operator new; arena blocks stay reachable for leak
-checkers; teardown-order-safe: the free-list heads are POD). Wired
-into BOTH hot maps: the dict's `inner_type` (shareddict.h) and the
-per-frame `PureCache` (eval.h). Node-POINTER STABILITY is untouched
-(rehash moves only the bucket array), so every held-LValue*/iterator
-invariant holds - a pure drop-in; the FLAT open-addressing map was
-REJECTED by the maintainer for exactly that stability reason.
-**UNDER ASAN THE POOL COMPILES TO PASS-THROUGH** (poolalloc.h: pooled
-reuse would mask a node use-after-free from AddressSanitizer - the
-RECYCLE philosophy from the other direction), so the ASan lanes keep
-their bug-finding power; test a pool-ACTIVE debug build with
-`make ASAN=0 UBSAN=0 OPT=0 TESTS=1`. Measured: 67_make_dict 0.770x,
-23_dict_insert 0.929x, 10_recursion_deep 0.968x, suite VM-wall 0.987,
-my/py 4.70-4.71x.
+**⛔ THE AUDIT-TABLE STAGE TRAP (2026-08-04) - `visit_use_def` did not
+know the B1/B2 SPECIALIZED family, and NOTHING could see it.** The
+table (codegen.cpp) is consulted by the PEEPHOLE's E1 liveness and by
+`compute_ref_slots`, and BOTH run before `specialize_arith_ops` - so
+the 23 specialized opcodes (IntAddRR .. FloatMulRI) simply never
+reached it and their absence was invisible. But **`jit_fwd_info` runs
+at JIT TIME**, on the specialized code, and its contract for an
+unaudited op is the conservative BARRIER `lin = all` - every temp live
+at every pc. So both of its consumers were silently inert: lever A's
+`skip_write` (whose own note already suspected it) and C4a-i's
+read-elision entry gate, which refused every float temp and made the
+whole increment measure FLAT. C4a-i had a second, smaller bug of the
+same family - it tested `fwd_lout` (live-OUT) where it meant live-IN,
+so a run head whose first op writes the temp trivially "read" it as
+live; `jit_fwd_info` now exports the fixpoint's own `livein` beside
+`liveout`. FIXED: the family joined the table. Measured (Ir/scale,
+OPT=1 ASSERTS=0): **55_float_sum -15.0%**, 40_math_builtins -3.2%;
+54/04 byte-flat (C2a already pinned their float locals), every int
+bench byte-flat (`skip_write` stays blocked there by ref_slots'
+conservatism - lever A's documented throttle). PINNED by
+`jit_fread_temps_audited` over a compile-time `g_jit_fread_temps`
+count of admitted TEMPS: `g_jit_fread` cannot see this - it bumps per
+fragment ENTRY, which the two LOCALS alone satisfy - and removing the
+family from the table again fails the test (watched).
+**IT RECURRED ON THE SIBLING TABLE (2026-08-05), and that is the
+strongest possible argument for the rule below.** `op_writes_scalar`
+lives in the SAME file, is consulted by `compute_ref_slots` at the SAME
+pre-specialization stage, and was NOT fixed when `visit_use_def` was -
+because at that stage it cannot see the family either, so its absence
+was equally invisible. **C5** is the first consumer to ask it at JIT
+time, on the specialized code, and its conservative "not a scalar
+write" answer silently refused most real arithmetic: 64_struct_create
+kept every store guard it was supposed to lose. Adding the 23 opcodes
+changed NOTHING for `compute_ref_slots` (they do not exist at its
+stage - `-vd` dumps are byte-identical) and read **-32.0% on
+54_mandelbrot, -28.1% on 03_int_arith, -24.1% on 64_struct_create,
+-16.7% on 06_if_branch, -15.4% on 07_nested_loops, -14.8% on
+04_float_arith**, -7.1% / -5.8% / -1.2% on 55/46/40, everything else
+byte-flat. The net is a `jit_release_c5` case whose qualifying temps
+are written ONLY by the specialized family, so the table losing them
+again fails a test instead of costing 20% in silence.
+**⛔ AND THE SAME TRAP HAS A SECOND SHAPE: A WRITE THAT IS NO LONGER
+AN OPCODE (2026-08-13).** `compute_ref_slots` derives a chunk's
+`ref_slots` from instruction write-dsts via `visit_use_def` - complete
+only while every write to a frame slot IS an instruction. **#78 step D
+broke that premise**: deleting the interpreted `CatchTest` chain moved
+the catch binding into the RAISE PATH, where `vm_dispatch_exc_body`
+does `ctx.frame->at(cl.bind_slot).put(...)`. No opcode writes that
+slot, so it never entered `ref_slots` - and `catch (T as e)` binds a
+STRUCT INSTANCE, a reference. `pop_window`'s release scan skipped it
+and the hardened re-scan aborted (`rec.window[i]...->t < Type::t_str`)
+on any frame catching a CALLEE's throw with a bind. The same-frame and
+top-level spellings release elsewhere and were fine, which is why no
+corpus program in the project's history had tripped it. Both `-rt` and
+`corpus_diff` stayed GREEN with the fix removed; the Net 3 enumeration
+failed 16 of 96 at depth 2. Fixed by feeding `handler_sites`' bind
+slots into `compute_ref_slots`; pinned by
+`tests/functional/11_catch_bind_release.my`.
+**When a RUNTIME path starts writing a frame slot, it must join
+`ref_slots` - an opcode-derived table cannot see it.**
 
-**B3 - THE 32-BYTE PACKED `Instr` (bytecode.h).** `sizeof(Instr) == 32`
-(static_asserted), down from 56: `slot` and `lit` are mutually exclusive
-(is_lit discriminates), so each operand is ONE 8-byte payload (`pa`/`pb`,
-default -1 = the old unset slot); the per-operand tag bits live in the
-shared `opflags` byte; `Op` is `: unsigned char`. Exactly two
-instructions per cache line. `Operand` SURVIVES as the codegen-side
-VALUE type (int_lit()/slot_op()/float_lit(), all compile_* plumbing
-unchanged) - an Instr packs one via `set_a()`/`set_b()` and unpacks via
-`a()`/`b()` (the cold pass-by-const-ref sites); the HOT readers use the
-direct accessors `a_slot()`/`a_lit()`/`a_flit()`/`a_is_lit()`/`a_kind()`.
-SEVEN ops (the CallBuiltinLV family incl. AppendV, and the chain stores
-StoreElem2V/StoreElemChainV/StoreLValueChainV) used the fat Operand's
-slot AND lit as TWO independent ints at once - they use the DUAL view
-(`set_a_dual(lo, hi)`, `a_dual_lo()`/`a_dual_hi()`: int32 halves of the
-payload; an op uses EITHER the plain view OR the dual view, never both).
-Measured: VM-wall geomean 0.970 (broad -2-4%), my/py 4.67-4.68x.
-**Stage 2: the runtime `Instr` has NO `node_idx` AT ALL** - codegen
-builds a `vector<CgInstr>` (`CgInstr : Instr` + the transient handle,
-implicitly constructible from Instr so plain emit sites are unchanged),
-`extract_locs`/`verify_ast_free` consume it, and `codegen_chunk` SLICES
-the Instr sub-objects into `Chunk::code` (specialize_arith_ops runs on
-the sliced chunk) - the zero-AST-at-runtime rule is enforced by the TYPE
-SYSTEM for instructions. A refactor of this kind is verified by
-BYTE-IDENTICAL `-vd` dumps over bench/ + samples/ (which caught
-pp_thread still reading the now-empty Chunk::code - a silent peephole
-WEAKENING that -rt cannot see; dump-diff output-preserving refactors).
+**⛔ AND AN EIGHTH SHAPE, ONE LEVEL IN: A TABLE'S INPUTS MUST BE
+COMPLETE BEFORE ANY RULE IN IT BECOMES RELATIONAL (#97 step 5,
+2026-08-27).** `compute_ref_slots` marks a slot that may hold a
+reference, and `compile_func_body` unioned the non-scalar PARAMETER
+slots into the result AFTERWARDS - the bind writes them and no
+instruction does, so `visit_use_def` cannot see them. That order was
+safe for years because every marking was INDEPENDENT: a late union of
+extra members changes nothing about the members already decided.
 
-**H3 - join/split reserve + borrow (engine-shared, str.cpp.h).**
-`builtin_join` on GENERAL storage (a string array is always general)
-borrows each element by const ref (no boxed copy / SharedStr refcount
-round-trip per part) and RESERVES the exact result size from a
-type-checking pre-pass, so the append loop never reallocates; the flat-
-storage branch keeps the kind-aware `arr_elem_at` loop (same TypeError,
-empty flat still ""). `builtin_split` pre-counts the pieces (a memchr
-scan, no stores) and reserves its LValue result vector. Measured:
-47_wordcount 0.882x (my/py 0.51x), suite VM-wall 0.990, my/py
-4.59-4.60x; 31_str_split_join ~flat (growth was already amortized there
-- the residual is the inherent per-piece slice LValue).
+It stopped being safe the instant one rule READ another entry to decide
+its own. Teaching the table that a `MoveV`'s dst is a reference only if
+its SOURCE is - the fix for "every argument temp in every program is
+reference-carrying" - made `move t = param` ask about a source the pass
+believed trivial, because the params had not gone in yet. The seeds are
+an INPUT now (`codegen_chunk`'s `ref_seeds`), not a post-hoc union.
+`jit_ret_audit` caught it on the first run and the old order is watched
+failing (rc 134).
 
-**H2 - the dict/slot-write micro pair (engine-shared).** From bench 62's
-callgrind profile (`counts[key] += 1` cost ~1130 instrs; the insert-alloc
-hypothesis was wrong - 62 is UPDATE-bound): (1) **`LValue::put` has an
-INLINE fast path** (evalvalue.h) - a put with no container back-pointer
-(frame slots, dict values, globals, captures - the overwhelmingly common
-case) assigns directly; only the array-element COW path calls the
-out-of-line `put_slow` (every put used to pay an out-of-line
-`get_value_for_put()` call, on every slot write VM-wide). (2) **String
-equality has an IDENTITY shortcut** (`str_views_eq`, str.cpp.h): equal
-data pointer + size == equal, no memcmp - the hot case is a string-keyed
-dict probe, whose stored key is the SAME StrObj as the probing value (the
-key freeze returns strings as-is). Measured: 62_dict_word_count 0.896x
-(my/py 0.42x), broad -4-10%, suite VM-wall 0.992, my/py 4.57-4.58x. The
-design-level flat open-addressing dict (23_dict_insert's node allocs)
-stays a maintainer-sign-off item - roadmap H2 v2.
+**When you add a rule that derives one entry from another, re-ask where
+every entry comes from** - including the ones no instruction writes.
 
-**H1 - STRUCT CREATION (dst-slot reuse + typed member reads).** Two
-pieces (plans/vm-performance-roadmap.md H1): (1) **`vm_struct_ctor`
-constructs INTO the dst slot with REUSE** - when the slot's current value
-is a same-def, non-readonly POD instance with `use_count() == 1` (the
-slot's handle is the only owner), the fields are coerced into a stack
-buffer (BEFORE dst is touched - throw-safety) and written over ITS bytes:
-zero allocations in the steady-state `var p = Point(...)`-in-a-loop
-shape (the same overwrite-in-place + COW-guard trick the flat-struct-
-array foreach uses; an aliased/const/other-def dst takes the fresh path,
-pinned by a dedicated aliasing test). `coerce_struct_field` is exported
-from eval.cpp for the pre-coercion; the fresh path stores the coerced
-bytes directly (construct_struct_from_values would coerce twice).
-(2) **`LoadMemberInt`/`LoadMemberFloat`** - the MEASURED discovery was
-that allocation was NOT the dominant cost: bench 64's body was 5
-`member.v` + 6 boxed arith per iteration, because a STANDALONE struct
-member read had no typed lowering (only the foreach-array
-LoadStructField* and dict DictLoad* pairs existed). The new pair (the VM
-analog of the tree-walker's M8 `MemberExpr::eval_int/eval_float`,
-`try_member_scalar` in codegen.cpp: th==i/f + `MemberExpr::base_struct`
-+ a resolved-LOCAL base) reads a POD field's scalar straight from the
-instance's bytes via the member_keys pool; the boxed-struct/dict/const-
-member residue falls to the shared `member_read_core` +
-`write_scalar_slot` (fallback throws stamped with the pooled member
-caret). Measured (both, full-suite interleaved A/B): 64_struct_create
-0.095->0.074s (0.779x; my/py 0.63x -> 0.48x), suite VM-wall 0.999.
+**THE RULE this earns:** a table is "audited" only for the PIPELINE
+STAGES that existed when it was written. A pass added later, at a
+DIFFERENT stage, sees a different opcode universe - and a conservative
+fallback means the gap costs silence, not failure. When you add a
+consumer of an audited enumeration, ASSERT THE TABLE COVERS ITS INPUT
+(the way `visit_pc_fields`' remap net and the `ref_slots` audit do),
+or the next such gap will also be found only by someone reading a
+disassembly for an unrelated reason.
+**⛔ AND A THIRD SHAPE: THE TABLE STAYED PUT WHILE AN OP CHANGED
+UNDER IT (2026-08-13).** `op_writes_pure_target` (codegen.cpp) lists
+the ops whose `.target` may be RETARGETED, so `<produce t>; MoveV
+rArg = t` fuses into `<produce rArg>` for a call argument. Its
+soundness needs the op to be the SOLE producer of that temp, and its
+own comment has excluded `MoveV` since 2026-07-26 for exactly the
+JOIN shape that breaks it. **`LogV` was in the list and belonged
+there** - a `&&`/`||` chain was a straight run of LogV ops, one
+producer each - until **#138 gave the chain real short-circuit
+branches**. `emit_logical_chain` then wrote ONE dst from N arms: a
+join whose tail is a LogV, not a MoveV. Retargeting only the last arm
+left the short-circuiting path writing the old temp, so
+`var dyn s = runtime(3); print(s > 5 && s < 6);` printed **`3`**
+under the VM and `false` in the tree-walker - a wrong answer and a
+RULE 2 divergence, latent in 8 corpus programs (bytecode changed,
+output did not). **When you change HOW a construct lowers, re-audit
+every table that classifies its OPCODE** - the entry does not have to
+be edited to become false.
+**IT HAPPENED A THIRD TIME, AND THE FIX STOPPED ASKING THE TABLE
+(2026-09-25).** The TYPED ternary ends its else arm on a `LoadImm`,
+which is whitelisted, so `g(1, i == 2 ? int(runtime(-5)) : 1)` staged
+the literal on both paths - a wrong answer in the DEFAULT engine
+whenever the callee is not inlined. A join is a CONTROL-FLOW fact, not
+an opcode one, so `compile_to_run_slot` now declines the retarget when
+any branch in the element's code lands past its last op
+(`visit_pc_fields`); the whitelist only says which producers CAN be
+retargeted, never whether this one is the sole producer.
+**⛔ AND A FOURTH SHAPE, THE CHEAPEST TO PREVENT: THE OPTIMIZATION
+WHITELIST NOBODY RE-READ (2026-08-16).** `jit_fwd_producer` /
+`jit_fwd_consumer` (jit.cpp) list the ops lever A may forward a value
+between. They were written over the B1/B2 specialized family as it
+stood - Add/Sub/Mul/And/Or/Xor, RR and RI - and `specialize_arith_ops`
+LATER grew **IntShlRR/RI, IntShrRR/RI** and IntModRI. Nothing
+re-audited the lists, and nothing could notice: an unlisted op simply
+does not forward, so `t = a >> 3; a = a ^ t` - a temp alive for ONE
+instruction - kept paying a type store, a payload store and a reload,
+per shift, per iteration. Admitting the shifts read **-21.0% Ir on
+83_regs_int_40 and -17.97% on 80_regs_int_08**, 11 corpus programs
+changed and every other one byte-identical.
+**The generalisation: a table whose stale entry costs an OPTIMIZATION
+is not self-announcing the way one whose stale entry costs
+CORRECTNESS is** - `verify_chunk` fails the BUILD, this failed
+nothing. FOUR nets ran over it and every one was structurally
+incapable of seeing it, which is the part worth internalising:
+ - the 5-mode differential, `corpus_diff` and all four fuzzers are
+   blind BY CONSTRUCTION - forwarding changes no observable behaviour,
+   so the answer is right whether the value travelled in RAX or
+   through a slot. **An optimization that only affects SPEED has no
+   correctness oracle**, the same structural gap as *Testing an AST
+   TRANSFORM*;
+ - `jit_counter_coverage` asks "did this lever run AT ALL?" and
+   `g_jit_fwd` was non-zero throughout - the add/mul shapes fire. A
+   whole-lever counter cannot see "runs for 12 of 17 opcodes";
+ - the lever's OWN test, `jit_fwd_deadtemp`, had its cases written
+   FROM the whitelist, so it exercised exactly the opcodes already in
+   it. **A test derived from a table can never find a hole in that
+   table** - this is the deepest of the four and the one to watch for
+   everywhere;
+ - no corpus program had a dense shift loop until #96 wrote one.
 
-**TYPED TERNARY (M8 + codegen).** `specialize_children` (the M8
-specializer's recursion, inferencer.cpp) descends into `TernaryExpr` /
-`CoalesceExpr` - previously ABSENT, so a ternary's cond/arms were never
-M8-specialized and BOTH engines ran them boxed (the recursion-unroll's
-guard ternaries - fib's whole body - were the visible cost). And a
-th==i/f `TernaryExpr` VALUE lowers natively (`try_typed_ternary`,
-codegen.cpp): a typed-compare condition emits one
-`JumpUnless{Int,Float}Cmp` to the else arm (any other condition boxes
-to `JumpUnlessTrueV`, arms still typed), both arms compile through the
-typed compilers into a common dst via MoveV/LoadImm, and the peephole's
-E1 join-move rule retargets the movs away - so fib$0's unrolled body is
-FULLY native (50 instrs of i.bin/i.jmp.ifnot/call.cached; zero boxed
-ops). Measured (full-suite interleaved A/B): 09_fib_recursive
-0.006->0.004s (**0.67x**), suite VM-wall geomean 0.990 (broad -3-9%
-on the arith/call benches).
+**⛔ AND IT HAPPENED AGAIN IN THE OTHER DIRECTION (#113,
+2026-08-27) - THE OPS THAT WERE NEVER CONSIDERED.** The shifts were
+a table gone STALE. `LoadCaptureV` / `StoreCaptureV` had never been
+in these lists at all, so a closure's captured counter moved
+through memory twice for one `add`: the read stored payload AND
+type into a temp the next instruction reloaded, and the write
+reloaded both out of the slot the instruction before had filled.
+Admitting them read **-4.55% Ir on 11_closure_counter** and took
+its closure fragment from 53 to 44 instructions per call. The
+ratchet cannot catch this one - it walks the specialized-arith
+RANGE, and these are not in it - so the lesson is the older one:
+when you build a lever, enumerate what it could serve, not only
+what it serves.
 
-**THE #9 FUSION BATCH (2026-07-17, the top-10 list's last item).**
-Three more pair-profile superinstructions in the peephole's fusion
-block: **`IntAddStep`** (an int accumulate tail `s = s + x` fused into
-the counted-loop `ForLoopStep` - add+step+test+branch in ONE dispatch;
-never fires when a `continue` targets the step, since that pc is a
-branch target), **`ForStepElemInt`** (the back-edge `a[i]` load,
-indexed BY THE COUNTER, fused into the step: the original load stays
-in place for the loop-entry path and the fused op's target lands past
-it; the load's OOB caret rides the fused pc - and the ascending scan +
-the is_tgt map make it compose safely with JumpUnlessElemInt), and
-**`StructFieldAddInt`** (`dst = other + a[i].f`, GENERAL 3-address -
-the struct reduction chains adds through temps, so an accumulator-only
-shape would never fire; b_dual = field idx + other slot). The batch's
-ROOT-CAUSE bonus: `LoadStructFieldInt/Float`, `LoadMemberInt/Float`,
-`LoadStructElemV`, `LoadElemBool` were MISSING from `visit_use_def` -
-liveness BARRIERS that made every temp look live in a struct-loop body
-and silently blocked IntAddModRI there since E4 landed (audit any new
-op into that table, not only visit_pc_fields). Measured: 65_struct_
-field_sum 0.783x, 02_for_loop 0.75x, suite VM-wall geomean 0.987,
-my/py **4.89-4.93x**.
+**⛔ AND A TENTH SHAPE, FOUND BY BUILDING A NEW CONSUMER (#106 phase 2,
+2026-08-29): `OpCode::Throw` IS NOT IN `visit_use_def` AT ALL.** It
+reads `a_slot` and writes no frame slot, so it belongs in the verified
+set; being absent makes it a BARRIER, i.e. "reads every temp and may
+write anything". `compute_nonneg_slots` (the new consumer) fails closed
+on a barrier, so **42_exceptions - whose
+`for (var i = 0; i < N; i++) { ... i % 2 ... }` is the qualifying shape
+exactly - declines the whole chunk** and keeps a six-instruction sign
+bias it does not need. The same absence costs lever A and the E1
+liveness inside EVERY try body, and nothing announces it: a barrier is
+conservative, so the answer stays right and only the speed moves.
 
-**E4 FUSIONS (in the peephole; plans/vm-peephole.md).** Two profile-
-chosen superinstructions (a scratch op-pair profiler counted 760M
-executed adjacent pairs over the suite; the distribution is flat, so
-only the caret-safe top pairs shipped): **`IntAddModRI`** (`dst =
-(a+b) % IMM`, the checksum shape - never throws: imm nonzero +
-int32-gated in `target2`, the add wraps; loc/node-free) and
-**`JumpUnlessElemInt`** (`if (arr[i]) ...` - LoadElemInt +
-JumpUnlessTrueV in one dispatch; keeps the LOAD's node in place so the
-OOB caret is byte-identical; the elem temp must be liveness-dead on
-BOTH successor paths). The fusion rules run inside the peephole's
-liveness block; `BinOpV→CompoundV` was REJECTED - two throw sources
-with different carets can't share one pc's loc entry. A NEW fusion op
-with a pc field MUST be added to `visit_pc_fields` (JumpUnlessElemInt
-is). Measured: 68_nested/60_bit_sieve -4%, suite VM-wall 0.981, my/py
-4.75x.
+**FIXED the same day, and the ledger says where the cost actually was:**
+42_exceptions took the arm it had been declining (200,000 of 200,000
+pow2 reductions, from 0) for **-0.26% Ir** - while **69_exc_crossframe
+read -6.03%** with no div or mod in it at all. That second number IS the
+liveness half, and it is 20x the first: the barrier was costing lever A
+and E1 inside the try body, exactly as predicted and nowhere near where
+the search started. 70_exc_runtime_error, 71_exc_no_throw,
+72_exc_finally, 03_int_arith and 01_while_loop are flat to the
+instruction.
 
-**THE POST-CODEGEN PEEPHOLE (`peephole_chunk`, codegen.cpp; design +
-field tables in plans/vm-peephole.md).** Runs in `codegen_chunk` BEFORE
-`extract_locs` - the load-bearing ordering: the loc/`inline_ctxs` side
-tables are built from the ALREADY-compacted code, so the pass only ever
-rewrites Instr pc fields (every pool is operand-indexed; `node_idx`
-handles ride inside the moved Instr structs). Iterated <=4 rounds, each:
-(E1) **MoveV elimination** - backward TEMP liveness (a single-word
-bitset over `[slot_count, slot_count+n_temps)`; >64 temps skips; an op
-not in the audited `visit_use_def` table is a BARRIER that reads every
-temp; when the chunk has handlers every op's live-out absorbs the
-handler pcs' live-in, since any throw may resume there), then
-`<producer dst=tX>; MoveV d=tX` (adjacent, tX a dead-after temp, no
-branch entering the move, producer in the audited `retargetable_dst`
-whitelist) retargets the producer to d and deletes the move; (E3)
-jump-chain threading, INT-only branch-over-jump inversion (float
-compares don't invert under NaN), jump-to-next deletion, reachability
-DFS, then compaction with a prefix-sum pc remap over `visit_pc_fields`.
-**`visit_pc_fields` is THE single audited pc-field enumeration** (a
-"target" field is NOT always a pc - `ForLoopStep::target2` is the
-COUNTER SLOT, `JumpUnlessTrueV::target2` the value slot,
-`SetPend::target` a Pend enum; the E-v1 fuzzer catch) - a new branching
-op MUST be added there, and ALWAYS run tests/nested_fuzz.py after a
-codegen-pass change. E2 (temp renumbering) was evaluated + DEFERRED (the
-native call stack made per-call temp cost ~nil - see the plan); E4 =
-this pass IS the fusion framework (no new fusions shipped). Measured
-(full-suite interleaved A/B): VM-wall geomean **0.987**, instrs -4.6%,
-MoveVs -31%, fib$0's chunk 68->56; the earlier STANDALONE
-threading-without-deletion attempt was a measured DECLINE (+3.2%, 1/77
-benches affected - roadmap E3 records it).
+**The generalisable half: a table's gaps are found by writing a new
+consumer of it, because the new consumer is the first thing that cannot
+afford them** - and the gap's real cost is rarely paid where the new
+consumer noticed it.
+
+**IT HAPPENED A SECOND TIME, SIX OPCODES AT ONCE, AND THE SAME WAY
+(#25, 2026-09-21): THE ELEMENT-STORE FAMILY WAS NOT IN
+`visit_use_def` EITHER.** `StoreElemInt/Float/Value`, `DictStore`,
+`StoreMemberV`, `StoreElem2V` - every one a barrier. Found by W3, the
+newest consumer, because `compute_ref_slots` BAILS on a barrier and so
+listed EVERY slot of any function containing `a[i] = v` as
+reference-carrying (76's `refs=[0 1 2 3]` for an array, an int and two
+temps). And again the cost was not where the finder looked: 76 read
+-9.0% Ir, but **60_bit_sieve -23%, 14_array_subscript -20%,
+86_elem_arith_compound -20%, 68_nested -18%** - the E1 peephole
+retargeting and fusing past the store, and the C5-class write guards
+and arm scans on temps that were never references. The rows say what
+the VM reads: base (when its KIND is local), keys, value - and NO def,
+because the COW paths rewrite the container handle in place, type
+unchanged, and a def would only kill C4d's `(slot, def)` fact for
+nothing. The two CHAIN forms stay barriers on purpose: their keys live
+in a pool the Instr-only signature cannot reach. **Pinned by
+`use_def_store_family`, which was the ONLY net that fired on any of
+three sabotaged rows** - the five-mode differential and corpus_diff
+stayed green through a dropped value use, an invented def and a global
+index reported as a frame slot. A wrong row in this table is not an
+answer the engines can disagree about.
+**AND A POOL-KEYED RUN CAN JOIN THE TABLE (2026-10-03):**
+`visit_use_def_pooled(in, u, d, chunk)` is the table's pool-aware twin:
+an op whose operand run lives in a pool (the in-place builtin calls:
+CallBuiltinLV, LVElem, LVMember) gets its row only there, and stays a
+barrier in `visit_use_def` proper (a separate function, so the row's
+branches are not instantiated once per caller - they cost 14 coverage
+elements that way). Pinned the same way,
+by `use_def_builtin_lv`. **A consumer that can hand it the chunk must
+ask it, not the table:** `compute_ref_slots` asked `visit_use_def`
+proper until 2026-11-09 and so listed EVERY slot of any function
+calling pop / sort / insert (`ref_slots_builtin_lv` pins the lists).
+
+**THE FIX, AND THE PATTERN TO REUSE: derive the test from the OPCODE
+ENUM, not from the table.** The B1/B2 specialized family is a
+CONTIGUOUS range (`IntAddRR .. FloatMulRI`, bytecode.h), so
+`jit_fwd_family_coverage` (tests.cpp) walks the range and requires
+every member to be CLASSIFIED - forwardable, or exempt with a written
+reason - and requires each row's claim to MATCH the live predicate in
+both directions. Adding an opcode to that range without deciding now
+fails with the opcode NAMED. Watched failing three ways: the shifts
+dropped from both whitelists (8 lines, one per opcode per side), a row
+deleted ("opcode #104 (IntShlRR) joined the specialized family with no
+row here"), and a row claiming an exemption for an opcode that is
+whitelisted.
+For that to be possible the whitelists had to be answerable at the
+OPCODE level (`jit_fwd_op_is_producer` / `jit_fwd_op_consumer_slots` /
+the float twins, jit.h) - and the Instr-taking predicates are now
+BUILT on those, so this is one edit site, not a second copy free to
+drift. Verified as a pure restructuring: emitted code byte-identical
+on all 94 corpus programs.
+**Do this for the next opcode family that gates an optimization.**
+And when you add a lever, give it a JITSTATS row too - `g_jit_fwd` was
+bumped from emitted code and appeared in no REPORT table, the third
+counter found that way.
+**DONE WHOLESALE (#98, 2026-08-25): `opcode_table_census` (tests.cpp)
+is that ratchet over the ENTIRE opcode enum x SIX opcode-keyed
+optimization tables** - `jit_op_eligible`, `op_fully_native`,
+`pick_visit_op` (register caching / LSRA qualification),
+`op_is_simple_island`, `op_writes_pure_target` (the arg-staging
+retarget whitelist) and `bc_inline_op_ok` (the splice whitelist) -
+one row per opcode, each claim checked against the LIVE predicate
+through exported forwarder shims (jit_test_* / bc_test_*), in both
+directions. **Adding an opcode now fails this test until all six
+columns are decided**; a deliberate non-answer is a row note, not a
+silent `default`. Its first run found and fixed two real holes: the
+CallBuiltinLV family was unlisted in `pick_visit_op` (one sort/pop in
+a run turned register caching off for the WHOLE run), and both struct
+ctors were left out of the #56 deletability batch though convey-only
+(the boxed one also missing its emit exc-stamp and the `catch (...)`
+eptr net - a #142-class terminate hazard). Record:
+docs/jit-optimizations.md, the #98 entry.
+
+**⛔ A SEVENTH AUDIT-TABLE SHAPE: A PROPERTY WRITTEN BY THE PASS YOU
+ARE INSIDE (#97 step 4, 2026-08-27).** The first six are about a table
+that went stale. This one is about a FIELD that is not written YET.
+`Chunk::sync_entry_off` and `Chunk::norec_ok` are both set at the END
+of `jit_compile_chunk` for that chunk, so a caller emitting a call to
+it reads them correctly - unless the callee IS the chunk being
+compiled. A SELF-RECURSIVE call (fib -> fib) therefore sees
+`sync_entry_off` unset, and `norec_ok` unset reads as **false**, which
+is a legal value meaning "no record-less tier". Gating on them took
+09_fib_recursive's baked reach to **4 of 555,823 calls** and would have
+silently disabled the no-record tier at the one site that needs it.
+
+**AND THE FIX IS NOT "READ IT IF IT HAPPENS TO BE SET".** That makes
+the EMITTED CODE DEPEND ON COMPILATION ORDER, and the JIT's Pass B
+walks a POINTER-keyed map - so `-vdj` would stop being reproducible,
+which is precisely what `scripts/vdjcmp` is. The elision is allowed
+for exactly ONE caller, on a structural argument rather than on luck:
+**MAIN is compiled LAST**, after every function body, so every callee
+it can name is already placed (`bake_final`; a null
+`g_cur_caller_desc` IS main). **#97 F1 added the second such
+argument, and it is the same kind:** Pass B jits every frameless
+LEAF body FIRST (a stable partition in `vm_jit_program` - a leaf
+names no callee, so it needs no placement of its own), so ANY caller
+may read a leaf callee's placement. A CALLING callee has no such
+order (mutual recursion is a cycle), so #97 G1 does not read its
+placement at emit time at all: the site loads the callee's
+`Chunk::frameless_entry_abs` at RUN time and declines when it is
+null. **When you read a field at emit time,
+ask which PASS writes it and whether that pass has run for THIS
+object** - and if the answer varies, do not let it vary per run.
+
+**⛔ A HELPER'S REGISTER ABI IS THE EMITTER'S JOB, NOT THE CALLER'S
+(2026-08-05).** THREE bugs in two days were one shape - an implicit
+register contract violated by a caller: C4a-ii forwarded a value in
+xmm0 across a store whose cold arm calls jit_put_float, which clobbers
+xmm0; C4b inc 2 let the result live in xmm1 and handed THAT to the same
+helper (bench/my/55 off by 1.5); and store_dst's cold arm clobbered RAX,
+which ForLoopStep reads immediately after for its loop test (an
+OutOfBounds). Detectors kept finding them one at a time, so the
+contracts moved INTO the emitter: `emit_put_scalar_call` takes the
+VALUE REGISTER and materialises xmm0 itself, and store_dst's cold arm
+restores RAX unconditionally - its `keep_rax` parameter is DELETED
+rather than defaulted, so no caller can believe it still decides
+anything. A caller can still pass the wrong value; it can no longer
+forget an ABI. Measured byte-flat (55/46/01 per scale) - the cold arm
+already paid the move, and the hot two-store path preserves RAX free.
+**When you add a helper the emitter calls, make its argument registers
+PARAMETERS and say what it clobbers.**
+**And the CALLEE's side is declared by its SIGNATURE (2026-10-02):**
+`call_direct` / `call_direct_framefree` / `call_rax` take a `Helper`
+built from the helper's TYPED function pointer, which derives the SysV
+argument registers it reads (GP and xmm, by position); REGTRACK's
+`trk_call_args` requires each to be written by the op emitting the call.
+Pass the helper, never `reinterpret_cast<const void *>(helper)`; an
+untyped pointer states its ABI (`Helper::untyped`, `Helper::fragment`).
+
+**⛔ A FIFTH AUDIT-TABLE SHAPE: AN `&&` OVER A FAMILY IS A TABLE THAT
+DOES NOT LOOK LIKE ONE (#96, 2026-08-16).** The four traps above are all
+`switch` statements, so "go re-read the audited tables" never pointed at
+this one. The JIT emitter holds THREE vectors describing what currently
+lives in a register — `cache` (N5 int pins), `fcache` (C2a float pins)
+and `tflush` (C3 type-elided slots) — and FOUR sites enumerated that
+family by hand:
+
+    flush_cache()   three loops, one per vector                    OK
+    exit_pc()       cache.empty() && fcache.empty() && tflush.empty()  OK
+    the brk guard   !cache.empty() || !fcache.empty() || !tflush...    OK
+    the barrier's CLEAR   cache.clear(); fcache.clear();           ⛔ 2 of 3
+
+C3 added `tflush` and updated the first three. The fourth — two
+`.clear()` calls that were supposed to mean "empty EVERYTHING" — was
+missed, so a barrier'd exit answered "something is still cached", took
+the FLUSHING epilogue, and that epilogue writes the whole RESTORED cache:
+pre-call register values over the slots the helper had just written,
+which is the exact clobber the clear exists to prevent.
+
+**⛔ AND WHEN THE FAMILY IS AN OPFLAGS BIT, ENFORCE IT IN THE ACCESSOR
+(#120, 2026-08-29).** `Instr::opflags` is a `uint8_t` with all eight
+bits spoken for, so a new per-instruction fact SHARES a bit with an
+unrelated opcode family — `cap_scalar` shares 0x40 with
+`elem_bool_hint`, and `ret_scalar` now shares 0x80 with
+`struct_checked`. The safety argument is always "these two opcode
+families do not overlap", which is a boolean over a family and so is a
+table in different clothes; its failure mode here is a LEAKED
+REFERENCE. State it as an `ML_CHECK` on the opcode INSIDE the accessor,
+not as a comment above it — then asking the wrong family aborts by name
+instead of returning a plausible answer.
+
+**⛔ AN ELEVENTH SHAPE, AND IT IS THE COST OF DELETING A PARTITION
+(#123, 2026-08-29): ONE BIT ANSWERING TWO QUESTIONS.**
+`RegAlloc::busy` means "taken right now". Under the allocator's
+TRANSITION mode that is a **PER-PC** fact - the binding gives a
+register back the moment its abstract register has no ENTRY occupant,
+because each install re-takes it at its own pc. A **RUN-SCOPED**
+consumer - the float literal pool, the #112 capture base - asks the
+same bit and reads the give-back as "free for the whole fragment".
+
+Both then own the register. The literal's per-entry reload is emitted
+after the cache loads, so it wins, and the pinned local falls back to
+memory with a type dispatch four times an iteration: **+45% Ir on
+05_mixed_arith, 4.54x on the wall clock**, with `-rt` 1978/1978,
+corpus_diff 34/34 and every fuzzer green. The ANSWERS were right; only
+the speed collapsed, so no correctness oracle could see it.
+
+**The half worth carrying: the code was immune BEFORE only by
+ACCIDENT.** `FLIT_REGS = {2,3}` and `FCACHE_REGS = {4,5,6,7}` were
+disjoint by construction, so those two consumers could not collide
+however confused the bookkeeping was. **Deleting a hand-partition
+converts every latent bookkeeping error in that resource into a live
+one - and they do not all surface as wrong answers.** Expect the
+second one after you fix the first: #123 hit this class twice, once on
+the TAKE path (a wrong answer, found in minutes) and once on the
+GIVE-BACK path (a silent 45%, found only by the benchmark).
+
+Fixed by giving the two questions two bits (`planned`/`fplanned`);
+found by logging every take/give inside the allocator, which showed it
+in five lines. **When a resource has two lifetimes, it needs two
+bits** - and when you delete a partition, go looking for who was
+relying on it.
+
+**A boolean chain and a run of `.clear()` calls are the same enumeration
+in different clothes.** When you add a member to a family, grep for every
+site that mentions ALL the existing members together. FIXED
+STRUCTURALLY: `snapshot_cache()` / `restore_cache()` /
+`clear_cache_state()` / `cache_live()` are adjacent in `Emitter`, are the
+only places the family is listed, and `clear_cache_state()` ML_CHECKs
+itself against `cache_live()` — so dropping a vector from one and not the
+other aborts BY NAME (watched: reintroducing exactly the original miss
+fails `-rt` instantly).
+
+**⛔ A SIXTH SHAPE, AND THE CHEAPEST TO WALK INTO: A WRAPPER WHOSE NAME
+ENCODES ITS OPERAND IS INVISIBLE TO AN AUDIT THAT GREPS FOR THE OPERAND
+(#96 step 3, 2026-08-17).** The JIT held the `t_int` / `t_float` Type
+singletons in rsi/r8 and re-materialised them at every fragment entry
+and after every helper call. Once the low-address arena made a tag an
+`imm32`, those `movabs` became dead — *provided nothing reads the
+registers*. The audit for readers was `grep -n "R8R\|RSI"` over the
+relevant emitters, and it came back clean, twice. It was wrong, twice,
+because the four readers are spelled
+
+    e.cmp_rax_r8();   e.cmp_rax_rsi();   e.cmp_rdx_r8();   e.cmp_rdx_rsi();
+
+— nine call sites, and **not one of them mentions the register as an
+argument**. The register is in the METHOD NAME.
+
+The two failures are worth separating, because the second is the nastier
+diagnostic:
+ - deleting the materialisation first cost four FLOAT tests, via
+   `emit_float_load`'s type dispatch — a visible wrong answer;
+ - after fixing those it cost the whole **#95 nested-store tier**, which
+   **still emitted perfectly**. `-vdj` showed the inline fast path
+   present and correct; at RUNTIME its value-type guard compared against
+   a garbage register, so every store declined to the helper and the
+   emitted-code counter read **0 of 64**. An emitted-code counter proves
+   the code was EMITTED; when the thing that broke is a GUARD, reach is
+   zero and the counter looks exactly like "the tier was never
+   nativized".
+
+Fixed structurally: `store_type_tag(disp, tag, fallback)` and
+`cmp_reg_tag(reg, tag, fallback)` are the ONLY tag store / tag compare
+entry points, both take the tag as an ARGUMENT, and the four fixed-pair
+wrappers are DELETED so they cannot be reached again. **When you audit
+for uses of a register, a value, or a slot, grep the ACCESSORS as well
+as the operand — and prefer a seam that makes the operand an argument,
+so the grep can work at all.**
+
+**⛔ AN ORACLE THAT SHARES ITS SUBJECT IS NOT AN ORACLE (#96,
+2026-08-16).** #96 widened lever A's temps-only liveness into an
+all-slot one (`jit_slot_liveness`) by making BOTH wrappers over one
+`jit_liveness_core` - correct, and it silently destroyed the natural
+test. "The new analysis must agree with the old one on every temp"
+reads like an independent computation of the same fact; after the
+unification a bug in the core is on both sides and CANCELS. Watched:
+making an unaudited op contribute NOTHING live - the direction whose
+loss is a silent miscompile - left that comparison green. What catches
+it is a check derived from the written CONTRACT ("an op
+`visit_use_def` does not know leaves every covered slot live-in"),
+plus a count that FAILS VACUOUS when no unaudited op appeared.
+**The general rule: the refactor that unifies two implementations is
+exactly the moment a cross-check between them stops being evidence -
+re-derive at least one check from the SPEC.** Same family as "a test
+derived from a table can never find a hole in that table".
+
+**⛔ A POOL ORDERED BY PREFERENCE HIDES ITS OWN TAIL - AND THE SIXTH
+SHAPE ATE THE TOOL BUILT TO PREVENT IT (#96, 2026-08-17).** r9 was added
+to the JIT's caller-saved pin pool on 2026-08-16 and was a **shipping
+wrong answer for a day**. The comment that added it claimed "r9 is used
+in exactly TWO local scopes and both are already safe". False: r9 is raw
+scratch in the CAPTURE ops and in every element tier
+(`emit_elem_int_read`, `emit_store_elem_inline`,
+`emit_load_elem2_inline`, `emit_store_elem2_inline`, `ForStepElemInt`) -
+about 80 sites outside any `emit_call_prologue` bracket. Twelve lines
+reproduce it: eight hot int accumulators in a closure loop plus
+`s7 += cap` prints **56640** under `-tw`/`-nj` and **88854283473440**
+under the JIT, because the entry emits `mov r9, s5` and
+`emit_ctx_chain_r9` then walks the ctx through r9.
+
+Three separate failures let that ship, and each earns a rule:
+
+- **THE CENSUS WAS BLIND TO ITS OWN SUBJECT.** `scripts/regcensus.py`
+  reported **14** sites for r9; the true figure is ~87. The misses are
+  `movabs_r9`, `cmp_r9_rdx`, `lea_rdi`, `slots_to_arg0`,
+  `store_elem_byte_dil` - the register is in the **METHOD NAME**, so a
+  scan for the operand cannot see it. This is *exactly* the sixth
+  audit-table shape recorded above, hit by the tool written to keep the
+  arc honest. It now **DERIVES** the accessor set from the source (every
+  `void name(` whose name, split on `_`, contains a register token) - so
+  a new fixed-pair wrapper is counted the day it is written. **When an
+  audit tool and your intuition disagree about a register, suspect the
+  tool's blind spot before the intuition.**
+- **THE POOL'S PREFERENCE ORDER IS A COVERAGE HOLE.** `take_reg` scans
+  the pool in order, so the LAST member is handed out only to a run with
+  the maximum pin count. r9 was 4th of 4, so `-rt`, all four
+  differentials, `corpus_diff`, and every fuzzer exercised the first
+  three heavily and r9 essentially never. A bigger corpus does not fix
+  this - the allocator's own preference is what hides the tail.
+  **`MYLANG_JIT_XROT=N` rotates the pool** so member N is handed out
+  first; `corpus_diff --xrot` runs the matrix, and the
+  `jit_xcache_pins` `-rt` case sweeps every rotation in-process. Making
+  r9 FIRST fails `-rt` in seconds - which is how it was found.
+  **Generalise: when a resource is allocated in a fixed preference
+  order, the test net must permute that order.**
+- **"SAFE BY THE SAME GATES AS X" IS NOT AN ARGUMENT.** r9 was admitted
+  by analogy to r10/r11. A register joins only with its OWN sites
+  enumerated against the gates. r8, audited that way, is genuinely safe
+  (its raw-scratch use is confined to `emit_sync_push_native`,
+  `emit_sync_call_inline` - both blocked by `jit_run_blocks_xcache` -
+  and `emit_ret_native`, whose first act is `flush_cache()`); r9 is not.
+
+**⛔ A FRAGMENT RETURN MUST NAME ITS WRITE-BACK CONTRACT (#96,
+2026-08-16).** The N5/C2a register cache holds frame slots in registers
+between an entry load and an exit flush, so a `ret` that leaves one
+there resumes the interpreter on a STALE slot - a silent wrong answer.
+`exit_pc` flushes automatically; **`frag_ret()` does not**, and 13 sites
+call it directly. Seven of them were relying on an invariant written
+nowhere near them: `pick_cached_slots` lists no call opcode, so it hits
+`default: return {}` and a run containing a call is not cached. So
+`frag_ret` now takes a `RetFlush` - `flushed` (a `flush_cache()` was
+emitted on this path), `empty` (**ML_CHECKed**), or `epilogue`
+(`emit_epilogues` only, where `exit_pc` already chose per exit). **A new
+return site must pick one**, and `empty` is the one that will fail
+loudly the day the allocator keeps a value in a register across a call.
+Do not "fix" that abort by switching to `flushed` - emit the flush.
+**That day was #97 increment 1b (2026-09-19):** the CALL family is a
+CLASSIFIED op now, a call run pins, and the sync call's two SWITCH
+exits emit the flush (`emit_divergent_flush`) before saying `flushed`.
+Two rules it added: a multi-exit call emitter closes its bracket ONCE,
+on the fall-through path - a divergent exit uses
+`emit_call_epilogue_divergent`, and `op_boundary` asserts the count is
+back to zero (it had been -4 per sync call, latent while no call run
+could pin); and a gate that enumerates "is this slot register-resident"
+must include the scan's TRANSITIONS, not only the entry occupants
+(argfuse's `pinned()` did not, and fused a loop counter that lived in
+r13). Record: `docs/jit-optimizations.md`, *#97 increment 1b*.
+
+**⛔ THE 16-ALIGNMENT RULE IS "AT THE CALL", NOT "EVERYWHERE" - AND
+THERE IS ONE CALL SEAM AND ONE rsp MODEL (SP1-SP3, 2026-09-22).**
+System V requires `rsp % 16 == 0` AT the `call` instruction. This file
+used to hold the far stronger *the body of every fragment is aligned at
+ALL times*, propped up by `frag_entry`'s parity filler, a comment rule
+that the hand-spill sites "push in PAIRS", and a third clause that had
+been STALE for months - and checked by NOTHING. Four rules replace it,
+and a new emitter must obey all four:
+
+ - **EVERY emitted call goes through `Emitter::call_direct`,
+   `call_reg` or `call_local_fixed_frame`** (#97 E2: a self site's call
+   to its own fragment's frameless entry, patched once that entry is
+   emitted) - all three open with `call_site()` and close with
+   `call_done()`, and there is no fourth spelling. 97 sites used to
+   open-code the reloc+E8 pair, so each carried the alignment
+   obligation privately and "does this run emit a call?" had to be
+   reconstructed from `call_relocs.size()`. The seam ALIGNS the call
+   if the model says it must, so a site that spills an ODD number of
+   registers no longer pads.
+   **#97 E2e adds a second duty to the seam:** in a calling
+   frameless body the vframe is published LAZILY, by `call_direct`
+   (unless fixed-frame) and `call_rax` - so a C++ helper there must
+   be reached through one of those two, never a bare `call_reg`,
+   or it runs with a stale `ctx->frame` (a TESTS build's poison
+   window then aborts it by name). **#97 R4 made a frameless LEAF
+   lazy too, on a bet** that its normal-return path publishes
+   nothing, so its site skips the restore. The one way to call C++
+   there without publishing is `call_direct_framefree` /
+   `call_rax_framefree`, for a helper that PROVABLY reads no running
+   frame (a value's release, a lean closure constructor handed its
+   slots, `jit_ret_norec` for a frameless frame, which finds the
+   window from rbp). A helper wrongly called that way reads the
+   poison window in a TESTS build; a publish the bet's count missed
+   is caught at the site (`jit_vframe_published`). **Any other way control reaches
+   C++ publishes too**: the exception epilogues and the ReturnV's
+   BOUNDARY arm (a callback's owner reuses the frame for the next
+   element - missing it was a release SEGV, 2026-09-25).
+ - **EVERY emission that moves rsp goes through a seam that calls
+   `Emitter::sp_move`** - push/pop, `push_base0`/`push_base`/
+   `push_abs32`, `op_reg_imm` on RSP, `push_rbp`/`pop_rbp`,
+   `frag_entry`'s pad and spill reserve, `frag_ret`'s `lea`, the
+   native-stack switch. A missed one is not a wrong diagnostic, it is
+   a SILENCED check: the model would say call-ready when it is not.
+   `MYLANG_JIT_SPCHECK` (above) is the layer that catches that, and it
+   is the reason that lever exists.
+ - **⛔ A VALUE THAT DRIVES EMISSION IS NOT DIAGNOSTICS, WHATEVER IT
+   LOOKS LIKE.** `sp_at_jump` only ever feeds an `ML_CHECK`, so it was
+   written `#ifndef NDEBUG` - but it is ALSO how a label revives the
+   model after a terminator. Compiled out, `sp_live` went false at a
+   fragment's first `ret` and never came back, so every later call
+   skipped BOTH the alignment and the check: bench/my/78 GP-faulted
+   inside `jit_ret_norec` in an `OPT=1 ASSERTS=0` build while `-rt`
+   2016/2016, every corpus matrix and even `--spcheck` on the DEBUG
+   build were green. Same family as `trk_push`'s own ⛔.
+ - **⛔ A SHAPE TEST ASSERTS ON AN INSTRUCTION, NOT ON THE TEXT THAT
+   RENDERS IT (maintainer, 2026-09-22).** `decode_one` FILLS a
+   `DecodedIns` - mnemonic plus typed `DecOp`s (`Gpr`, `Xmm`, `Cl`,
+   `Mem{base,index,scale,disp}`, **`Slot`**, `Imm`, `Rel`, ...) - and
+   `-vdj` is `render_op` of that, so a test reads the structure the
+   dump was rendered FROM, through `g_jit_decode_sink`. The `native_*`
+   string patterns remain for pinning a long SEQUENCE verbatim, which
+   is what they are good at; they degenerate the moment a test wants to
+   say something about ONE OPERAND.
+   **⛔ AND DO NOT "FIX" THAT BY PARSING THE DUMP BACK** - that is a
+   SECOND DECODER in all but name: it re-derives what the disassembler
+   knew, it is not what `disasmcheck` cross-checks against objdump, and
+   it cannot recover what the rendering COLLAPSED (the dump spells a
+   scratch TEMP `rN`, the same as r8..r15, so `mov r10, rax` is
+   ambiguous in the TEXT and not in the decode). ANCHOR the instruction
+   under test - its destination store, its op mark - rather than
+   counting matches. The decode FAILS CLOSED and has its own `-rt`
+   self-test over every form the emitter produces. When you change the
+   renderer or the decoder, `vdjcmp` byte-identity is the proof that it
+   is inert.
+ - **WHEN EVERY GUARD IS ELIDED, EMIT NEITHER THE JOIN JUMP NOR THE
+   ARM.** A tier that falls to a helper behind one or more `ref_slots`
+   guards has an UNREACHABLE helper when all of them are elided -
+   nothing is patched to it - and the `jmp` that hops over it is ONE
+   EXECUTED INSTRUCTION on the fast path. #113 gave the capture read
+   this rule; `MoveV` did not get it for two more years, at about 40
+   dead bytes plus that `jmp` per staging move (45_gcd **-2.93% Ir**
+   when it landed). The rsp model is what found it - a call nothing
+   branches to has no stack state to align against - and
+   `g_jit_call_dead_model` is the ratchet, held at ZERO by *the CALL
+   SEAM is total*.
+ - **A CALL WHOSE CALLEE READS THE CALLER'S FRAME AT A FIXED OFFSET
+   FROM THE RETURN ADDRESS uses `call_fixed_frame`.** The push
+   protocol's captures (`[rbp+16]`), the pushed dst word (`[rbp+24]`)
+   and the frameless WINDOW (`[rbp+32]`) are all counted through the
+   residue the SITE pushed, so an alignment `sub rsp, 8` slipped in
+   between the last push and the call MOVES the window. Found by
+   sabotage, where it surfaced as a `jit_ret_audit` abort four layers
+   from the cause.
+
+Record, with the measurements and the seven watched sabotages:
+`docs/jit-optimizations.md`, *SP1/SP2/SP3*.
+
+**⛔ EVERY CALL TIER MUST END A RUNAWAY RECURSION IN `StackOverflowEx`
+(2026-09-23).** Recursion depth is unspecified (RULE 2) - a tier may
+carve windows from the native stack and go deeper than the slot
+segment would - but it must still reach a CATCHABLE overflow, never a
+SIGSEGV, and the rest of the output must not change. `driver_checks`'s
+*overflow* case runs five recursion shapes at four caps under `-nj` and
+five JIT configurations and compares everything but the depth. Its first
+run found two real bugs in the depth-cap SWITCH materializer, reachable
+only on a build whose native stack is off (a sanitized one, or
+`MYLANG_NATIVE_STACK=0`). Record: *THE SWITCH MATERIALIZER* in
+docs/jit-optimizations.md.
+
+**⛔ AND IT BROKE AGAIN, ONE DAY AFTER THE ABS32 MEMORY OPERAND LANDED,
+WITH THREE NETS PRESENT AND ALL THREE BLIND (2026-08-26 -> found
+2026-08-27).** `mov rax, [+0x41250108]` - the arena global reached in
+ONE instruction (#97 step 1a) - printed its RAW ADDRESS. Every other
+baked pointer masks to `<addr>`/`<int-tag>`/`<helper>` for exactly one
+reason, that two runs and two separately-linked binaries must produce
+IDENTICAL text, and the new operand form was added without learning it.
+
+**THIS IS THE MOST INSTRUCTIVE INSTRUMENT FAILURE IN THE REPO, because
+the defences existed and each failed DIFFERENTLY:**
+
+1. **`vdjcmp`'s SELF-TEST was correct and refused every comparison**
+   from that commit on ("the same binary gave two different dumps for
+   samples/gcd"). It was not lying - it was shouting. **Nobody ran it.**
+   A self-test that fires only when someone remembers is not a net; it
+   is now a CI step (`nets.yml`, the differential job).
+2. **`-rt`'s ADDRESS-FREE INVARIANT check - written expressly to make
+   this bug impossible - did not fire, because it ENUMERATED WHERE AN
+   ADDRESS CAN APPEAR.** It walked `", "` operand separators and
+   skipped anything whose first character was not a digit, on the
+   reasoning that `[` begins "a register / [mem]". True when written,
+   when an address could only be an IMMEDIATE; the new operand put one
+   inside the brackets it was skipping. **⛔ THE NINTH AUDIT-TABLE
+   SHAPE: a check that enumerates the PLACES a hazard can occur goes
+   stale exactly like a table that enumerates the OPCODES that can
+   cause it.** It enumerates nothing now - every number anywhere on the
+   line, brackets included - with ONE exemption stated as a property
+   (a control transfer's operand is a fragment-RELATIVE offset).
+3. **Nothing checked the property END TO END.** `-rt` runs in-process,
+   so it can only assert the invariant that IMPLIES reproducibility,
+   never reproducibility itself. `tests/driver_checks` now spawns
+   the binary twice and compares - the same split as every other
+   driver-visible property.
+
+**THREE RULES, all of them earned here:**
+
+- **⛔ ADDING AN OPERAND FORM TO THE EMITTER IS A DISASSEMBLER CHANGE.**
+  A new addressing mode, a new immediate position, a new prefix: the
+  rendering obligation (mask every baked address) attaches to it, and
+  no existing check can be assumed to cover a shape it was not written
+  against. Run `scripts/vdjcmp BIN BIN` - not only after a change
+  you believe is a pure restructuring.
+- **⛔ A SELF-TEST THAT IS NOT IN CI IS NOT A NET.** The whole point of
+  one is that it fires without being asked. If a tool can check itself,
+  that check belongs in `nets.yml`.
+- **⛔ WHEN AN INSTRUMENT REFUSES, THAT IS A RESULT.** "The tool errored
+  so I moved on" is how a correct refusal becomes a silent regression.
+  A refusal is a failing test.
+
+(`MYLANG_VDJ_HEX=1` remains non-reproducible BY CONSTRUCTION - the raw
+bytes contain the address - which is why the comparison path does not
+use it, and why the driver check compares the plain dump.)
+
+**⛔ `-vdj` IS REPRODUCIBLE - AND THE FOUR YEARS OF WORKAROUNDS THAT
+SAY WHY YOU MUST FIX A TOOL, NOT ITS CALLERS (2026-08-17).** Comparing
+two binaries' emitted code is a plain `cmp` now
+(`scripts/vdjcmp OLD NEW`): baked addresses print as
+`<int-tag>`/`<addr>`/`<helper>` - the operand SHAPE, which is all a
+reader or a differ needs - with the digits behind `MYLANG_VDJ_ADDRS=1`.
+
+This paragraph used to say the opposite ("comparing needs
+normalisation") and prescribed a sed pipeline, ordered just so, because
+a libm displacement is 5 or 6 hex digits depending on where the code
+page lands. Every word was true and the whole approach was wrong:
+
+ - **the masks rotted silently.** They were hex-only, and #96 step 3
+   moved the Type singletons into a low-address arena so a tag encodes
+   as an `imm32` - which the disassembler printed in DECIMAL. From that
+   day `vdjcmp` reported **0 identical / 108 differing** for ANY
+   pair of binaries. It was not an oracle; it was a constant
+   "everything changed", and nobody noticed because that is also what a
+   broken change looks like;
+ - **no regex could ever have been enough.** A mis-decoded instruction
+   emerges as bare `.byte 0xe0` / `nop` lines with no maskable token,
+   and 31 of 108 programs differed from THEMSELVES that way;
+ - **the disassembler was ALSO just wrong**, which the masking hid:
+   5543 undecoded bytes corpus-wide, from six missing opcodes and a SIB
+   decoder that never consumed its displacement (so `mov rdi, [rsp+8]`
+   printed as `mov rdi, [rsp+rsp*8]` and desynchronised the fragment).
+
+**THE RULE: fix the TOOL, not the script that reads it.** A workaround
+in one consumer leaves the tool broken for every other consumer - and
+for you, reading the dump by eye, which is the consumer that matters
+most. `-vdj` now self-reports: a fragment it cannot fully decode prints
+`⛔ DUMP IS UNRELIABLE: N undecoded byte(s), M skipped op mark(s)`,
+and the `jit: -vdj decodes every emitted form, reproducibly` `-rt`
+check fails the day a new emitted instruction form appears.
+
+**⛔ BENCHMARKS ARE NOT FUNCTIONAL TESTS (maintainer-set, 2026-08-05).**
+`bench/` measures THROUGHPUT - millions of iterations - and must NEVER
+be used as a correctness corpus. A JIT bug shows on iteration 1 or not
+at all, so running benches for it buys no coverage and costs minutes:
+the first cold-arm stress lane took `-rt` from 2.6s to over TEN
+MINUTES purely because the shapes it needed were buried in benchmark
+loop counts. Functional tests live in **`tests/functional/`** - tiny,
+self-asserting programs that CONSTRUCT the hazard shape on purpose
+(a reference parked in the very temp a float chain reuses, a
+ref-listed loop counter, each element tier and its decline) rather
+than hoping a benchmark happens to contain it. `tests/corpus_diff`
+runs those plus `samples/` in **0.2 seconds**, and its `--cold` matrix
+in 0.7. Write a new dedicated test for the construct under test; do
+not reach for a bench.
+
+**⛔ EMITTER-ONLY CODE LIVES INSIDE `#if ML_JIT_SUPPORTED` (2026-08-05).**
+The lever switches below first sat ABOVE the guard and broke three CI
+lanes at once, none of them reproducible locally: macOS clang
+`unused function 'jit_lever_forced' [-Werror]` (off-platform nothing
+calls them) and MSVC `C4996` on their `getenv` (inside the guard it is
+never compiled - which is why jit.cpp's OTHER getenv calls are fine).
+The same push also hit `std::binary_search` in vm.cpp with no
+`#include <algorithm>`: GCC and the local clang pulled it in
+transitively, the runners' newer stdlib does not. **Before pushing a
+JIT batch, compile the NON-JIT path**: temporarily flip jit.h's
+`#if defined(__linux__) && defined(__x86_64__)` to `#if 0`, build with
+BOTH g++ and clang++, run `-rt` (JIT mode self-skips; still
+1715/1715), restore. And build once with **CMake** - that is what CI
+runs, and `make` alone passed all three broken configurations.
+
+**⛔ THE JIT'S TEST NETS - AND THE AXIS THEY ALL MISSED (2026-08-04).**
+A JIT register bug needs THREE things to coincide: a PROGRAM SHAPE
+(which temps are shared between reference-producing code and the hot
+chain - slot allocation), a RUNTIME STATE (that slot actually holding a
+reference when the guarded op runs, so the cold arm is taken), and an
+EMITTER DECISION (which register the value is in - forwarding armed?
+result in xmm0 or xmm1? pinned?). Measured against that: `-rt` varies
+only the first, weakly (hand-written tests have few locals, so their
+temps rarely collide); `tests/nested_fuzz` varies control flow but
+is **INT-ONLY** by construction - it maintains a CPython twin, which
+forbids int `/`, negative `%`, >64-bit ints and dict iteration - so it
+can never build a reference/float temp collision; the 5-mode
+differential is an excellent ORACLE over those same programs. Nothing
+varied axes 2 or 3. That is why TWO bugs in one day were green
+everywhere and both died instantly on a bench program (a real `main`
+reuses its low temps for argv/print AND for the hot loop - exactly the
+collision). Three nets now:
+- **`tests/corpus_diff`** - tree-walker vs the default engine over
+  `tests/functional/` + samples (14 programs, 0.2s). RUN IT with -rt,
+  rel-hard, clang and the fuzzer on any JIT/register batch.
+- **`MYLANG_JIT_COLD=tier[,...]`** - force a guarded tier's DECLINE arm
+  so a path normally reached only by a runtime coincidence becomes the
+  ONLY path (the RECYCLE=1 philosophy for the JIT). `refstore` forces
+  the ref-listed scalar store's release-helper arm; `guard` (#97
+  closure inlining) makes every GuardCalleeV MISS, running the inline
+  cache's miss arm - the original call - which our own compilation
+  never reaches (the analysis named the one callee), and which a wrong
+  or tampered image would. `g_jit_cold_extra` (jit.h) is its
+  in-process twin, OR'd in the way `g_jit_off_extra` is for the levers:
+  a test that must run a cold arm sets and restores it. On its FIRST
+  run `refstore` found a real latent bug in 0.7s: `store_dst`'s cold
+  arm gated its RAX
+  reload on `keep_rax`, but `ForLoopStep`/`IntAddStep` store the
+  counter and then `cmp rax, <bound>` - so a ref-listed counter taking
+  that arm compared garbage and the loop ran the wrong number of times.
+  The reload is unconditional now (it costs the hot path nothing).
+  Opt in PER CALL SITE via emit_ref_check's `cold` parameter - a
+  first version overrode the shared helper for every caller at once,
+  which is the wrong granularity for a knob meant to isolate one tier.
+- **⛔ LEVER A FORWARDS LOCALS TOO, AND THE TEMP RULE MOVED (#96,
+  2026-08-16).** Lever A's arming test used to require a TEMP
+  destination. That restriction belongs to the WRITE ELISION - only a
+  temp's liveness proves the slot dead - not to the READ, and eliding
+  just the read still removes a real instruction: on a memory-backed
+  local it is a store-to-load-forwarding stall ON the dependency chain
+  (`mov a4, rax; mov rax, a4; sar rax, 7`). The test now sits inside
+  `skip_write`, which is ALSO where `tb = fdst - slot_count` stops
+  being negative - **`1 << tb` for a local is UB**, and that is the
+  trap in doing this the quick way. Measured -8.86% Ir / 0.89x on
+  83_regs_int_40, 28 corpus programs changed, none regressed.
+- **THE LEVER SWITCHES** (`MYLANG_JIT_OFF=lever[,...]`, jit.cpp): the
+  JIT analogue of `--no-opt`, which CLAUDE.md already mandates for AST
+  transforms for the same reason (`-nj` is all-or-nothing and localises
+  nothing). Levers: cache, fcache, telide, fread, flit, fwd, ffwd,
+  resreg, hoist, hoist2, mfact, cest, relent, norec (the no-record
+  call tier, DEFAULT ON since 2026-08-12 - its TESTS nets self-adjust
+  per mode, so `-rt` is green with it on OR off), argfuse (#162: a
+  reference argument already in a named local is bound STRAIGHT from
+  that slot and its staging MoveV is not emitted; the cold arms
+  materialise the run. A FRAMELESS site - #97 inc 3 W2 - fuses ANY
+  named local, pinned or not: the site builds the callee's window
+  itself and binds each argument from where it lives at that pc, a
+  pin from its register; its decline trampoline materialises the
+  run the same way; a TWO-WAY value site - E3 - dispatches on the
+  live descriptor into one of two such tails; W3: the site leaves a
+  window slot UNINITIALISED when it is not a parameter, not
+  ref-listed and written ONLY by ops in `jit_instr_stores_dst_raw` -
+  a per-INSTRUCTION whitelist an op joins only when EVERY tier of its
+  emission stores the dst raw; a TESTS build poisons such a slot with
+  `jit_poison_type`, so a wrong row aborts by name. Without TESTS the
+  slot is raw stack, so a whole-window scan must skip it UNREAD:
+  `jit_ret_audit` (VM_HARDENING) read one and SEGFAULTED on a debug
+  build with no test suite until 2026-10-11 - the `dbg-nt` lane, in
+  CI now, is the configuration that sees it. ⛔ AND "written
+  only by raw ops" is VACUOUSLY true of a slot NO op writes
+  (2026-09-22, myv_fuzz small-60 on a v18 image): a mutated ctor dst
+  left `p` unwritten, the site left it uninitialised, `p.x` read stale
+  stack whose type word said "dict" - a SEGV in both builds. The site
+  now also subtracts `Chunk::frameless_read_first` (a definitely-
+  written dataflow over the CFG, `chunk_read_before_write`) from the
+  LOCAL half; a parameter's bit is ignored - the fill writes it.
+  `jit_chunk_frameless_derive` is the ONE derivation point for the
+  three frameless facts (codegen, the splice, the loader). Emitted code
+  byte-identical corpus-wide. ⛔ A RESET of a possibly-raw slot covers
+  exactly that set (`frameless_init_free & ~frameless_read_first`): the
+  boundary decline's dst reset (E2b) wrote `none` over EVERY dst and
+  dropped a reference an initialised one held (a leak past the depth
+  cap, 2026-11-09); W5: a frameless
+  site BORROWS a non-escaping reference INLINE - the callee is baked,
+  so `noescape_params` is an emit-time bit - as a raw copy with the
+  `borrowed` byte set, declining ONLY an array whose slice byte is set
+  to the helper (#94's slice rule); the arm tests that byte before
+  calling the release helper; a proven-scalar parameter's tail stores
+  are gone. The bit rides in the image since myv v17), capprot (W4: a
+  W4 callee's frameless site leaves `ctx.captures` ALONE - the entry
+  takes the capture base from the FuncObject in rdx - which is sound
+  only while NO op in the body can reach `ctx->captures`: the
+  `jit_op_w4_safe` whitelist, the post-emission check over the
+  emitted call targets against `jit_w4_unsafe_helpers`, and a TESTS
+  build's `jit_poison_captures()` installed as ctx.captures. A helper
+  that starts reading `ctx->captures` joins that list - the poison is
+  what tells you it did not. The TESTS arm restores the caller's
+  captures UNCONDITIONALLY, which the release arm does not - so it
+  first CHECKS the poison is still there (`jit_w4_captures_replaced`):
+  a site that wrote anything else (the G2 empty set did, a release
+  SEGV, #97 R3) was invisible to every TESTS lane until it did), xcache
+  (#96: the
+  CALLER-saved half of the
+  pin pool - it holds hot locals too, spilled/reloaded around every
+  helper call by emit_call_prologue/epilogue. **Which members a run
+  may spend is a per-register CLOBBER MASK, `jit_xcache_clobber` -
+  not a boolean.**
+  It was a boolean until 2026-08-18, and the boolean cost a register
+  for nothing: one C1 hoist region denied the WHOLE pool, though the
+  hoist claims only r10/r11, and an element read on a loop-invariant
+  base is exactly what CREATES a region - so "walks an array in a
+  loop" and "may pin a caller-saved register" were mutually exclusive,
+  0 of 20 hoist runs corpus-wide having a register left. Each
+  contributor now names its own: hoist -> {r10,r11}, a MyLang call ->
+  the whole pool ONLY when the run lost #124(b)'s bet (below); a type
+  singleton still in a register is a B1 GRANT
+  claimed as ra.busy, not a clobber entry - Emitter::grant_tag_regs
+  decides it once per run and tag_holder() is the one query.
+  **⛔ A DENY IS ABOUT SPENDING, NOT OCCUPANCY (#97, 2026-08-26):**
+  it says this fragment may not HOLD a value there across a helper
+  call, which is what a PIN does - it does NOT say the register is
+  in use. So `alloc_scratch(..., transient=true)` ignores `denied`
+  for a grant that lives and dies inside ONE op (acc_take, which
+  always ignored it, is the precedent), while `busy` - a hoist
+  region's claim, a tag grant - still excludes. Getting that
+  backwards is not a wrong answer, it is a SILENT STARVATION: a run
+  containing a MyLang call denied the whole pool, so every inline
+  tier asking for scratch in exactly the shape it exists for
+  declined to its helper and the counter read zero), xcall (#124(b):
+  a run that CALLS may pin caller-saved too. Each MyLang call op is
+  emitted with every caller-saved GP pin LIVE across it written back
+  (payload and tag) and out of the register view - the call emitters
+  use rax/rcx/r9/r10/r11 raw between their prologue and the `call`,
+  so they must meet no such pin - and reloaded where the op's paths
+  rejoin; a pin DEAD across it is dropped and re-adopted with no
+  reload. ⛔ "Live" includes the call's FUSED argument sources: the
+  dropped staging move is where the liveness credits the read, but
+  the call binds at its own pc (missing it printed 771 for 3055). Pins
+  live across a call are assigned callee-saved first. A run whose call
+  INSIDE A LOOP had to write back a live caller-saved pin LOSES the
+  bet and is emitted again with the old whole-pool denial - writing
+  back per iteration measured +17% Ir on 97_regs_int_call;
+  `MYLANG_JIT_FORCE=xcall` skips the bet (the soundness half alone).
+  Float pins are untouched: xmm is all caller-saved and they were
+  always spilled as payloads by the call bracket), tregs (#86: an
+  expression TEMP may hold a register - the linear scan's second plan,
+  run only when the locals' plan leaves three registers idle, at a
+  budget two below the pool so the emitters keep scratch. A temp is
+  admitted only if non-ref-listed, touched only by the specialized int
+  family (IntAddRR .. IntModRI), not read by a ReturnV, not spanning a
+  MyLang call, and never in rax/rcx/rdx (ISA roles) or a callee-saved
+  register (a push/pop per entry); installed at its definition with no
+  load, and a dead temp's evict writes nothing, in main too),
+  bakecallee (#97 step 4: a call to a WRITE-ONCE global slot has a
+  callee the emitter can NAME - `jit_baked_callee` reads it out of
+  `JitCtx::slot_desc`, the same map `callv_native_ok` has always
+  used - so the five descriptor gates, the window SIZE, the
+  record-less fork and each proven-scalar argument's reference test
+  become COMPILE-TIME constants and one identity compare is what
+  survives. **Its FORCE half is not decoration**: the write-once
+  gate is about PROFITABILITY (a reassigned slot fails the compare
+  on every call and loses the cache that would have hit), so the
+  compare is unreachable under our own compilation and deleting it
+  leaves every net green - `MYLANG_JIT_FORCE=bakecallee` lifts the
+  cost gate alone and makes it fail in `Frame::at`),
+  lsra (#103 A': selects the LEGACY pick over the linear scan -
+  a different PIN SET for the same program.  It was ONLY the
+  `MYLANG_JIT_LSRA=0` env var until 2026-08-31 and so was absent
+  from this matrix, which meant a whole second allocator was
+  exercised by four hand-written `-rt` cases and nothing else -
+  the "configuration nobody runs" shape.  NOT VACUOUS: 21 of the
+  35 corpus programs emit DIFFERENT machine code under the two,
+  which is 21 programs' worth of alternative slot -> register
+  assignment - the axis the r9 bug lived in.  ⛔ It cannot see a
+  bug that keeps the ANSWERS right: #123's give-back regression
+  was correct-but-45%-slower and only the benchmark caught it),
+  capbase (#112: a run making TWO OR MORE inline capture accesses
+  walks `ctx -> ctx->captures -> data()` ONCE, at the run head, into
+  a CALLEE-saved register claimed from whatever the pins, the C2b
+  pair and trans mode's abstract registers left (#123: it asks
+  `ra.take(CAP_ALLOCATABLE|CAP_MEM_BASE|CAP_CALLEE_SAVED)` - both
+  requirements STATED, where the callee-saved half used to be
+  implicit in a list's contents). **It is a BASE register, not a
+  value register, and that excludes r12**
+  - `(r & 7) == 4` is the ModRM encoding meaning "a SIB byte
+  follows", which `load_base` does not write; `base_needs_sib`'s
+  ML_CHECK caught it on the first run, exactly as its own comment
+  predicted it would the day a base came from an ALLOCATOR rather
+  than a literal.
+  ⛔ **W6 (2026-09-22): CALLEE-SAVED IS A CONDITION, NOT A PROPERTY
+  OF THE JOB.** It is what SURVIVES A CALL, paid for with a push at
+  `frag_entry` and a pop at every exit - and a FRAMELESS entry runs
+  PER CALL. A run that makes no call has nothing to survive, so its
+  base is claimed from the caller-saved half (a `prefer` mask, never
+  a capability: "caller-saved" is the ABSENCE of one) and joins no
+  save list. "Makes no call" is two halves: `jit_run_blocks_xcache`
+  refuses a MyLang CALL op statically (its emitter uses r8/r10/r11
+  raw, outside any bracket), and the HELPER half is bet
+  optimistically and settled from `n_prologues` after the run, with
+  one re-emission. The base then needs a LIVE RANGE - it ends at the
+  run's terminal ReturnV, whose arm uses caller-saved registers as
+  raw scratch - and `reg_holds_pin` reads it, so the establishing
+  loads must declare themselves MACHINERY. **`--xrot` found that
+  last part on its first run** (r11 at rotation 11; the default
+  rotation picks r10 and never meets the arm)),
+  vfquiet (#97 R4, the quiet vframe of a frameless leaf), gproof (#97
+  G3: an inline-cache guard a local `make.closure` proves emits
+  nothing - `jit_guard_facts`, recomputed over the bytecode being
+  run, so sound on an image), ghoist (#97 G1: a loop whose inline-
+  cache guards read a slot the loop never writes checks them once,
+  before the loop - a C1 hoist region with no element base; every
+  post-call resume stub inside it RE-CHECKS the guards and resumes in
+  the cold copy on a miss, since a switched call can come back into
+  the loop), regcall (REGCALL 1A: a frameless callee's int parameters
+  arrive in rdi/rcx/r9/r10 and its entry moves each straight into the
+  parameter's pin, or writes the slot when it is not pinned - one rule,
+  `jit_regcall_arg_reg`, for the site and the entry; step 4 is its float
+  twin, `jit_regcall_farg_reg`, in xmm2-xmm5 (a declared or proven
+  `float` parameter also gains pin evidence from its BIND, so it can be
+  float-pinned at all); 1B, the result in
+  rdx/rcx for a callee whose every return is trivial, has no lever:
+  `Chunk::frameless_ret_regs` is derived and the site and the arm both
+  read it), pincs (REGCALL step 1: a FUNCTION BODY whose run brackets
+  no call pins in the CALLER-saved half - a REGCALL parameter in its
+  own argument register - since a callee-saved pin costs a push/pop
+  per ENTRY, i.e. per call; settled from `n_prologues` after emission
+  with one re-emission, the W6/SP3 bet shape), retwb (REGCALL step 2:
+  a function body writes no register-resident value back into its
+  dying window - at the return, and at a linear-scan evict of a slot
+  `jit_slot_liveness` proves dead (no try region in the body); the
+  skipped slots are `Chunk::ret_unflushed`, which the hardened
+  `jit_ret_audit` skips, since a frameless window's never-written
+  REGCALL parameter slot holds stale stack), `all`.
+  `tests/corpus_diff BIN --levers`
+  runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
+  design - the coverage tests assert their own lever ran - so the
+  matrix runs against the CORPUS, not the suite.
+- **⛔ `MYLANG_NO_LOWMEM=1` - REFUSE THE LOW-ADDRESS ARENA (2026-08-18).**
+  The JIT names `t_int`/`t_float`/`t_bool` with a sign-extended `imm32`
+  only while they live below 2^31 (`lowmem.h`); everywhere else -
+  Darwin, Windows, a hardened kernel, an exhausted low 2GB, **a failed
+  `MAP_32BIT` on an ordinary Linux box** - every tag store and tag
+  compare falls back to a REGISTER form instead. That is materially
+  different emitted code, it ships, and **no build and no CI lane could
+  enter it**, because the arena is decided by an `mmap` at static init
+  with no switch. This is the `LTO=0` shape exactly: a configuration
+  only one platform can take is a configuration nobody tests.
+  Its FIRST run found a shipped wrong answer. `store_dst_bool` wrote
+  the `t_bool` tag as `store_type_tag(a.type, t_bool, RCX)` - and when
+  #96 step 3 made tags immediates, the `movabs RCX, t_bool` that made
+  that call TRUE was deleted as "an instruction saved". Nothing else
+  ever loads RCX with a tag, so on the fallback path every bool store
+  wrote whatever RCX happened to hold **as the slot's type pointer**:
+  7 corpus programs crashed or answered wrongly, `-rt` was 1922/1922
+  and plain `corpus_diff` 20/20 (both watched). The seam is split now -
+  `store_type_tag(disp, tag, held_reg)` ML_CHECKs that the tag is one
+  of the two something actually materialises, and
+  `store_type_tag_via(disp, tag, scratch)` BUILDS the value for any
+  other - so the next tag cannot repeat it.
+  **The general rule: an optimization that makes a register
+  UNNECESSARY must not leave an argument behind claiming it is still
+  LOADED.** Delete the parameter or honour it.
+  **NET: the `nolowmem` JOB** (`.github/workflows/nets.yml`) - `-rt`
+  off-arena, `corpus_diff --nolowmem` and `driver_checks`, over
+  TWO builds because they catch different things, MEASURED by
+  reintroducing the defect: **debug+ASan/UBSan ABORTS (rc=134)** with a
+  located report, **release `ASSERTS=OFF` SEGFAULTS (rc=139)** - the
+  raw crash a user gets once the ML_CHECK net is compiled away, in the
+  configuration a shipped program actually runs. Each of its tests
+  opens with a VACUITY GUARD (`guard_nolowmem` in tests/run) asserting
+  `mylang -v` reports `lowmem 1` by default and `lowmem 0` under the
+  env, in both directions: a lane that cannot prove it is in the
+  configuration it tests goes green doing nothing the day a default
+  moves (the `lto0` lane's reason for asserting `lto 0` first).
+- **`MYLANG_JIT_XROT=N` - ROTATE THE ALLOCATOR'S SCAN** so a different
+  one of several EQUALLY-WEIGHTED registers is met first
+  (`tests/corpus_diff BIN --xrot` runs the matrix; `g_jit_xrot` is
+  settable in-process, and `jit_xcache_pins` sweeps every rotation).
+  `RegAlloc::take` scans in PREFERENCE order, so its last candidate is
+  reached only by a run with the maximum pin count - which is how an
+  UNSAFE register (r9) sat in the pool for a day, exercised by no net
+  in the project, as a wrong answer. Unlike a lever switch this is not
+  an A/B: every rotation must produce the SAME output, so it is a pure
+  differential axis.
+  **#123 MOVED IT INTO `RegAlloc::take`/`ftake`** (it used to permute a
+  caller-saved ARRAY, and with the arrays deleted there would be
+  nothing left to rotate - the axis would have gone silently vacuous).
+  It reaches the WHOLE GP file and the FLOAT file now, period 16;
+  `mylang -v` reports it and `corpus_diff --xrot` derives the sweep
+  from that line rather than hardcoding a count.
+- **`MYLANG_JIT_OFF=lsra` - the D3 REGISTER-ALLOCATOR lever, ⛔ DEFAULT
+  ON since 2026-08-26.** ⛔ **IT IS AN ORDINARY LEVER NOW (#103 A',
+  2026-08-31), AND THAT WAS THE WHOLE POINT.** It used to be THREE
+  spellings of one gate - the `MYLANG_JIT_LSRA` env var, the
+  `g_jit_lsra` global the coverage tests set in-process, and the
+  lever - and it was in NO differential matrix, so a whole second
+  allocator was exercised by four hand-written `-rt` cases and
+  nothing else. The env var and the global are DELETED; the in-process
+  need is `g_jit_off_extra`, the seam every other lever's test uses;
+  and `corpus_diff --levers` (hence CI) now covers it. ON means the
+  linear scan (`jit_lsra_assign` + snap/transitions + the float twin)
+  chooses the register plan; OFF restores the legacy pick end to
+  end, so a suspected allocator bug has a same-binary A/B one lever
+  away. Flipped on the completed two-axis ledger: Ir zero
+  per-iteration regressions corpus-wide (wins to -16.8%), wall
+  geomean 0.997x over 87 (wins to 0.73x). The opt-out config stays
+  covered: `corpus_diff --levers` runs the whole corpus under the
+  pick on every CI run - NOT VACUOUS, 21 of 35 programs emit
+  DIFFERENT machine code under the two allocators - and the four
+  coverage tests that pin the PICK's mechanisms
+  (jit_xcache_pins, jit_rax_pin_test, jit_range_share_test,
+  jit_share_region_clamp) set the lever through `g_jit_off_extra`
+  for their duration.
+
+  ⛔ **AND ONLY ONE OF THE THREE IS ACTUALLY THE PICK'S** - this said
+  "those mechanisms are the pick's alone" for a day and that was
+  WRONG on two counts, both from reading a counter as if it were a
+  reach measurement:
+   - **xcache is SHARED and LIVE.** Since #123 both allocators bind
+     pins through the same `ra.take(CAP_ALLOCATABLE)`; there is no
+     separate xcache path, only "the allocator handed out a
+     caller-saved register" plus the save/restore
+     emit_call_prologue/epilogue already does. The scan reaches it on
+     46_matrix_mult (`xcache 1`), the ONLY corpus program that makes
+     it do so. Deleting it would forbid the allocator 9 of its 13
+     registers - the opposite of what #123 was for.
+   - **rax is SHARED and LIVE, and `rax_pin` is the WRONG COUNTER.**
+     `rax_pin` counts fragments that RAN with rax pinned (0 - because
+     the eviction worked). `rax_retries` counts rax being chosen,
+     conflicting, and the chunk re-emitting with it denied: **1 on
+     each of 83/82/81_regs_int**, under the shipping allocator. The
+     machinery fires; the absence of a pin is its SUCCESS.
+   - **ShareSeam / `range_share` IS pick-only**, and structurally so:
+     under trans mode `spill_hot = lsra_homes`, so the scan
+     substitutes its own overflow plan and the share plan never runs
+     (`range_share` 0, `share_clamped` 0 corpus-wide). That is the one
+     real deletion candidate if the pick ever goes.
+
+  **THE GENERAL LESSON: a counter that reads 0 may be measuring a
+  mechanism that WORKED, not one that never ran.** Ask what the
+  counter is bumped BY before concluding a path is dead - `rax_pin`
+  and `rax_retries` differ by exactly that, and only the second
+  answers "did the rax machinery execute".
+
+  The scan does answer pin pressure differently, which is true and
+  was the sound half: 83_regs_int_40 gets `lsra_trans 22` where the
+  pick gets `xcache 1`. ⛔ TWO RULES
+  it already earned: GP admission needs uses_int > 0 - an int-op
+  touch is the TYPE evidence the t_int flush relies on; a ReturnV
+  read is weight, never evidence (a ret-only closure slot pinned on
+  its ReturnV was flushed t_int over t_func - NotCallableEx + a leak;
+  the pick's >= 3 threshold had been carrying this rule silently).
+  And a coverage test that pins the DEFAULT allocator's mechanism
+  (jit_xcache_pins, jit_hoist_pair_conflict) must force
+  g_jit_lsra = false for its duration, or the lever-on suite starves
+  its crafted shape.
+- **`MYLANG_JIT_FORCE=lever[,...]`** - ignore a lever's COST heuristic
+  but NOT its soundness guards, so it engages in shapes it would
+  normally decline as unprofitable. This is the half with real catch
+  power: it tests a gate's CORRECTNESS independently of its
+  PROFITABILITY. `FORCE=flit` is how C4b's "correctness lives in
+  emit_call_epilogue, not the gate" claim is checked.
+- **`tests/norec_coverage` - the NO-RECORD COVERAGE RATCHET (Net 4,
+  built 2026-08-13).** Reads gcov's JSON from the existing `-DGCOV=1`
+  lane and reports LINE + BRANCH coverage of the tier's walk /
+  reconstruction / verification surface, function by function (the
+  `SCOPE` list in the script — **a function missing from it is
+  silently ungated**, so add yours when you add one). Exemptions live
+  in the SOURCE, as a trailing `/* NOREC-COV-EXEMPT: reason */`, so
+  they cannot rot when line numbers shift and the next editor sees the
+  claim they must keep true; a marker that is no longer needed is
+  reported STALE. gcc's exception edges are excluded by default
+  (`--with-throw` to look).
+  **The number that justifies the whole thing: a plain `./mylang -rt`
+  leaves `norec_walk_chain` at ZERO** — it is gated `!jit_norec_on()`,
+  so the project's primary shadow oracle only runs in SHADOW mode,
+  which `-rt` does not select. `--run` drives a workload that does
+  (corpus_diff `--levers`, Net 3, Net 2, and the deep-switch program),
+  taking the surface from 54.8%/47.0% to 77.4%/62.6%.
+  **The 100% goal (`--gate`) is NOT met** — see the Net 4 entry in
+  `docs/jit-optimizations.md` for what is left and why. CI pins the
+  current floor instead (`--min-lines`/`--min-branches`), so the
+  surface can only improve.
+- **`tests/norec_enum` - the EXHAUSTIVE SMALL-SCOPE ENUMERATION
+  (Net 3, built 2026-08-13). NOT a fuzzer:** it emits EVERY program in
+  a bounded shape space - depth 1-4 x per-level frame kind
+  {plain, try, try/finally, dict-iter} x terminal {int, float, throw}
+  x the level a throw is caught at (or uncaught) - and runs each
+  through **four** engine configurations (`-tw`, `-nj`, jit,
+  `MYLANG_JIT_OFF=norec`), comparing stdout, stderr and exit status
+  BYTE-FOR-BYTE. RULE 2 is the spec, and an uncaught throw's rendered
+  BACKTRACE is the hard consumer - it is built from the reconstructed
+  frames. 2272 programs / 9088 runs at depth 4, ~1.3 min.
+  It reports TIER REACH from a sample, so a space that never engages
+  the tier says so instead of printing a green zero.
+  **It found two real bugs on its first run** - the mixed-kind ret
+  audit abort, and the catch-bind ref_slots gap below - neither of
+  which `-rt` or `corpus_diff` caught.
+  Two axes are deliberately SUBSTITUTED rather than dropped (recorded
+  in the script): "cached-call" as a frame kind is unreachable in an
+  impure chain by construction, and there is no builtin that captures
+  a backtrace without throwing, so capture is covered by every throw
+  variant and rendering by the uncaught ones.
+  **The three cases the depth bound does NOT cover are enumerated
+  explicitly instead** (they are reached by DEPTH, not shape, so the
+  generator cannot make them) and are all covered by the
+  `norec_segment_boundary` `-rt` check: 12000 levels of mutual
+  recursion that throws at the bottom and catches at the top. That
+  crosses TWO `SEG_SLOTS` boundaries in every lane and drives the
+  native stack to 12001 on the non-sanitized ones (vs the cap of 32
+  under ASan, where `ML_NSTACK_OFF` is set). `g_vm_seg_advance` and
+  `g_jit_sync_depth_max` (TESTS-only, in `MYLANG_JITSTATS`) make it
+  measurable - depth leaves no other trace, and the check ASSERTS the
+  boundary was crossed so it cannot decay into a merely-deep test.
+  It is an `extra_check`, not a `tests` entry, and that is FORCED: the
+  differential reruns `tests` entries in the TREE-WALKER, which
+  recurses on the C stack and overflows at this depth.
+- **`MYLANG_RECON_AT=N` + `tests/norec_sweep` - the NO-RECORD
+  tier's DETERMINISTIC EVENT SWEEP (Net 2, built 2026-08-13).** The
+  G1 tier does not write a call record it can REBUILD later, and the
+  rebuild runs only where an exception happens to fall - so its
+  correctness was tested wherever a corpus throws, and nowhere else.
+  `MYLANG_RECON_AT=N` forces a reconstruction at the Nth CALL EVENT
+  instead; the driver walks N over a program's whole event count, one
+  process per N, in BOTH `MYLANG_JIT_OFF=norec` (records still
+  written, so the rebuild is compared field-for-field - the oracle)
+  and the shipping config (record-less, where only the record-free
+  half can be asserted, but which is the mode that ships AND the only
+  mode that walks the real mixed chain - note the Net 1 walk is gated
+  `!jit_norec_on()`, so nothing else traverses it there). Every sweep
+  run's stdout/exit must match a probe-free baseline, so a probe that
+  PERTURBS a program fails too. **Why it earns its keep, watched
+  failing:** corrupting the emitted push's `seg_top_before` store by
+  one leaves `-rt` GREEN at 1907/1907, `corpus_diff` green, and the
+  program printing the right answer, while the sweep fails at N=1 -
+  the slot stack leaks a slot per call and nothing else in the tree
+  looks. The in-suite seed is the `Net 2` `-rt` entry (a few forced
+  events, asserting frames were actually walked); the full sweep is
+  the script, ~5.5 min over the default corpus serially - it runs a
+  process pool now (`tests/jobs count`), each sweep submitting a
+  small window of N values and reading them in order, so it stops
+  exactly where the serial walk did and prints the same report.
+A fourth - forcing a guarded tier's DECLINE arm so a rare cold path
+becomes the only path (the RECYCLE=1 philosophy for the JIT) - is
+DESIGNED and NOT BUILT: a first attempt overrode the SHARED
+`emit_ref_check`, whose call sites have different fall-through
+expectations, and 43_sieve raised OutOfBounds; it needs per-CALL-SITE
+opt-in plus a bounded lane (forcing every scalar store through a helper
+took `-rt` from 2.6s to over 10 minutes).
+
+**⛔ A JIT PASS OVER A RUN NEVER ANSWERS A PER-ITEM QUESTION BY WALKING
+A WHOLE LIST, AND A SET PAID FOR AT EVERY EXIT IS BOUNDED (#34,
+2026-10-08).** "O(n^2) over a run's piece count, which is small" was a
+comment in the snap; the corpus's largest run is a few hundred ops and
+a `nested_fuzz` `main` is 7,862, so the scan, the snap, the region
+tests and the interning together took 32 s to JIT one program. Index
+the list (per slot, per register, per target pc - docs/jit-optimizations.md,
+#34). And every member of `tflush` cost a type store at every exit and
+barrier with no `MAX_*`, unlike every other per-exit family (the pins,
+C5's releases, the share seams): 210 machine instructions per bytecode
+op. **A `nested_fuzz` TIMEOUT whose engines agree is a finding, not
+noise** - this one hid both.
+
+**⛔ THE GUARD-ELISION FAMILY IS AN INSTRUCTION-COUNT WIN WITH A
+WALL-CLOCK CEILING NEAR ZERO (measured 2026-08-05).** The
+specialized-family table fix above is the controlled experiment: it
+deleted guards worth **-15% to -32% Ir on six benches** and its
+wall-clock is **FLAT** (best-of-9 at table scale: 06_if_branch 1.005x,
+03_int_arith 0.995x, 54_mandelbrot 0.983x, 64_struct_create 0.963x;
+suite `cur/base` 1.006x, inside the run-to-run spread). The reason is
+what the guards ARE: a perfectly-predicted branch over two L1-hitting
+loads, with no dependency on the store's data - they retire nearly free
+alongside the real work on a wide out-of-order core. This is the
+documented instruction-vs-time divergence at its extreme, and it is the
+measured argument that killed the first-iteration PEEL (see
+plans/archived/typed-invariant-arrays.md: its reach across bench/ is
+ZERO guards, and even with reach it would trade real I-cache for free
+instructions).
+C4d/C4e/C5 stay - they cost nothing and shrink the emitted code - but
+**do not push this line further on Ir evidence alone.**
 
 **VM dispatch: `CGOTO` (default 1).** On GCC/clang the VM's dispatch loop
 (`vm_run_chunk`) is COMPUTED-GOTO (direct-threaded): a static table of
@@ -425,9 +2264,139 @@ mirroring the Makefile. It ALSO now sets `-Wall -Wextra -Wno-unused-parameter`
 for GCC/clang (it set no warning flags before) and **`-DWERROR=ON/OFF`**
 (default ON) — warnings-as-errors (`-Werror` / MSVC `/WX`), matching the
 Makefile's `WERROR`. CI (`.github/workflows/`) builds Debug+Release ×
-g+++clang on Linux (plus a `RECYCLE=ON` lane), macOS (with libc++ hardening),
+g+++clang on Linux (plus a `RECYCLE=ON` lane and an **`lto0` lane** — see the
+non-LTO note above), macOS (with libc++ hardening),
 and Windows, and runs `./mylang -rt` — correctness only, no timing, so the
 lanes carry as many checks as possible.
+
+**THE `Nets` LANE (`.github/workflows/nets.yml`, added 2026-08-13) runs
+everything `-rt` is BLIND TO.** Until it existed CI ran `-rt`,
+`driver_checks` and `myv_doc_check` and nothing else — the
+differential corpus and all four fuzzers only ran when someone
+remembered to, by hand. That gap was not theoretical: `corpus_diff`
+catches a JIT abort (a mixed-kind call chain tripping `jit_ret_audit`)
+that `-rt` passes straight through, and the Net 3 enumeration catches a
+`ref_slots` leak that BOTH miss. Its jobs run in parallel with the fast
+lanes so an `-rt` failure still reports quickly, and like every CI job
+they build with CMake and run their tests through `tests/run --bin` (see
+the `tests/run` paragraph below):
+- **differential** (Debug, ASan+UBSan+hardening): `corpus_diff`,
+  `norec_enum --depth 3`, `norec_sweep`, `bt_oracle` (#38:
+  inlining never changes a backtrace), the `vdjcmp` self-test;
+- **differential-levers-fuzz** (the same build): `corpus_diff
+  --levers` and `nested_fuzz`, the two longest steps, split out so
+  the halves run side by side;
+- **disasmcheck**, `scripts/disasmcheck --matrix` on a rel-hard build:
+  its (configuration, program) items run on a pool, and a rel-hard
+  `-vdj` run is 11x faster than a Debug one while emitting every form
+  the Debug build does in all 23 configurations except ASan's
+  native-stack-off depth check - which the `differential` job's
+  `disasmcheck` (Debug, both arenas) covers. It used to be three Debug
+  shards, and before that 34 of `differential`'s 57 minutes;
+- **all three fuzzers take a FRESH SEED per run** (`--seed
+  ${{github.run_id}}`, printed first; a re-run keeps it): with a fixed
+  seed every push ran the same programs - a regression corpus, not a
+  fuzzer. A failure is a real bug with a reproducible seed, whichever
+  push it lands on;
+- **myv-fuzz** on BOTH a Debug/ASan and an `ASSERTS=OFF` Release build,
+  because those catch different things (a memory error vs. a check the
+  debug build was relying on being compiled away). Findings are
+  uploaded as artifacts — an image embeds its source path, so a `.myv`
+  finding replays from its seed only through `tests/run` on a build of
+  the same commit (tests/CLAUDE.md);
+- **repl-fuzz** under `RECYCLE=ON` + ASan, the combination this file
+  names for the REPL's retained-AST/stale-node class;
+- **coverage-gate** — Net 4's ratchet (below).
+- **int-enum** — the #107 P3 decision enumerator, tiers 1 and 2 over
+  tests/functional on an optimized `ASSERTS=ON` `INT_TESTS` build (the
+  REGTRACK net live), after a vacuity guard on `mylang -v`.
+**`int-deep.yml` is ON DEMAND (workflow_dispatch):** the enumerator's
+tier 3 and `tests/int_select --with-rt`, each an input - minutes
+locally, an hour or more on a hosted runner. **It and `mutate.yml` live
+only on exp-work, and GitHub's "Run workflow" button exists only for a
+file on the DEFAULT branch (master)**, so neither could be started at
+all until 2026-11-06. Each now has a `push` trigger limited to its own
+file, which registers it with GitHub while every job is skipped on that
+event; it is started through the API on exp-work:
+`gh workflow run int-deep.yml --ref exp-work -f tier3=true -f
+select=true` (and `gh workflow run mutate.yml --ref exp-work`). A new
+dispatch-only workflow needs the same registering trigger, and its
+jobs the same `github.event_name == 'workflow_dispatch'` guard - an
+`always()` job included, which would otherwise run on the push.
+(Measured 2026-10-03: the
+push workflows finish in Linux 8.7 min, Coverage 3.8, Windows and macOS
+2 each, Nets 57 min - all of it `differential`, whose `disasmcheck`
+step was 34; that step is its own three-shard job since, which made
+Nets 31 min with `differential` at 28 - itself split in two since:
+Nets is 18 min.)
+
+**MUTATION TESTING IS ON DEMAND TOO (`mutate.yml`, `tests/mutate`,
+2026-10-04).** Coverage says a test REACHED a line, never that it would
+FAIL if the line were wrong: `2*x` and `2+x` agree at x = 2. A mutant is
+one edit to product code (`<`/`<=`, `+`/`-`, `==`/`!=`, `&&`/`||`, a
+negated `if`/`while`, a constant off by one, `true`/`false`) in a COPY
+of the tree, rebuilt (`OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1`) and
+run through the stages in order - `-rt`, `corpus_diff`, `int_run`, the
+enumerator's tier 1, the fuzzers - stopping at the first failure. A
+mutant nothing kills is a SURVIVOR: a missing check. Since the fuzzers
+run LAST, "killed by fuzz" is exactly what no deterministic test
+noticed - the evidence any decision to cut a fuzzer needs. Test-only
+code (ML_INT spans, INT helpers, `#ifdef TESTS`/`INT_TESTS`) is not
+mutated, and the pristine build must pass every stage first (else the
+stage would kill everything and mean nothing). Hours for a few hundred
+mutants, so 8 sharded CI jobs, dispatched after an arc of complex
+changes; never locally beyond `--count 2` to check the tool.
+**LONG RUNS GO TO A MANUAL CI WORKFLOW, NOT THE LOCAL MACHINE AND NOT
+EVERY PUSH (maintainer-set, 2026-10-04).**
+
+**EVERY TEST IS ONE COMMAND: `tests/run` (2026-10-05, after Tilck's
+`run_all_tests`; it replaced `run_battery`) - LOCALLY AND IN CI.** A catalog of
+TESTS - one run of one tool, each with a TYPE (unit, diff, fuzz, int,
+cli, jit, coverage, mutation), a time CLASS (short <= 30 s, med <= 3 min,
+long <= 30 min, manual = hours) and the BUILD it needs. A bare
+`tests/run` is the quick check (short + med, all on the debug build,
+about 4 minutes); `-t long` adds every other build (clang, rel-hard,
+release, rna, recycle, both non-JIT builds - those from a COPY of the
+tree with jit.h's platform test flipped, never the src/jit.h other
+lanes compile - int-rel, int-gcov, cmake-gcov); `-a` the manual ones.
+`-l` / `-L` list (`-d` with each test's CASES), `-n` prints every build,
+binary check and test command line and runs nothing, `-T` / `-f` / names
+select, `NAME@BUILD` runs a test on another build (`rt@clang`),
+`--case REGEX` runs some cases of a test (`mylang -rt --only`,
+`corpus_diff` / `int_run` / `bt_oracle --only`). **CI runs the same
+catalog** (2026-10-04): each workflow job builds its binary itself
+(CMake mostly, the only place that build system is exercised) and
+runs `tests/run --bin LANE=PATH NAME@LANE ...`, so a check CI needs is a
+catalog test - with its vacuity guard as a `guards=` entry - never a
+workflow shell step (tests/CLAUDE.md has the job map). Builds are made
+incrementally under `--build-root` (default `build-tests/`, the
+maintainer's - **Claude passes `--build-root build-claude`**, or exports
+`MYLANG_TEST_BUILD_ROOT=build-claude`, under the rule above) and each
+binary's `mylang -v` is CHECKED against its recipe before a test runs on
+it, so a wrong `--bin` or a stale directory is refused, not tested.
+Tests run as a dependency graph over `tests/jobs count` cores with
+per-test logs (`BUILD_ROOT/test-logs/latest`), timeouts and a PRIVATE
+`$TMPDIR` each (`-rt` writes fixed names such as
+`/tmp/mylang-myv-corrupt.myv`, so two lanes' suites sharing one `/tmp`
+fail each other). A pass is one line; a failure prints the end of its
+output, its log and a REPRODUCE line naming exactly the failing cases
+(or a fuzzer's seed). The fuzzers get a fresh seed per run (`--seed` to
+repeat), and the measured times go to `BUILD_ROOT/test-times.json`.
+**`tests/jobs` is the ONE
+definition every parallel tool asks:** workers = nproc - nproc/8 where
+the idle CPU class is available, nproc - max(2, nproc/8) under the
+`nice` fallback (`MYLANG_TEST_JOBS` overrides; a 4-core box ran 2
+workers until 2026-11-15), memory caps for concurrent
+`-rt` runs and builds (the measured peaks are in the file), and the
+priority - each tool re-execs itself ONCE through `jobs run`, which
+puts the whole tree in the IDLE scheduling and I/O classes (`chrt
+--idle 0`, `ionice -c3`), falling back silently to `nice -n 19` where
+those are refused (`MYLANG_TEST_IDLE=0` forces the fallback). A
+battery is background work: it must never slow the person at the
+keyboard. `tests/nested_fuzz` checks its programs on a thread pool
+of that size too (`--jobs`) and prints them in PROGRAM ORDER, so its
+report is byte-identical to the serial one for any job count (checked
+over 100 programs, and over a sabotaged binary's 13 divergences).
 
 Running scripts:
 ```
@@ -436,12 +2405,93 @@ Running scripts:
 ./build/mylang -s FILE           # dump syntax tree (const-folded), then ALSO
                                  # the post-optimizer tree (inline/unroll), run
 ./build/mylang -t FILE           # dump tokens
-./build/mylang -nc FILE          # disable const-eval (compare -s with/without)
+./build/mylang -nc FILE          # disable const FOLDING (compare -s with/
+                                 # without) - NOT const-eval: see #54 below
 ./build/mylang -ni FILE          # disable function inlining (debug)
 ./build/mylang -npc FILE         # disable the per-frame pure-call cache
                                  # (recursion still unrolls; for measurement)
+./build/mylang --no-opt LIST F   # disable AST transforms (comma-separated:
+                                 # licm, slice-hoist, for-range, typed, all).
+                                 # The same-binary A/B lever for a pass that
+                                 # rewrites the tree - see "Testing an AST
+                                 # TRANSFORM": the engine differential cannot
+                                 # see a bug in one, so the only oracle is the
+                                 # same program with the pass off
+./build/mylang --strict FILE     # require every NON-LOCAL to be DECLARED
+                                 # above its first use (step 7's opt-in half,
+                                 # FIX-2's original shape). Off by default: it
+                                 # refuses programs that are CORRECT today -
+                                 # "helpers at the top, configuration at the
+                                 # bottom" - so it is the place for rules too
+                                 # aggressive to impose on everyone. What it
+                                 # buys is that UnboundSymbolEx becomes
+                                 # UNREACHABLE. FUNC/STRUCT names are exempt
+                                 # (they bind at SCOPE ENTRY, #134, so a
+                                 # forward call is not a forward reference and
+                                 # requiring order would forbid mutual
+                                 # recursion), as is a LAZY builtin's argument
+                                 # (`isbound(g)` is how a program COPES with
+                                 # an order it cannot fix). Measured: 0 of the
+                                 # 95 corpus programs trip it
+                                 #
+                                 # FUTURE (maintainer, 2026-08-09 - agreed as
+                                 # an idea, NOT scheduled): make `--strict`
+                                 # stronger by requiring define-before-use for
+                                 # FUNCTIONS and STRUCTS too, which needs
+                                 # FORWARD DECLARATIONS (`func f(x);` with no
+                                 # body) to be added to the language first.
+                                 # Without them the rule is not compliable:
+                                 # mutual recursion is a CYCLE and a linear
+                                 # file cannot linearise one, so whichever of
+                                 # `ev`/`od` is written second leaves the other
+                                 # pointing forward. The motivation would be
+                                 # top-down readability discipline (C's rule),
+                                 # NOT safety - a func/struct name binds at
+                                 # SCOPE ENTRY (#134), so a forward reference
+                                 # to one can never raise UnboundSymbolEx and
+                                 # ordering it prevents nothing. Note MyLang
+                                 # already has ONE such requirement, arrived at
+                                 # for a parsing reason: a struct used as a
+                                 # TYPE annotation (`P p;`) must be declared
+                                 # first, because the parser resolves the type
+                                 # name to tell a declaration from an
+                                 # expression - while `P(1)` and `P.CONST`
+                                 # work forward. Before building it, MEASURE
+                                 # how many corpus programs call a function
+                                 # declared below them; that number says
+                                 # whether the discipline is paid for
 ./build/mylang -it N FILE        # inline threshold: max inlined body (nodes)
-./build/mylang -nr FILE          # parse/validate only, don't run
+./build/mylang --max-instances N F  # typed instances one template gets
+                                 # (default 64); past it a call runs the
+                                 # base. Not in the README, by choice
+./build/mylang -v                # how THIS binary was built (opt, asserts,
+                                 # lto, sanitizers, vm_hardening, cgoto,
+                                 # tests, recycle, jit, compiler) - one
+                                 # `key value` line each, read from
+                                 # COMPILER-SET macros (`__OPTIMIZE__`,
+                                 # `NDEBUG`, ...) so it cannot drift from
+                                 # what was compiled. Where the compiler
+                                 # says nothing, both build systems pass
+                                 # one: ML_LTO, and ML_UBSAN (GCC defines
+                                 # no macro for -fsanitize=undefined, and
+                                 # a gcc debug build said `ubsan 0`;
+                                 # driver_checks now checks asan/ubsan
+                                 # against the binary's runtime symbols).
+                                 # bench/run.py parses it; see the
+                                 # ASSERTS=0 rule below
+./build/mylang -nr FILE          # COMPILE and validate, don't run: lex,
+                                 # parse, infer, AND run_optimizers (#147,
+                                 # 2026-08-09 - it used to stop before the
+                                 # optimizers, so every diagnostic that lives
+                                 # in resolve_names was invisible to it: the
+                                 # step 7 prover, the whole WARNING tier,
+                                 # FIX-1, the TDZ, the duplicate-decl check.
+                                 # `-nr` exited 0 in silence on a program a
+                                 # plain run REFUSES, which is backwards for
+                                 # the flag a CI job reaches for. It is no
+                                 # longer a cheap parse - it is the whole
+                                 # compile minus execution.) Exit 1 on a
+                                 # refusal, 0 with warnings on stderr
 ./build/mylang -vm FILE          # execute via the bytecode VM — the
                                  # DEFAULT engine (flipped 2026-07-18);
                                  # kept for pre-flip scripts/CI
@@ -455,8 +2505,104 @@ Running scripts:
                                  # its POOLS (consts/catch_types/…/side tables);
                                  # closures + their capture struct shown, 256-
                                  # color syntax-highlighted on a TTY
+./build/mylang -nbi FILE         # disable the bytecode-level INLINER (the
+                                 # "splice": a callee's BYTECODE pasted into
+                                 # the caller's chunk, so the call protocol
+                                 # disappears). DEFAULT ON since 2026-08-02;
+                                 # -bi forces it on, MYLANG_BCINLINE=0/1.
+                                 # The same-binary A/B lever - the
+                                 # un-inlined bytecode is a splice's only
+                                 # oracle (plans/bytecode-inliner.md).
+                                 # #97: it also splices a VALUE call
+                                 # whose callee the analysis names (one,
+                                 # or 2..8 as a guard CHAIN - increment
+                                 # 2 and #72), main included, behind a
+                                 # GuardCalleeV - the
+                                 # inline cache (plans/closure-inlining
+                                 # .md); MYLANG_BCINLINE_VALUE=0 turns
+                                 # that half off alone, and
+                                 # MYLANG_BCINLINE_STEP1=0 keeps it but
+                                 # restores the staging moves and the
+                                 # result copy (step 1's A/B). ⛔ A call-
+                                 # PROTOCOL test (frameless, capbase,
+                                 # capture forwarding) reaches its tier
+                                 # through a closure call the splice now
+                                 # inlines: it holds ValueSpliceOff
+                                 # (tests.cpp) or it tests nothing.
+                                 # A DIRECT call to a TYPED callee is
+                                 # inlined too (2026-10-02): each int/
+                                 # float parameter binds through
+                                 # CoerceNumV - the identity when
+                                 # inference proved the argument's kind
+                                 # (`call_arg_kinds`), a widening or a
+                                 # TypeErrorEx with the argument's caret
+                                 # otherwise. MYLANG_BCINLINE_TYPED=0 is
+                                 # its A/B; a protocol test that reached
+                                 # its tier through `func f(int n)` holds
+                                 # TypedInlineOff. ⛔ The inliner trusts a
+                                 # global slot's descriptor only for a
+                                 # WRITE-ONCE slot (bc_inline_slot_map):
+                                 # it pasted a reassigned function's
+                                 # DECLARED body until then, a shipped
+                                 # wrong answer.
+                                 # #97 inc 3: main also splices a call to
+                                 # a closure FACTORY (a body that builds a
+                                 # closure; its captures follow the splice
+                                 # base); inc 5: a closure BUILT IN A LOOP
+                                 # that never escapes is scalar-replaced -
+                                 # its captures become frame slots and no
+                                 # object is built - a slot that may hold
+                                 # one of several closures keeps an int
+                                 # TAG (MYLANG_BCINLINE_SRA=0 keeps the
+                                 # object, MYLANG_BCINLINE_SRAC=0 its move
+                                 # collapse; a test of the guards or of a
+                                 # spliced make.closure holds SraOff, or
+                                 # it tests nothing)
+./build/mylang -vdj FILE         # -vd + the native x86-64 disassembly of
+                                 # each JIT fragment, interleaved under its
+                                 # `enter.nat` line with `; vm pc N` markers
+                                 # (`; vm op N` on a fragment whose originals
+                                 # were deleted - #56 - naming the op by its
+                                 # pre-remap pc; each mark carries a copy of
+                                 # the op, so a deleted one is still named).
+                                 # IT RUNS THE JIT SEQUENCE A RUN DOES:
+                                 # vm_jit_program (vm.h) is the ONE driver
+                                 # for a compile, a .myv load and this dump
+                                 # - the dump's own copy went stale twice
+                                 # (main with no map, no frameless pre-pass)
+                                 # and showed a push the run never took;
+                                 # pinned by the `-vd/-vdj's driver` -rt
+                                 # check and a driver_checks case.
+                                 # REPRODUCIBLE: a baked address prints as
+                                 # <int-tag>/<addr>/<helper>, so two runs
+                                 # and two separately-linked binaries give
+                                 # byte-identical output and `cmp` is the
+                                 # whole comparison (scripts/vdjcmp).
+                                 # MYLANG_VDJ_ADDRS=1 shows the numbers
+                                 # when you need one specific pointer.
+                                 # Each chunk header adds `; refs:` - its
+                                 # ref_slots (and ref_slots_raw when they
+                                 # differ), the slots the JIT guards and
+                                 # a frame pop releases. -vdj only: a
+                                 # compile and its image may disagree
+                                 # there, and -vd is the round trip's
+                                 # oracle.
+                                 # It SELF-REPORTS: a fragment it cannot
+                                 # fully decode prints "DUMP IS UNRELIABLE"
+                                 # with the undecoded-byte and skipped-mark
+                                 # counts, instead of quietly printing
+                                 # confident wrong mnemonics (it did that
+                                 # for 5543 bytes until 2026-08-17)
 ./build/mylang -nti FILE         # disable static type inference / checking
 ./build/mylang -dti FILE   # dump every identifier's inferred type + uses
+./build/mylang -dcs FILE   # dump every CALL SITE's CALLEE SET (#116):
+                                 # which function(s) the callee expression can
+                                 # reach - `direct` / `one` / `many` / `top`
+                                 # (unknown) / `none` (nothing can reach here)
+                                 # / `builtin` - plus one `dcs-esc` line per
+                                 # function whose value left the analysed
+                                 # program. Runs inference non-strict and
+                                 # exits, exactly like -dti
 ./build/mylang -a FILE           # analyze: source colored by optimization
 ./build/mylang -a --no-color F   # same, plain (for piping / diffing)
 ./build/mylang -T CATS FILE      # trace the compiler's reasoning to stderr
@@ -473,7 +2619,7 @@ site).
 record per declared identifier — `name, kind (var|const|param|func), line, col,
 const, type, uses(line:col,...)` — then exits without running. It is the audit
 tool for the mandatory-`dyn` / type-driven work (see
-`plans/type-driven-specialization.md`): used to find identifiers inferred `dyn`
+`plans/archived/type-driven-specialization.md`): used to find identifiers inferred `dyn`
 / `array<dyn>` and decide whether each is justified (annotate with `dyn`) or an
 inference gap (fix the inferencer).
 
@@ -510,14 +2656,58 @@ tree"** dump showing the post-inline/unroll/specialize AST — the actual node
 shapes, e.g. an `InlinedCall(Block(...))`), and `-nc` lets you see the tree as
 written before folding. Reach for them whenever behavior surprises you.
 
+**⛔ `-nc` TURNS OFF FOLDING, NOT CONST-EVALUATION (#54, 2026-09-25).** It
+was ONE switch (`ParseContext::const_eval`) for two concerns, and turning
+it off removed the language's compile-time entities along with the
+optimization: `struct S { const Z = K * 2; }` was refused, `P p = P(1);`
+said "'P' is not a type", a nested POD field was stored BOXED (a different
+`layout()`), `const A = [1]; A[0] = 2;` became legal and `const X = f();`
+with an impure `f` compiled. RULE 2 forbids every one of those. The flag is
+`ParseContext::fold` now and means exactly: **do not REPLACE a constant
+expression by its value** (a call, a subscript, an operator chain, an
+expression statement, a `var` initializer, and the CSE that shares them).
+Still done either way, because each is part of the program's MEANING:
+evaluating and binding a `const` (a scalar const NAME still denotes its
+value - that is what a const scalar is, and a pure function body relies
+on it), registering a struct descriptor and a pure function, discarding a
+statically dead branch (`if`/`while`/`foreach`/`?:`/`??` on a constant -
+README *Const evaluation of conditional statements*: its contents are not
+checked, so keeping them would refuse programs), and EVALUATING each
+constant expression, so an error it raises is the same compile error
+(`nc_eval_const`). A folded node's absence is visible to exactly one rule,
+pExpr14's assignable shape (`K[0]` folds to a VALUE), which reads
+`Construct::nc_folds`. ONE exception, `ParseContext::folding()`: a `pure
+func` BODY folds either way - it is the const evaluator's own code, and a
+const CONTAINER it reads (`len(NAMES)`) is reachable at compile time only
+through a folded use, so `const T = f(5);` failed under -nc alone. Nets:
+the `parse: -nc ...` `-rt` entry
+(`const_fold_equivalence`: fold on/off x both engines, byte-identical
+output AND rendered error) and `tests/corpus_diff`'s `-nc` pass.
+
 ## Tests
 
 ```
 ./build/mylang -rt               # run the whole suite (needs a TESTS=1 build)
 ./build/mylang -rt -s            # same, but dump the tree of a failing test
-./build/mylang --weights         # inlining cost-model calibration (any build;
-                                 # use OPT=1 ASSERTS=0 for meaningful numbers)
+./build/mylang -rt --list        # print every case's name (what [ RUN ] says)
+./build/mylang -rt --only REGEX  # run only the cases the regex finds, in all
+                                 # five modes; matching nothing is a failure
+./build/mylang --weights [N]     # inlining cost-model calibration (any build;
+                                 # use OPT=1 ASSERTS=0 for meaningful numbers;
+                                 # N iterations per node, default 20M - a
+                                 # small N is driver_checks' instant run;
+                                 # an N that is not a positive number is
+                                 # refused, never the default)
 ```
+
+**The standalone test tools (`tests/`) have their own
+`tests/CLAUDE.md`** - which tool runs where in CI, the progress API every
+long tool must serve, the reach-vs-check traps of shrinking and coverage,
+the tests/int unit formats, mutate's rules. READ IT before writing or
+changing a test tool. `tests/README.md` is the human overview: keep it
+plain prose with space-aligned tables, readable on a console, and a `$ `
+before each command. The tools have NO extension (755, a shebang); their
+shared Python code is `tests/lib/*.py`.
 
 **`--weights` — the inlining cost-model calibration** (`run_weight_bench`,
 eval.cpp). Measures the per-node-type eval cost of the tree-walker by building
@@ -525,40 +2715,103 @@ the AST nodes **by hand in C++** (never parsed, so no fold/inline/specialize can
 perturb the measured nodes or the loop count) and timing each in a tight C++
 loop; per-node marginal cost is isolated by subtracting child-subtree costs and
 printed relative to a slot read. The **CALL** weight is the reference for the
-planned inliner benefit function (inline a body when the sum of its node weights
-is below the call weight — see `plans/function-inlining.md`). Re-run when the
-interpreter changes; reusable for the eventual bytecode VM (the weights change,
-the benefit function does not). Current (`OPT=1 ASSERTS=0`): id/lit/add/cmp ≈ 1,
+inliner's benefit function (inline a body when the sum of its node weights is
+below the call weight — see `plans/archived/function-inlining.md`). Re-run when
+the interpreter changes; the weights are tree-walker-specific but the benefit
+function is not. Current (`OPT=1 ASSERTS=0`): id/lit/add/cmp ≈ 1,
 return ≈ 3, if ≈ 7, assign ≈ 11, **CALL ≈ 21** (×id-read).
+
+**⛔ `-rt` RUNS IN-PROCESS, SO IT CANNOT SEE THE CLI DRIVER (#147,
+2026-08-09).** It calls lexer/parser/infer/resolve directly and never goes
+through `mylang.cpp`'s argument handling — so a FLAG wired to the wrong side
+of an `if` is invisible to every one of its tests. `-nr` ("compile and
+validate, don't run") called `run_optimizers` only when it was going to
+*run*, which silently skipped the step 7 prover, the whole warning tier,
+FIX-1, the TDZ and the duplicate-decl check: `mylang -nr prog.my` exited 0
+in silence on a program `mylang prog.my` refuses. The whole suite was green
+throughout, and stays green when the bug is reintroduced. **`tests/
+driver_checks` (POSIX sh, in CI) is the net** — spawn the binary and
+assert the flag's behaviour; reverting the wiring fails 7 of its 9 checks.
+**Add a case there when you add or change a CLI flag**, because no `-rt`
+entry can cover one.
 
 Tests are **not** a separate framework — they are entries in the `tests` table
 (a `static const std::vector<test>`) in `src/tests.cpp`. Each entry is a tuple:
 a name, a list of source-line strings, and an optional `&typeid(ExpectedEx)`.
 `check()` lexes+parses+evals the joined source lines. A test **passes** if it
 throws nothing — or, when an expected exception type is given, throws *exactly*
-that type (compared via `&typeid(e) != t.ex`). There is no single-test CLI
-selector; `-rt` runs all of them and `exit(1)`s if any fail. Add a test by
+that type (compared via `&typeid(e) != t.ex`). `-rt` runs all of them and
+`exit(1)`s if any fail; `-rt --only REGEX` runs the cases whose name the
+regex finds (a `repl:` case by its `repl: ` name) - how `tests/run`
+reproduces one failure - and `--list` prints what it would select. Its
+options come AFTER `-rt` (it used to run the moment it was parsed, which
+silently dropped the documented `-rt -s`). Add a test by
 appending an entry to that table (no registration needed). Note the expected
 exception is matched against the *static* C++ type; a user-level
 `throw <struct>` always surfaces as `ExceptionObject` (a.k.a.
 `DynamicExceptionEx`), not a distinct C++ type.
 
-**The `tests` list runs TWICE — once per execution engine (`g_exec_engine`) —
-but is COUNTED ONCE.** The headline `Tests passed: N/total` is unchanged
-(`total = tests + extra_checks + repl_tests`, the tree-walker pass). After it,
-`run_tests` reruns the **same** `tests` list under the **bytecode VM**
-(`vm_execute`, marked `vm:` in the output) and prints a **separate** line,
-`VM differential (same K tests via -vm): M/K` — it is the same tests a second
-time, not a new set, so it is *not* added to the headline total. Both must be
-green to `exit(0)`. This is the **differential-testing pillar** of the VM
-build-out (see "Execution strategy" + the plan): `check()` dispatches its final
-run on `g_exec_engine`, with the tree-walker as the oracle. Because the VM
-falls back to `do_eval` for any construct not yet lowered natively, the
-differential pass is green by construction today and stays a regression net as
-native opcodes land. A new functional test therefore auto-covers both engines
-with no extra work.
+**THE 3-WAY DIFFERENTIAL (maintainer-set, 2026-08-02): the `tests` list
+runs in EVERY EXECUTION MODE, but is COUNTED ONCE.** The headline
+`Tests passed: N/total` is unchanged (`total = tests + extra_checks +
+repl_tests`, the tree-walker pass). After it, `run_tests` reruns the
+**same** list — not a new set, so not added to the headline — in each
+mode, printing one `Differential (same K tests) - <mode>: M/K` line per
+mode. ALL must be green to `exit(0)`:
+
+1. **the AST tree-walker** — the reference. It has NO JIT path: the only
+   pipeline is AST → bytecode → native, so this is a JIT-free oracle by
+   construction.
+2. **the bytecode VM, JIT OFF** (`vm:`) — pure interpreted bytecode.
+3. **the bytecode VM, JIT ON** (`jit:`) — native code; the script default.
+4. **JIT OFF, splice ON** (`vm:`).
+5. **JIT ON, splice ON** (`jit:`) — **the script DEFAULT**.
+
+Modes 1-3 run with the splice OFF (`-nbi`) and 4-5 with it ON. BOTH SHIP
+— the bytecode splice went default-ON on 2026-08-02 and `-nbi` turns it
+off — so each is a configuration a user can select and neither may be the
+untested one. ("The configuration nobody runs" is exactly how a disabled
+branch remap survived 39 commits.) Two passes per splice state, not one:
+a splice bug can live in the bytecode it PRODUCES (visible with the JIT
+off) or in how the JIT CONSUMES it (visible only with it on). The full
+suite is green in all five; `-rt` costs ~17s in the debug lane.
+
+**WHY MODE 2 IS NOT OPTIONAL.** With only tw-vs-VM, a codegen bug and a
+JIT bug are the SAME SYMPTOM, and a JIT bug that happens to be
+unobservable in the default corpus is invisible — which is exactly how a
+silently-disabled branch remap survived 39 commits (see the switch
+fall-through note under *Invariants & hazards*). Splitting the VM into
+with- and without-native says WHICH LAYER broke: PROVEN by injecting a
+JIT-only fault (an off-by-one in the loc remap), which fails mode 3
+`1483/1486` while mode 2 stays `1486/1486`.
+
+**Mode 3 runs only where `ML_JIT_SUPPORTED`** (jit.h — Linux x86-64
+today); elsewhere mode 2 IS what the VM does, so a third pass would prove
+nothing, and the summary says so. `check()` dispatches its final run on
+`g_exec_engine`, and the harness sets `g_jit_enabled` per mode
+(save/restored). A new functional test therefore auto-covers all three
+modes with no extra work.
 
 ## Benchmarks
+
+> ## ⛔⛔ BEFORE YOU RUN ANYTHING HERE — RULE B1 ⛔⛔
+>
+> **1. `rm -rf build`** (the maintainer's binary; deleting it before a
+> perf run is his 2026-08-12 instruction — it makes a forgotten flag
+> FAIL instead of silently timing his program).
+> **2. `--mylang build-claude/<lane>/mylang` EXPLICITLY**, every run,
+> plus `--baseline` when comparing. `bench/run.py`'s default `--mylang`
+> is **`build/mylang`, the MAINTAINER'S binary** — a bare
+> `python3 bench/run.py` measures HIS build, not your change, and
+> prints a believable geomean you will report as yours.
+> **3. READ the `mylang : <path>` header line run.py prints.** If it is
+> not a `build-claude/` path, the run is INVALID — discard it.
+>
+> Full statement of the rule under "CLAUDE BUILDS ONLY UNDER
+> `build-claude/`". Two full-suite runs and a reported geomean were
+> invalid this way on 2026-08-12; the maintainer's words were "it's
+> truly unacceptable". The failure is invisible without step 3 —
+> the wrong answer looks exactly like the right one.
 
 `bench/` is a standalone performance suite comparing MyLang against CPython,
 construct by construct
@@ -574,25 +2827,248 @@ first argv. It is *not* wired into `make`/CI and has no third-party deps.
 `bench/README.md` is also the
 written answer to "do MyLang and Python behave the same?": they do *observably*
 — assignment aliases,
-slices act like independent copies (MyLang via lazy copy-on-write, so read-only
-slicing is far cheaper),
+a slice is a new array when taken and is shared like any array after that
+(MyLang via lazy copy-on-write, so read-only slicing is far cheaper),
 `clone()` makes a shallow copy and `deepclone()` a deep one — with the
 divergences (64-bit wrapping vs bignum,
-truncating vs flooring division, unordered vs insertion-ordered dicts)
-enumerated there. (Floats match: both are 64-bit IEEE `double`.)
+truncating vs flooring division) enumerated there - both languages keep
+a dict's insertion order (#50). (Floats match: both are 64-bit IEEE `double`.)
 `bench/verify_semantics.{my,py}` assert that equivalence and must both print the
 same line.
 
-**THE FULL-SUITE MEASUREMENT HARD RULE (maintainer-set, 2026-07-16).** Any
+**⛔ THE PURE-CALL CACHE IS OFF FOR EVERY BENCHMARK RUN (maintainer-set,
+2026-08-16).** `bench/run.py` passes **`-npc`** by default, to the current
+binary AND to `--baseline`; `--pure-call-cache` opts back in, and the header
+line says which way the run went. **Claude never runs the suite with the
+cache on.** Two reasons, both measured:
+- **It is not a language comparison.** The per-frame cache memoizes a pure
+  call's result within one frame. C++, CPython, Ruby and Lua all re-execute
+  the call, so with the cache on a bench that repeats a pure call times
+  MyLang's memo table against the other language's real work.
+- **It makes `scale` NON-LINEAR, which invalidates the startup
+  correction.** `09_fib_recursive` is `for (k...) r = fib(29);` — iterations
+  2..N are cache HITS, so it costs **93,116,925 Ir at scale 1 and
+  93,121,763 at scale 3**. With `-npc`: 235.6M -> 561.5M, exactly linear.
+  The scale3-minus-scale1 correction therefore divided a 4,838-instruction
+  delta of cache hits by C++'s real one and produced a recorded
+  "09_fib_recursive 6.41x -> 0.09x, FASTER than C++" that was an artifact
+  (now marked INVALID in `plans/cpp-gap-ladder.md`). **Only
+  startup-correct a bench whose work actually SCALES** — and check that it
+  does, rather than assuming.
+- **⛔ AN AD-HOC CALLGRIND SCRIPT IS NOT EXEMPT FROM `-npc` (2026-08-29).**
+  The rule above is written about `bench/run.py`, which passes the flag by
+  DEFAULT — so it reads as a property of the harness, and a one-off
+  `valgrind --tool=callgrind ./mylang bench/my/X.my` quietly loses it. That
+  happened while measuring #120: 09_fib's scale-3-minus-scale-1 delta came
+  out **2,375 instructions instead of 136 million** (a "-0.50%" that was
+  really a few thousand cache lookups), and the wrong number was reported
+  before the sanity check caught it. **Whatever runs the binary, pass
+  `-npc`** — the flag belongs to the MEASUREMENT, not to the harness.
+
+**BENCHMARK-RUN DISCIPLINE — 1-vs-1 BY DEFAULT, the maintainer controls the
+deep runs (maintainer-set, 2026-07-19).** Do NOT run the bench suite over and
+over on your own initiative — `--repeat 3`, hand-rolled 25x loops, run-after-run
+to chase a fluctuating number — it WASTES the maintainer's time. Context: the
+`>=2 interleaved runs` rule below was set during the regression-prone AST→VM
+CONVERSION, where new bytecode kept introducing regressions and heavy A/B was
+warranted. For ordinary OPTIMIZATION work the default is lean:
+- **Run the basic 1-vs-1: ONE run before the change (or a series of changes),
+  ONE run after — then MOVE ON.** No extra repetitions, no larger scale, on
+  your own initiative. Bring the maintainer the data; HE interprets it. You do
+  NOT get to re-run because a number looks off or surprising.
+- **Escalating to more repetitions / larger scale / a deep perf session is the
+  MAINTAINER'S call, not yours.** He decides when to stop and focus on perf; you
+  cannot take that initiative. Only run heavier measurements when he explicitly
+  asks (and approves the repetitions/scale). The `>=2 interleaved` rule below
+  applies to those maintainer-initiated deep sessions (and to conversion work),
+  not to routine optimization.
+- **If a bench is too noisy to trust, the fix is a more RELIABLE BENCH, not more
+  runs.** There is a planned, dedicated effort to LOWER bench VOLATILITY
+  test-by-test, with various approaches per bench (bumping the scale of the
+  most-fluctuating ones, reducing allocation/OS-interference noise, etc.) — a
+  specific work item, done with the maintainer, so each bench gives a stable
+  signal from a single run. (TODO, agreed 2026-07-19.)
+- **Spend most of your time WRITING CODE and doing FUNCTIONAL testing** (`-rt`,
+  the fuzzer, samples, reading the diff for mistakes) — correctness errors have
+  been creeping in. Benchmarks are a small, final check, not the main activity.
+- **Do NOT revert a change that SHOULD optimize things** — especially one the
+  maintainer approved — because a measurement looks neutral. Bring the data and
+  let him decide (see the "ask before reverting" convention + the "distrust a
+  surprising result" rule below).
+- **The other-language bench results are CACHED, and a measure run is
+  cache-ONLY (DONE, 2026-07-19).** Python (and now C++, later Ruby/Perl/Lua/…)
+  don't change between MyLang edits, so their timings live in a GIT-IGNORED
+  `bench/.bench_cache/<lang>.json`, keyed by **(scale, sha1 of the comparison
+  SOURCE file)** — NOT a git commit, so a MyLang edit/commit never invalidates
+  them; only a scale change or a real `.py`/`.cpp` (or `bench.h`, for C++)
+  change does. A normal (**measure**) run re-times ONLY MyLang and reads the
+  cache **read-only**: `run.py` checks EVERY selected bench up front and
+  **fails fast** if any comparison entry is stale/missing, naming the
+  `--recompute` command — it NEVER re-times a comparison inline. Re-timing is a
+  **separate, explicit step**: `bench/run.py -cl <lang> --recompute [--filter …]`
+  (re)caches the stale entries — or all, with `--force` — then exits
+  without timing MyLang. This is the load-bearing fix for a real asymmetry: a
+  comparison subprocess re-run inline used to interleave with the variance-
+  gated MyLang reps of the *next* bench and perturb them (so a stale Python
+  cache made py-mode abort on variance where a fresh cpp cache did not — the
+  inline re-run is now impossible). MyLang itself is NEVER cached (its time is
+  the whole point). Cuts a normal suite run's wall-time roughly IN HALF.
+- **The cache carries a MACHINE-SPEED MARKER, and a mismatch WARNS (2026-07-31,
+  warning-only by maintainer instruction — it never blocks a run).** Caching the
+  comparison creates one asymmetry the halved wall-time is worth: MyLang is
+  timed LIVE and the comparison is read from disk, so a box that is merely
+  SLOWER TODAY reads as a MyLang REGRESSION with no code change. That is not
+  hypothetical — it cost a full false-alarm investigation: the suite geomean
+  read 8.2x where it had read 10.7x, while an interleaved `--baseline` A/B
+  proved HEAD was 1.02x FASTER than the 10.7x binary and callgrind Ir was flat
+  or better on 13 benches; re-timing the byte-identical `.py` scripts showed
+  CPython itself **1.148x slower** than the Jul-20 cache (median 1.205x). So a
+  whole-cache `--recompute` stores a `__machine__` entry, and a measure run
+  re-times it and prints — above
+  the table AND under the geomean — how far off the box is plus the CORRECTION
+  FACTOR to apply to the printed "x faster" figures. A cache with no marker gets
+  a one-line note. **A PARTIAL recompute (`--filter`, or stale-only) does NOT
+  stamp**: most entries would still be from the old machine, and a fresh marker
+  would wrongly certify them — a false negative is worse than no marker. The
+  lasting lesson: **`cur/base` from `--baseline` is the trustworthy number**
+  (both binaries timed interleaved, so drift cancels); my/py alone is not.
+  **⛔ THE MARKER ITSELF MUST BE STABLE, AND IT REFUSES WHEN IT CANNOT BE
+  (maintainer-set, 2026-10-01).** The first marker (best-of-3 of a 0.1s loop,
+  unpinned) read this hybrid box "~14% faster" than the C++ cache's day; a
+  full `--force` re-time followed and moved the C++ benches by a few percent
+  at most - the marker had measured which CORE it landed on. It is now a
+  CONVERGING calibration (`machine_calibration`, method 2): pinned to the
+  lowest-numbered P-core other than CPU 0, GC off, a 0.1s warm-up, ~20ms
+  samples sized Google Benchmark's way, and sampled until the LOW CLUSTER
+  agrees - 5 samples, and 20% of all, within 2% of the fastest (timing noise
+  on deterministic CPU-bound code is one-sided, so the fast end is the truth:
+  Chen & Revels 2016) - its median is the marker. Measured: 15 runs, all
+  converged in ~0.35s, 2.1% spread. **No convergence within 1s, or other
+  processes using more than one CPU on average (from /proc/stat) REFUSES the
+  run** - and a `--recompute` calibrates BEFORE re-timing anything, so a noisy
+  box never writes a cache. A marker from the old method is not compared (a
+  note says so) until the next whole-cache re-time replaces it.
+
+**THE FULL-SUITE MEASUREMENT HARD RULE (maintainer-set, 2026-07-16; applies to
+DEEP, maintainer-initiated perf sessions — see the 1-vs-1 default above).** Any
 claim about a VM perf change is made ONLY from FULL-SUITE `bench/run.py`
-runs, BOTH binaries built and run in the SAME session, repeated (>=2 runs
-each, interleaved A/B/A/B to cancel machine drift) — never from a bench
-subset probe, never by comparing my/py prints across sessions (the CPython
-denominator drifts several percent day to day on this box; it masked a real
-~5% Phase-C regression as "noise" once). Compare the VM WALL-CLOCK per bench
-(the my column) between the binaries, plus the my/py geomean, which run.py
-now prints with THREE digits (0.256x / ~3.91x) for exactly this. A phase
-does not land on a probe geomean.
+runs, BOTH binaries built and run in the SAME session — never from comparing
+my/py prints across sessions (the CPython denominator drifts several percent
+day to day on this box; it masked a real ~5% Phase-C regression as "noise"
+once). Compare the VM WALL-CLOCK per bench (the my column) between the
+binaries, plus the my/py geomean, which run.py prints with THREE digits
+(0.256x / ~3.91x) for exactly this. For a deep session the maintainer may ask
+for >=2 interleaved A/B/A/B runs to cancel machine drift; that is HIS call, not
+a routine default. A phase does not land on a probe geomean.
+
+**⛔ bench/run.py DOES NOT PIN A CORE, AND THIS CPU IS HYBRID
+(2026-09-26).** A run can land on an E-core, so one bench's wall ratio
+can move 30%+ with no code cause: #124(a) read 82_regs_int_25 at 1.38x
+and 1.34x SLOWER for -0.8% Ir and a pure register renaming, while
+`taskset -c 2 perf stat` (a P-core; `cpu_core/*` counters) gave -3.2%
+cycles. A ratio that contradicts both the Ir and the emitted code gets
+a pinned cycle count before it is believed.
+
+**⛔ AND A PINNED CYCLE COUNT CAN CONTRADICT THE Ir FOR A REAL REASON
+(#97 R1, 2026-09-26).** R1's first version was **10% SLOWER in cycles
+for 11.8% FEWER instructions**, reproducibly, against the exact parent
+commit. Cause: a hot helper's `*this = LValue()` compiles to two 8-byte
+stores of a stack temporary and one 16-byte reload - a BLOCKED
+store-forward per call (`ld_blocks.store_forward` doubled; `perf record
+-e cpu_core/ld_blocks.store_forward/pp` names the load). **When Ir and
+cycles disagree in sign, run top-down (`perf stat -M TopdownL2
+--cputype core`) and count blocked store-forwards before anything
+else.** The fix was an in-place destructor, and it turned -11.8% Ir into
+-15% cycles. Record: docs/jit-optimizations.md, *#97 R1*.
+
+**THE ASSERTS=0 MEASUREMENT RULE (maintainer-set, 2026-08-01).** EVERY
+performance measurement — callgrind Ir or wall-clock, a one-off A/B or a
+full-suite run — is taken with **`OPT=1 ASSERTS=0` on BOTH sides**. A plain
+`make -j` is `ASSERTS=1` (the default), and **an ASSERTS=1 delta CANNOT be
+extrapolated to ASSERTS=0**: assertion cost is NOT a uniform multiplier. It
+lands unevenly per code path (the per-op `ML_VM_CHECK` tier;
+`_GLIBCXX_ASSERTIONS` bounds-checking every `vector::operator[]`), so a change
+that MOVES work between paths measures better or worse purely because of where
+the asserts happen to sit. This is not theoretical — both directions were
+measured on the same day: **#81** read **+0.22%** at ASSERTS=1 and **+1.14%**
+at ASSERTS=0 (5x the delta — the nested baseline was the side paying the
+hardened access, so removing hardening exposed the flat form's real cost), and
+**69_exc_crossframe** read **−2.36%** at ASSERTS=1 but **+0.22%** at ASSERTS=0
+— a SIGN FLIP, i.e. a "2.4% win" that was mostly the removal of hardened
+container access, not the mechanism it was credited to. Corollary for the
+code: with hardening on, `vector::operator[]` in a hot scan is NOT free —
+read through `.data()` when you have already proven the range (a flattened
+pool indexed with `operator[]` cost +28 Ir per throw versus the nested form
+it replaced).
+
+**⛔ RULE B1 AGAIN, BECAUSE THIS IS WHERE THE FLAGS ARE CHOSEN: `rm -rf
+build` FIRST, then pass `--mylang build-claude/<lane>/mylang` (and
+`--baseline`) EXPLICITLY, then READ run.py's `mylang : <path>` header.
+The default is the MAINTAINER's `build/mylang`; a bare
+`python3 bench/run.py` times HIS binary and reports a wrong number that
+looks right. The build-config gate below checks `opt`/`asserts` — it
+does NOT check WHOSE binary you handed it, so passing the gate proves
+nothing about this.**
+
+**THE BUILD-CONFIG GATE — AND `--force` IS THE MAINTAINER'S ALONE
+(maintainer-set, 2026-08-01).** `bench/run.py` runs `mylang -v` on EVERY
+binary it will time (the current one AND `--baseline`) and **REFUSES to run**
+unless each reports `opt 1` and `asserts 0` — a mixed-config A/B is exactly
+the trap, so the baseline is checked too. The refusal names the rebuild
+command. **`--force` skips the gate and is RESERVED FOR THE MAINTAINER:
+⛔ CLAUDE MUST NEVER PASS `--force` TO `bench/run.py`.** There is no
+situation in which Claude should produce, quote, or record a forced number —
+if the gate refuses, REBUILD (`make -j OPT=1 ASSERTS=0
+BUILD_DIR=build-claude/perf`) and measure properly. When the maintainer uses
+it, a full-width WARNING banner prints at the START and again at the END of
+the output (both ends deliberately: this output is routinely piped through
+`head` or `tail`, and a reader who sees only one end must still learn the
+numbers are invalid).
+
+**THE "PROVE THE CODE RAN + DISTRUST A SURPRISING RESULT" HARD RULE
+(maintainer-set, 2026-07-19).** Two joined rules, both learned the hard way in
+ONE investigation. **RULE B1 is the third member of this family and the
+crudest: before asking whether the code PATH ran, make sure the BINARY
+was yours — `rm -rf build`, pass `--mylang build-claude/<lane>/mylang`
+explicitly, and read run.py's `mylang :` header line. A run of the
+maintainer's binary is not a weak measurement, it is a measurement of
+something else entirely.**
+
+(1) NEVER draw a conclusion from a performance measurement until you have HARD
+DATA that the code path under test ACTUALLY EXECUTED in that measurement. If
+the code *might* not have run, you do not have a result — you have nothing.
+INSTRUMENT (a counter, `-vd`/`-vdj` for the `enter.nat`, callgrind) and debug
+until you are 100% sure it ran; ONLY THEN measure. **The trap:** a JIT change
+was declared "dispatch doesn't matter for dict" from a `MYLANG_JIT=0` vs JIT-on
+A/B that came out ~1.00x — but the JIT compiled **ZERO fragments** for that
+bench (the store split the loop into sub-MIN_RUN pieces), so BOTH sides ran the
+identical interpreted code. "JIT-on == JIT-off" proves NOTHING when the JIT
+never engaged; a "neutral" result on an unverified path is INDISTINGUISHABLE
+from "the optimization didn't run" — treat it as the latter until proven. This
+is the general form of the ref-store-bail lesson (all those "native builtins
+are neutral" numbers were interpreter-vs-interpreter).
+
+(2) DISTRUST A SURPRISING RESULT — especially a null/zero one. When I finally
+made the JIT engage (nativized the dict store; PROVED it: `native_entries=1`,
+`dict_store_calls=1.5M` from native, `compiled_frags=1`) the first wall-clock
+A/B came out ~1.00x and I ACCEPTED IT ("dispatch removal changes nothing") — a
+SECOND methodological failure. It was WRONG: at low scale + few repeats on an
+allocation-heavy bench (1.5M `unordered_map` inserts), timing NOISE swamped the
+effect. Re-measured with rigor — 25 runs (min AND median agree at 0.934) plus
+the DETERMINISTIC callgrind instruction count (213.6M vs 242.7M = **12% fewer
+instructions**, zero timing noise) — the real answer is a stable **~6.5%
+wall-clock / 12%-instruction win**. So: (a) a surprising result (0% where the
+mechanism predicts non-zero) is a signal to RE-MEASURE, not to conclude; (b)
+for a SMALL effect on a NOISY (alloc/cache-bound) bench, best-of-N wall-clock
+is unreliable — reach for a DETERMINISTIC metric (callgrind I-refs) and/or many
+repeats where min AND median must agree; (c) the removed dispatch was ~12% of
+INSTRUCTIONS but only ~6.5% of TIME, because the removed ops are the CHEAP ones
+(predicted branches / L1 hits) while the time is the dict's alloc/cache-miss
+work — instruction-count and wall-clock deltas differ and BOTH are worth
+knowing. Net for the dict tier: dispatch is a real, capturable chunk (~6-12%);
+the BIGGER headroom is still the value model (boxing/alloc/refcount, `my/cpp`
+~5x in bench/cpp/ → the N7 arc) — but "dispatch is irrelevant here" was FALSE
+and was asserted twice without adequate data.
 
 **`--vm` — the bytecode-VM performance gate.** `run.py` measures the VM by
 DEFAULT (the binary's default engine since the 2026-07-18 flip); `--vm`
@@ -602,19 +3078,22 @@ with `--baseline <the same post-flip binary>`, `--vm` gives the baseline
 `-tw`, so the `cur/base` column and geomean are **VM / tree-walker** (<1 ==
 VM faster). This is the
 per-phase performance gate for the VM build-out (see "Execution strategy" +
-`plans/bytecode-vm.md`): run it release + `ASSERTS=0` at the end of each phase;
+`plans/archived/bytecode-vm.md`): run it release + `ASSERTS=0` at the end of each phase;
 a phase must not regress the tree-walker unless the regression is flagged as
 temporary + tracked to a later phase that erases it. Phase 0 (pure fallback) is
 neutral (geomean 1.00x), as it must be.
 
 ## Source layout & compilation model
 
-**Only `src/*.cpp` are compiled** (the Makefile globs them) — twenty-one
+**Only `src/*.cpp` are compiled** (the Makefile globs them) — twenty-four
 translation units:
 `lexer.cpp`, `parser.cpp`, `syntax.cpp`, `resolver.cpp`, `inferencer.cpp`,
 `eval.cpp`, `types.cpp`, `statictype.cpp`, `trace.cpp`, `coderender.cpp`,
 `backtrace.cpp`, `errfmt.cpp`, `highlight.cpp`, `lineedit.cpp`, `replhelp.cpp`,
-`repl.cpp`, `codegen.cpp`, `vm.cpp`, `disasm.cpp`, `mylang.cpp`, `tests.cpp`
+`repl.cpp`, `codegen.cpp`, `vm.cpp`, `jit.cpp`, `disasm.cpp`, `serialize.cpp`,
+`mylang.cpp`, `tests.cpp`, `inttest.cpp` (the intrusive-test core, #107 -
+empty unless `INT_TESTS`; its macros are `inttest.h`, its site list
+`intsites.h`, its builtins `builtins/inttest.cpp.h`)
 (six of them are the REPL — see "The interactive REPL" below; `trace.cpp` is the
 diagnostic tracer and `coderender.cpp` the optimized-AST "decompiler", both used
 by the REPL; `codegen.cpp`/`vm.cpp` are the bytecode-VM engine and `disasm.cpp`
@@ -639,11 +3118,26 @@ nothing to register).
 - `parser.cpp` / `parser.h` — recursive-descent parser, const-folding woven in.
   `pBlock()` is the
   entry point.
+- `numtext.h` — the one reading of a number written as text (header-only):
+  `numtext_int` / `numtext_float` take the WHOLE string in a literal's
+  spelling and report ok / bad / overflow / underflow. The parser's
+  literals and the `int()` / `float()` builtins both call it; README's
+  `int(value)` / `float(value)` are its spec.
 - `funcdesc.h` — **`FuncDescriptor`**, the SERIALIZABLE runtime function
   identity (name/params/captures/frame data/purity/chunk pointer), plus the
   `DeclType`/`SymKind`/`ResolvedSym` enums it needs (moved here from
   syntax.h). The runtime call model reads ONLY this - see the value-model
-  section and plans/vm-ast-free-runtime.md.
+  section and plans/archived/vm-ast-free-runtime.md.
+- `orderedmap.h` — **`OrderedHashMap`**, the dict's map (#50): a chained
+  hash table whose entries also form an INSERTION-ORDER list, which is what
+  every walk over a dict follows. See the `DictObject` bullet under
+  *Copy-on-write containers*.
+- `cyclewalk.h` — **THE CYCLE GUARD** (header-only, plus
+  `cyc_keep_until_exit` / `cyc_release_kept` in eval.cpp): the container
+  keys, path stacks, pair stack and copy stack every recursive walk over a
+  value graph uses, so a value that contains itself cannot send one into
+  infinite recursion. A new such walk must use it - see the ⛔ bullet in
+  *Copy-on-write containers*.
 - `syntax.h` / `syntax.cpp` — the `Construct` AST node hierarchy, its
   `serialize()` (what `-s` prints), and `clone()` (a deep copy of a subtree,
   used by inlining; pure virtual so every concrete node must provide one — see
@@ -659,7 +3153,8 @@ nothing to register).
   same file also hosts the **auto-const** folder (the `AutoConst` class), run at
   the end of `resolve_names` (see the const-evaluation section), and the
   **inliner** (the `Inliner` class), run after it (gated by `-ni`; see the value
-  model section / `plans/function-inlining.md`).
+  model section / `plans/archived/function-inlining.md`), and the **parameter
+  escape analysis** (`stamp_noescape_params`, last — see below).
 - `eval.cpp` — the `do_eval()` bodies: the actual tree-walking interpreter.
 - `types.cpp` — the single TU that stitches the type system and builtins
   together (see next section).
@@ -669,9 +3164,15 @@ nothing to register).
   `resolve`/`unify`/`assignable`/`join`/`equal`/
   `to_string`). Distinct from the runtime `Type *` ops table — this is what the
   compile-time inferencer reasons over (type variables, nullability `opt`,
-  structural array/dict/func shapes). See `plans/type-inference.md`.
+  structural array/dict/func shapes). See `plans/archived/type-inference.md`.
 - `inferencer.cpp` / `inferencer.h` — `infer_types(root)`, the **whole-program
   static type inference + checking** pass (see the dedicated section below).
+- `calleeset.cpp.h` — **THE CALLEE-SET ANALYSIS** (#116), `#include`d once
+  at the end of `inferencer.cpp` (the `.cpp.h` convention below; it needs
+  `TypeSym`/`FuncInfo`, which live in that file's anonymous namespace). It
+  answers ONE question - *which function does this expression evaluate
+  to?* - as a set or ⊤, keyed by PROGRAM LOCATION rather than by type.
+  See the dedicated section below.
 - `backtrace.cpp` / `backtrace.h` — `format_backtrace()`, which renders an
   `Exception`'s captured call-stack (see the error model section).
 - `analyzer.h` / `analyzer.cpp` — the `AnalysisInfo` `Loc`-keyed annotation
@@ -683,9 +3184,10 @@ nothing to register).
   `specialize_types` in `inferencer.cpp`, mutation-time records in
   `parser.cpp`/`resolver.cpp`). See the `-a` description under "Build & run".
 
-**The `.cpp.h` convention.** Files under `src/types/` and `src/builtins/` are
-named `*.cpp.h` and are
-`#include`d *once* into `types.cpp`. Each starts with a comment: "this is NOT a
+**The `.cpp.h` convention.** Files under `src/types/` and `src/builtins/` (and
+`src/calleeset.cpp.h`) are named `*.cpp.h` and are
+`#include`d *once* into one TU (`types.cpp`; `inferencer.cpp` for
+`calleeset.cpp.h`). Each starts with a comment: "this is NOT a
 header file… it's a
 C++ file in the form of a header, just because it's faster to compile it this
 way." So `types.cpp` is
@@ -696,17 +3198,23 @@ code, put it in the matching `.cpp.h` and rely on it being pulled into
 compile standalone, and there is nothing to add to the Makefile.
 `builtins/reflect.cpp.h` holds the **runtime reflection** builtins
 (`globals`/`typestr`/`kindstr`/`signature`/`layout`/`specializations`) and the
-shared `reflect_*` rendering helpers (signature/type/layout strings) the REPL's
+shared `reflect_*` rendering helpers (signature/type strings) the REPL's
 introspection commands reuse; it is `#include`d last (after the other builtins)
-so it can call `arr_elem_at`. See `plans/repl-introspection.md`.
+so it can call `arr_elem_at`. See `plans/archived/repl-introspection.md`.
+**`reflect_decl_annot` is the ONE rendering of a declared annotation** (`P p`,
+`array<int>? a`, `opt int o`): `signature()` reads it through
+`ParamDesc::sig_type` - set by `sync_params`, stored in a `.myv` (v36), since
+a loaded image has no AST to render from - and the decompiler (`:show`'s
+parameters and declarations) calls it directly, so the two cannot drift.
 **`layout(S)` returns a structured value, not a string** — a **native composite
 type** (`StructLayout`, holding an `array<StructField>`), the first of the
 reflection objects. The two native `StructTypeDef`s are built in C++
 (`native_struct_field_def`/`native_struct_layout_def`, `eval.cpp`), the
 inferencer registers them in `struct_by_name` (`setup()`) and types `layout()`
 via `builtin_result`, and `reflect_make_layout` (reflect.cpp.h) constructs the
-boxed instance. This is the mechanism `Type` objects (the planned
-`type()`/`decltype()` return value) will reuse — see `plans/reflection.md`.
+boxed instance. `Type` objects (the `type()`/`decltype()` return value, see
+*Compile-time TYPE QUERIES*) reuse this same mechanism — design record:
+`plans/archived/reflection.md`.
 
 **Why so many headers are templates.** `type.h` (`TypeTemplate`),
 `sharedarray.h`
@@ -829,8 +3337,15 @@ match C precedence; an unused level is skipped):
   AutoConst analogue is in `fold_reads` (`resolver.cpp`), which **must** descend
   into `TernaryExpr`/`CoalesceExpr` (it has no generic fallthrough — a missing
   case silently fails to fold their children).
-- `pExpr14` — assignment `=  +=  -=  *=  /=  %=`, plus `var`/`const` decls and
-  id-list targets
+- `pExpr14` — assignment `=  +=  -=  *=  /=  %=  <<=  >>=  >>>=  &=  |=  ^=`
+  (the compound set is defined ONCE, `compound_assign_base` in operators.h —
+  the parser's accept list, the inferencer's typing, both engines' RMW
+  dispatch, the codegen lowerings, the REPL continuation sets and the disasm
+  spellings all ask that function), plus `var`/`const` decls and id-list
+  targets. A compound lowers byte-identically to its spelled-out
+  `x = x OP rhs` (pinned by test); the shift/bitwise compounds are int-only
+  like their binary forms. The lexer's maximal munch probes 4 chars first
+  (`>>>=`), then 3, then 2.
 
 `pExprGeneric<ExprT>` implements the common left-associative chain: it collects
 `(Op, operand)` pairs
@@ -892,7 +3407,11 @@ A `fl` bitmask of `pFlags` (`pInDecl`, `pInConstDecl`, `pInLoop`, `pInStmt`,
 under `pInLoop`, `return` only under `pInFuncBody`, `rethrow` only under
 `pInCatchBody`, and
 `var`/`const` set `pInDecl`/`pInConstDecl` so `pExpr14` knows to *declare*
-rather than *assign*.
+rather than *assign*. **A function literal's body starts from none of
+them** (`body_fl` in `pAcceptFuncDecl`, 2026-10-11): inherited, a `break`
+in a lambda inside a loop and a `rethrow` in one inside a catch body
+parsed (the codegen then refused them, NotLoweredEx), and a lambda in a
+`const` declaration's rvalue took its own `var t` for a const.
 
 ### Const-evaluation — the central design feature
 
@@ -911,12 +3430,25 @@ and it lives *inside the parser*. Mechanics:
 - As soon as the parser finishes a const node, it evaluates it against
   `const_ctx` and calls
   **`MakeConstructFromConstVal()`** to replace the subtree with a literal node.
-  That function inlines
+  **The literal keeps the SPAN of the node it replaces** (and
+  `cse_materialize` gives a baked literal its expression's span) - until
+  2026-10-05 it was span-less, so an error about a folded argument had no
+  location and the call stamped the whole argument list (`str(f, 65)`
+  underlined `f, 65`, in every engine). That function inlines
   `int`/`float`/`none`/`str` unconditionally, and `arr`/`dict` only when
   `process_arrays` is set — in which case it bakes the whole value into **one
   `LiteralObj` node** (`syntax.h`), not one literal per element. (It stores
-  `v.clone()` so a small slice of a huge const array doesn't pin the huge
-  buffer.) `LiteralObj` carries an **`immutable`** flag. The materializer sets
+  a self-contained copy - `make_const_clone` for a read-only result,
+  `v.clone()` otherwise - so a small slice of a huge const array doesn't pin
+  the huge buffer. A value that CONTAINS ITSELF is the exception: `clone()`
+  of a ring is its one-step unrolling, so a folded `var r = mk();` and the
+  same call at run time compared and printed differently (RULE 2); it is
+  baked by `make_mutable_clone`, a cycle-preserving deep copy - which
+  keeps every dict's order, since a dict iterates in insertion order and a
+  copy inserts in that order (#50; a hash-ordered rebuild once reordered
+  the print of a folded dict, which `corpus_diff`'s `-nc vs default` pass
+  caught).) `LiteralObj`
+  carries an **`immutable`** flag. The materializer sets
   it when **either** the target is a `const` decl (`fl & pInConstDecl`) **or the
   value itself is already read-only** (`is_readonly_value()`). The second case
   is how **const-ness propagates**: a slice/element/result derived from a const
@@ -952,6 +3484,19 @@ and it lives *inside the parser*. Mechanics:
   at every use site would be wasteful; operations on them like `arr[2]` or
   `len(arr)` still get
   const-folded to literals though.
+  **A const bound to a BUILTIN (`const L = len;`) is dropped like a scalar
+  (#94)**, so its read must be something that stands at run time:
+  `pAcceptId` replaces it by `builtin_ref` (parser.cpp), an Identifier
+  naming the builtin with `Identifier::builtin_only` set. A parameter may
+  share the builtin's name (`func f(len) => L(len)`), so EVERY pass that
+  resolves a name must ask the flag first: the resolver binds it to the
+  builtin table's slot, the inferencer to no user symbol,
+  `Identifier::do_eval` (parse time, a pure function run then) to
+  `const_builtins`, and the inliner's `substitute` never pastes an
+  argument for it. A capture of it
+  gets the synthesized `var dyn L = len` (H2), and a store into it is
+  CannotRebindConstEx (`pRefuseUnassignable`, the multi-assign target
+  check). It was "Undefined variable" wherever a read was not folded.
 - **Const-expression de-duplication (CSE).** The three sites that bake an
   array/dict (`pAcceptCallExpr`, `pAcceptSubscript`, the `pExpr14` decl-rvalue)
   go through **`cse_materialize()`** (`parser.cpp`) instead of calling
@@ -967,7 +3512,11 @@ and it lives *inside the parser*. Mechanics:
   this is why two identical const exprs report equal `intptr()`. On a miss it
   bakes via `make_const_clone` and caches the value *only when it is read-only*
   (the sole safely-shareable case; mutable `var`-bound literals are never
-  cached/shared). Popping a scope with its block is what stops a freed block's
+  cached/shared). **A value frozen only because its TARGET is a const**
+  (`const X = f(A);`, `f` returning a fresh array) is cached for CONST
+  targets alone (`CseCache::Entry::any_target`): a `var` hitting it got
+  the constant's read-only value, so an earlier identical `const` decided
+  whether `append(y, 3)` worked, and `-nc` disagreed (2026-10-08). Popping a scope with its block is what stops a freed block's
   reused stack addresses from colliding with a live key. `pExpr14` skips
   re-materializing an rvalue that is *already* a `LiteralObj` (a subscript/call
   result baked at its own site), so the de-dup lives at one layer and no double
@@ -976,6 +3525,40 @@ and it lives *inside the parser*. Mechanics:
   literal). `bench/52_cse_dedup` and the `CSE:` tests cover it.
   `cse_materialize` is PIMPL-friendly: `CseCache` is forward-declared in
   `parser.h` with an out-of-line `~ParseContext()`.
+- **⛔ A BAKE MUST NOT FREE A FUNCTION THE BAKED VALUE STILL NAMES (#47,
+  2026-09-25).** A `pure func` LITERAL is const, so `[pure func(a, b) => a
+  < b]` (and a dict, a struct `const` member, a mutable `var` bake) folds
+  to ONE `LiteralObj` holding a FuncObject - whose `FuncDescriptor` is
+  owned by the literal's `FuncDeclStmt::desc_owner`, INSIDE the subtree
+  the bake replaces. The replaced subtree used to die with it: the
+  inferencer's baked-value walk (`cs_eval_value`) read the freed
+  descriptor (ASan, every engine) and codegen had no body to compile.
+  It presented as an INLINING bug because it hid one - `sort(xs, OPS[k])`
+  holds no function literal after the fold, so the inliner splices the
+  body. Now `cse_materialize` (and the struct-const path) DETACH every
+  literal the value names into `ParseContext::baked_funcs`, and `pBlock`
+  re-inserts it as a plain expression statement just before the
+  statement that baked it - same scope, so its body resolves as it would
+  have in place, and every later pass sees an ordinary lambda. `pure`
+  forbids captures, so evaluating it earlier is unobservable. A literal
+  the value does NOT name (`sort([3, 1], pure func..)` bakes ints) still
+  dies. (A struct const member holding a function is storable in a
+  `.myv` since v20's table of contents, #52.)
+  **THE SAME UAF HAD A SECOND, UNRELATED PATH - the one #47 was reported
+  as.** `for_each_child_of` (inferencer.h), the "COMPLETE" walker that
+  `vm_compile`'s `collect_funcs` uses to decide which bodies to compile
+  and which descriptors the program takes, inherited the inferencer's
+  choice to treat a `TypedScalarExpr` as a LEAF - right for the
+  inferencer (its passes run before M8), wrong on the FINAL tree. So a
+  lambda under one (`sum(xs, func..) + 1`; an inlined `f(x) + 1` whose
+  `f` was a lambda argument, as with `sort` in a caller's loop) was never
+  compiled or owned, and the AST teardown freed its descriptor under the
+  closure the VM then built - `-nj` and the JIT only, and invisible to
+  `-rt`, whose harness keeps its AST. The exported wrapper descends a
+  `TypedScalarExpr` now. **A walker exported as COMPLETE must be complete
+  over the tree its CALLERS walk, not the tree its owner walks.** Both
+  paths are pinned by `tests/functional/28_func_literal_lifetime.my`
+  (and path 1 by the `baked pure func literal` `-rt` entry).
 - **Statement folding:** an `if` with a const condition is replaced by just its
   taken branch; a
   `while`/`foreach` proven to never execute (const-false condition / const-empty
@@ -984,17 +3567,398 @@ and it lives *inside the parser*. Mechanics:
   `is_const = true` and is
   registered into `const_ctx`, so it *can* be invoked during const-eval (a plain
   `func` cannot). Pure
-  funcs may not have a capture list and see only consts + their own params. A
+  funcs may not have a capture list and see only consts + their own params -
+  the consts in scope at the DECLARATION: a FuncObject created in a const
+  scope remembers it (`FuncObject::const_scope` + the scope's
+  `EvalContext::scope_alive` token, #38 B), and a const-eval call parents
+  its body there while the scope is alive. The root const ctx holds only
+  builtins, so parenting to it (as before) lost every const container and
+  every other pure func (`const Z = f(1)` with `f(i) => A[i]` failed). A
   `CallExpr` folds when
   the callee and all args are const — that's how
   `sort(arr, pure func(a,b) => a<b)` runs at parse time.
+- **⛔ A USER FUNCTION THE PARSER RUNS, RUNS TYPED (question 5, decision
+  A, 2026-10-18; README *A call at compile time computes what it computes
+  at run time*).** Parse-time const-eval runs before inference exists,
+  and inference's stamps CHANGE what a run computes (a local's
+  `decl_type` widening, `ret_coerce`, a literal's `arr_hint` /
+  `elem_coerce`, a store's `rv_coerce` / `val_widen`, a template
+  instance) - so an untyped constant call gave another answer than the
+  same call at run time, and `-nc` disagreed with the default (RULE 2).
+  Once `do_func_call` has bound the arguments, `pt_try_typed` (eval.cpp)
+  hands the call to parser.cpp, which builds a SYNTHETIC PROGRAM: clones
+  of the functions the call reaches by name, each const it reads, each
+  struct as a NON-OWNING `StructDeclStmt` (`def` set, `def_owner` null),
+  and the call. It runs `infer_parse_time` over it (strict, checks on,
+  then `propagate_decl_types`, the resolver's decl_type propagation done
+  through the inferencer's own symbol links, since `resolve_names` does
+  not run here), marks every function in it
+  `FuncDescriptor::parse_typed` (COMPILE-only, never stored), and binds
+  its declarations under a const root OF ITS OWN (the builtins only;
+  `EvalContext::pt_copy`) - the REPL keeps its consts in the parser's
+  root, where declaring one was a store into it. Two forms:
+  - **A call the PARSER makes runs AS WRITTEN** (`pt_typed_written`; the
+    `CallExpr` is `dispatch_call_value`'s `pt_call`): the callee and
+    argument EXPRESSIONS are cloned, and a const holding a FUNCTION is
+    declared by a clone of its OWN INITIALIZER (`pt_note_const` keeps it
+    in the declaring scope's `EvalContext::pt_inits`, `dyn` as declared).
+    That is what makes a FUNCTION VALUE arrive as it does in the program,
+    which is what decides whether inference instantiates a template for
+    it: through a name bound to it (`const G = show`, `pick(true)`, an
+    argument) the program redirects the use to an instance; out of a
+    const container (`OPS[0]`, `const dyn F1 = first()` where `first()`
+    returns `OPS[0]`) it cannot - a baked value - and the template runs
+    untyped. Neither the `dyn` keyword nor "called by name" decides it;
+    both were tried and each got one shape wrong. **A BUILTIN call the
+    parser makes runs as written too when its arguments name a user
+    function** (`pt_args_name_function`: a function literal, or a name
+    bound to a function - `dispatch_call_value`'s builtin branch): the
+    builtin then calls the copy's function, whose parameters inference
+    typed from the CONTAINER's element type - by value, `map(pure
+    func(opt v) {...}, [1, none])` typed `v` from the value 1, `int` where
+    the program has `int?`.
+  - **A call a RUNNING function makes runs BY VALUE**
+    (`pt_typed_value`: a call through a value inside a body, a callback
+    a builtin calls inside a body, a call at a copy's own top level):
+    the copy is called by the function's name with the values as
+    literals (a function by its name, a BUILTIN by `pt_builtin_name`),
+    and a TEMPLATE reached that way runs untyped, as the program runs
+    one it reaches through a value.
+  Rules, each watched failing: the by-value cache key is the decl's
+  `node_id` plus each argument's STATIC type (and the ids of any function
+  in it), the written one the call's `node_id`; a result holding a
+  function value of a copy runs the call untyped instead (its
+  descriptors die with the cache - `pt_result`); a struct DECLARED INSIDE
+  a copied function is the program's own, since a clone shares its
+  definition (below; tests/functional/119); the cache is cleared when
+  the outermost `pBlock` exits (`ParseContext::block_depth`) and in
+  `~ParseContext`, because the copies and the noted initializers are AST
+  the `-vm` teardown's `live_nodes == 0` proof counts; a copy's own root
+  is `pt_copy`, or a written call through a baked value recursed forever;
+  the switch is `EvalContext::parse_typed` on the const ROOT, set by the
+  ParseContext ctor, the REPL, and the script driver to
+  `!opt_no_type_infer` - under `-nti` both compile-time and run-time
+  calls run untyped, and `-rt` cannot see that wiring (`driver_checks`
+  does). A by-value call given a struct TYPE passes it by its name,
+  declared in the copy (a `dyn` value, as in the program - #95). Not
+  typed (the call runs as before): guards no program reaches. The known
+  gap, documented: a type the program JOINS over the whole program (an
+  un-annotated `opt` parameter, a lambda's unless written as a builtin's
+  argument, a template's instance through a value, made only when every
+  call through it agrees) is decided by this call alone - where the
+  value is needed while compiling (a const initializer, a decided
+  condition, a struct's const member) and for a join reached only
+  inside the called function. A constant call in an expression is
+  folded after inference instead (#96, below), and runs when the program
+  types it otherwise. Nets: the
+  `parse: a function the parser runs runs typed` `-rt` entry (counters
+  `g_pt_runs` / `g_pt_untyped` prove the copy ran, or was declined),
+  the `repl:` cross-input case,
+  `tests/functional/97_parse_time_typed.my`, a `driver_checks` case.
+- **THE PROVER: a call that is GUARANTEED to fail is a COMPILE error
+  (step 7 tier 2, `prove_unbound_calls` in resolver.cpp).** An
+  unconditionally-evaluated call to a function that unconditionally reads a
+  global declared further down can only ever raise `UnboundSymbolEx`, so it is
+  refused — **even inside a `try`** (maintainer's call; the two exception
+  kinds exist so this is expressible, `UseBeforeBindingEx` being the
+  uncatchable compile one). **The whole soundness argument is one idea: only
+  UNCONDITIONAL code counts, on BOTH sides** — a false "provable" refuses a
+  program that would have worked, which is worse than a late error. So
+  `for_each_unconditional`'s exclusion list IS the proof: if/loop bodies,
+  catch/finally, ternary arms, `??` and `&&`/`||` tails, a function body, and
+  **a lazy builtin's argument** (`isbound(g)` is how a careful program AVOIDS
+  this error — counting it as a read refuses the code that got it right).
+  Two traps: `for_each_child` does NOT descend into `Block` or `Expr14`
+  (`walk()` handles them), so a generic descent silently stops at
+  `var t = f();`; and it runs on the **CLEAN tree, before AutoConst and the
+  inliner**, because whether a program COMPILES must not depend on which
+  optimizations ran (RULE 2) — after DCE, `if (false) { fetch(); }` would
+  compile while `-nc` refused it; after the inliner, the analysed shape would
+  differ between `-ni` and the default.
+  **IT IS TRANSITIVE** (2026-08-09): the globals a call can reach are a
+  FIXPOINT over the CALL GRAPH (`build_reachable_reads`), not a one-level look
+  at the callee's own body — `outer` calling `fetch` which reads `g` is
+  proven, where before the two-hop program compiled and died at run time while
+  the one-hop one was refused. A fixpoint and not a walk **because mutual
+  recursion makes the graph cyclic**, and a cycle has no traversal order. ONE
+  switch keeps the error tier sound: `unconditional_only` picks the walker, so
+  with it BOTH the reads and the CALLS are the unconditional ones and a global
+  enters a set only if every step from the call to the read is guaranteed — a
+  conditional link ANYWHERE drops the case to the warning tier, and all three
+  positions (outer call, inner call, read) are pinned.
+  **IT SEES THROUGH A WRITE-ONCE NAME** (#140/#146, 2026-08-09):
+  `var f = fetch; var t = f();` is refused exactly like the direct `fetch()`
+  spelling, at the top level and through a call hop alike
+  (`index_func_aliases` + `callee_of`, consulted by BOTH tiers and by the
+  fixpoint's call edges). Three rvalue shapes name one function: a top-level
+  NAMED func, a LAMBDA literal (`var f = func() { return g; };` — then the
+  lambda is the whole call graph, so `build_reachable_reads` must iterate
+  the alias TARGETS and not just the name index, and the cheap early bail
+  must ask about both or a program with no named function is skipped
+  entirely), and a CHAIN (`var f2 = f;` — free, because the index is built
+  in statement ORDER, so each link sees the one above it, which is also
+  exactly when it holds that value).
+  Sound for the same reason AutoConst's promotion is: the declaration is the
+  ONLY write, so wherever the name is bound at all it holds that one
+  function — proven from the write counters the resolver has already
+  collected (`writes[slot] == 1` for a main-frame local, absence from
+  `reassigned_globals` for a global), and a reassignment at any depth in any
+  scope disqualifies it. A capture cannot defeat it: captures are BY VALUE.
+  **The decline direction is the one that matters** — a false alias refuses a
+  program that RUNS (`var f = fetch; f = other; f();` where `other` never
+  reads the global), which is why the write-once sabotage is watched failing
+  on a case that asserts its own result, not merely that it compiled. One
+  deliberate limit stays silent: a top-level call ABOVE the binding is left
+  alone (the failure there is the unbound NAME, and reporting what it will
+  later hold would name the wrong cause — the TDZ already refuses it). A
+  callee that needs a real callee-SET analysis to bound — a container
+  element (`ops[0]()`), a parameter, an alias declared inside a body — is
+  not proven, but it IS reported by the warning tier's weak arm below.
+- **`isbound(name)` — the TDZ pair's runtime half (#131 step 6).**
+  `defined(name)` asks whether the name EXISTS (true throughout its scope,
+  ABOVE the declaration included — the name is declared, merely unbound);
+  `isbound(name)` asks whether its declaration has RUN. LAZY (unevaluated
+  argument — `mark_lazy_builtin` + the F1 rule: callable directly, never a
+  value), and its argument must be an **identifier** (or `none`), checked by
+  `Inferencer::stamp_lazy_calls`. **Three things a future reader will get
+  wrong:** (1) the arg-shape rule must be a COMPILE error, because the runtime
+  body's own throw is the tree-walker's answer while the no-fail codegen
+  refuses the shape (`NotLoweredEx`) — an engine divergence; (2) it must run
+  UNGATED, not inside `reject_dev_builtins` (which the `-rt` harness and the
+  REPL skip wholesale via `g_dev_builtins_allowed`, so a check placed there is
+  invisible to every test) nor behind `checks_enabled` (`-nti` must not turn a
+  syntactic rule off); (3) the FIX-1 exemption is NARROWER than the TDZ one —
+  every lazy builtin is exempt from BOTH (`no_tdz_check` and `no_undef_check`),
+  so a name declared NOWHERE answers `false` rather than erroring. That was
+  the reverse until 2026-08-09, when the maintainer made the short form the
+  point: `isbound(x)` ALONE is the feature test, where the conjunction
+  `defined(x) && isbound(x)` used to be required. The typo hazard it accepts
+  is one `defined()` already had, so the two lazy queries are now consistent.
+  `isbound` is a #135 NARROWING GUARD for the same reason — without that, the
+  `print(x)` inside `if (isbound(x)) { ... }` would still be refused and the
+  short form would not work at all.
+  `builtin_isbound` reads `sym` off the Identifier and never evaluates it —
+  evaluating an unbound global throws the very `UnboundSymbolEx` the call
+  exists to avoid. The lexical kinds fold in `try_fold_isbound`; a GLOBAL is
+  the one runtime query and reuses `DefinedGlobalV` (which `defined` no longer
+  reaches, since a declared global folds to `true`).
+  **⛔ A LAZY CALL IS RECOGNIZED BY ITS BINDING, NOT ITS NAME
+  (2026-11-13).** The resolver and AutoConst asked the callee's NAME, so in
+  a program with its own `func defined` (or a parameter, a variable of a
+  lazy builtin's name) `defined(zork)` compiled and called the BUILTIN -
+  `false` - and the REPL folded `defined(p)` to `true` over an earlier
+  input's function. `stamp_lazy_calls` (the same structural walk, which
+  knows the REPL's earlier inputs and runs under `-nti`) stamps
+  `CallExpr::user_callee`, and every resolver site asks
+  `lazy_builtin_callee(call)` - the FIX-1 exemption, the #135 guard, the
+  prover's argument skip, the folds and refold's no-fold rule. A new site
+  that treats a lazy call specially asks it too.
+- **⛔ A DECLARATION BEATS THE CONST BUILTIN IT SHADOWS (#133, 2026-08-09).**
+  `pAcceptId` used to resolve a name straight to a const builtin without ever
+  asking what the program declared, so `func abs(x){return 42;}` gave
+  `abs(-1)` == **1** (the builtin, folded) and `abs(runtime(-1))` == **42**
+  (the function) — the same call, two answers, and a RULE 2 violation (`-nc`
+  printed 42 twice). It hit five shapes: the func name used after OR before
+  its decl, a param in a `=> expr` body (which folded `<builtin> + 1` into a
+  COMPILE error), a lambda param, and a foreach loop var.
+  The fix is **`ParseContext::shadowed`** (parser.h): names that also name a
+  const builtin, which `pAcceptId` refuses to const-resolve. Two feeders,
+  deliberately different in reach — a **token PRE-SCAN in the ParseContext
+  ctor** for every `func NAME`/`struct NAME` in the stream (whole-parse, since
+  #134 binds those at SCOPE ENTRY so a use ABOVE the decl already means the
+  user's function, which a single-pass parser cannot know at the use), and a
+  **scoped push/pop** for params (`pAcceptFuncDecl`, around BOTH body forms —
+  the `=> expr` sugar never reaches `pBlock`) and foreach vars. `pBlock`
+  pushes a scope in lockstep with the CSE cache. A `pure func` is NOT
+  shadowed: it IS the const evaluator's own binding and must keep folding.
+  The pre-scan is intentionally over-broad (a nested `func abs` shadows the
+  name everywhere): shadowing only ever COSTS A FOLD, never an answer, since
+  the resolver then binds the name correctly at run time — so when in doubt,
+  shadow. **A `var`/`const` of that name is still refused outright**
+  (`CannotRebindBuiltinEx`, `declExprCheckId`); this rule is for the forms
+  that were always allowed.
+  **AutoConst's call fold had the same hole (2026-10-06):** it evaluates a
+  constant-argument call in `cctx`, which holds the const builtins BY NAME,
+  and the program's own function cannot be registered under a taken name -
+  so `func top() {...} top()` ran the builtin (InvalidNumberOfArgsEx in
+  every engine), as did `top(1)` under `-nti`. A call whose callee resolved
+  to a user symbol named like a const builtin is not folded now.
+  **AND A USER CONST IS SHADOWED THE SAME WAY (H1, 2026-10-06).** The set
+  took only CONST BUILTIN names, so `const K = 5; func f(K) => K + 1;`
+  folded the param's reads to 5 - a wrong answer in EVERY engine. The
+  feeder `shadow_add` now records any name the const scope binds
+  (**`ParseContext::const_binding(uid)`** walks the `const_ctx` chain: a
+  const builtin in the root, a user const, a pure func, a struct name), and
+  two more sites feed it: a **catch variable** (a `shadow_push`/`pop` around
+  the catch body) and a closure's **captures** (added with the params - the
+  capture-list identifiers themselves are parsed by `pIdentifier`, which
+  never const-resolves). AutoConst's twin: a callee resolved to
+  `SymKind::local` or `SymKind::capture` is not folded either (`pure func
+  a ..; func f(a) { return a(2); }` ran the OUTER `a`). The cost is a lost
+  fold of a captured const CONTAINER's reads, deliberately: the capture is
+  rebindable. **And in TYPE position too (2026-10-07):** `P p;` inside
+  `func f(P)` resolved the outer struct - `lookup_struct_type` ignored the
+  set; it asks `is_shadowed` now, and the error says why (`not_a_type`:
+  "a parameter ... named 'P' hides the struct"). A per-name check is
+  exact here: the ctor pre-scan adds an entry only for a builtin's name,
+  which no struct can take. **And ACROSS REPL INPUTS (2026-10-11):** the
+  pre-scan sees only the input being parsed, so after `func abs(x) =>
+  42` a later input's `abs(-3)` folded to the builtin's 3 while
+  `abs(runtime(-3))` gave 42. Every REPL parse goes through
+  `ReplEngine::Impl::bind_parser`, which also feeds the set each
+  run-time global an earlier input bound under a const builtin's name.
+- **A CLOSURE CAPTURING A CONST SCALAR GETS A SYNTHESIZED `var` (H2,
+  2026-10-06).** A const scalar has no run-time symbol (its decl is
+  dropped, `ShouldConstSymbolExistAtRuntime`), so `func [K]` snapshot
+  nothing - "Undefined variable". `declare_captured_const_scalars`
+  (parser.cpp, run right after the capture list is parsed) pushes
+  `var K = <value>` - SAME name - into `ParseContext::baked_funcs`, and the
+  innermost `pBlock` re-inserts it before the statement holding the
+  closure (the #47 mechanism), so a closure in an `if` condition or a
+  brace-less body lands before that whole statement.
+  **⛔ An ARROW body `=> expr` is its own block for these statements
+  (2026-11-16):** it is parsed by `pExpr14`, never `pBlock`, so what its
+  expression pushed went to the ENCLOSING block, before the statement
+  holding the arrow function - outside the body that reads it. `func()
+  => func [K] () => K` in a function body was "Undefined variable 'K'"
+  (the middle function cannot see the enclosing function's local), and a
+  named arrow function - or, since question 21, a `const` bound to a
+  pure one - called above its line read the synthesized global before
+  its statement ran (UnboundSymbolEx); the braced spelling of each
+  worked. `pAcceptFuncDecl`'s arrow branch now takes the entries its
+  expression pushed, with a `cap_const_decls` scope of its own, and puts
+  them before the `ReturnStmt` (such a body is then no `func_expr_body`,
+  exactly like its braced twin). A new way to parse a function body
+  takes its own baked statements too.
+  **`ParseContext::cap_const_decls`** (one vector per `pBlock` in
+  progress, and per arrow body) dedupes per block - two captures of one
+  const in one block would otherwise be AlreadyDefinedEx. Every OTHER
+  read of K is still folded by the parser, so the synthetic var is read
+  only by capture snapshots; AutoConst cannot promote and drop it (it is
+  captured, `prescan_blocked`); the capture is shadowed in the body
+  (H1), so `K++`
+  changes the closure's copy. Skipped for a shadowed name (a param or loop
+  variable is a run-time binding already), a const builtin (it has a
+  builtin slot) and a value no literal can hold - a struct NAME, whose
+  hoisted global slot is its run-time symbol (a null rvalue there crashed
+  the parser). Rejected designs, both for their blast radius: a
+  "constant" capture KIND (capture kinds are branched on in ~12 places
+  including the JIT's lean closure paths and the bytecode inliner, plus a
+  `.myv` change), and a hidden-named outer var with a "capture source"
+  field (every consumer of a capture's outer name would need it). Visible
+  side effects: `-s` / `:show` show the synthetic `var K = 5`, and in the
+  REPL it lands in the run-time map, so `cmd_globals` lists the CONST
+  scope first and skips a run-time entry of the same name.
+- **A CONST MULTI-DECLARATION BINDING A CONTAINER (H4, 2026-10-06).**
+  `const a, b = [[1], [2]]` was DROPPED: the assignment's value is none,
+  so the scalar test said "no run-time symbol" and reading `a` was an
+  undefined name. The
+  decl is kept now when ANY target is bound to a container, and in a kept
+  one each SCALAR target becomes a `_` placeholder - the invariant **a
+  const scalar never has a run-time symbol** must hold here too, or a
+  capture of it (H2's `var c`) collides with the kept `c`
+  (AlreadyDefinedEx). The rvalue literal stays a literal (unpacked as
+  written, F6), but each ELEMENT is baked deep read-only with
+  `cse_materialize`, as `const a = <element>` would bind it - the VM
+  appended to a fresh mutable array where the tree-walker refused.
+- **A CONST MULTI-DECLARATION IS UNPACKED AS WRITTEN (H7, 2026-10-06).**
+  **`LiteralArray::unpacked`** (syntax.h, stamped by `pExpr14` on an
+  IdList's literal rvalue, `var` or `const`) stops the parse-time
+  `const_values_widen`: `const x, y = [12, 2.5]` gave `x` the float 12.0
+  where the `var` form gave 12 (the run-time paths were right already -
+  the inferencer's `lit_coerce_by_parent`).
+- **An explicit `pure func`'s name is a CONST binding in the REPL (H3,
+  2026-10-06)** - `FuncDeclStmt::do_eval`'s map path emplaces it const
+  (`desc->explicit_pure`), as a struct name already was, so `a = 3` is
+  CannotRebindConstEx at run time there (a script refuses it at compile
+  time, G3). Redefinition still works: `allow_redeclare` erases first.
 - **Early failure:** exceptions raised *during* const-eval propagate immediately
   and are *not*
   catchable by script `try/catch` (the parser never enters a const assignment
   inside a try). This is
-  intentional — const errors should fail the build, not be swallowed.
+  intentional — const errors should fail the build, not be swallowed - and
+  it is the language rule (question 6, decision A, 2026-10-20), in a branch
+  that never runs too. The message says so: a CATCHABLE run-time kind
+  (DivisionByZeroEx, OutOfBoundsEx, a thrown struct) that reaches the
+  script driver before the program runs (`mylang.cpp`'s `compiling`, false
+  from the first `vm_run` / `eval` / image load) or a REPL input's
+  parse/check/optimize phase (`format_compile_error`) gets
+  `format_const_eval_note` (errfmt.cpp; `format_exception` prints it when
+  its `compiling` argument says so - the driver's flag, true for a REPL
+  compile error), which names `runtime()`. A plain compile error (a type error, a syntax error -
+  `Exception::is_catchable()` is false) and an uncatchable one get no
+  note. Only the driver knows the program has not started, so its wiring's
+  net is `driver_checks` (and the `repl:` case); the rule's is the
+  `errfmt:` `-rt` check.
 - A const decl in `pInConstDecl` whose rvalue isn't actually const throws
   `ExpressionIsNotConstEx`.
+- **⛔ A CONSTANT CALL IS FOLDED AFTER INFERENCE, NOT WHILE PARSING (#96,
+  2026-10-21; a BUILTIN call too since 2026-11-14).** Folded while
+  parsing, the call was gone
+  from the program inference typed, while `-nc` kept it: a parameter the
+  program JOINS over its call sites (an `opt` one, a lambda's) missed its
+  argument - `pure func o(opt v) => str(v); o(2.5); o(int(runtime(2)))`
+  printed `2` where -nc printed `2.000000` - and a type error or a warning
+  about the call landed on another call (RULE 2 in all three). So a folding
+  parse, outside a const declaration and a pure function's body (where both
+  runs fold or bake), leaves an expression holding such a call in place
+  (`pDeferFold`, parser.cpp, at the five fold sites - the call, the
+  subscript, the operator chain, the declaration's rvalue, `pExprTop`):
+  EVALUATED, for its errors and its value, with `Construct::defer_fold`
+  set and the literal in `Construct::late_fold`. `Inferencer::
+  apply_late_folds`, the last step of `infer_one` (and of its `-nti` early
+  return), swaps the literal in for each outermost such node when
+  `late_fold_fits`: the literal's type is the node's, for a call each
+  argument fits its parameter as is (a converting bind runs the body with
+  another type than the parse did), EVERY deferred node inside it fits
+  too (its value was computed from theirs: `str(id(2) + 1) == "3.0"`),
+  and no function literal is written inside it (inference may name it
+  from elsewhere - a callee stamp - so it stays; no test can see that
+  rule today). Otherwise the node runs, as under -nc; AutoConst may
+  still fold it, with the program's types. The replaced subtree is
+  RETIRED. `-s`'s first dump (before inference) shows such a call
+  unfolded. Net: `const_fold_equivalence` (`-rt`, which compares the
+  warnings now too) and `tests/functional/100_fold_after_inference.my`.
+  **A BUILTIN call defers the same way** (it used to fold while parsing):
+  inference typed its VALUE, which is exact where the builtin's rule is
+  not - `get(D, "a")` was an `int`, not `int?`, so `g + 1` compiled where
+  -nc refused it, and `dict(pairs)` was `dict<str,int>`, not `dict<dyn,
+  dyn>` (typestr, keys()' storage, an error's wording; tests/functional/
+  118). A value the fold would not bake - an ARRAY outside a declaration,
+  `sort(K)` inside `sum(sort(K))` - is kept as a WITNESS
+  (`Construct::late_fold_witness`): late_fold_fits reads its type, so the
+  enclosing call still folds, and apply_late_folds never swaps it in.
+  Without it the enclosing fold was refused and bench/my/52's loop sorted
+  on every iteration. Two more rules came with it: a swapped literal
+  standing for a call that builds to its place's storage (`keys`,
+  `values`, `map`...) is REBUILT in the hint set_array_repr_hint stamped
+  on the call's arguments - the swap runs after that pass, so without it
+  tests/functional/109 failed again; and a function literal written as a
+  BUILTIN call's argument does not block a late fold (no builtin keeps
+  its argument, and a result naming a function keeps no literal), or
+  every constant `map(pure func.., K)` ran at run time.
+  **Three things the parse-time fold gave that the deferral must keep,
+  each lost at first (2026-11-14):** the bake goes through the CSE cache
+  (`cse_materialize_core`'s `deferred` argument - `var a = get!(E, "k");
+  var b = get!(E, "k");` name ONE read-only array, as under -nc; a value
+  naming a function is not cached there, since the node that owns the
+  literal stays in the tree and may still be dropped); `var dyn d =
+  range(3)` puts `general` on the call's arguments in pExpr14, where the
+  builtin and the late fold's rebuild read it (inference stamps the same
+  from the type, and with `-nti` nothing else does - the parser's
+  stamp_literal_annot only sees a baked literal); and **a `??` the parser
+  decides marks the left side it keeps `Construct::never_none`**, which
+  `type_of` strips `opt` from: the kept node stands for the whole `a ??
+  b`, and as a deferred `get()` / `find()` call (or any constant
+  expression under -nc) its own type is `int?` - `var n = get(D, "a") ??
+  0; n + 1` was refused in every mode. ⛔ The mark is set only for an
+  expression of constants and builtins (`pValueIsTypingFree`: no user
+  function called, named or written in it): a pure function's body is
+  typed by the program, so its run-time value may be `none` where the
+  parse-time one was not, and stripping `opt` then put a none in a slot
+  typed int under -nc (watched). `pf(D) ?? 0` therefore stays `int?`,
+  as it was. A new parser fold that keeps a NODE where it used to keep a
+  literal must ask what the literal's exact type was standing in for.
 
 `-s` (with vs. without `-nc`) is the way to *see* all of the above happening.
 
@@ -1019,7 +3983,16 @@ slot identity). For each function (and the top-level "main"), it:
   || 5` is `true`, not `5`), which shapes the rules. A const that **determines**
   the result — `false && rest` → `false`, `true || rest` → `true` — folds the
   whole expression to that bool (sound regardless of `rest`: it is
-  short-circuited, so never evaluated, even side effects / an undefined name).
+  short-circuited, so never evaluated - including its side effects. **That
+  claim was FALSE until #138**: only the FOLD skipped `rest`; the runtime
+  evaluated every operand, so the same operator behaved differently depending
+  on whether const-eval could see the left side - a RULE 2 violation this
+  paragraph was quietly asserting away. `&&`/`||` short-circuit at run time
+  now, in all three engines - see *Short-circuit* under the eval section. An
+  UNDEFINED NAME there is nonetheless a compile error since FIX-1 (#130):
+  the resolver rejects it before this fold runs. Early dead-code
+  elimination, which would let a name survive under a false guard, is a
+  separate parked idea (#135).)
   This is what makes a feature-flag guard fold: `const DEBUG = false; if (DEBUG
   && heavy())` → `if (false)`, which the DCE then drops — matching C++ `-O3`. A
   **non-determining** leading const (`true && rest`, `false || rest`)
@@ -1072,10 +4045,13 @@ explicitly.
 **Pure functions: no observable side effects.** A function is pure iff it has
 no side effects: it reads only consts + its params (+ calls pure functions),
 nests no function, **and does not mutate a reference parameter.** The last
-clause matters because mylang passes arrays/dicts/structs **by reference**, so
-`a[i] = v` / `a.f = v` / `append(a, …)` on a param *is* observable by the
-caller — such a function is NOT pure (mutating a **scalar** param is fine, it is
-a copy; mutating a **fresh local** container is fine, it never escaped).
+clause matters because mylang passes arrays/dicts **by reference**, so
+`a[i] = v` / `d.k = v` / `append(a, …)` on a param *is* observable by the
+caller — such a function is NOT pure (a struct is a VALUE since 2026-10-08,
+so `p.f = v` on a struct param is the callee's copy - but the analysis
+cannot tell `p.f` from a dict's `d.k` and still counts it, which only costs
+a fold; mutating a **scalar** param is fine, it is a copy; mutating a
+**fresh local** container is fine, it never escaped).
 `func_mutates_input` (`resolver.cpp`) proves this with a small taint analysis:
 a non-scalar param is tainted, an *identifier-lvalue* assignment from a tainted
 value (`var b = a`, `var r = [a]`) taints the lhs, a `foreach` var over a
@@ -1094,6 +4070,128 @@ this way costs ~no optimization:** a param-mutator can't const-fold (a const arg
 is read-only → the write throws), isn't inlined (mutators are block-bodied), and
 the for-range already excluded it — but it *enables* a sound pure-container-arg
 for-range bound (`compute(arr)`); see the eval below.
+
+**⛔ THE PARAMETER ESCAPE ANALYSIS (#93, `stamp_noescape_params` in
+resolver.cpp) — A FALSE "SAFE" IS A USE-AFTER-FREE, SO EVERY RULE FAILS
+CLOSED.** `func_mutates_input`'s transitive, escape-aware sibling: per
+parameter, *can the reference this is bound to still be reachable after the
+call returns?* The answer is a bit in `FuncDescriptor::noescape_params`, and
+its consumer is **#94 THE BORROW BIND** — a reference argument bound with NO
+retain, since the caller's slot holds one for the whole of a synchronous
+call. Four rules a future editor must not soften:
+
+- **It runs LAST in `resolve_names`, after `devirtualize_direct_calls`** — it
+  reads `SymKind::global` (pass 2) and `direct_func_slot` (that call). A
+  first version sat in `process_function` beside `func_mutates_input` and
+  marked a global-writing function's parameter safe. The audit-table stage
+  trap, with a dangling-pointer failure direction.
+- **An unknown NODE SHAPE declines** (`esc_known_shape`). A node kind the
+  walk does not descend into HIDES occurrences — and a hidden occurrence is
+  exactly how a parameter gets wrongly marked. It is an exhaustive switch
+  over the tag (no `default`), so a new kind is a build error until it is
+  classified; `ForRangeStmt` (out of reach only because this pass runs
+  before `specialize_types`) and `DerefExpr` are the kinds it declines.
+- **An unlisted BUILTIN captures everything** (`esc_builtin_transparent`). A
+  listed one claims three things at once: stores no argument, does not return
+  one, and invokes no callback. **Audit the third by grep, not by eye** —
+  `sum` was listed on the reasoning that a sum is a number, but `sum(arr, f)`
+  is a reduce; the awk that finds every builtin reaching `VmInvoker`/
+  `eval_func` is quoted at the table. A new builtin needs no entry.
+  A SECOND, weaker list (`esc_builtin_no_invoke`) claims only "runs no
+  MyLang code" and gates the callback rule alone. It is an allowlist of
+  NON-invokers on purpose: **that grep misses `map`, `filter` and `sort`**,
+  which reach their callback through a shared helper not named `builtin_*`,
+  so a list built FROM the grep would have declared `sort` safe. Inverted,
+  the same imprecision costs only an optimization.
+- **A callee it cannot NAME poisons the whole function**, not just the
+  arguments handed to it: it might reassign the global that some caller
+  passed us and drop the last reference mid-call. A HIGHER-ORDER BUILTIN's
+  callback is a callee like any other, and IS named when it is an inline
+  lambda or a global function slot nothing reassigns (`esc_callback_fn`) —
+  the fixpoint then propagates its `unsafe` along an ordinary call edge.
+  One reached through a parameter or a container element still poisons.
+- **`esc_collect` walks function BODIES explicitly**, because
+  `for_each_child` has no `FuncDeclStmt` arm and would otherwise stop at
+  the top level. That is not only an enabler for naming callbacks:
+  `written_slots` — the reassigned-global-slot set that decides whether a
+  call may be resolved through `slot2fn` at all — was collected from
+  top-level statements ONLY, so a function body doing `helper = other;`
+  was invisible and a call to `helper` elsewhere was answered for a callee
+  that may no longer be there.
+
+Every rule is pinned by a `param_escape_analysis` row that fails when the
+rule is deleted (watched, one sabotage build per rule), except the
+reassignment guard, which is proven REDUNDANT by an `ML_CHECK` — no test can
+reach it, and the check fires if a future change ever makes it load-bearing.
+
+**⛔ #94 THE BORROW BIND — THE CONSUMER, AND ITS THREE RUNTIME DECLINES
+(2026-08-15).** With the bit set, the callee slot takes a RAW BIT-COPY of the
+caller's and skips the retain at the bind AND the release at the frame pop.
+The decision is ONE function, **`vm_bind_arg`** (vm.cpp), shared by the C++
+`fast_bind` and the emitted push's reference arm, and the slot records the
+answer in **`LValue::borrowed`** (in `is_const`'s tail padding, so the slot
+did not grow — the emitter bakes a 48-byte stride). Measured on
+76_funcval_dispatch: **−13.5% instructions, 0.88x wall clock**, from
+1,000,000 borrows — the whole call count.
+
+Four things a future editor must not soften, each watched failing:
+- **Only a REFERENCE is ever borrowed** (`t >= t_str`). The release scan
+  skips a trivial slot, so a borrowed int would keep its flag set forever and
+  the next call to reuse that window slot would rebind over it. Not
+  hypothetical: it fired on the first run, in ackermann, whose un-annotated
+  TEMPLATE parameter is not `binds_scalar` (so the analysis claims it) but
+  holds an int.
+- **Never a SLICE.** A slice registers itself in its parent's live-slices set
+  when COPIED, and an element write to the parent detaches every registered
+  view in place (`clone_aliased_slices`), as a write through any sibling
+  handle moves the whole slice (`materialize_slice`); a borrowed view is in
+  no such set, so the write leaves it reading storage the detach just gave
+  away — and freed, if the caller's slot held the last reference. Every
+  other reference type's copy is a plain retain, which is what makes the
+  bit-copy symmetric with the abandon.
+- **`LValue::frame_release()` IS THE ONE RELEASE POINT.** Seven scans used to
+  open-code `lv = LValue()`; a borrow makes the decision PER SLOT, and a scan
+  that forgets it decrements a count the slot never took.
+- **In the emitted push, the slot zeroing runs BEFORE the copy loop.** The
+  qword at +40 covers `container_idx` and BOTH flag bytes, so zeroing it
+  afterwards wiped the flag the reference arm had just set — a use-after-free
+  from a store that reads as tidy-up.
+
+REACH is `MYLANG_JITSTATS`' `arg_borrow` (the retain actually skipped) and
+`arg_borrow_slice` (cleared by the analysis, declined by the value) — two
+counters so "the tier ran" and "the tier was reachable and every value
+declined" cannot be confused.
+
+**The emitted INLINE borrow arm was BUILT AND REVERTED at the generic
+push** — −3.27% Ir on bench 76 (999,999 of its calls served by generated
+code) for **1.00x wall clock**, while two benches that never borrow paid
++1.44% / +0.48% Ir for the emitted bytes. The guard-elision signature
+again. Full record, including the conditions under which to re-introduce
+it: `plans/archived/inline-borrow-arm.md`. **One of them came true and it
+is BUILT there (#97 inc 3 W5, 2026-09-21): at a FRAMELESS site the callee
+is baked, so the bit is an emit-time fact and the arm is emitted only at
+the sites that take it** - 76 −13.5% Ir, the whole cut being the two
+helper bodies (`vm_bind_arg`, `frame_release`), while the emitted site
+grew by four. The generic push keeps the helper. **Remaining cases, none
+built:** the builtin-CALLBACK bind paths (`argv[i]` — sort/map/filter/
+make_dict) and the tree-walker's `do_func_bind_params`.
+
+**⛔ A REBOUND FUNCTION NAME IS A VARIABLE (#38 D, 2026-09-25).**
+`func sq(x) {...}; sq = ng;` - the name is then a global holding a function
+VALUE, and no pass may treat a call through it as a call to the declared
+body. That was ignored in EVERY engine, `-tw -ni -nc` included, by four
+passes each keyed on the declaration's name: the inferencer's template
+redirect (`callee_funcinfo`), auto-purity and AutoConst's fold, the
+inliner (and its recursion unroll), and the callee-set analysis (which
+answered `one sq` - a wrong MUST answer the #93 escape analysis reads).
+The guards: `func_name_rebound` (inferencer: a named func with any counted
+write, a var-bound lambda with more than one), the resolver's
+`rebound_names` (a pre-scan, by NAME, of every assignment target, because
+purity is decided before the walk reaches a later reassignment) and
+`global_name_rebound` (the published `global_slot_reassigned`, for
+AutoConst and the Inliner). An explicit `pure func` is the exception: its
+name is a compile-time binding, and rebinding it is CannotRebindConstEx in
+every engine (the tree-walker used to rebind it silently).
 
 **Auto-pure & const/pure introspection.** `func_body_is_pure` (`resolver.cpp`),
 run after a function body is resolved, promotes a non-pure, capture-free func to
@@ -1134,7 +4232,14 @@ writes mutable global state that may differ at the new site (and its result
 isn't compile-time-known anyway), so it is left a runtime call. Only pure
 *functions* are seeded (never a runtime var); registration skips any name the
 current input defines, so a redefinition wins and a redirected call already
-points at the current input's own instance. **A prior input's body is
+points at the current input's own instance - **and any name the current
+input ASSIGNS** (`collect_rebound_names`, now file-scope, asked by all three
+seeding sites): the name holds the prior function only until the input
+rebinds it, so `gf = func(y) => y * 2; gf(3)` folded to the OLD lambda's
+answer. The callee-set analysis has the same open-world rule for a rebound
+NAME: a pinned symbol's points-to set is the current input's only, so a
+rebound pinned name is ⊤ (it answered the declared lambda, and the
+inferencer instantiated it). **A prior input's body is
 POST-specialization** (it already ran `specialize_types`, so it can hold M8
 `TypedScalarExpr` nodes — which the inliner never sees in a normal single
 compilation, since it runs *before* `specialize_types`). So
@@ -1155,41 +4260,22 @@ parse-time consts and `const` params; `isconst` also accepts auto-const vars and
 auto-const params. All four are registered as runtime builtins (with fallback
 bodies) so the names resolve even when the pass doesn't fold them.
 
-**In progress: function inlining & specialization.** Designed and being built;
-see `plans/function-inlining.md` for the full plan and task order. Three aims:
-(1) *specialization* — propagate a const/auto-const argument into a (possibly
-non-pure) function and fold (the missing half of const-parameter propagation,
-since today only pure/auto-pure whole-call folding crosses a call); (2) *inline
-trivial bodies even with no const args* (`func f(x) => x+1` called `f(y)` folds
-to `y+1` in place — removes call overhead and exposes the body to the caller's
-const-folder); (3) keep backtraces identical with inlining on/off. The two
-formerly-open questions are settled: the **criterion** is "specialize→fold→
-measure→decide" (inline if tiny-after-fold; else emit a shared specialized clone
-if it folded a lot; else leave the call), and the **backtrace** uses
-"inlined-at" chains (`InlineCtx`, `errors.h`) flushed by `flush_inline_frames`
-(`backtrace.cpp`) at two error-path points (`Construct::eval` and
-`do_func_call`'s catch), keyed off `Exception::inline_origin_emitted` (see the
-re-fold paragraph), leaving `format_backtrace` unchanged. Algebraic
-simplification of non-constant operands (`x+1-1 -> x`, `a+a -> 2*a`,
-`x*2*3 -> x*6`) is done for **int-typed** operands only (`fold_int_arith`, see
-its own section) — sound because inference proves the type (`-fwrapv` makes int
-`+`/`-`/`*` associative); it stays out of scope for `float` (non-associative
-rounding) and `str`/`array` (`+`-overloading), and `/`/`%` (truncating division
-isn't associative). **Status:** the `InlineCtx` backtrace foundation exists (a
-`Construct::inline_ctx` field, the flush helper + the `Construct::eval` hook),
-**AST deep-clone** (`Construct::clone()`, all node types), and the **size-only
-inliner** (`Inliner` in `resolver.cpp`, run after `AutoConst`; gated by `-ni`).
+**Function inlining & specialization** (design record:
+`plans/archived/function-inlining.md`). The pieces: "inlined-at" chains
+(`InlineCtx`, `errors.h`) keep backtraces identical with inlining on or off
+(see *Inlined (virtual) frames* under the error model), **AST deep-clone**
+(`Construct::clone()`, all node types), and the **size-only inliner**
+(`Inliner` in `resolver.cpp`, run after `AutoConst`; gated by `-ni`).
 It splices eligible direct calls — top-level, expression-bodied, non-capturing,
 non-recursive, no nested function, arity match, body ≤ a node threshold (`-it
-N`, default 24), sound arg use
-(an arg is evaluated as often as the param is used; side-effecting args neither
-dropped nor duplicated). The spliced body's params are replaced by the args
-(which inherit the parameter occurrence's loc), and the whole splice is tagged
-with an `InlineCtx`. **The inliner re-scans each splice** (`walk(slot, depth+1)`
-after splicing), so a g-into-f-into-h chain collapses in one pass even when
-declaration order defeats the bottom-up walk (h declared before the callees it
-transitively reaches) or a call is newly exposed by the re-fold — this is the
-"fixpoint." Two bounds keep it finite: `MAX_INLINE_DEPTH` (16) caps nesting so
+N`, default 24), and THE ARGUMENT RULE (below). The spliced body's params are
+replaced by the INERT args (which inherit the parameter occurrence's loc), and
+the body is tagged with an `InlineCtx`. **The inliner re-scans each splice**
+(`walk(slot, depth+1)` after splicing), so a g-into-f-into-h chain collapses
+in one pass even when declaration order defeats the bottom-up walk (h
+declared before the callees it transitively reaches) or a call is newly
+exposed by the re-fold — this is the "fixpoint." Two bounds keep it
+finite: `MAX_INLINE_DEPTH` (16) caps nesting so
 mutual recursion (`a()=>b(); b()=>a()`) terminates, and `inline_budget`
 (`max(4096, 8 * program nodes)`) caps total nodes added so breadth-doubling
 (`f()=>g()+g()`) can't blow the tree up; hitting either bound just leaves the
@@ -1205,11 +4291,77 @@ flag, so an error that arrives with a loc already set (a builtin like
 `append(tbl, 9)`, a not-an-lvalue assignment `d.k = v`) still keeps its frames.
 `do_func_call` sets the same flag after its own call-site flush so the enclosing
 `CallExpr` doesn't re-emit, while each physical call's flush stays unconditional
-(multi-level inlined call sites all show). Backtraces for **body** errors are
-byte-identical with/without inlining;
-**known limitation** — an error *evaluating an argument* (e.g. an undefined var)
-is attributed to the inlined callee rather than the call site (the arg node is
-both the call-site value and the in-body operand). After splicing, the inliner
+(multi-level inlined call sites all show). **⛔ The flag is PER PHYSICAL
+FRAME, not per exception (#38 repro B, 2026-09-25):** `Exception::push_frame`
+is the ONE place every engine records a physical frame, and it resets the
+flag (and the JIT's baked `jit_inline_frame`) - the exception has moved into
+the CALLER, whose inlined regions are not flushed yet. It used to persist, so
+a callee's virtual frame suppressed its caller's (`top -> sort -> cmpw ->
+weight` lost `top`, every engine). A new frame-recording site must use
+`push_frame`, never `backtrace.emplace_back`. `tag_inline` must walk a
+COMPLETE child visitor (`fmi_children`): the resolver's `for_each_child`
+skips Block/for/foreach/try/Expr14, which left every STATEMENT of a spliced
+block body chain-less. And an inlined frame renders the callee's
+`display_name` (`inline_frame_name`), exactly as a physical one does - it
+rendered `weight$0` where `-ni` rendered `weight`. The oracle is
+`inlined_backtrace_oracle` (`-rt`) + `tests/bt_oracle` (CLI configs):
+every engine with inlining ON must render the `-ni -tw` backtrace and
+caret. Backtraces are byte-identical with/without inlining, for an error in
+the body AND for one evaluating an argument.
+
+**⛔ THE ARGUMENT RULE (RULE 2, #38 follow-up, 2026-09-25) - every inlining
+path (`arg_substitutable` / `arg_is_inert`, resolver.cpp).** A real call -
+what `-ni` runs - evaluates every argument ONCE, left to right, BEFORE the
+body, binds it (coercing a param declared `int`/`float`), and an error in
+one is the CALLER's, with the argument's own caret. Pasting the argument
+EXPRESSION into the body moves its evaluation to wherever the parameter is
+used: after a side effect of the body (`func f(x) => tick() + x;
+f(12 / z)` printed `tick` before the DivisionByZeroEx), into a guard or a
+`&&` tail (the throw simply vanished when the arm was not taken), zero
+times, twice, past a body that reassigns the global it reads, and under
+the CALLEE's inlined-at chain (one extra virtual frame, every engine). So
+an argument is substituted ONLY when it is **INERT** - it cannot throw,
+has no side effect and reads nothing the body can change - AND its bind is
+the identity; every other argument is bound to a frame temp at the top of
+the body (`$a = arg`, "args as locals") in param order. INERT is a
+fail-closed WHITELIST: a scalar literal or a deep read-only `LiteralObj`;
+a caller LOCAL read; a top-level function name nothing reassigns;
+`+ - *`, comparisons, `& | ^`, `&& ||`, unary `- + ! ~` over inert
+operands inference proved scalar (`th` - int arithmetic wraps, float is
+IEEE), and `/` `%` by a literal other than 0 and -1. NOT a runtime
+divisor, NOT a shift (negative count), NOT a
+subscript/member/call/global read/string op, and NOTHING under `-nti`. A
+MUTABLE array/dict literal may be substituted only where the param is read
+at most once (each evaluation is a fresh object). The expression engine,
+when an arg is not substitutable - or when its body is not LOCAL-FREE any
+more (an earlier block splice left slots of the callee's frame in it,
+which the uid substitution cannot remap) - goes through the block
+engine's `splice_block_call` (an `=> expr` body is a `{ return expr; }`
+Block); in a loop condition (`no_block`) it declines instead. The temp
+stores carry the CALL SITE's chain and the argument's span, and are
+inserted after the body's statements are tagged (the Block keeps the call
+site's chain too), so an argument error renders exactly what `-ni` does.
+A coercing temp (an int/float parameter) with another temp-bound argument
+after it stores its argument UNTYPED and is coerced in place (`$a = $a`)
+once every argument is evaluated - a real call binds after evaluating all
+of them, so `g(d, tick())` with a float `d` into `int a` must still run
+`tick()` before the TypeErrorEx (it did not, inlined, until 2026-10-06).
+The same property had three more homes, fixed with it: the old "cheap
+arg to a PURE callee" substitution (the callee's purity says nothing about
+the ARGUMENT), `collapse_locals` (a `var q = a / b; return 1;` body lost
+its throw - it now requires an inert, value-stable rvalue, and
+`count_slot_writes` counts destructure/foreach/catch writes too), and
+`fold_int_arith` (`(k / z) * 0 -> 0` and `k/z - k/z -> 0` dropped a
+DivisionByZeroEx in plain code, since the fold runs only with the inliner:
+only inert terms merge or cancel). In the REPL a TEMPLATE BASE's body
+takes no splice that adds frame slots (`in_repl_tmpl_base`): a later input
+clones and RE-RESOLVES it, and the resolver cannot take a slot it did not
+allocate. Nets: `inlined_backtrace_oracle` + `tests/backtrace/arg_*.my`,
+`local_dropped.my` (the rendered backtrace), the `inline:` cases of
+`opt_layer_equivalence` (which now runs `-ni` as a layer), and
+`tests/functional/33_inline_arg_eval.my` (an event log - a VALUE
+assertion cannot see a reorder).
+After splicing, the inliner
 **re-folds** (`Inliner::refold`): a `MultiOpConstruct`, subscript, slice, member
 access, or const-builtin call folds to a literal when its operands are
 compile-time constants — scalar/array/dict literals *and* const globals (the
@@ -1226,9 +4378,15 @@ bound, and folded with DCE via `AutoConst::fold_specialized` (which *catches*
 const errors and discards, so a runtime error never becomes a compile one) then
 `refold`. Both **scalar** and **deep read-only array/dict** const args seed a
 specialization: a read-only array/dict is sound to substitute because it is
-only ever folded in read positions (`fold_reads` never rewrites an assignment
-lvalue or an lvalue builtin's first arg) and any *mutation* of it throws the
-same error at runtime as the un-specialized call (`prescan_blocked` gained a
+only ever folded in read positions - `fold_reads` never rewrites an assignment
+lvalue or an lvalue builtin's first arg, and (fixed 2026-08-02)
+`fold_lvalue_reads` folds only a write chain's INTERIOR reads (the indexes),
+never its base spine: folding the seed into `arr[j] = n`'s base produced
+`Obj([...])[j] = n`, which the tree-walker survived (same NotLValueEx as the
+un-specialized call) but the NO-FAIL codegen refused with NotLoweredEx - a
+compile refusal of a legal must-throw-at-runtime program. Any *mutation* of
+the seed throws the same error at runtime as the un-specialized call
+(`prescan_blocked` gained a
 `block_subscript_bases` flag; the relaxed seed set keeps the genuinely-unsafe
 blocks — capture, lvalue-builtin first arg, callee, foreach var — but lets a
 subscript/member READ base fold, since the
@@ -1275,15 +4433,34 @@ pays — ~1.4x on a call-heavy non-const loop). **Scope (`block_inlinable_decl`)
 closure that is a decl rvalue `var h = func[..]..`, which let an inline break the
 capture), **non-recursive** (a COMPLETE `refs_uid` check), no scalar-param
 reassignment (a reassigned param is a by-value copy — substituting the arg would
-alias it). **Args (use count by SLOT):** a **value-stable** arg (`tail_arg_ok` —
-a caller LOCAL or const literal the body can't reassign) is substituted DIRECTLY;
-**any other arg** (a non-trivial expression, a global, a side-effecting call) is
-bound to a fresh frame **temp once** at the top of the body (`$a = arg`) and the
-param reads that temp — **"args as locals"**. Evaluating once captures the
-call-time value, so a body that mutates the passed-in global, or a multi-use
-side-effecting arg, stays sound (the earlier `sub_ok` allowed a bare global
-identifier, an unsoundness); it also lets `f(a+b)`, `f(g())`, `f(global)` inline,
-and is what the recursion-unroll needs (a self-call's arg is `n-1`). The size
+alias it). **Args (use count by SLOT) - THE ARGUMENT RULE above:** an INERT
+arg whose bind is the identity (`arg_substitutable`) is substituted DIRECTLY;
+**any other arg** (a call, a global, a subscript, a division, a value a typed
+param would coerce) is bound to a fresh frame **temp once** at the top of the
+body (`$a = arg`, carrying the param's `decl_type` so the store coerces as the
+bind would) and the param reads that temp — **"args as locals"**. Evaluating
+once, first, is what a real call does, so a body that mutates the passed-in
+global, a multi-use side-effecting arg, or a throwing arg the body reads
+conditionally all stay sound; it also lets `f(a+b)`, `f(g())`, `f(global)`
+inline. The recursion unroll's self-call args (`n-1` on an int `n`) are inert,
+so they stay substituted.
+**⛔ A parameter the body WRITES THROUGH takes NO argument directly, not
+even a NAME** (`writes_through` / `param_written_through`, resolver.cpp:
+the root of an assignment target, an inc-dec operand, or an lvalue
+builtin's first argument - `p[0] = v`, `p.x += v`, `append(p, v)`); it is
+temp-bound, as the call binds it. Two reasons, each a RULE 2 bug before:
+an inert literal put in the lvalue position is a store to a temporary (the
+tree-walker raised NotLValueEx for `h([1, 2, 3])` and the VM refused to
+compile it, NotLoweredEx, while `-ni` ran it); and a NAME holding a SLICE
+was not the parameter - the call's copy of a slice handle was its own view
+(2026-10-12). Since question 3 (2026-10-18) a copy of a slice IS the same
+array, so that half no longer holds and the name rule is only conservative
+now (a missed paste, never a wrong answer). The same goes for a
+parameter the body writes INTO THROUGH A MEMBER (`p.x = v`, `p.f[i] += v`,
+`p.x++` - `param_member_written`): a struct is a value, so the parameter
+is the call's own copy and the write must not reach the caller's
+variable; the temp is that copy (the write makes it its own,
+struct_own). The size
 gate is the **cost model**: `body_weight` (a weighted
 node sum, weights from `--weights`/`run_weight_bench`: a CALL is ~21x an arith
 op, assign 11, if 7, return 3) must be **below `CALL_WEIGHT` (21)**. **Bodies WITH
@@ -1314,19 +4491,24 @@ a **temp-free guard chain** — `{ if(c1) return a1; ...; return b; }`,
 `guard_to_ternary` — it is converted to the equivalent **`TernaryExpr`**
 `(c1 ? a1 : (... : b))`, real code that runs in the caller's frame like any
 expression (no flow boundary, no `InlinedCallExpr`). "Temp-free" requires the
-args to be DIRECT-substituted, not bound to temp statements; for a **pure**
-callee an arg is side-effect-free, so a cheap one (`body_weight ≤ ARG_SUBST_MAX`,
-which excludes a nested call) is substituted directly and re-evaluated at each
-param use (sound: a pure body can't change the arg's value). The recursion
+args to be DIRECT-substituted, not bound to temp statements - i.e. every arg
+INERT (THE ARGUMENT RULE; it used to be "any cheap arg of a PURE callee", which
+dropped a throwing `f(12 / z)` whenever its arm was not taken - the callee's
+purity says nothing about the ARGUMENT). An untyped template BASE's `n - 1` is
+not inert (`n` may be anything), so only the typed INSTANCES unroll to
+ternaries. The recursion
 unroll therefore produces **nested ternaries** (fib →
 `(n-1<2 ? n-1 : fib(..)+fib(..)) + (n-2<2 ? n-2 : ..)`), and the frontier
 self-calls in the ternary branches still hit the per-frame cache. **A body with
 write-once LOCALS** is first run through **`collapse_locals`** (copy propagation):
-a `var t = <cheap side-effect-free expr>` whose slot is written once is
-substituted into its uses and the decl dropped, so `{ var t=a*a; return t; }`
-collapses to `{ return a*a; }` → a temp-free guard chain → a ternary/expression
-(`uc(x)` → `x*x+1`). Sound — a write-once local with a side-effect-free rvalue is
-just a name for that expression (re-evaluating a cheap rvalue is exact). With
+a `var t = <cheap INERT expr>` whose slot is written once is substituted into
+its uses and the decl dropped, so `{ var t=a*a; return t; }` collapses to
+`{ return a*a; }` → a temp-free guard chain → a ternary/expression
+(`uc(x)` → `x*x+1`). Sound — a write-once local with an inert rvalue whose
+reads keep their values to the end of the block (`rvalue_stable_after`) is
+just a name for that expression. "Side-effect-free" was NOT enough: a
+throwing rvalue moved into a conditional or absent use threw conditionally
+or not at all. With
 this, the small bodies that used to inline as a non-expressible
 `InlinedCallExpr(Block(...))` now inline as **expressible** code; the
 `InlinedCallExpr` form survives only for a residual that can't collapse (a
@@ -1354,6 +4536,15 @@ is sound). **SOUND for int ONLY** — `+`/`-`/`*` are associative & commutative 
 (concatenation) is never touched. `/` and `%` are excluded (truncating int
 division isn't associative). A rebuilt chain's base op is `Op::invalid` (asserted
 in `eval_first_rvalue`, so a structural mistake aborts rather than miscomputes).
+**A rebuilt chain carries the ORIGINAL's base fields** (task #75, 2026-07-28):
+fold_addsub/fold_mul/make_int_mul copy_base_fields from the node they replace -
+a fresh chain with EMPTY fields lost the caret AND the inlined-at chain for
+errors thrown through it, which (compounded by the TYPED eval path bypassing
+Construct::eval's flush hook) made the tree-walker render NO backtrace where
+the VM rendered the virtual frames. TypedScalarExpr::eval_int/eval_float now
+flush their own chain on an unwinding exception (a chain-less node calls the
+un-wrapped *_body directly - zero cost); pinned by the
+typed_inlined_backtrace_parity test (byte-identical engines).
 This is the type-narrowed realization of the long-deferred "algebraic
 simplification" pass, now safe because inference proved the type. **Caveat:** an
 UNTYPED template base
@@ -1388,7 +4579,14 @@ inliner sets `FuncDeclStmt::cache_results`, the devirt pass turns a call to such
 a func into a **`CachedCallExpr`** (a `DirectCallExpr` subclass — a SEPARATE node
 so the plain `DirectCallExpr` path pays NO per-call cache check), and
 `cached_call` (eval.cpp) checks the caller `Frame`'s lazily-allocated `PureCache`
-(`{func, arg values}` → result): hit → reuse, miss → call + store. **Sound**:
+(`{func, arg values}` → result): hit → reuse, miss → call + store. **Only for
+a function whose every parameter is a cache-safe key type**
+(`FuncDeclStmt::args_cache_safe`, stamped by the inferencer): the key holds
+the argument VALUES, compared with `==` - copy-on-write detaches an array /
+dict / struct key from a later write through the caller's name, but a class
+instance or a box compares by IDENTITY and stays equal to itself while its
+fields change, so a cached result went stale (2026-10-08: `g(c, 5)` returned
+8 before and after `c.v = 100`; `-npc` said 800). **Sound**:
 lazy (only calls actually made are cached → never evaluates a call the program
 wouldn't, so a recursion whose base case misses negatives — `fact(-1)` — can't
 diverge), and frame-scoped (the cache dies with the frame → not global
@@ -1423,8 +4621,8 @@ tables,
 so it
 leaves the tree untouched for the later passes (the one exception is the
 named-argument desugaring below, a deliberate lowering). Full design + the
-decisions behind it: `plans/type-inference.md`,
-`plans/type-inference-questions.md`.
+decisions behind it: `plans/archived/type-inference.md`,
+`plans/archived/type-inference-questions.md`.
 
 - **Named-argument desugaring (`lower_named_args`).** A call may pass arguments
   by name (`f(x: 1, z: 3)`, see README *Named arguments*). The parser attaches
@@ -1457,6 +4655,17 @@ decisions behind it: `plans/type-inference.md`,
   disabled: `-nti` no longer makes `infer_types` a full no-op — it sets
   `checks_enabled = false`, and `run()` still does the structural pass +
   lowering, then returns before the fixpoint.
+  **⛔ AND IT STAMPS EVERY CALL A `dyn` CALLEE (`stamp_untyped_calls`,
+  #51).** The VM codegen lowers a call only on a TYPE proof -
+  `vm_direct_func` (CallV), `vm_struct_ctor_def`, or `vm_dyn_callee` (the
+  generic CheckCallableV + CallValueGenericV, which dispatches on the
+  RUNTIME callee) - so with no stamp at all, every user call that survived
+  the inliner and the folder was a NotLoweredEx compile refusal under
+  `-nti` while the tree-walker ran it. `dyn` is the honest answer with no
+  types, and `try_native_value_call` admits a `DirectCallExpr` carrying
+  it. **A hint the codegen requires must have an `-nti` answer too.** The
+  net is `corpus_diff`'s always-on `-nti` pass (both engines untyped)
+  plus a `driver_checks` case; nothing in `-rt` runs untyped.
 
   Both sites share **one** mapping implementation, `desugar_named_call`
   (`syntax.cpp`, declared in `syntax.h`): it takes the call plus a normalized
@@ -1487,8 +4696,17 @@ decisions behind it: `plans/type-inference.md`,
   function; (2) *fixpoint* — **Jacobi** iteration: each round recomputes every
   symbol/return type into `acc` (the `join` of all contributions) while reading
   the previous round's stable `type`, then commits; reading stable values makes
-  rounds order-independent, and since kinds only climb the lattice a `join`
-  conflict (e.g. `int` vs `str`) is a real, stable error raised immediately;
+  rounds order-independent. **⛔ A CONFLICT IN A ROUND IS NOT YET AN ERROR
+  (2026-11-07):** a `join` conflict, or a contribution that does not fit a
+  declared or REPL-committed type, is RECORDED (`Inferencer::conflict`) and
+  raised only if it is still there in the converged round. This said "kinds
+  only climb the lattice, so a conflict is stable, raised immediately" -
+  false, because a type can climb to `dyn`, where the conflict disappears
+  (a dyn value coerces into a numeric local, a dyn element fits any
+  `array<T>`): `func big(dyn v) { if (v < 9) return v * 2; return "s"; }`
+  returns `str` after round 1, since `v * 2` waits for `v`, and `dyn` after
+  round 2, so `var k = 5; k = big(x);` was refused naming `str`. A new
+  error a fixpoint contribution can raise goes through `conflict` too;
   (3) *check* — with final types, validate every operator, call, assignment, and
   return, throwing on a violation.
 - **Inference rules of note** (the non-obvious ones): a never-(concretely-)
@@ -1498,9 +4716,30 @@ decisions behind it: `plans/type-inference.md`,
   mandatory-`opt` rule errors if a non-opt param can actually receive `none`
   (see below) — this holds for `dyn` params too (a nullable dyn must be
   `opt dyn`; nullability is orthogonal to dyn). Local/return nullability is
-  *inferred* (`None` joined with a concrete `T` is `opt T`; a `dyn` var that
-  gets `none` becomes `opt dyn`). `runtime(x)` returns `Dyn`
-  (its documented opt-out: it defers to runtime). `==`/`!=` are always
+  *inferred* (`None` joined with a concrete `T` is `opt T`). **A `dyn`
+  var, element or field is never none (rule 3, plans/strict-container-
+  types.md, 2026-11-20):** `contribute` keeps a non-opt `dyn` symbol's
+  type `dyn` and records a possibly-none value as a converged-round
+  CONFLICT raised as NullabilityEx (`Conflict::null`); `static_type_
+  assignable` refuses a possibly-none source into a non-opt `Dyn`
+  (`check_call` therefore skips the TYPE check for a param TYPED `dyn`,
+  whose none is the mandatory-opt rule's); `contribute_elem` refuses a
+  `none` element into a fixed non-opt element type; the parser refuses
+  `dyn x;` (no zero value); `value_fits` / `ct_fit` refuse a `none` for
+  a non-opt `dyn` annotation at run time, and the JIT's inline
+  `array<dyn>` store tier declines a `none` to that helper. A
+  container made at a `dyn` place carries the DYNAMIC type, which
+  refuses nothing - `array<dyn?>` / `dict<dyn?, dyn?>`
+  (`annot_dyn_array` / `annot_dyn_dict`) - while the fixed `array<dyn>`
+  is `annot_array_of_dyn`; that inline tier takes both pointers, the
+  second for a value that is not none. `fit_annot_of` keeps a `dyn?`
+  component's `opt` (it dropped it while a `dyn` checked nothing, so
+  `["a", none] + [runtime(5)]`, statically an `array<dyn?>`, was
+  stamped `array<dyn>` and refused a store the compiler allowed). A `dyn`
+  READ through a `dyn` may still hold none at run time (only a typed
+  parameter's bind catches it - a documented gap). `runtime(x)` returns
+  `Dyn` with its argument's nullability (its documented opt-out: it
+  defers to runtime). `==`/`!=` are always
   well-typed (→ int); ordering is numeric-or-string. `str + anything` → str.
   **`int OP dyn` → `dyn`** — the NATURAL result of mixing a concrete with a
   variant; it is NOT forced to the concrete type. So a FRESH `var r = 3 + d`
@@ -1511,7 +4750,9 @@ decisions behind it: `plans/type-inference.md`,
   comes from its non-dyn contribution (`0`), and the `dyn` rhs is a
   runtime-checked coercion.
   Higher-order builtins (`map(func,c)`, `filter(func,c)`, `sort(c,func)`,
-  `make_dict(keys,gen)`,...) feed the container's element type into the
+  `make_dict(keys,gen)`, `sum(a,key)`, `find(a,x,key)` - the last only
+  since #49, and only for an ARRAY container, the one kind that calls
+  its key) feed the container's element type into the
   callback's params (named **or** inline lambda; `callee_funcinfo`) — for
   `make_dict` the callback's param is the KEYS array's element type (the key),
   and the result is `dict<K, V>` (K the key type, V the callback's return), the
@@ -1535,7 +4776,8 @@ decisions behind it: `plans/type-inference.md`,
   In `StaticType`, `opt dyn` is `g_dyn[1]` (the opt-`Dyn` ground); `with_opt`
   carries
   the opt bit onto a `Dyn` kind, and `join` keeps it when a mix collapses to dyn
-  (`dyn | none` → `opt dyn`).
+  (`dyn | none` → `opt dyn` - for an inferred `var`, which the mandatory
+  dyn rule then makes the program write `var dyn?`).
 - **Explicit type annotations** (`int x = 5;`, `func f(str s)`,
   `array a = [...]`): the primitive type keywords `bool`/`int`/`float`/`str`/
   `array`/`dict` may replace `var` on a decl/`for`-init or precede a parameter
@@ -1592,9 +4834,14 @@ decisions behind it: `plans/type-inference.md`,
   decide decl-vs-expr). `A(...)`/`A.x`/`a = ...` don't match the shape and stay
   expressions. *Then* a SEMANTIC step resolves the type name via
   `lookup_struct_type` (an identifier bound to a `StructTypeDef*` in the const
-  ctx; needs const-eval on, since structs register their descriptor there at
-  parse time): a name that doesn't resolve to a struct type is a clear
-  `SyntaxErrorEx` ("'foo' is not a type"), not a silent fall-through.
+  ctx - structs register their descriptor there at parse time, with or without
+  `-nc`, which turns off folding only (#54)): a name that doesn't resolve
+  to a struct type is a clear `SyntaxErrorEx` ("'foo' is not a type"), not
+  a silent fall-through. **It walks the WHOLE const scope chain:**
+  `EvalContext::lookup` is local, and asking the innermost scope alone made
+  `P p;` in every function body and block "not a type" - unnoticed until
+  2026-10-07, because no test declared a struct-typed local below the top
+  level.
   **Decl-vs-ternary:** a `T ? name` run is ambiguous with a ternary
   (`flag ? a : b`), so when a `?` was seen the scanner requires the token after
   `name` to be a decl terminator (`is_decl_terminator`: `;` `=` `,` `}` EOF) —
@@ -1650,13 +4897,13 @@ decisions behind it: `plans/type-inference.md`,
   array now starts flat too (`LiteralArray::do_eval` honors
   `flat_i`/`flat_f`/`flat_b` for `elems.empty()`, matching the existing `flat_s`
   case), so `array<int> a; append(a, 5)` stays unboxed. **The explicit/
-  inferred `= []` form too (2026-07-18 profile #1):** `eval_literal_obj`
-  gained the flat_i/f/b empty-array arms (only flat_s existed), so
+  inferred `= []` form too (2026-07-18 profile #1):** the baked empty `[]`
+  is rebuilt flat at compile time (`set_array_repr_hint`, below), so
   `array<int> e = []` AND the inferred `var a = []; push(a, i)` (typed
   array<int> by the fixpoint) start flat — the whole grow-from-empty class
   ran on general 48-byte LValues before (bench 13: 3x faster fixed). Generic `array a` /
   `dict d` (no `<...>`) are unchanged (element inferred). See
-  `plans/typed-containers-syntax.md`.
+  `plans/archived/typed-containers-syntax.md`.
 - **Compile-time TYPE QUERIES: `type`/`decltype` (-> `Type` object),
   `typestr`/`kindstr` (-> string).** All four are non-const builtins with an
   **UNEVALUATED operand** (like C++ `decltype`/`sizeof` - the arg is never
@@ -1687,8 +4934,18 @@ decisions behind it: `plans/type-inference.md`,
   elem/key/val are read with optional chaining `?.`, or narrowed with `if`);
   `typestr(x)`/`kindstr(x)` are the cheap string forms. The arg-slot
   rewrite (not a whole-node replacement) needs no slot-based inferencer walk
-  (`args->elems` is a direct vector). The `?`-suffix nullability format
-  (`static_type_to_string`) matches `:type` and error messages.
+  (`args->elems` is a direct vector). ⛔ The replaced argument is
+  RETIRED (`Inferencer::retired`, alive as long as the inferencer), NEVER
+  freed: its identifiers, calls and lambdas are keys in `id_sym` /
+  `func_of_decl` / the callee-set maps, and `-dti` / `-a` ITERATE
+  `id_sym` - freeing it was a heap-use-after-free in both dumps
+  (`driver_checks` runs them over a folded query). A pass that cuts
+  a subtree out of the tree while those maps are live does the same.
+  And because the check pass never reaches a retired operand, a type
+  query INSIDE it is folded first, innermost first, so it applies its
+  own rule (`typestr(decltype(len))` printed "Type" until 2026-11-13).
+  The `?`-suffix nullability format (`static_type_to_string`) matches
+  `:type` and error messages.
 - **Nullable `?` suffix, `~` short form, `null` alias.** `?` is a token
   (`Op::questionmark`, `operators.h`) that is the canonical short form of `opt`:
   `int? x` ≡ `opt int x`, `var? x`, `dyn? x`, `array? a`. `pAcceptDeclPrefix` is
@@ -1715,6 +4972,24 @@ decisions behind it: `plans/type-inference.md`,
   header and always DECLARES a fresh loop-scoped var — the old bare-name
   reuse-an-existing-var path is gone — so `idsVarDecl` is set for both forms).
   Each carries an interned custom message + a `Loc`.
+  **An error about a CONTRIBUTION marks the node it names (H5,
+  2026-10-06):** `contribute` / `contribute_arg` take `loc, loc_end`, and
+  every caller passes the span of the node it names (the assigned
+  identifier, an element/member store's base, an argument, a foreach or
+  idlist target) - `contribute` used to pass `Loc()` as the end, a
+  zero-width caret. The one site with no node is value-template
+  instantiation's phantom signature contribution (`Loc(), Loc()`).
+  A DECLARATION-site error (DynRequiredEx, OptRequiredEx, a generic
+  `array`/`dict` annotation's mismatch) marks the declared name:
+  `TypeSym::decl_end` beside `decl_loc` (#45 - it was the zero-width
+  span `decl_loc, decl_loc`, printed "col 5:4").
+  **A CAPTURE'S INNER NAME IS BOUND TO THE OUTER `TypeSym` (it shares the
+  outer's static type, by design) BUT IS ITS OWN BINDING (H6):**
+  `Scope::capture_names` marks those aliases and `capture_uses` records
+  each identifier resolved through one - inserted OR ERASED at every
+  resolution, exactly as `id_sym` is overwritten, so a reused node address
+  keeps no stale entry. A const check on a target (the `++`/`--` "cannot
+  ++ a const") skips them.
 - **Mandatory `dyn`** (`enforce_concrete_decls`, ON by default via
   `infer_types(strict=true)`, off under `-nti`): a plain `var`/`const` must
   infer a *concrete* type; if its type is `dyn` it throws `DynRequiredEx`
@@ -1723,7 +4998,7 @@ decisions behind it: `plans/type-inference.md`,
   into containers. Skips params (a never-called func's param is legitimately
   `dyn`), foreach loop vars (type derived from the container), and func names.
   Runs **after** the check pass, so a var that is `dyn` *because of* a real type
-  error surfaces that error first. See `plans/type-driven-specialization.md`.
+  error surfaces that error first. See `plans/archived/type-driven-specialization.md`.
 - **dyn-into-concrete COERCION** (a plain `var` accepts a `dyn` value). `int OP
   dyn` is `dyn` (above), so `var s = 0; s = s + x` (x `dyn`) contributes `dyn`
   to `s`. Rather than widen `s` to dyn (which mandatory-`dyn` would then
@@ -1743,6 +5018,162 @@ decisions behind it: `plans/type-inference.md`,
   arrived). A FRESH `var r = 3 + d` (only a dyn contribution) correctly stays
   `dyn` → `DynRequiredEx`; `var dyn r = 3 + d` holds the actual result.
   (`TypeSym::{round_got_dyn,coerces_dyn,decl_id}`.)
+- **⛔ A `dyn` VALUE ENTERING A TYPED PLACE IS CHECKED AT RUN TIME, BY
+  ONE FUNCTION (#49, 2026-10-12; README *A `dyn` value entering a typed
+  place*).** `value_fits(v, annot, FitMisfit &)` (types/fit.cpp.h) is
+  the only answer to "does this value fit that declared type"; every
+  engine calls it, so the refusals and their messages agree
+  (`fit_error` renders one). Its walk is bounded by the ANNOTATION, not
+  the value - a struct or class is a def identity test, a flat array is
+  its storage kind, a `dyn` element stops it - so it needs no cycle
+  guard; a container met twice at one annotation is walked once (an
+  array keyed by its WINDOW, as the cycle guard keys it: two slices of
+  one storage are two values). **Whether a site checks is decided statically, by
+  `fit_needed(value_type, place_type, top)`** (inferencer.cpp): at the
+  top level an int / float place is the numeric coercion's job, below
+  it a `dyn` or unknown element counts. The homes, one per place:
+  a call's bind (`ParamDesc::fit`, gated per call by
+  `CallExpr::fit_args`, which `check_args()` folds into the
+  CheckNoneArgsV mask - so a fit failure is a BIND fault like the none
+  one), a struct constructor's field (`BoxedCtor.fit`), an element /
+  field / dict-value store and a store into a variable whose type is
+  declared (`Expr14::rv_fit` - a variable's only for a value with a
+  `dyn` INSIDE, `Place::var`: a `dyn` itself is refused statically),
+  each declared target of a multi-assignment (`IdList::fits`, checked
+  just before that target's store - the VM unpacks such a statement
+  into temps, `emit_multi_via_temps`), a
+  dict key (`Subscript::key_fit`) and an in-place builtin's stored
+  argument
+  (`ExprList::arg_fit` / `fit_of(i)`), each a `FitSpec` (structtype.h:
+  the annotation, the place, its name). The tree-walker calls
+  `check_fit_loc` where the store or bind happens (the append path in
+  builtins/arr.cpp.h too - it evaluates its own argument); the VM emits
+  **`CheckFitV`** on the value's slot (`emit_fit`, its spec in
+  `Chunk::fit_specs`, `.myv` v37), whose native form is
+  `jit_check_fit`, conveying and exc-stamped. A COMPOUND store whose
+  result may misfit is refused at compile time
+  (`refuse_compound_misfit`, for an element, a field, a declared
+  variable and each declared multi-assignment target): the result is
+  computed in the store, past any point a check could stand. **A new
+  place a value can enter - a new store form, a new in-place builtin, a
+  new bind path - takes a FitSpec and a check through `value_fits`**,
+  or a `dyn` launders a wrong value into it. The bytecode inliner does
+  not paste a body holding CheckFitV (its index names the callee's
+  pool). The gap left on purpose: a container reached through a `dyn`
+  NAME is not a typed place, so `var dyn d = rows; d[0] = v` is
+  unchecked. **Under `-nti` the BIND and CONSTRUCTOR checks still run**
+  (`ParamDesc::fit` and `FieldDef::annot` are the declaration's, an
+  unstamped call keeps `fit_args`, and every `-nti` call takes the
+  generic op, which always checks - the none check's rule), **while no
+  store is checked** (rv_fit / key_fit / arg_fit / IdList::fits are
+  inference's stamps). A functional program must exit 0 under -nti
+  too, so one asserting a STORE refusal gates it on a typed run (93's
+  `typed`, `typestr(runtime(0)) == "dyn"`). Net:
+  `tests/functional/93_dyn_fit.my` (every place, refused and fitting,
+  old value kept).
+- **⛔ THE CAST, `cast<T>(x)`, IS ONE FUNCTION: `cast_value`
+  (types/cast.cpp.h; plans/cast.md, README *Casts*, 2026-11-19).** The
+  AST node is `CastExpr` (`ConstructType::cast`; `to` is the INTERNED,
+  complete TypeAnnot - the parser refuses a bare `array` / `dict` at any
+  depth), the opcode `CastV` (its type an index into
+  `Chunk::cast_types`, a pool of its own because `Chunk::ctypes` admits
+  container types only; `.myv` v45), the JIT helper `jit_cast` (a
+  conveying status helper). Every engine converts through
+  `cast_value` / `cast_value_loc`, so the conversions, the refusals and
+  their messages cannot drift. Four rules a change here must keep:
+  - **the result has EXACTLY type T**: `type_of` is T whatever the
+    operand, a container is rebuilt in T's storage
+    (`cast_arr_hint`: flat for a non-opt int / float / bool and a POD
+    struct, the class references for a class, else general) and carries
+    T as its `ctype`. A nested container that already carries its
+    target type is SHARED (a memo per walk shares one met twice); the
+    top is always new (a struct / class / box copied with `clone()`).
+    `cast<dyn?>` returns the value itself;
+  - **a never-possible cast is a compile error** (`check_cast` /
+    `cast_possible`, inferencer.cpp): decided per COMPONENT, an unknown
+    or `dyn` source - or component - decided at run time, a `none`
+    component UNFILLED (an empty container casts to any container
+    type), the value `none` refused unless T is `?` (or `dyn?`);
+  - **a constant cast folds like a call with constant arguments**
+    (`pCastExpr`: evaluated at parse time for its errors, deferred to
+    #96's late fold, which keeps the node when its literal's type is
+    not T's - `cast<dyn>(5)` stays a cast). AutoConst and the inliner's
+    refold descend into the operand (`fold_reads` has an explicit arm:
+    a promoted `n` read inside a cast was left reading a dropped
+    declaration's slot, `none`) but never fold the cast itself;
+  - **the operand is an expression like any other**: every walker
+    classifies the node (the exhaustive switches; `esc_known_shape`
+    DECLINES it, since `cast<dyn?>(p)` IS `p`; the callee-set analysis
+    passes the operand's set through).
+  `dynarray()` is gone: `cast<array<dyn>>(a)` / `cast<array<dyn?>>(a)`
+  replace it. A test that needs a GENERAL-storage typed array (which
+  `dynarray`'s place-typed call used to make) builds one with an inline
+  `keys()` (tests/int/93, 106).
+- **AN ASSIGNMENT'S VALUE IS THE STORED VALUE (2026-10-05).** `type_of`
+  of `t = v` is v's type WIDENED to the target's numeric static type
+  (`numeric_widen`: int/bool into float, bool into int), for a variable,
+  an element and a field alike; its runtime half is the variable's own
+  `decl_type` coercion, a dict's `rv_coerce` and, for an element or field,
+  `Expr14::val_widen`, which the tree-walker applies to its result and the
+  VM's value form (`try_value_store`) to its value temp. It was v's type,
+  so `var z = (s.f = 3)` with a float field typed `z` int while it held
+  3.0 - the tree-walker's typed `z + 1` raised TypeErrorEx, and the JIT
+  would have read the float's bits as an int once the VM lowered the
+  form. A `dyn` target converts nothing, statically or at run time: the
+  value is the rvalue as typed, whatever the dyn container stored. A
+  `dyn` RVALUE into a numeric element, field or dict value converts
+  too (`assign_value_widen` stamps val_widen; the static type stays
+  dyn), CHECKED in both engines - `coerce_to_decl_type` in the
+  tree-walker, CoerceNumV in the VM - so a misfit is the same
+  TypeErrorEx everywhere (an int stored into a float element made the
+  value the int 5 while the element held 5.0). ⛔ The tree-walker
+  converts the value in STATEMENT position too (it cannot tell), the
+  VM only in its value form, so the conversion must never throw after
+  a store succeeded: an array element and a dict value convert the dyn
+  rvalue BEFORE the store (rv_coerce, checked - which also keeps a
+  misfit out of a general array<float?> or a dict, RULE 1); a struct
+  field refuses a misfit in the store itself.
+  A MULTI-assignment has NO value (question 11, 2026-10-26): the parser
+  refuses one where its value would be used - an assignment's or a
+  declaration's value, a `return`, a `throw` (`pRefuseMultiAssignValue`)
+  - so codegen lowers it only as a statement. It evaluated to `none`
+  until then (typed as the rvalue before 2026-10-06, so `array<int> w;
+  w = a, b = [5, 6]` compiled and held none). What giving it a value
+  would take is plans/multi-assign-value.md.
+- **A MULTI-ASSIGNMENT'S TARGETS ARE WRITES LIKE ANY OTHER (2026-10-06).**
+  `for_each_child` treats an IdList as a leaf, so walk_struct resolves
+  each target of a non-declaring multi-assignment explicitly - until then
+  they stayed out of `id_sym`, the write to each was never counted (a
+  function name rebound by `q, sq = [1, seven]` kept running the declared
+  body, in every engine) and spread_idlist contributed to a null symbol
+  (`x, y = ["s", 2]` kept `x` typed int while it held "s"). A compound
+  `a, b OP= rhs` contributes `target OP element` per target, and the check
+  pass validates each such op as it validates a single compound
+  (`check_compound_op`; `idlist_elem_types` is the one answer to "what
+  does each target receive", shared with spread_idlist). The same
+  rules as a single target now apply: an annotated `int a` refuses a dyn
+  element at compile time, as `a = d` does. **An array LITERAL on the
+  right is unpacked AS WRITTEN** (maintainer, 2026-10-06; README): the
+  parser does not bake it (pExpr14, `in_idlist`), annotate_hints does not
+  stamp its `elem_coerce` (it joins `lit_coerce_by_parent`) and its
+  unpack reads untyped (`unpack_rv_th` none) - `x, y = [ri(12), 2.5]`
+  gave `x` 12.0 in the tree-walker and the VM's general unpack while
+  spread_idlist typed it int, and the JIT read the float as an int.
+- **A JOINED parameter binds like a DECLARED one (#38 C,
+  `stamp_inferred_param_types`).** A lambda's un-annotated param (and a
+  named function's `opt` one) joins every call site's argument, so
+  `f(1); f(2.5)` types it `float` - and the `int` then sat unconverted in a
+  slot every typed consumer reads as a float (RULE 1: `print(f(1))` gave
+  `1`). The param's `Identifier::decl_type` and its `ParamDesc::decl_type`
+  are stamped i/f after the check pass, exactly like the coerces_dyn stamp
+  for a local, so EVERY bind path (`bind_param`, `vm_bind_arg`, the JIT's
+  bind tiers and baked-callee checks, the `.myv` image, which already
+  carries ParamDesc::decl_type) coerces as for `float x`. It walks the
+  LIVE tree, not `all_funcs` (which keeps FuncInfos of literals a
+  parse-time bake freed), and skips a template base and an INSTANCE's
+  template params (keyed by the exact argument type, they join nothing,
+  and a typed param declines the frameless tiers; the bytecode inliner
+  takes it, binding through CoerceNumV).
 - **Mandatory `opt` for params** (`enforce_nonnull_params`, same gate/timing as
   mandatory-`dyn`): a parameter that can receive `none` from *some* call path,
   if not declared `opt`, throws `OptRequiredEx` **at the param's declaration**
@@ -1774,6 +5205,12 @@ decisions behind it: `plans/type-inference.md`,
   pass re-validates genuine errors (`require_nonopt`, not-subscriptable) with
   the final types, so deferring during accumulate hides nothing. **When
   touching the inferencer, audit any new `return A.dyn_ty()` for this.**
+  **And a CALLBACK's return is an operand too (2026-10-05):** `make_array`,
+  `make_dict` and `map` built `array<f->ret>` while `f->ret` was still
+  Unknown - `array<?>` is not Unknown at its top level, so it passed every
+  deferral and failed a DECLARED destination's check (`array<int> a =
+  make_array(n, f)` was refused; `var` waited and settled). They defer
+  through `cb_ret`, as `sum`'s key form already did.
   `-dti` dumps
   every identifier's inferred type + uses to find spurious `dyn`s. The
   invariant also applies to *contributions*, not just return types:
@@ -1782,8 +5219,13 @@ decisions behind it: `plans/type-inference.md`,
   contribute `array<?>`, whose **outer** kind isn't `Unknown` so `contribute`'s
   own pinned-symbol guard wouldn't catch it, tripping a PINNED global array's
   cross-input assignability check before a template-instance arg settles
-  (`var g=[1,2,3]; func f(x){append(g,x);} f(3)`). The invariant also covers a
-  **call to a TEMPLATE**: `type_of` of a `CallExpr` whose callee is a template
+  (`var g=[1,2,3]; func f(x){append(g,x);} f(3)`). **That guard reaches
+  inside a type now (`has_unknown`, 2026-10-07)** - a declared or pinned
+  symbol's check defers on an Unknown ANYWHERE in the contribution, since
+  `[p]` is `array<?>` until `p` settles and `array<P> a = [p];` was refused
+  in round 1 (a valid program, with no test until then). The invariant
+  also covers a **call to a TEMPLATE**: `type_of` of a `CallExpr` whose
+  callee is a template
   returns `bottom` (defer), NOT the template's `ret` — a template's `ret`
   finalizes to `dyn` (it is never inferred in isolation), and instantiation is
   about to redirect this call to a concrete clone whose `ret` is the real type.
@@ -1800,13 +5242,117 @@ decisions behind it: `plans/type-inference.md`,
   unconstrained inputs, e.g. a func only ever passed as a value); a func with no
   value-returning path → `none` (it contributed `none` to `ret_acc`). An
   unresolved identifier / callee defers to Unknown (so the enclosing var isn't
-  forced to `dyn`, and the runtime `UndefinedVariableEx` surfaces); a *builtin*
-  used as a value is genuinely `dyn`.
+  forced to `dyn`, and the resolver's FIX-1 `UndefinedVariableEx` surfaces); a
+  *builtin* used as a value is genuinely `dyn`.
+  **⛔ A LOCAL THAT RECEIVED VALUES IS NOT UNCONSTRAINED (2026-10-09).** One
+  whose every contribution stayed Unknown - `var y = nosuch(1)`, a copy of a
+  parameter no call site feeds - finalizes `dyn`, not `none`, and is
+  `untyped_dyn`: exempt from the mandatory-dyn rule (`TypeSym::got_unknown`,
+  set in `contribute`). As `none` it made the inferencer, which runs before
+  the resolver, refuse `y + 1` with "possibly-none (type 'none')" and hide
+  the undefined name. The CHECK PASS must defer on an Unknown operand the
+  same way (the arithmetic and unary checks did, the ordering comparison did
+  not: "cannot compare '?'" inside a `defined()`-guarded branch, #135).
+  **And a NUMERIC local that received such a value besides its typed ones
+  sets `coerces_dyn`**: the value is a `dyn` at run time (the parameter
+  finalizes `dyn` after the fixpoint, so the coercion rule never saw it),
+  and without the store's coercion an unattributed indirect call left a
+  float in an `int` slot - the JIT printed its bits, the VM aborted, the
+  tree-walker threw (RULE 1 and RULE 2 at once).
 - **Null narrowing** (`check_if`/`narrow_target`, check pass only): inside a
   proven branch a nullable var reads as non-opt — `if (x != none)` / `if (x)`
   (then), `if (x == none) ... else` (else), and the guard clause
-  `if (x == none) return/throw; ...` (rest of the block). Sound (the branch
-  guarantees non-none). Not flow-narrowed elsewhere.
+  `if (x == none) <cannot finish>; ...` (rest of the block). Sound (the
+  branch guarantees non-none). Not flow-narrowed elsewhere.
+- **"Cannot finish" is ONE function, `Inferencer::always_exits`**: a
+  return/throw/rethrow/break/continue, a block holding one, an if/else of
+  two, a loop whose condition the PARSER found constant-true
+  (`WhileStmt` / `ForStmt::cond_true`, set in both fold modes, so `-nc`
+  types a function the same) with no `break` of its own (`breaks_out`),
+  a `try` whose body and every catch cannot finish or whose finally
+  cannot. It decides `FuncInfo::falls_through` (a reachable end returns
+  `none`, so `opt` return) and the guard-clause narrowing above. It was
+  return/throw, a block's LAST statement and if/else only, so a function
+  returning from inside `while (true)` or from both arms of a try/catch
+  was `int?` and `f() + 1` a false NullabilityEx (README *Where a
+  function can end*). Answering true is a PROOF: a shape it does not
+  understand answers false.
+- **A container LITERAL takes a FIXED destination's type (#46,
+  2026-10-08).** A FIXED symbol is one whose type is checked, never
+  joined: annotated or a committed REPL global (`fixed_type`). An
+  element contribution to one (a store, `append`/`push`/`insert`) is
+  checked against the declared ELEMENT (`contribute_elem`) - the implied
+  `array<int>` is not assignable to an `array<int?>`, arrays being
+  invariant, but an element store is no alias. A container literal
+  landing in a fixed place - a variable, an element, an append, an
+  annotated PARAMETER (`known_params` / `arg_type`), a struct field -
+  HAS that type there when it fits element by element (`literal_into`),
+  and `stamp_literal_into` makes its elements widen at run time (the
+  `lit_coerce_by_parent` stamp on a LiteralArray / LiteralDict; for a
+  literal baked at parse time, `widen_baked_value` rewrites the
+  LiteralObj once). Only a WRITTEN literal: `LiteralObj::from_literal`
+  marks a bake of `[...]` / `{...}`, so a folded call or a named const
+  of another element type is still refused - and only a literal whose
+  every element is written too (`is_container_literal`, parser.cpp): an
+  element that is a call's value or a named constant (`[f()]`, `[K]`,
+  `[dict(1)]`) is checked as that value, so such a literal is not baked
+  for a `var` (a const's bake is checked whole). It was baked and given
+  the widening at every level, so `array<array<float>> m = [f()];`
+  compiled and was refused under -nc (#74). A typed `const` container
+  is widened by the PARSER when it binds it (pExpr14), because a read of
+  it folded at parse time (`str(F)`) must see the run's value.
+  Its STORAGE follows the destination too, at every nesting level
+  (`stamp_literal_repr`): the ArrHint `array_repr_hint` derives from the
+  type - the one helper `set_array_repr_hint` also uses - on each written
+  literal, and `WidenShape::hint` for a value baked inside one. The
+  PARSER applies the same rule to a literal a declaration annotates
+  (`stamp_literal_annot`, read off the `TypeAnnot` / `dyn` - its
+  `annot_arr_hint` is `array_repr_hint`'s twin), because a typed const is
+  bound, and an explicit `pure` call with constant arguments RUNS, before
+  inference: `pure func mk(int n) { array<dyn> a = [n]; a[0] = "s"; ...}`
+  failed when folded and worked at run time. An explicit `pure` body's
+  STORES get the same treatment (`pure_stamp_stores`, parser.cpp): a
+  store into an element / field of a place the body declared - a
+  parameter, a declared local, a struct field of one - is stamped
+  rv_coerce / val_widen and its literal stamp_literal_annot'ed from the
+  declarations, scoped as the language scopes them (a block, a `for`'s
+  init, a foreach / catch variable); inference overwrites them later, and
+  the tree-walker applies rv_coerce CHECKED (coerce_to_decl_type, the
+  whole assignment's caret), as CoerceNumV does, so a stamp that meets
+  a misfit (-nti) is the same error in both engines. A store into a
+  DECLARED numeric variable (`float x; x = n`) gets its use's
+  decl_type there too - the one resolve_names carries from the
+  declaration, later. A local whose type
+  only INFERENCE widens still differs there (an open design question).
+  **And the parse-time BAKE follows the annotation too (2026-11-17):**
+  the const evaluator builds a constant literal with no stamp by the
+  JOIN of its own values (`const_values_widen`), so `array<dyn> k = [1,
+  2.5, true]` was baked as 1.0, 2.5, 1.0 while -nc built 1, 2.5, true
+  (RULE 2), and a const - baked in both modes - widened everywhere.
+  pExpr14 now calls `stamp_literal_annot` BEFORE the bake as well, and a
+  literal whose element type the annotation gives
+  (`LiteralArray::annotated`, `LiteralDict::annotated`) never joins:
+  elem_coerce decides. The inference twin: a literal nested in a `dyn`
+  element is no longer stamped from the `dyn` (which converts nothing)
+  but by annotate_hints' visit of it, at its OWN type - as a literal in
+  a `dyn` variable is (tests/functional/127).
+  Built from its own values, `[1.5]`
+  for an `array<float?>` was flat floats and a later `none` store failed.
+  **A store into a DECLARED place is checked against it (#48):**
+  `declared_type_of` answers the declared type of a location - a fixed
+  identifier, a struct FIELD (always declared), an element / dict value
+  of a declared container - and `check_declared_store` /
+  `check_builtin_store` check a field store, a nested element store and
+  an append through a field or an element (`s.a = v`, `m[0][0] = v`,
+  `append(s.a, v)`), which contributed to nothing and so were checked by
+  nothing. A store whose container is a plain variable stays the
+  contribution's to check (contribute_elem). A `dyn` value is not
+  checked there (an open design question, like a dyn argument).
+  A single value an in-place builtin stores (`append`/`push`/`insert`,
+  insert's dict key) widens like an element store's `rv_coerce` (#47):
+  `ExprList::arg_widen`, applied by the tree-walker's lvalue adapters and
+  by a CoerceNumV on the argument's run slot in the VM
+  (`compile_builtin_arg` - every in-place builtin path goes through it).
 - **Const-container types are exact** (`static_type_from_value` recurses): a
   folded
   const array/dict is typed `array<T>`/`dict<K,V>` from its actual elements
@@ -1815,13 +5361,65 @@ decisions behind it: `plans/type-inference.md`,
   (`join_elem`) so `array(N)`-then-fill stays `array<int>`, not opt-element;
   an empty `[]` (`array<none>`) or a `dyn`-element container fits any
   `array<T>` (`static_type_elem_compat` — invariance relaxed at the bottom/top
-  element).
+  element). **A `none` component is UNFILLED, never "an element typed
+  none" (question 9, 2026-10-25):** a read of it (`component_read`: an
+  element, a key, a value, a foreach variable) is `bottom` during the
+  fixpoint, so a later round's fill types it, and a reader nothing ever
+  fills finalizes `dyn`; every type string spells the component `dyn`,
+  and a folded `type()` / `decltype()` builds its reflection object from
+  the filled type (`fill_unfilled`). So iterating an empty container is
+  never a compile error, while `var a = []; append(a, 1)` stays
+  `array<int>`. **So a container that HOLDS nones is never typed with an
+  unfilled component** (`Inferencer::held`, 2026-11-21): `[none]`, a
+  baked one, `array(n, none)`, a callback that always returns none give
+  `dyn?` there - typed unfilled, `var a = [none, none]; a[0] = 5` made an
+  `array<int>` holding a none (a three-engine divergence). A new site
+  that builds a container's type from the types of values IN it uses
+  `held()`.
+  A DEFAULT dict's reads also yield its default, so its type
+  joins the default's: an empty one is `dict<dyn, T>`, the type the
+  unfolded `dict(v)` call has (it was `dict<none,none>`, and a folded
+  `dict(0)`'s `d.a + 1` a NullabilityEx `-nc` did not raise).
 - **Interaction**: const scalars are already inlined to literals before this
   pass runs, so it never sees them as symbols. A statically-known type error
   that used to surface as a runtime `TypeErrorEx`/`NotCallableEx` is now a
   compile error — to keep such an error catchable at runtime, make the value
-  `dyn`. **Not yet done** (deferred): function subtyping is arity-only;
-  cross-statement narrowing beyond the patterns above.
+  `dyn`. **Not yet done** (deferred): cross-statement narrowing beyond the
+  patterns above.
+- **FUNCTION SUBTYPING CHECKS THE SIGNATURE (option B, 2026-08-12) — and it
+  is a TYPE-SOUNDNESS rule, not a style rule.** Assigning a function to a
+  func-typed name requires the arity AND every *settled* param/return type to
+  match; `dyn` anywhere opts that position out. It used to check **arity
+  alone**, which made a function type a promise the runtime did not keep:
+
+      func a(int k) { return k; }
+      func b(int k) { return 2.5; }
+      var g = a; g = b;          # was ACCEPTED
+      var s = 0; s = s + g(1);   # -> s = 2.500000, though g : func(int)->int
+
+  Every consumer of `g(1)` — the inferencer, M8, and each of the JIT's
+  unboxed tiers — is entitled to treat the result as the `int` the signature
+  promises, and none of them could. **This is the same principle as the
+  brace-less-body note under *Invariants & hazards*: a hole in the type
+  system is a hole in every unboxed tier built on it**, because they all
+  elide their guards on the strength of inference's proof. Closing it here,
+  once, is what lets a typed call-result tier be built with no per-call
+  runtime guard.
+  **TWO doors had to close, and finding only one is the trap:** an
+  *annotated decl or an argument* goes through `static_type_assignable`, but
+  a **REASSIGNMENT contributes through the fixpoint's `join`**, whose Func
+  arm used to widen a conflicting component to `dyn` (`rj ? rj : g_dyn[0]`)
+  — so tightening `assignable` alone changed nothing observable and the
+  probe still ran. Both arms now consult `static_type_sig_compat`.
+  **It DEFERS on an unsettled component** (Unknown / None / `dyn`), which is
+  the whole reason the old code gave for staying arity-only: a callback's own
+  param and return types are themselves inferred, so a strict rule would fire
+  on inference ORDER rather than on a mismatch (`apply(sq, i)`, a func array,
+  an inline `map` lambda — all three are pinned as ACCEPT cases). Only two
+  settled concretes can refuse. `param_opt` is deliberately not compared —
+  opt-ness governs call arity, which `check_call` enforces per site.
+  Measured blast radius before landing: **0 of 96** corpus programs
+  (bench/my + samples + tests/functional) refused.
 
 ### M8 — typed scalar specialization (`specialize_types`, the speed payoff)
 
@@ -1832,7 +5430,34 @@ its promoted value, so a typed scalar over bool operands is unboxed like int
 (the boxing in `TypedScalarExpr::do_eval`/`LiteralBool` keeps a bool where it
 must — a comparison/logical/`!` result, a bool literal — while arithmetic over
 bools correctly yields int). `Construct`/`Identifier`/`Subscript`
-`eval_int`/`eval_float` read a bool value/slot/flat element as `0`/`1`. After
+`eval_int`/`eval_float` read a bool value/slot/element as `0`/`1` - a
+GENERAL array's element too (`general_elem_int`, eval.h, which every
+engine's element-int read calls, and its float twin `general_elem_float`
+for a typed float chain's int or bool operand): an `array<bool>` is not
+always flat (an `array<bool>` a `dyn` laundered, a constant's), and
+`if (b[i])` on a general one raised TypeErrorEx in every engine until
+2026-11-07 (`x * b[i]` in the tree-walker alone).
+**⛔ SO `th == i` DOES NOT MEAN "int" - IT ALSO MEANS BOOL, AND A
+CONSUMER THAT NEEDS THE VALUE MUST ASK (`Construct::th_bool`, added
+2026-08-26).** The VM lost that distinction for four shapes:
+`compile_boxed_expr` lowered a `th==i` node through the typed INT path
+on the written argument that the result "is a valid int EvalValue, so a
+boxed consumer reads it fine" - true for an int, FALSE for a bool. So
+`a[i]`, `p.b`, `d[k]` and a slice element printed **`1`/`0`** under the
+VM and the JIT where the tree-walker printed `true`/`false` - a RULE 2
+divergence that shipped, while a bool VARIABLE, RETURN, `foreach`,
+unpack and `dyn` read were all correct (which is exactly why nothing
+noticed). `th_bool` is set wherever the inferencer stamps `th=i` for a
+Bool type, and `compile_boxed_expr` falls through to the BOXED lowering
+for it. **The `truthy_only` exemption is not a shortcut**: a consumer
+that only asks `is_true()` cannot tell an int 0/1 from a bool, so the
+four JumpUnlessTrueV feeders (if/while/for/ternary conditions) keep the
+typed path - without it, `if (a[k])` stopped emitting LoadElemInt and
+the E4 peephole that fuses it into `JumpUnlessElemInt`
+(57_bool_reduce's whole hot loop) no longer matched. Pinned by
+`tests/functional/20_bool_value_reads.my`, which asserts BOTH halves -
+the value shapes render as bools, the condition/arithmetic shapes still
+promote to 0/1. After
 `resolve_names`, `specialize_types`
 (`inferencer.cpp`, called from `mylang.cpp` + the test harness, gated by `-nti`)
 rewrites hot scalar nodes — `Expr03/04` (arith), `Expr06/07` (compare),
@@ -1852,7 +5477,17 @@ boxing between them. **Effect:** ~2.8x on `bench/44_primes_sqrt`, ~2x on
 float-heavy reductions; the once-slower-than-Python primes benchmark is now
 faster. `th` is copied by `copy_base_fields` (clones/inliner preserve it), and
 the typed eval's `get<int_type>()` throws `TypeError` if inference were ever
-wrong (a safety net, not silent corruption). See `plans/type-inference.md` M8.
+wrong (a safety net, not silent corruption). See `plans/archived/type-inference.md` M8.
+**⛔ A FLOAT CHAIN'S INT PREFIX IS AN INT NODE (2026-10-09).** A chain
+typed `f` may begin with int operands, and the operators between them
+are INT operators (`i / 3 * 0.5` divides ints, `big * 4 * 0.5` wraps
+first) - the float loop reads every operand as a float, so
+`split_int_prefix` moves the leading int operands into their own
+`Cat::arith` / `i` node, the chain's first operand. And a `kind == i`
+arith/neg node asked for `eval_float` computes in int and converts the
+RESULT. Both were wrong in every typed engine (RULE 2 against
+`--no-opt all`); pinned by the `typed: an int operation inside a float
+expression` `-rt` entry.
 **A base template's body is NOT specialized** (`FuncDeclStmt::is_template`,
 skipped in `specialize_types`): it is a monomorphization shell, cloned per
 signature (each clone specialized separately) and run boxed for indirect
@@ -1861,6 +5496,211 @@ instance's `eval_int` on a float param). `type_of` learned the `TypedScalarExpr`
 case (a REPL retains a post-specialization body a later-input clone re-enters
 inference on) — a defensive robustness fix (the inliner already handles
 cross-input `TypedScalarExpr`).
+
+**Loop-invariant slice hoisting (`try_hoist_loop_slices`,
+inferencer.cpp; lever 3 inc 2, 2026-07-27).** A DIRECT loop-body decl
+`var sl = base[a:b]` hoists ABOVE a For/While loop (a `Block{decl,
+loop}` with scope_free; the decl's slot is frame-wide and resolution
+already happened, so both engines just run decl-then-loop) when every
+part is provably iteration-independent AND unobservable: base is an
+inlined scalar LITERAL (an auto-const string) or a slotted local
+NEITHER in `mut_len` NOR in `mut_content` - the content half is the
+COW-DETACH hazard: an element write to a base with a LIVE slice clones
+the base away (clone_aliased_slices), so a hoisted view would keep
+reading the detached OLD storage while per-iteration fresh views see
+the new one (pinned by the "base content write keeps per-iteration
+views" test) - and the same write through ANOTHER name does the same,
+so an array base also needs `FrMut::alias_content` clear (see the
+for-range paragraph's aliasing rule); bounds are absent or
+fr_immutable AND int-proven; and
+with `Slice::base_sliceable` (a new inferencer stamp: statically
+non-opt array/str) the slice CANNOT throw (pure clamping), so hoisting
+is safe even for a ZERO-iteration loop. The slice var itself must be
+written only by its decl (no write-through/mutating builtin - those
+would COW the view privately, diverging from fresh-view-per-iteration)
+and unreferenced by cond/inc. **⛔ And an ARRAY slice must not ESCAPE
+(`hoist_slice_contained`, question 3):** a copy of a slice is the same
+array, so one hoisted slice stored by every iteration would be ONE array
+where the loop stored a fresh one each time. Its uses must be an element
+read, a slice of it, `len`, or a foreach container; a STRING slice may
+escape (immutable, identity unobservable). **⛔ And NOTHING it reads may
+be DECLARED IN THE BODY (`licm_collect_decls`, LICM's own rule; added
+2026-11-16):** `fr_collect_mutated` skips a declaration, so a body-local
+`var m = [..]; var sl = m[1:3];` looked invariant and the hoisted slice
+read `m` above the loop, before anything set it - TypeErrorEx in every
+typed configuration where `--no-opt all` answered, shipped since the
+pass was written (LICM got this check on day one; its sibling never
+did, and no test sliced a body-local). A `const` declared BELOW the
+slice is the same read: it binds at the body's entry (question 21). A
+slice OF a hoisted slice still hoists, one visit later (`specialize()`
+runs again on the wrapper block's children, and by then the first slice
+is declared above the loop). Runs in
+`specialize()` BEFORE try_for_range (the wrapper block's children then
+specialize individually, so the loop still becomes a ForRangeStmt).
+Measured with the pooled slices set (inc 1): 15_array_slice_readonly
+-56% Ir / ~0.46x wall combined, 29_str -20.9% Ir; 16/47 flat.
+
+**Loop-invariant CONTAINER-SUBSCRIPT hoisting - LICM
+(`try_hoist_loop_subscripts`, inferencer.cpp, 2026-08-01).** The sibling
+of the slice hoister for a nested-container READ. `for (var k = 0; k < n;
+k++) s += a[i][k] * b[k][j]` re-materializes the ROW `a[i]` every
+iteration - a boxed EvalValue plus an intrusive_ptr retain/release, about
+half of 46_matrix_mult's inner loop - although nothing in the loop can
+change it. It is hoisted into a SYNTHETIC temp (unlike the slice hoister,
+which moves an existing decl, there is no decl here: `$licm<N>` gets a
+fresh frame slot, so `specialize()`/`specialize_children`/`try_for_range`
+now thread an `int *fsize` - the root Block's `slot_count` for main, else
+`FuncDescriptor::frame_size`, exactly as the Inliner's `walk` does; null
+= unresolved = no hoisting, capped at 64 slots):
+`Block(scope_free){ if (0 < n) { var $licm0 = a[i]; } for (...) s +=
+$licm0[k] * b[k][j]; }`.
+**THE GUARD is the load-bearing part.** A slice only CLAMPS, so the slice
+hoister is safe for a zero-trip loop; a SUBSCRIPT throws on OOB, and
+hoisting one above a loop that runs zero times turns "never evaluated"
+into "throws before the loop". The guard is the loop's own entry test
+with the loop variable replaced by the init value (`COND[k := INIT]`), so
+a zero-trip loop still evaluates nothing and a >=1-trip loop evaluates it
+exactly once - the value iteration 1 would have read. Restricted to the
+counted shape `for (var k = INIT; k CMP BOUND; ...)` with INIT and BOUND
+both `fr_immutable` (hence side-effect-free), which makes the guard
+literally `INIT CMP BOUND` - no substitution machinery and no risk of
+duplicating a side effect into it. Two int literals decide it at compile
+time: false means the body never runs (no hoist at all), true means no
+guard is emitted. **The ForStmt is left UNTOUCHED and merely WRAPPED** -
+try_for_range runs next and must still match the counted shape, and
+losing `ForRangeStmt` would cost more than the hoist gains.
+Gates on the candidate: `base_array` (not a dict/string), a CONTAINER
+result (`th` neither i nor f - a scalar element is already a raw slot
+read), `fr_immutable` with the loop var's uid (which also requires the
+base absent from `mut_content`, so an element write anywhere in the loop
+disqualifies it - that is what rules out the COW-detach hazard - and
+`FrMut::alias_content` clear, since the row can be replaced through
+another name, `b[i] = [..]` with `b = a`), no
+reference to anything DECLARED INSIDE the body (`licm_collect_decls`:
+above the loop such a slot is stale - `fr_collect_mutated` deliberately
+SKIPS a pInDecl assignment, so a body-local `var m = map(..)` taints
+nothing and `m[1][0]` looked invariant; the -rt suite caught exactly
+this), and UNCONDITIONAL evaluation (the scan stops at the first body
+statement that is not a plain expression statement, and never descends
+into a ternary arm / `??` rhs / `&&`-`||` tail). Occurrences of the same
+expression share one temp (`licm_expr_equal`). The result is expressible
+MyLang - `:show` renders the guard and the decl as real code.
+**CALLS IN THE BODY - `licm_has_opaque_call` + `CallExpr::
+callable_arg_mask`.** A pure USER function is always fine (`pure` forbids
+captures, global reads AND mutating a reference param, so it cannot reach
+the enclosing frame at all). A CONST BUILTIN is fine too - `len(arr)`,
+`abs(x)`, `str(v)` cost nothing - EXCEPT that the higher-order ones
+(map/filter/sort/make_array/make_dict/find) run a CALLBACK that
+`fr_collect_mutated` cannot see (it stops at a FuncDeclStmt), so a lambda
+appending to the base would taint nothing and the base would look
+invariant. The discriminator is a new inferencer stamp,
+**`CallExpr::callable_arg_mask`** (bit i = argument i's static type is a
+`Func`, or a `dyn` that might hold one) - stamped in `annotate_hints`
+where types are live, because only the TYPE question is answerable there:
+`effective_pure` is the RESOLVER's answer and does not exist yet. LICM
+then requires each masked argument to be provably pure - an inline lambda
+whose `desc->effective_pure` holds, or a name in `g_fr_pure`. Anything
+else (a local variable holding a lambda, an impure named callback) is
+unprovable and refuses the loop. **The mask DEFAULTS to `~0u`** so an
+unstamped call - no inference ran, a node a later pass built, a field a
+copy forgot - reads as "every argument may be callable" and declines.
+`licm_is_const_builtin` additionally requires `sym.kind == builtin`,
+since `fr_is_const_builtin` matches the NAME only and a user's own
+`func len(x)` answers true there (a pre-existing looseness in
+try_for_range's bound analysis, left alone).
+Measured (callgrind Ir, `OPT=1 ASSERTS=0`): 46_matrix_mult whole-program
+-24.1% at scale 1, and **369 -> 233 Ir per inner iteration** (the
+scale-1-vs-scale-3 delta, so compile time is excluded); wall-clock
+interleaved A/B **0.68x**, suite geomean cur/base 0.998x. It fires on
+exactly ONE program in bench/ + samples/ (46) - a narrow blast radius by
+construction, and every other program's output is byte-identical to the
+pre-LICM binary.
+
+**THE NESTED-READ FUSION - `LoadElem2Int`/`LoadElem2Float` (2026-08-01,
+plans/archived/unboxing.md option A).** LICM above removes the row read
+whose index is loop-INVARIANT (`a[i][k]` in the k-loop). What it cannot
+touch is the
+one whose outer index VARIES with the inner loop - `b[k][j]` - and that is
+where 46_matrix_mult's remaining cost sat: a profile put **61% of the
+inner iteration inside C++ helpers**, ~134 Ir of it in the two-op pair
+`LoadElemValue t = b[k]` + `LoadElemInt dst = t[j]`. Materialising `t`
+costs a helper call, an `intrusive_ptr` retain, a 32-byte `EvalValue`
+copy, the `SharedArrayObjTempl` live-slices registration, and a release
+when the temp is overwritten next iteration - for a row that is **alive
+for exactly one instruction**. C++ gets the row with one `mov`.
+The fused op BORROWS it instead: `vm_elem2_borrow_row` returns a raw
+`const EvalValue &` into the outer array's storage and the scalar read
+runs off that, so nothing is boxed. **The soundness argument is short,
+which is the point:** the borrow is taken and consumed inside ONE
+instruction (no user code, no allocation, no mutation, no unwinding can
+run in between), the OUTER array holds the row's reference throughout,
+the op only READS so it can trigger no copy-on-write detach, and it
+creates no VIEW, so there is nothing to register in the parent's slices
+set. The scalar read itself is the SHARED single-level
+`vm_load_elem_int/float_core`, so the two levels cannot drift.
+**The asymmetry that made this a gap rather than a design choice:** the
+STORE side already did exactly this - `StoreElem2V` walks `a[i][j] = v`
+in one op and `StoreElemChainV` generalises it - and the read side simply
+never got the twin. It also reuses the store side's caret machinery: the
+two levels need DIFFERENT carets (an OOB on `i` reports the `base[i]`
+span, one on `j` the whole `base[i][j]` span) which ONE loc-table entry
+per pc cannot hold, so the pair comes from `chain_locs` exactly as the
+per-step store carets do. That is also what fixes the encoding: `a` is a
+DUAL (outer index SLOT, chain_locs idx), `b` the inner index operand,
+`target2` the base, `target` the dst - so a LITERAL outer index cannot
+ride it and DECLINES to the byte-identical unfused pair, as do a
+non-array level, a dict, and a `dyn` base. A deeper chain fuses its last
+two levels and materialises the rest through `compile_array_base`.
+The JIT emit is a plain helper call (`jit_load_elem2_int/float`): the win
+is the deleted materialisation, not the call, and both indices stay
+cache-aware VALUE args so a matrix loop keeps its counters pinned. It is
+`op_fully_native` - the helper throws WITH the baked per-level caret
+rather than loc-less, and the emit-side stamp (first conveyor wins)
+supplies only the inlined-at chain. myv **v10**: the two opcodes are
+APPENDED, so no ordinal moved and a v9 image would still decode - but the
+version bump is what stops a v9 BINARY from mis-dispatching a v10 image.
+Execution-proven by `g_jit_op_run` in the `jit_load_elem2_native` test
+(the counters are bumped ONLY from emitted code; the interpreted case
+goes straight to the core), plus dual-engine `elem2:` tests for values,
+negative wrap at both levels, ragged rows, a slice base, both OOB carets,
+and the declines. NOTE the test shape: the outer index must vary with the
+INNER loop, or LICM hoists the row before codegen sees a nested read.
+Measured (callgrind Ir, `OPT=1 ASSERTS=0` both sides, scale-1-vs-scale-3
+delta so compile time is excluded; n=70 -> 343k inner iterations per
+scale unit): 46_matrix_mult **221.5 -> 170.5 Ir per inner iteration
+(-23.0%)**, whole-program -12.3% / -17.9% at scale 1 / 3; everything else
+neutral (14_array_subscript +0.03%, 43_sieve +0.04%, 18_foreach_array
++0.02%, 01_while_loop +0.06%, 15_array_slice_readonly -0.55%), so the new
+opcode costs no `vm_dispatch` layout tax. The suite geomean does not move
+and was not expected to - the pair occurs in ONE corpus program, at three
+sites, one hot. **The plan predicted ~90 Ir/iter and that was WRONG:** the
+ceiling was right, the assumption that a HELPER-CALL tier would reach it
+was not. The residual splits as ~87 Ir inside the helper (two levels of
+`is<SharedArrayObj>` + `skind`/`size`/`offset`/`get_vec` + bounds, none of
+it visible through a call boundary), ~22 in `EvalValue::operator=(&&)`
+(the helper's `dst->put()` boxing an int the emit could `store_dst` in two
+stores), and ~54 native.
+**The INLINE tier LANDED (#93, 2026-08-02):** the two guard/read
+sequences emitted at the call site (general outer -> the LValue row at
+stride sizeof(LValue), bounds by an unsigned BYTE-length compare that
+also catches a negative index -> non-slice flat-INT row -> the shared
+count compare -> `mov rax,[rcx+r9*8]` -> the ref-aware store_dst), the
+helper kept as the slow tier for every decline - slice outer/row,
+non-general outer, bool/float/str/general rows, OOB (whose per-level
+carets stay the helper's baked chain_locs pair). Measured: 46_matrix_mult
+whole-program **-22.4%** and **170.5 -> 91.5 Ir per inner iteration** -
+the ~90 the plan named as the ceiling and the helper tier missed.
+Execution-proven by `g_jit_elem2_fast` (bumped by the EMITTED code; the
+fusion test requires it STRICTLY, since the helper makes the values right
+too). Two guards were sabotage-verified through new 5-mode `elem2:`
+entries, each needing a shape-eater defeated first: SLICE rows share the
+parent's SharedObject, so a raw read skipping `off` returns the PARENT's
+elements (608 vs 128 - and the corpus had no slice-ROW case at all); and
+BOOL rows fuse to LoadElem2Int too (a bool node is stamped `i`) but store
+ONE byte per element - the catching shape needs rows >= 8 wide (a
+3-element row is saved by accident: byte-length/8 rounds its count to 0
+and bounds decline anyway) and must SUM the elements, not branch on them
+(garbage truthiness matched an if-based version by luck).
 
 **Counted-loop specialization (`ForRangeStmt`).** Also in `specialize_types`
 (via `try_for_range`, run on the RAW `for` before its cond/inc are specialized),
@@ -1889,7 +5729,29 @@ needs length-stability (`∉ mut_len`) — so the common fill
 `for(i;i<len(a);i++) a[i]=…` still specializes (an element write doesn't change
 the length); a subscript READ `arr[k]` additionally needs `∉ mut_content`. A
 *pure* call taints nothing (it can't mutate its args); an *impure* call taints
-the length and content of each non-scalar arg. `ForRangeStmt::do_eval`
+the length and content of each non-scalar arg.
+**⛔ THOSE SETS ARE BY NAME, AND A NAME IS NOT THE STORAGE (2026-10-08).**
+Arrays and dicts are references: `b[0] = 9` changes `a[0]` when `b = a`,
+and an impure function can `pop` a global a local aliases. The for-range
+bound, the slice hoist and LICM each gave a different answer from
+`--no-opt all` on such a loop. So `FrMut` (the sets' bundle) carries two
+facts about EVERY container: `alias_content` (a store whose chain passes
+through an array, a dict or a `dyn`, or a call that may run program
+code) and `alias_len` (a mutating builtin on a shared container, or such
+a call - an impure user function, a function value, a builtin given a
+callback). A read THROUGH a shared container needs the matching flag
+clear; "shared" comes from **`Construct::th_val`**, stamped in
+`annotate_hints`: true for a static type that is a value ALL THE WAY DOWN
+(a scalar, a string, a struct whose fields are such values) - a struct
+with an array field is not, since a callee reading through it reaches
+shared storage. A member store into a struct VALUE is the variable's own
+copy and sets nothing. And "const builtin" does not mean "changes
+nothing": `sort`/`rev_sort`/`reverse` fold on a constant and sort a
+variable's array in place - `fr_builtin_mutates` names the in-place
+builtins. Nets: the `alias:` cases of `opt_layer_equivalence` and the
+alias rows of both hoist shape tests (watched failing with the flags
+ignored). Blast radius: 1 of 194 corpus programs (a loop calling an
+impure function no longer caches `len(vals)`), no bench. `ForRangeStmt::do_eval`
 evaluates `bound`/`step` **once** (cached as raw `int_type`), then the
 per-iteration condition test and increment are plain C on the slot's
 `int_type` — no expression eval, no `num_bin_op`, no `TypedScalarExpr` dispatch
@@ -1910,54 +5772,332 @@ visible. **Not yet specialized:** a pure-user-func bound with a *container* arg
 **VALUE-USED templates instantiate too (plans/value-template-
 instantiation.md).** A template stored in a container/var and called
 INDIRECTLY (`ops = [add_op, sub_op]; fn = ops[i%2]; fn(st, i)`) gets a
-typed instance when every such call agrees on ONE settled signature: the
-`Func` StaticType carries a **finfo set** (`StaticType::finfos`, seeded
-by `func_static_type` for a template, UNIONED by `join`, copied by
-`with_opt` - metadata, never part of equal/assignable), which rides the
-ordinary lattice through array/dict elements and var joins, so each
-indirect call's callee type names its candidate templates with no new
-dataflow machinery. `value_instantiate_round` (run beside
+typed instance when every such call agrees on ONE settled signature.
+
+**⛔ THE CANDIDATE SET COMES FROM THE CALLEE-SET ANALYSIS (#116
+increment 3), NOT FROM THE TYPE.** It used to be a **finfo set**
+stapled to the `Func` StaticType (`StaticType::finfos`, unioned by
+`join`) - and that was a category error: identity metadata on a SHAPE
+object, which every equality-based path in the lattice quietly
+destroyed. `finfos`, `escaped_finfos`, `note_escaped_into` and
+`drain_escapes` are all DELETED; `value_instantiate_round` asks
+`callee_set(e)` and `callee_escaped(f)`. Blast radius of the deletion:
+**0 of 126** corpus programs change `-vd` or output, and
+76_funcval_dispatch still gets its `add_op$0`/`sub_op$0` instances.
+See *THE CALLEE-SET ANALYSIS* below. `value_instantiate_round` (run beside
 `instantiate_round`) checks per-template UNIFORMITY over the attributed
 sites, makes the instance through the ordinary clone machinery
 (`tmpl_cache`/`make_template_clone` - same `$N` naming/display_name),
-REDIRECTS every value-use Identifier IN PLACE (uid + id_sym rebind), and
+REDIRECTS every value-use Identifier IN PLACE (uid + id_sym rebind) - the
+name a DECLARATION binds is not one (`const tw = pure func..` reached only
+through a baked `const OPS = [tw];` renamed its own declaration to the
+instance until 2026-11-14, AlreadyDefinedEx) - and
 seeds the clone's params with the signature each fixpoint round (a
 phantom call - no direct call feeds them). **ESCAPES disable it**
-(`FuncInfo::value_escaped`): a join that DROPS the finfo set (collapse
-to dyn / conflict - recorded in the arena's `escaped_finfos` ledger,
-drained per round), an ARG-position value use (any call/builtin arg -
-`map(f, ...)`, `runtime(f)`), or a capture-list use - an untracked call
-site could reach the typed instance with a mismatched signature, so an
-escaped template keeps its boxed base (sound, as before). Non-uniform
-signatures across sites → no instantiation. All value uses redirect to
+- **ONE ESCAPE QUESTION, ONE ANSWER: `callee_escaped(f)`** - *can this
+function be CALLED from a site the analysis did not see?*
+`FuncInfo::value_escaped` is **DELETED** (2026-08-28). It was fed by
+`escaped_finfos` (deleted in increment 3) and by a blanket rule that an
+ARG-position or CAPTURE-LIST use of a template escapes it outright.
+**Both of those uses are ordinary value uses now**, because the
+callee-set analysis NAMES their consumers: an argument bound to a
+parameter appears in `pts(param)`, so a call through that parameter is
+an attributed site like any other, lands in `sites[tmpl]`, and its
+signature meets the same uniformity rule as every other site.
+⛔ **THAT IS WHERE `12_higher_order` WENT FROM BOXED TO TYPED.**
+`func apply(f, x) => f(x);` called as `apply(sq, i)` used to escape
+`sq`, so `sq` stayed a boxed template base and `f(x)` dispatched
+dynamically. `sq$0` is instantiated now and
+`apply$0 : func(func(int)->int, int)->int` where it was
+`func(dyn,dyn)->dyn` - **-63.5% Ir per scale unit**, and it is the only
+corpus program whose bytecode changes. Still declining: a BUILTIN
+consumer (opaque -> `callee_escaped`), a ⊤ callee anywhere, and
+attributed sites that disagree. Non-uniform
+signatures across sites → no instantiation. **An UNINFORMATIVE signature
+is declined too** — a `dyn` param (the clone would be just as boxed) or a
+container carrying the BOTTOM `none` element type (`type_has_bottom_elem`:
+`array<none>` / `dict<none,none>`, what an empty `[]`/`{}` infers and what
+a container symbol KEEPS while nothing the inferencer can see writes it —
+a callee filling it through its reference param contributes to the PARAM's
+symbol, never back to the caller's). That case is not merely useless but
+HARMFUL: the clone's params are seeded from the signature, so a body that
+only READS the container types every element `none` and an ordinary use of
+one (`k + ":"`) became a spurious `NullabilityEx` (until question 9 made
+such a read `dyn`; the clone is still uninformative) — even though the
+container is non-empty at runtime, filled by a SIBLING function
+(`samples/phonebook`: `cmd_add` fills `data`, `cmd_view` iterates it; a
+WRITER body repairs its param type by contribution, a reader cannot). The
+decline is a DEFER, not a veto — a later fixpoint round that settles the
+element type instantiates. (The DIRECT-call `instantiate_round` has the
+same bottom-signature blind spot, pre-dating this feature; there a
+container arg is usually written by the callee, which repairs the type.)
+All value uses redirect to
 ONE instance, so `ops[0] == add_op` identities hold. v1 is INPUT-LOCAL
 in the REPL (a prior input's array called later keeps the base -
 correct, unoptimized; pinned by a `repl:` test). This closed the last
 CPython-losing bench (76_funcval_dispatch 1.05-1.12x → **0.68x**; its
 callee bodies 6 boxed ops → 4 typed).
 
+**⛔ THE FINFO SET NOW TYPES A FACTORY-RETURNED CLOSURE'S PARAMETER
+(#115, 2026-08-27) - AND THAT IS A SCRIPT-VISIBLE RULE, NOT ONLY AN
+OPTIMIZATION.** `accumulate_call` fed argument types into a callee's
+params only when `callee_funcinfo` could NAME it - a named function, a
+func-var bound to an inline lambda, or the lambda literal itself. A
+closure RETURNED from a factory is none of those:
+
+    func make_adder(n) {
+        var base = n * 10;
+        return func [base] (x) { return base + x; };
+    }
+    var add = make_adder(i);
+    add(i);                      # always an int
+
+`x` finalized to `dyn`, so `base + x` was `int + dyn` and the whole
+closure body ran boxed - the full ctx chain, a 32-byte capture read and
+TWO runtime type checks per call (64 Ir against the 44 of the same
+bench's counter closure, whose lambda takes no parameter and so was
+never affected). The finfo set already carried the answer the whole way
+- the lambda's type flows into the factory's `ret`, out of the call and
+into the variable's symbol, `join` unioning the sets - so the fix is to
+seed it for every function and to contribute through an INDIRECT call
+whose callee type names **exactly one** candidate.
+
+**⛔ TWO GATES, AND BOTH ARE LOAD-BEARING - EACH WAS A REFUSED-VALID-
+PROGRAM BUG BEFORE IT WENT IN.**
+
+**(a) THE DECISION IS A SNAPSHOT, TAKEN AFTER INSTANTIATION.** A finfo
+set only GROWS (`join` unions it), so a callee that ends with two
+candidates passes through a round holding one - and a contribution made
+in that round is already committed when the second arrives. The answer
+depended on ROUND ORDER, which is what the fixpoint's read-stable-values
+design exists to prevent, and it is unrecoverable: nothing un-joins a
+param. `snapshot_indirect_callees` decides once, from a converged state.
+⛔ AND IT MUST RUN **AFTER** THE INSTANTIATE LOOP: a call to a TEMPLATE
+defers by design, so a factory's return type does not exist until
+instantiation has made the clone and redirected the call. Placed before
+the loop the snapshot found ZERO sites and the whole rule was inert.
+
+**(b) EVERY SITE CONTRIBUTES, AND THE JOIN DECIDES - the UNIFORMITY
+rule that used to sit here is DELETED (maintainer's call, 2026-08-28),
+and that is a LANGUAGE change, not a cleanup.** It said "every site
+attributed to a callee must agree on the argument types, or none of
+them contributes", so a factory-returned closure with disagreeing sites
+declined to `dyn`.
+
+⛔ **IT WAS NEVER COMPUTING A DIFFERENT ANSWER - IT DECIDED WHETHER TO
+ANSWER AT ALL.** `contribute_arg` is the SAME function the ordinary
+direct-call path uses, and a lambda the inferencer can NAME already had
+every call site contribute unconditionally, the fixpoint joining them.
+A factory-returned closure cannot be named, so `indirect_callee` is its
+only route to `contribute_arg` - and uniformity was the gate on that
+map. Same source shape, two behaviours:
+
+```C#
+var wbase = 20;                                     # B: DIRECT
+var f = func [wbase] (x) { return typestr(x); };
+print(f(1) + " " + f(2.5));      # float float  (join widened, int coerced)
+
+func mk(n) { var wbase = n * 10;                    # A: FACTORY
+             return func [wbase] (x) { return typestr(x); }; }
+var g = mk(2);
+print(g(1) + " " + g(2.5));      # WAS: dyn dyn      NOW: float float
+```
+
+and with an int/str pair, B raised `TypeMismatchEx: 'x' has type 'int'
+but is assigned 'str'` while A printed happily - now both refuse. **The
+two spellings of a CAPTURING closure are indistinguishable.** (A third
+spelling, a NON-capturing var-bound lambda, is a TEMPLATE and
+monomorphizes per signature: `f(1)` and `f("s")` both work. That is a
+different feature and is untouched.)
+
+⛔ **IT WAS SAFE TO DELETE ONLY BECAUSE THE CANDIDATE SET IS COMPLETE.**
+Uniformity went in when the set UNDER-COLLECTED - `join`'s
+`static_type_equal` shortcut dropped one side's members whenever two
+functions shared a signature, so sites belonging to two DIFFERENT
+closures were attributed to one survivor, and joining those invents a
+`TypeMismatchEx` in a program with no conflict in it. The callee-set
+analysis reports such a site as a TWO-candidate set, which gate (c)
+below already refuses. **Do not restore this check to fix a refusal:
+if a valid program is refused, the candidate set is wrong.**
+Blast radius of the deletion: 1 of 123 corpus programs, one line.
+Watched: restoring it fails 10 `-rt` checks and re-splits the two
+adjacent lines of `25_factory_closure_param.my`.
+
+**(c) EVERY SITE WHOSE SET *CONTAINS* THE CALLEE MUST NAME IT ALONE -
+THE MULTI-SITE HOLE, which #115 SHIPPED WITH and #116 increment 2
+closed (2026-08-28).** Gates (a) and (b) are both about the sites
+ATTRIBUTED to a closure. Neither asks about a site that can reach it
+and was *not* attributed, and a closure can be reached by both kinds
+at once:
+
+```C#
+func mk_a(n) => func [n] (x) { return "A:" + typestr(x) + str(n); };
+func mk_b(n) => func [n] (x) { return "B:" + typestr(x) + str(n); };
+func probe(int k) {
+    var only_a = mk_a(1);           # names ONE closure
+    var p = [mk_a(2), mk_b(3)];     # ...the SAME FuncInfo as only_a
+    var either = p[k];              # may be either
+    return only_a(7) + " " + either("str");
+}
+print(probe(runtime(0)));
+```
+
+`only_a(7)` typed the parameter `int`; `either("str")` was never
+attributed; the check pass then REFUSED the program on a signature the
+rule had invented - `argument 1 has type 'str' but the parameter is
+'int'`. The IDENTICAL program with no size-1 site compiles and prints
+`A:dyn B:dyn`. Pinned as case (7) of
+`tests/functional/25_factory_closure_param.my`, and it is what exposed
+`corpus_diff`'s compile-gate gap above.
+
+**⛔ AND THE SOURCE OF THE ANSWER IS THE CALLEE-SET ANALYSIS NOW, not
+`finfos`** (#116 increment 2). `snapshot_indirect_callees` asks
+`callee_set(e)` and `callee_escaped(f)`; `value_escaped` is gone from
+this consumer. Measured blast radius of the migration: **0 of 126**
+corpus programs change `-vd` or output - the only behaviour change is
+the hole above closing. Uniformity was kept at that point as an
+open language question; it has since been DELETED - see gate (b).
+
+**⛔ AND THE SET'S INCOMPLETENESS WAS A `join` BUG - METADATA EXCLUDED
+FROM EQUALITY, THEN DISCARDED BY AN EQUALITY-BASED SHORTCUT
+(2026-08-28).** `join` opens with
+
+    if (static_type_equal(a, b))
+        return a;
+
+and `finfos` is deliberately NOT part of `static_type_equal` (two
+functions with one signature must stay one TYPE). So whenever two
+DIFFERENT functions shared a shape - the common case - the join
+returned `a` and **silently dropped b's candidates**:
+
+    func mk_a(n) => func [n] (x) { return str(n) + str(x); };
+    func mk_b(n) => func [n] (x) { return str(n) + str(x); };
+    var p = [mk_a(10), mk_b(20)];   # both `func(dyn)->str`
+    var f = p[k];
+    f(5);          # the callee named ONE function, for a value with two
+
+Everything asking "is this callee provably one function?" got a
+confident wrong answer: #115 typed one lambda's parameter from call
+sites that reach either, and `escaped_finfos` could not see it - that
+ledger reports members a join DROPPED, and here they never ENTERED.
+FIXED at the source: a Func whose partner adds candidates falls through
+to the Func arm, which builds a fresh type and UNIONS them. **The merge
+must not be done in place** - `a` is some function's own type object,
+and adding to it would make that function claim a candidate it does not
+have, everywhere the object is shared. Blast radius: 0 of 124 corpus
+programs change compile outcome or output. Watched failing (the helper
+neutered): `-rt` 1971/1972.
+
+**THE GENERAL SHAPE, worth carrying:** when a type carries METADATA that
+its equality deliberately ignores, every `if (equal) return one_of_them`
+in the system is a place that metadata dies.
+
+**⛔ AND THE REAL FIX WAS TO STOP PUTTING IT THERE.** The `join` union
+above is REVERTED (#116 increment 3): `finfos` is deleted, the shortcut
+is a plain `if (static_type_equal(a, b)) return a;` again, and an
+`StaticType` describes SHAPE and nothing else. Patching `join` to
+preserve identity was treating the symptom - the class of bug is
+open-ended, because "treat equal types as interchangeable" is what a
+type system is FOR. The identity question has its own answer now, keyed
+by PROGRAM LOCATION.
+
+**THE ASYMMETRY IS GONE (2026-08-28).** This used to read "the price,
+stated plainly: this does NOT match the directly-bound capturing
+lambda" - that form refused `f(1)` and `f("s")` while a
+factory-returned closure declined to `dyn` and compiled. Deleting the
+uniformity rule (gate (b)) made the two spellings identical, so the
+price is no longer paid. Measured blast radius when the rule LANDED:
+0 of 125 corpus programs change compile outcome, 0 of 124 change output.
+Pinned by `tests/functional/25_factory_closure_param.my` and four `-rt`
+entries. **Making the set COMPLETE is the real fix and is not done** -
+it is an audit of finfo propagation through every flow path, which
+value-template instantiation depends on too.
+
+**⛔ A DEAD BASE TEMPLATE IS DECIDED FROM THE TREE, AND A BAKED CONST
+VALUE IS NOT IN THE TREE (2026-08-25).** `is_template_base` excludes a
+template NEVER used as a value from codegen - every call to it was
+redirected to an instance, so the base never runs. "Used as a value" was
+read off `TypeSym::value_used`, i.e. off IDENTIFIERS the inferencer can
+see - and the parser's const-fold gets there FIRST: `const OPS = [sq];`
+becomes ONE `LiteralObj` carrying the array, FuncObject and all, so by
+inference time nothing NAMES `sq`. The base was dropped, and
+`var dyn f = OPS[runtime(0)]; f(7);` reached a chunk-less body: an
+ML_CHECK abort under ASSERTS, a walk of the FREED AST without them,
+while `-tw` (which never tears the tree down) printed the right answer -
+a RULE 2 divergence on top of the RULE 1 one. **The #149 closure now
+also walks BAKED VALUES** (`keep_in_value`, inferencer.cpp): const
+arrays, dicts, struct instances, a struct's folded `const` MEMBERS, and
+nesting - a flat array is skipped, since it cannot hold a function and
+`get_view()` would PROMOTE it. The generalisation: **when a pass asks
+"is this thing referenced?", const-eval may have turned the reference
+into a VALUE** - the same shape as the `abs` shadowing bug and the
+brace-less-body scope bug, all three being "the parse-time evaluator
+knows something the later passes cannot see". Pinned by
+`tests/functional/const_pool_func.my` (watched failing: the tree-walker
+printed `49 50 60 42 81`, the VM aborted).
+
 
 
 A **named** function with ≥1 *template param* — un-annotated, non-`dyn`,
-non-`opt` — is a **template** (`FuncInfo::is_template`, set in
-`declare_funcdecl`): not type-checked in isolation, but **instantiated per
+non-`opt`, or annotated with a bare `array` / `dict` (rule 5: a HOLE each
+call fills; the annotation then only checks the kind, in the instance) —
+is a **template** (`FuncInfo::is_template`, set in `declare_funcdecl`;
+**`template_param` is the one predicate**, asked by the instantiation
+rounds, the value-template rounds and the lambda marking, so a new site
+must ask it too): not type-checked in isolation, but **instantiated per
 call-site signature** as a typed clone the ordinary concrete-function path
 handles. So `func f(x){var t=x+1; return t;}` never needs `var dyn t`, a
 never-called template never errors, and `f(1); f("s")` makes two instances not a
 type conflict. `dyn` is the explicit one-instance-any-type param. Full design +
-deferrals: `plans/function-templates.md`.
+deferrals: `plans/archived/function-templates.md`.
 
-**`opt`/typed params coexist with template params** and just `join` within each
-clone — the signature is keyed by the *template params only*. So `func f(a, opt
-b)` is a template over `a` (`b` joins; arity in `instantiate_round` is the
-`[min,nparams]` range). `func f(opt x)` with no template param keeps the join
-model. **A var-bound lambda** (`var id = func(x)=>x`) becomes a template iff it
+**Typed params coexist with template params** and just `join` within each
+clone — the signature is keyed by the *template params only*. **An
+un-annotated `opt` param IS a template param (rule 8.1)**, keyed by the
+argument's type with its `?` dropped, and an omitted argument keys as
+`none` (`template_arg_key`, used by both instantiation rounds - arity in
+`instantiate_round` is the `[min,nparams]` range); a `none` contributed
+to an `opt` param adds nothing (`contribute`), so the `none` instance's
+param is an unconstrained `dyn?` and its non-none branches type-check.
+⛔ A late fold refuses a call that still reaches a template BASE
+(`late_fold_fits_one`): the parse's typed copy sees one call and may make
+an instance where the program, seeing every call through the same value,
+runs the base untyped - same type, another value (RULE 2; rule 8.1 made
+this reachable through `OPS[0](3)`). **A var-bound lambda** (`var id = func(x)=>x`) becomes a template iff it
 is non-capturing and the var is **write-once + calls-only** (`mark_lambda_
 templates`, after the structural pass, using per-symbol `writes`/`value_used`
 bookkeeping — the decl write is counted in `walk_struct`, not `declare_target`,
 which runs twice via hoist); a value-used / capturing / reassigned lambda stays
-join. **D4:** past 64 instantiations a template's further calls run dynamically
-(`tmpl_inst_count`, a one-time stderr warning).
+join. **⛔ Its redirected calls still READ the variable (2026-11-14):** the
+instance `lambda$N` is a named function bound at the top of the program, the
+variable binds where it is written, so `print(f(2)); var f = func(x) => x;`
+compiled and ran where `-nti` refused it (the TDZ), and a call made before
+the declaration ran answered instead of raising UnboundSymbolEx. The redirect
+keeps the original Identifier as the new callee's `Identifier::bind_guard`:
+the resolver resolves it as an ordinary read (TDZ, the step 7 prover and the
+warnings count it, and so does auto-purity), and a GLOBAL one
+(`live_guard()`) is read before the call by the tree-walker (CallExpr /
+DirectCallExpr / CachedCallExpr) and by codegen (`emit_bind_guard`, a
+LoadGlobalV before the arguments, in both call lowerings); the AST inliner
+leaves such a call a call, and the constant folders decline it because the
+read fails in their const context. EACH of the inliner's four engines asks
+`live_guard()` itself: the tail engine finds its call through the `return`,
+and the block and specialize engines run on whatever the expression engine
+left in the slot - a check in `walk()` alone let `return lf(k);` of a
+block-bodied lambda, and `use(2)` once `use` was inlined, lose the read. A
+local guard needs no check - a use the TDZ allows runs after the
+declaration. **D4:** past `g_tmpl_max_instances`
+instantiations (default 64; the
+driver's `--max-instances N`, not in the README by the maintainer's choice) a
+template's further calls run dynamically (`tmpl_inst_count`, a one-time stderr
+warning). **⛔ A call left UNREDIRECTED runs the BASE, so the dead-base pass
+must keep it (2026-11-09):** past that cap, and past the instantiation loop's
+64 rounds (one per nesting level of `f([x], n - 1)`), a direct call still
+names the template; the base had been dropped as dead, so the VM aborted
+("call to a chunk-less function after AST teardown") where the tree-walker
+answered - and an `ASSERTS=0` build, which never tears the AST down, walked
+it. Every LIVE call whose callee is still a template keeps it (the same
+`collect_calls` instantiate_round uses).
 
 Mechanism (`inferencer.cpp`): the fixpoint and check pass **skip** an
 un-instantiated template (`accumulate`/`accumulate_call`/`check`/`check_call`
@@ -1971,6 +6111,14 @@ monotonic counter, so it is readable AND inspectable, `typeof(f$0)`; with
 **redirects** the call to it, and re-runs the fixpoint; the clone's params
 accumulate their one signature through the concrete path. Arity is still checked
 for a template call; per-arg type/nullability is checked inside each clone.
+**⛔ Only a LIVE call instantiates (2026-10-09): `instantiate_round` skips the
+calls inside a template BASE's body** (`collect_calls`' `skip_templates`).
+The fixpoint skips that body, so an instance such a call made was fed by no
+call site and was checked with unconstrained parameters - a never-called
+`func use(q) { var b = ac(2); ... }` refused `ac`'s body. Each instance of
+the enclosing template is a fresh copy whose calls instantiate normally, and
+a KEPT base (value-used) calls the other template's base, which #149's
+closure keeps.
 **The `(template, signature)` cache (`tmpl_cache`) is SESSION-persistent, NOT
 cleared per input** — a signature already instantiated by a prior input
 **reuses** that instance instead of building a duplicate (`f(2,3)` then `f(2,3)`
@@ -1991,6 +6139,176 @@ callee to a prior clone), and `make_template_clone` clears the clone subtree's
 `id_sym`/`func_of_decl`. (This was an MSVC-only, address-dependent,
 non-deterministic bug, root-caused via CI instrumentation; GCC/clang +
 sanitizers never reproduced it.)
+
+### THE CALLEE-SET ANALYSIS (#116, `calleeset.cpp.h`)
+
+**The category error it fixes.** There are TWO different questions about
+a callable value, and MyLang had been answering both with one mechanism:
+
+ - **SHAPE** - *how do I emit the call, the window, the return?* Asked
+   by the JIT, answered by the `Func` StaticType. N functions
+   assignable to one variable share ONE shape, and one answer is
+   exactly what the emitter needs - so `join`'s
+   `if (static_type_equal(a,b)) return a;` shortcut is CORRECT for it
+   and nothing here changes that.
+ - **IDENTITY** - *is it always the SAME function?* Asked by
+   devirtualization, by value-template instantiation, and by #115
+   (typing a factory-returned closure's parameters from its call
+   sites).
+
+`StaticType::finfos` asks IDENTITY off the SHAPE object. Two distinct
+functions routinely have equal types (`func sq(x) => x*x;` and
+`func neg(x) => 0-x;` are both `func(?)->?`), so **every shape-level
+equivalence is a place identity dies** - the `join` shortcut was the
+first one found (fixed 2026-08-28) and the class is open-ended, because
+"treat equal types as interchangeable" is what a type system is FOR.
+
+**And the deeper flaw: `finfos` has no ⊤.** It cannot distinguish
+*"nothing flows here"* from *"I have no idea"* - both are the empty set.
+That is why `escaped_finfos` / `FuncInfo::value_escaped` exist at all (a
+side ledger carrying the unknown the set cannot express), why that
+ledger is structurally insufficient (it records members a join DROPPED
+and says nothing about members that never ENTERED), and why
+`finfos.size() == 1` was never a proof - #115 needed a UNIFORMITY rule
+on top purely to survive it.
+
+**The analysis**: a monotone least fixpoint over FUNCTION VALUES ONLY -
+inclusion-based (Andersen-style), flow-insensitive, one abstract object
+per container ALLOCATION SITE. Locations are `Sym(TypeSym*)`,
+`Ret(FuncInfo*)` and `Elem(obj)`, keyed by PROGRAM LOCATION and never by
+type. Every constraint is `dst ⊇ src` with ⊤ absorbing, so - unlike the
+type fixpoint, which is deliberately Jacobi because a `join` CONFLICT is
+order-sensitive - iteration order cannot change the answer.
+
+**Queries**: `callee_set(e)` -> a set or ⊤; `callee_escaped(f)` ->
+did f's value leave the analysed program. **A consumer must require
+`|set| == 1 && !top`**; ⊥ is a real, different answer ("no function can
+reach here" - a base TEMPLATE's parameter, since every call was
+redirected to a clone) and must never be read as a MUST answer.
+
+**⛔ THE FAIL-CLOSED DIRECTION IS ⊤, AND IT IS RULE 1, NOT PRECISION.**
+A MISSING member is a wrong MUST answer: `{F}` where the truth is
+`{F,G}` makes #115 type F's parameters from arguments G received, and
+every unboxed tier downstream is built on that proof (*static types
+imply runtime guards*). An EXTRA member costs an optimization. So every
+path that cannot name what flows answers ⊤ - a builtin's result, a
+value read out of a baked const pool, a caught exception payload, the
+REPL's open world - and **`cs_eval`'s switch has NO `default`**, so
+`-Werror=switch` forces every new `ConstructType` to be classified
+rather than falling through as "no function here" (the
+`esc_known_shape` rule: an unrecognised kind HIDES occurrences).
+
+**⛔ THREE RULES IT ALREADY EARNED, all three found by its own `-dcs`
+dump on the corpus, and all three in the UNSOUND direction:**
+
+ - **`append` IS A WRITE, not an opaque builtin.** Treating every
+   builtin as a black box loses the STORE, so `var fns = []; append(fns,
+   mk(i));` left the array EMPTY and `fn(1)` answered ⊥ for a site that
+   reaches five closures. Note the allowlist here is INVERTED from
+   `esc_builtin_transparent`'s: a builtin handed a container makes its
+   contents UNKNOWN unless the write is modelled exactly, so a missing
+   entry costs precision and can never cost soundness.
+ - **`None` IS "NOT PINNED YET", NOT "EMPTY"** - the inferencer's own
+   defer-on-Unknown/None invariant. `var fns = [];` types the LITERAL
+   `array<none>`, so a `can this hold a function?` gate that answered
+   *no* pruned the allocation site before it existed.
+ - **A BAKED CONST VALUE IS NOT IN THE TREE.** `const OPS = [sq];` folds
+   to ONE `LiteralObj` at parse time, FuncObject and all
+   (`const_pool_func.my`'s shape) - and so does the everyday `var a =
+   [];`. A blanket ⊤ there is sound but makes the commonest container
+   initialiser untraceable, so the value is WALKED, FuncObjects resolved
+   back through `desc->decl`, with ⊤ only for what cannot be named.
+
+**⛔ ⊤ ABSORBS, SO A SET THAT WIDENS TO ⊤ MUST RECORD WHAT IT
+DISCARDS - THE LOSS LEDGER (2026-08-28).** `CsSet::set_top()` clears
+the members; a consumer reading that ⊤ can still call them, so those
+functions have left the analysable program and must be reported
+ESCAPED. This is the SAME fact `escaped_finfos` carried in the type
+lattice ("the members a join dropped"), at the layer where it is
+complete: `set_top` is the ONLY way a non-empty set loses members
+(`merge` with a ⊤ partner, and the `CS_MAX_SET` cap, both funnel
+through it), so one hook catches every loss instead of an enumeration
+of loss SITES that goes stale.
+
+**It replaced the analysis's bluntest rule, and the numbers say why.**
+The first version answered "an unnameable value escaped somewhere" by
+escaping EVERY function in EVERY points-to set - measured firing on
+**20 of 124** corpus programs, **31 of its 38 firings** from that
+premise alone, with ZERO calls through an unnameable callee in the
+program. Corpus-wide escapes **21 -> 10**; the C3 proven-param gate,
+which had been blocking **1 corpus + 15 suite** stamps purely because
+of this, now blocks **none**. The `a call THROUGH an unnameable callee
+escapes everything` half REMAINS - that premise is real.
+
+⛔ **AND IT MADE THE ANALYSIS BETTER, NOT JUST QUIETER**, which is the
+half a "nothing regressed" check cannot show: `func g(a) {...};
+var dyn h = g; h(1);` used to escape `g`, so value-instantiation
+declined and `h` held the BOXED BASE. It now redirects `h` to the
+monomorphized `g$0` and the indirect call runs typed code. C3 then
+correctly declines to stamp `g$0` - an instance reachable as a VALUE is
+dyn-launderable - which is its own `value_used` rule doing what it
+says, not a lost optimization.
+
+**⛔ A SET'S MEMBER ORDER IS THE FIXPOINT'S INSERTION ORDER, AND THAT
+FOLLOWS POINTERS (2026-10-01).** `CsSet::funcs` is a vector in the order
+members arrived, and the fixpoint visits locations keyed by `FuncInfo*` /
+`TypeSym*` - i.e. by heap address. Two consumers turned that order into
+emitted code: the guard chain of a multi-candidate value call (stamped
+from `cs.funcs`), and value-template instantiation, whose
+`std::map<FuncInfo *, ...>` iteration decided which instance was created
+first and so which got the lower global slot. An `INT_TESTS` build, which
+interns more strings, swapped `a1$0`/`a2$0` in `43_closure_twoway`, and
+#107's `vdjcmp` non-perturbation check refused it. Both now order by the
+declaration's monotonic `node_id`. **Anything that turns the analysis's
+answer into code must impose a deterministic order first** - and an
+ordered container keyed by a pointer is an unordered one.
+
+**Testing it: `-dcs` is the ONLY possible oracle.** The analysis changes
+no answer any program computes, so the five-mode differential,
+`corpus_diff` and every fuzzer are blind by construction. The `-rt`
+entry asserts the SET per constraint form AND a stated ⊤ per SINK, each
+watched failing against a sabotage build (see the entry's header for the
+six that fail and the one that is proven redundant instead).
+
+**Status: increments 1-4 done - #116 IS COMPLETE.** #115 is migrated
+(`snapshot_indirect_callees` asks `callee_set`/`callee_escaped`, and
+closing the multi-site hole was the first thing the real answer bought
+- see gate (c) above); 0 of 126 corpus programs changed. Increments
+increment 3 migrated `value_instantiate_round` and DELETED
+`finfos`/`escaped_finfos`/`note_escaped_into`/`drain_escapes`,
+reverting the `join` union - `StaticType` describes shape and nothing
+else again, and `stamp_proven_params` (C3) gained `callee_escaped` to
+replace the half of `value_escaped` the ledger used to supply.
+
+**Increment 4 handed the answer to the RESOLVER** via
+`CallExpr::callee_fn` - the single function a call can reach, stamped
+by the inferencer, read by the #93 ESCAPE ANALYSIS where its own slot
+lookup fails (`f(x)` with `f` a parameter, or a closure in a variable,
+has no global slot and used to poison the whole enclosing function).
+⛔ **MEMORY-SAFETY-CRITICAL**: #93/#94 make a false "safe" a
+use-after-free. Measured: `noesc_p_callee` 8 -> 4 corpus-wide,
+`noesc_cs_named` 6, one function un-poisoned, and `arg_borrow`
+UNCHANGED - the borrow set is identical, so the risk surface is a
+latent one and the whole `param_escape_analysis` table was re-watched.
+Full plan: `plans/callee-set-analysis.md`.
+
+**⛔ TWO CONSUMERS WERE DELIBERATELY NOT WIRED, and the reasons are
+rules:**
+
+ - **the step-7 PROVER (`callee_of`)** decides whether a program
+   COMPILES. The stamp exists only when inference ran, so wiring it
+   there would make **`-nti` change whether a program is REFUSED**. An
+   optimization may consult inference; a compile-error tier may not.
+ - **`direct_func_slot`** is not an identity question at all - it
+   records a global SLOT, backed by a runtime `is<FuncObject>` check,
+   and the analysis cannot improve it without flow sensitivity it does
+   not have.
+
+Also measured and not built: **`esc_callback_fn` never fails on the
+corpus** (`noesc_p_hobuiltin` is **0**), so migrating it would have
+been inert. Measuring the poison counters BEFORE writing any code is
+what redirected this increment from three consumers to the one with a
+payoff.
 
 ## The value & type model (the subtle part)
 
@@ -2092,7 +6410,8 @@ sanitizers never reproduced it.)
 - **The trivial / non-trivial boundary is `t_str`.** `TypeE` order matters:
   `t_none, t_lval, t_undefid, t_int, t_builtin, t_float, t_bool` (`< t_str`,
   trivial, stored inline,
-  bit-copyable) then `t_str, t_func, t_arr, t_ex, t_dict` (`>= t_str`,
+  bit-copyable) then `t_str, t_func, t_arr, t_ex, t_dict, t_struct, t_box`
+  (`>= t_str`,
   non-trivial, need the
   type-erased lifecycle ops). Hot paths branch on `type->t < Type::t_str` /
   `>= Type::t_str` (e.g.
@@ -2150,16 +6469,24 @@ sanitizers never reproduced it.)
   resolver's pass 1 collects the names functions read (`escaped`) and pass 2
   routes an escaped top-level var into the global table rather than a main-frame
   slot. **Not slotted (stay in the map):** REPL top-level names (open-world
-  redefinition) and anything genuinely unresolved (a truly-undefined name → the
-  runtime map → `UndefinedVariableEx`; the map fallback keeps the pass purely an
-  optimization). The resolver does a forward
-  lexical walk (no hoisting **for locals**, so `var x = x + 1` reads the outer
-  `x`; top-level *functions* ARE hoisted — see next bullet). **No per-slot
+  redefinition). **A name declared in NO scope is a COMPILE error since
+  FIX-1 (#130)** - `resolve_ref` refuses it rather than leaving it for the
+  runtime map, which was guaranteed to fail anyway (the script map is empty
+  and asserted). Two exemptions: a LAZY builtin's argument
+  (`defined`/`isconst`/`isconstdecl` never evaluate it - they ask a question
+  ABOUT the name, answered `false`) and the `_` placeholder. A name declared
+  BELOW its use is NOT this error - see `Scope::all_names`, the whole-scope
+  pre-scan that distinguishes them. The resolver does a forward
+  lexical walk (no hoisting **for locals**), but since the TDZ (#131) a use
+  that a LATER declaration in the same scope will shadow is a COMPILE error
+  (`UseBeforeBindingEx`) rather than a read of the outer binding - so
+  `var x = x + 1` is refused, where it used to read the outer `x`. Top-level
+  *functions* ARE hoisted, binding and all — see the next bullet. **No per-slot
   liveness**: a slot is default-constructed when the `Frame` is built, and a
   local can only *resolve* to its slot AFTER its decl (forward resolution), so a
   re-entered loop body re-binds its locals via their decls (which re-run each
-  iteration) and a use-before-decl resolves to an outer binding or errors via
-  the map — the slot's stale value is never observed. (This is why there is no
+  iteration) and a use-before-decl is a compile error (the TDZ, #131) — so the
+  slot's stale value is never observed. (This is why there is no
   script `undef`: removing a binding would need per-slot definedness; the REPL's
   `:undef` works on its map-resident globals instead.) Same-block duplicate
   declarations are caught here (`AlreadyDefinedEx`) so the runtime decl path can
@@ -2188,7 +6515,8 @@ sanitizers never reproduced it.)
   not a `dynamic_cast`.
 - **Top-level functions AND escaped variables are slotted in a GLOBAL table
   (`SymKind::global`).** A global symbol can't be a *frame* slot — a function
-  body runs parented to its definition scope (`capture_ctx` → root), not the
+  body runs parented to its definition scope (`capture_root`, the program
+  root), not the
   call site, so a global reference from deep in a recursion isn't in the current
   `frame`. Instead each top-level function AND each top-level variable some
   function reads gets a static slot in a program-wide **`GlobalFuncTable`**
@@ -2250,30 +6578,106 @@ sanitizers never reproduced it.)
   nested* functions doesn't resolve (each function's body resolves in its own
   scope stack, which doesn't see the enclosing scope's scoped globals) — it was
   already broken (a runtime `UndefinedVariableEx`), and stays so.
-  **FIXED CRASH (2026-07-14, `pWrapDeclBody` in parser.cpp):** a func (or
-  struct) decl as a **BRACE-LESS** `if`/loop body — `if (c) func g() => 1;`,
-  `while (i < 1) func g() => 1;` — ABORTED the tree-walker:
-  `hoist_scoped_decls` only pre-scans **Block** statement lists, so a
-  bare-statement body's decl was never hoisted to a scoped global; it fell to
-  `declare_masking` (a local map entry) and `FuncDeclStmt::do_eval`'s
-  `ctx->emplace` tripped the asserted-EMPTY script map
-  (`in_const_eval() || repl_mode`). The fix is a **TARGETED parser
-  normalization**: `pWrapDeclBody` wraps a brace-less body in a synthetic
-  single-statement `Block` **only when it is a func/struct decl** (the
-  crashing shapes, which nothing could have depended on). It is deliberately
-  NOT the blanket wrap first proposed, because a brace-less body **decl LEAKS
-  into the enclosing scope by long-standing behavior** — `if (c) var x = 5;
-  print(x)` prints 5, `if (c) const K = 7;` keeps `K` visible, a `while`-body
-  `var` too (all verified + pinned by tests) — and a blanket wrap would have
-  silently broken that. Two more preserved subtleties: the `if` applies the
-  wrap only to the RUNTIME statement, so a const-folded
-  `if (true) func g() => 1;` still folds to the bare decl (the feature-flag
-  pattern keeps `g` in the enclosing scope); and a PURE expr-bodied `g` is
-  const-folded/inlined at its call sites regardless of scope (a pre-existing
-  fold-vs-scope quirk, identical in both engines — the block-scoping tests
-  must use an IMPURE func). With the masked route gone, a SCRIPT's named
-  func/struct decl ALWAYS has a global slot — the VM codegen's `gen_stmt`
-  now `ML_CHECK`s that invariant instead of falling back.
+  **⛔ A BRACE-LESS BODY IS ITS OWN SCOPE — and getting there took three
+  fixes to the same two functions (`pStmtDeclaresName` / `pWrapDeclBody` /
+  `pBraceLessBody`, parser.cpp).** A declaration written as a brace-less
+  `if`/`else`/loop body used to land in the ENCLOSING scope, unlike its
+  braced form. The three ways that was wrong, in the order they were found:
+  - **(2026-07-14, a CRASH)** a func/struct decl there — `if (c) func g() =>
+    1;` — ABORTED the tree-walker: `hoist_scoped_decls` only pre-scans
+    **Block** statement lists, so a bare-statement body's decl was never
+    hoisted to a scoped global; it fell to `declare_masking` (a local map
+    entry) and `FuncDeclStmt::do_eval`'s `ctx->emplace` tripped the
+    asserted-EMPTY script map (`in_const_eval() || repl_mode`).
+  - **(2026-08-08, a SILENT WRONG ANSWER)** a `var`/`const` decl there stayed
+    visible after the statement even when the branch NEVER RAN, so its slot
+    held `none` while inference still proved the declared type — and the
+    engines then disagreed about a typed read of it:
+    `if (runtime(false)) var x = 5; return x + 1;` **printed 1 under the
+    JIT** (reading `none` as int 0), aborted `ML_VM_CHECK` under `-nj`, and
+    threw `TypeErrorEx` in the tree-walker. The JIT is NOT at fault — it
+    elides the tag check BECAUSE inference proved the type (see *static types
+    imply runtime guards*), and that proof is sound only once a declaration
+    cannot be skipped. **This is the general principle: a scoping hole is a
+    TYPE-SOUNDNESS hole here, because every unboxed tier is built on the
+    inferencer's proof.**
+  - **(2026-08-08, an OPTIMIZATION CHANGING SEMANTICS)** the const-folded
+    taken branch was hoisted UNWRAPPED, so const-eval changed scoping:
+    `if (1) func g() {...} g();` worked by default and threw
+    "Undefined variable 'g'" under `-nc`.
+
+  The fix: `pBraceLessBody` parses a brace-less body inside its own const +
+  CSE scope (pushed AROUND the parse — a `const` registers its VALUE as it is
+  parsed, so wrapping the finished statement is too late for
+  `if (c) const K = 7;`) and then `pWrapDeclBody` wraps it in a synthetic
+  single-statement `Block` **iff it DECLARES** (`pStmtDeclaresName`: a
+  `FuncDeclStmt`, a `StructDeclStmt`, or an `Expr14` carrying `pInDecl`).
+  A non-declaring body is left ALONE on purpose — a blanket wrap would put an
+  extra `Block` around `for (...) sum += a[i];` and perturb the shapes
+  for-range and LICM match on, for no scoping benefit. **ADD TO
+  `pStmtDeclaresName` if a new declaring statement form appears**; a missing
+  kind silently restores the leak. Both halves have watched-failing coverage
+  (`brace-less * is block-scoped` in tests.cpp: removing the `Expr14` case
+  fails 5, removing the const-scope push fails the const one).
+  Two subtleties that survive: a PURE expr-bodied `g` is const-folded/inlined
+  at its call sites regardless of scope (a fold-vs-scope quirk, identical in
+  both engines — the block-scoping tests must use an IMPURE func); and with
+  the masked route gone, a SCRIPT's named func/struct decl ALWAYS has a
+  global slot — the VM codegen's `gen_stmt` `ML_CHECK`s that invariant
+  instead of falling back.
+  **A NAMED func/struct decl BINDS AT SCOPE ENTRY, not where the statement
+  sits (#134, 2026-08-08).** So a call to a function declared BELOW it works,
+  mutual recursion works regardless of order, and a struct can be constructed
+  above its `struct` line — at EVERY scope, not just the top level. Sound
+  because such a declaration cannot depend on the enclosing frame: the grammar
+  REJECTS a capture list on a named func (`func f[a](x)` is a SyntaxError —
+  captures are for closure EXPRESSIONS only) and a named func's body is
+  parented to `capture_root`, the program root, so it cannot read an enclosing
+  local either. A LAMBDA is deliberately excluded: `var f = func(x) {...}` is
+  an `Expr14` var declaration, so it keeps its declaration-point binding and
+  its TDZ — its capture snapshot must happen where it is written.
+  TWO twins that must stay in lockstep, or the engines diverge on WHEN a name
+  becomes callable: `bind_hoistable_decls` (eval.cpp, both the scope_free and
+  general Block paths) and `gen_stmts`' decls-first emission (codegen.cpp).
+  **Re-entering a block re-runs them**, so a decl in a LOOP BODY is still
+  re-bound per iteration exactly as before.
+  ⛔ **MEASURING THIS NEEDS AN IMPURE CALLEE AND A `runtime()` STRUCT ARG.**
+  A tiny func is INLINED at the call site and a const-arg construction is
+  CONST-FOLDED — either makes a test pass without the binding ever being
+  needed, and both masked this bug for a long time (they are why the earlier
+  claim "top level already works" was believed).
+  **THREE PASSES MUST AGREE ON THIS, and the third was the last to learn
+  it (#136).** The resolver hoists the names (`hoist_scoped_decls`), the
+  engines bind them at scope entry (above) — and the INFERENCER's
+  structural pass has to pre-declare them per BLOCK too. It did that only
+  for the root (`hoist_globals`); inside a block it walked declarations in
+  statement order, so a call above the declaration got a callee whose
+  static type had not settled to `Func`, `annotate_hints` left
+  `CallExpr::vm_direct_func` false, and the codegen REFUSED to lower the
+  call (`NotLoweredEx`) while the tree-walker ran it. A struct used above
+  its `struct` line typed as `none`, so `p.x` became a bogus
+  `NullabilityEx`. The tell is `typestr`: `func inner()` before the decl
+  vs `func()->int` after, where the top level said `func()->int` in both.
+  **If you add a fourth pass that cares about declaration order, it needs
+  the same pre-scan.**
+  **⛔ AND THE PARSER NOW ORDERS THE TREE, WHICH IS WHAT MAKES ALL OF THEM
+  AGREE (question 21, decision A, 2026-11-16).** `pBlock` ends with a stable
+  sort of the block's statements: named func/struct decls first, then the
+  RUN-TIME `const` decls (a container, a function, a type alias) in source
+  order, then the rest - so a const binds at scope entry too, and a read
+  above its line sees it in every engine (the optimizers folded some such
+  reads and others raised UnboundSymbolEx, a RULE 2 divergence). The twins
+  above were not enough on their own: `compile_scalar_body` (loop and `if`
+  bodies) emitted a func decl where it was written, so a call above it in a
+  loop body raised UnboundSymbolEx under `-ni -nj` alone. Every pass and
+  every lowering walks the ordered tree, so no new one can miss it. A
+  const's value is computed while parsing and can name only what is above
+  it, so moving it changes no value; a const SCALAR has no run-time decl
+  (the parser substitutes it) and stays declare-before-use. The REPL's
+  INPUT keeps its order (`push_const_scope` false: it runs statement by
+  statement, and its echo reads the last one) - which is why
+  `emit_ctor_guard` (a construction through a global alias reads the alias
+  first) still exists: in a script the alias is always bound by then.
   **Scope, still map-bound:** lambdas (anonymous — no name binding; their
   params/locals ARE slotted) and, in the **REPL** (top-level names stay
   redefinable), all top-level names; template-instance clones, inserted before
@@ -2296,10 +6700,11 @@ sanitizers never reproduced it.)
   `in_const_eval()` walks the parent chain for a `const_ctx` ancestor, because
   AutoConst folds pure functions in throwaway non-const args contexts whose ROOT
   is the const `cctx` (so a struct/func decl inside a folded body legitimately
-  emplaces into a discarded map). A genuinely-undefined name at runtime reaches
-  `lookup` on an empty map → `UndefinedId` → `UndefinedVariableEx`, as before.
+  emplaces into a discarded map). Since FIX-1 (#130) a genuinely-undefined
+  name is refused at COMPILE time, so that runtime path is now reachable only
+  in the REPL (open world) - which is exactly why the invariant holds.
 - **Captured variables are slotted (`SymKind::capture`).** A closure's explicit
-  `[x,y]` capture list is snapshot into a per-instance `vector<LValue>`
+  `[x,y]` capture list is snapshot into a per-instance **`CaptureSlots`**
   **`FuncObject::capture_slots`** at closure creation (`func.cpp.h`), in
   declaration order; a body reference to a captured name resolves to
   `SymKind::capture` + its index there, read/written via **`EvalContext::
@@ -2319,9 +6724,16 @@ sanitizers never reproduced it.)
   / global / capture assignment fast paths). `clone()` of a capturing
   `FuncObject` deep-copies `capture_slots` (independent per clone); a
   non-capturing one clones to itself (the `capture_slots.empty()` check in
-  `TypeFunc::clone`). `capture_ctx` survives only as the empty linking context
-  that parents the body's args-context to root (for `gfuncs` + the builtins
-  map).
+  `TypeFunc::clone`). **`CaptureSlots` (eval.h) is a hand-rolled tiny vector,
+  not a `std::vector`** (G2, 2026-08-06): `inline_cap` (2) slots live inside
+  the `FuncObject`, so the common closure — every capture list in bench/,
+  samples/ and tests/functional/ is exactly ONE name — allocates NOTHING,
+  and only a wider list takes a heap buffer. **Its data pointer MUST stay the
+  FIRST member**: the JIT walks `ctx->captures->data()` as a bare
+  `mov r9,[rax+0]` (`emit_ctx_chain_r9`), which is where libstdc++ puts
+  `vector`'s `_M_start`; a `static_assert` in `layout_contract()` enforces it.
+  A `CaptureSlots` is neither movable nor assignable, since its pointer may
+  point into itself.
 - **Builtins are slotted (`SymKind::builtin`).** A builtin reference the
   resolver couldn't shadow with a user symbol resolves to `SymKind::builtin`
   plus an index into the program-wide **builtin table** (`builtin_slot`,
@@ -2332,8 +6744,9 @@ sanitizers never reproduced it.)
   symbols` map is **empty and never a resolution path** (asserted — see *The
   script runtime symbols map is EMPTY* above): the map is populated only by the
   REPL (open-world redefinition) and the parse-time const-evaluator (which runs
-  before slots exist). A genuinely-undefined name reaches `lookup` on an empty
-  map and surfaces `UndefinedVariableEx`. **A user symbol always wins** — the resolver checks scopes (local/param/capture)
+  before slots exist). Since FIX-1 (#130) such a name is a COMPILE error in a
+  SCRIPT, so that path is now REPL-only. **A user symbol always wins** — the
+  resolver checks scopes (local/param/capture)
   then the global table (user functions + escaped vars) BEFORE the builtin
   table, so a `func len(x)` shadow resolves to `SymKind::global` and the builtin
   is unreachable by name (`var <builtin>` for a *const* builtin is still a
@@ -2389,8 +6802,58 @@ sanitizers never reproduced it.)
   C++ exceptions:**
   runtime errors (`RuntimeException` subclasses), user `throw`
   (`ExceptionObject`), and `rethrow`
-  (`RethrowEx`, defined locally in `eval.cpp`) — caught by
-  `do_catch`/`TryCatchStmt`.
+  (it raises `FlowState::handling`, the exception the innermost RUNNING
+  catch body of the invocation handles, so a `try` around the `rethrow`
+  inside that body catches it, as in the VM - question 8; the private
+  `RethrowEx` it threw instead reached only the catch's own `do_catch`,
+  skipping that `try`) — caught by `do_catch`/`TryCatchStmt`.
+- **⛔ EVALUATE OPERANDS INTO LOCALS, LEFT TO RIGHT - NEVER AS TWO
+  ARGUMENTS OF ONE CALL (2026-10-05).** C++ leaves the order of a call's
+  arguments unspecified and GCC evaluates them RIGHT TO LEFT, so
+  `typed_cmp(op, a->eval_int(ctx), b->eval_int(ctx))` ran `b` first: in a
+  GCC-built tree-walker `a() < b()` and `x[f():g()]` called the right
+  operand first, while the VM, the JIT and a clang build went left to
+  right (RULE 2, printed output). Found by the value-class work, which had
+  to restructure exactly that line; pinned by
+  `tests/functional/62_eval_order.my` (an event log - a value assertion
+  cannot see a reorder).
+- **⛔ A PARAMETER THAT IS NOT `opt` NEVER HOLDS `none` - THE BIND
+  REFUSES IT (RULE 1, 2026-10-05).** The static check refuses an `opt`
+  argument, but a `dyn` value is non-opt by type and may hold none at run
+  time, so every bind path checks: the tree-walker's `bind_param` (first
+  thing, before the coercion; and `do_func_bind_params` now EVALUATES
+  EVERY ARGUMENT before the arity check and the binds, as the VM's staged
+  run always did - it used to evaluate each argument just before its own
+  bind, so a refusal skipped a later argument's side effect); the generic
+  dyn-callee op and the callback invoker (`bind_fault`, eval.h); and
+  for `CallV`/`CachedCallV`/`CallValueV`, whose native tiers bind raw, a
+  `CheckNoneArgsV` that codegen emits before the call ONLY where
+  `CallExpr::check_args()` holds - a none, or (#49) a misfit, may reach
+  the bind (docs/vm-ops.md has the rules). The
+  AST inliner keeps such a call a call (`Inliner::binds_none`). **Two
+  facts other passes may lean on:** a non-opt parameter never written in
+  its body cannot hold none (the inferencer's mask and the inliner clear
+  such an argument), and an operator chain or a non-none literal cannot
+  evaluate to none (`CallExpr::arg_never_none`). A new bind path must
+  call `bind_fault` or sit behind the op; a new call op that binds
+  raw must be preceded by it.
+- **⛔ `&&` / `||` SHORT-CIRCUIT — in THREE places that must agree (#138,
+  2026-08-09).** The determining operand (false for `&&`, true for `||`) stops
+  the chain: the rest is not evaluated, so its side effects do not happen and
+  its errors are not raised. Before this only the CONST-FOLD skipped the tail,
+  so `const F = false; F && side()` skipped it while
+  `runtime(0) > 1 && side()` did not — the same operator, two behaviours,
+  decided by whether const-eval could see the operand.
+  The three implementations are **`Expr11`/`Expr12::do_eval`** (the boxed
+  tree-walker), **`TypedScalarExpr::eval_int_body`'s `Cat::logical`** (the M8
+  typed form), and **`emit_logical_chain`** (codegen — a logical chain is the
+  one boxed chain that is NOT a straight op run: it needs real branches, one
+  `JumpUnlessTrueV` per operand plus an extra `Jump` for `||`, every path
+  writing the SAME dst). Which form a node gets is an inference detail the
+  program cannot see, so a divergence between them is invisible until it
+  bites. **A VALUE assertion cannot test any of this** — `a && b` was always
+  `bool(a) && bool(b)`, so only side effects and errors changed; test with a
+  call counter or a would-throw tail.
 - **`Construct::eval()` wraps `do_eval()`** to attach the node's source `Loc` to
   any in-flight
   `Exception` that doesn't already carry one — this is how runtime errors get
@@ -2398,14 +6861,38 @@ sanitizers never reproduced it.)
   Override `do_eval`, not `eval`.
 - **Function call scoping is lexical/closure-based, and the call model is
   AST-FREE.** `do_func_call` binds params into an `args_ctx` whose parent is
-  the function's **`capture_ctx`**, not the call site. A `FuncObject` holds a
+  the function's **`capture_root`**, not the call site. A `FuncObject` holds a
   **`const FuncDescriptor *`** (funcdesc.h — NEVER a `FuncDeclStmt*`), the
   per-instance **`capture_slots`** (captured values, read via
   `SymKind::capture`; snapshot at creation from the descriptor's RESOLVED
-  capture kind/slot list via `read_sym`, the descriptor twin of
-  `Identifier::do_eval` — no capture Identifier is evaluated), and that
-  `capture_ctx` — an empty context parented to the *root* whose only job is
-  to link the body's `args_ctx` to root (for `gfuncs` + the builtins map).
+  capture kind/slot list via **`read_sym_lv`**, the descriptor twin of
+  `Identifier::do_eval` — no capture Identifier is evaluated), and
+  **`capture_root`** — the program root (`EvalContext::root`), which
+  the body's `args_ctx` parents to so it reaches `gfuncs` + the builtins map.
+  **⛔ `read_sym_lv` IS THE DISPATCH; `read_sym` IS A WRAPPER OVER IT
+  (#114, 2026-08-27)** — every answer either can give except an
+  `UndefinedId` is a slot, and `read_sym` boxed its ADDRESS into an
+  `EvalValue` purely so the caller could unbox it again with `RValue()`.
+  The capture snapshot took the slot directly and built its `LValue` in
+  place, turning FOUR `EvalValue` lifecycle events per captured value
+  (box the address, copy out, move in, destroy the temporary — each with
+  its own `type->t >= t_str` test) into ONE. `read_sym_lv` returns null
+  EXACTLY where `read_sym` answers `UndefinedId`, i.e. where the
+  following `RValue()` throws, so a caller's fallback is the ERROR path
+  and the two cannot disagree about a value. **`EvalContext::root`** is
+  the same shape one level down: inherited from the parent like `frame`
+  / `gfuncs` / `captures`, where `get_root_ctx` used to WALK the parent
+  chain per closure. The trade is one store per EvalContext against one
+  walk per closure, and it is lopsided the right way *because the VM+JIT
+  call protocol builds no EvalContext per call* — measured at ~30k Ir of
+  EvalContext construction in a program that creates 400,000 closures.
+  Together: **113 -> 85 Ir per closure creation, 63_closures -4.22% Ir
+  and 0.95x wall.**
+  That used to be an `EvalContext capture_ctx` BY VALUE, an empty node whose
+  only job was to be that parent; constructing one cost ~39 Ir per closure and
+  carried a `std::map` nobody wrote, and since the ctor inherits
+  repl_mode/frame/gfuncs/captures from the parent and the node passed all four
+  through unchanged, parenting straight to the root is byte-identical (G2).
   Binding reads the descriptor's `ParamDesc` snapshot (uid, opt, const,
   decl_type); the tree-walker reaches the body via `desc->decl` (null after
   the `-vm` AST teardown, where every call runs the compiled chunk). The
@@ -2467,13 +6954,17 @@ sanitizers never reproduced it.)
   tail-inliner / specializer all bail on an arg-count ≠ nparams mismatch, so an
   under-arity call simply runs through `do_func_call` at runtime (correct).
 - **Const parameters.** A param declared `const` (`func f(const x, y)`, parsed
-  by `pFuncParam`, flagged `Identifier::const_param`) is bound as a const
-  `LValue`, so reassigning it throws — caught at compile time by the resolver
-  (a `const` param with a nonzero body write count → `CannotRebindConstEx`) and,
-  as a fallback, at runtime. Params are otherwise bound **mutable** — even
-  during const-eval — so a (pure) function may reassign its own by-value params;
-  binding const-ness is keyed off `const_param`, *not* `ctx->const_ctx`. A plain
-  param the resolver finds is never reassigned (`slot_writes == 0`) is tagged
+  by `pFuncParam`, flagged `Identifier::const_param`) may not be REASSIGNED -
+  a compile error from the resolver (a `const` param with a nonzero body
+  write count → `CannotRebindConstEx`); a struct, box or class it holds is
+  read-only by the inferencer's `check_const_param_store`. **Every parameter
+  is BOUND mutable at run time** (`bind_param`), in every engine and during
+  const-eval too: the binding's const-ness used to reach the tree-walker's
+  in-place builtins, which refused `append(a, 9)` through a `const a` (and
+  sorted a copy) where the VM changed the caller's array, and a callback a
+  builtin ran at compile time could not reassign its own parameter (2026-10-11,
+  RULE 2). A deeper `const` is plans/immutable-views.md. A plain param the
+  resolver finds is never reassigned (`slot_writes == 0`) is tagged
   `auto_const_param` (effectively const; used by `isconst()`).
 - **`clone()` semantics differ by capture.** A non-capturing `FuncObject` clones
   to *itself* (shared
@@ -2517,19 +7008,33 @@ sanitizers never reproduced it.)
   `i`/`f` — the usual case, incl. flat-array elements and POD fields that have
   no `LValue`) it routes the mutation through `handle_single_expr14`
   (`operand += 1`), reusing every store fast path (slot, flat array, COW,
-  struct), and **derives `old = new ∓ 1`** for postfix so it never re-reads the
-  operand; a `dyn`/un-hinted operand (always `LValue`-backed) goes through a
-  read-modify-write so the int/float requirement is enforced at runtime. The
+  struct), the store reporting the value it replaced (`old_out`, through
+  `handle_single_expr14` / `subscript_store` / `member_store` /
+  `flat_store_core`), which postfix returns. ⛔ It used to DERIVE `old = new
+  ∓ 1`, which is exact for an int and not for a float: `(0.1 + 1) - 1` is not
+  0.1, `(1e-20 + 1) - 1` is 0.0, and -0.0 came back +0.0 (the tree-walker for
+  every lvalue but a local, the VM's IncDecChainV for an impure index;
+  `tests/functional/67_incdec_exact_old.my`). A `dyn`/un-hinted operand goes
+  through a read-modify-write so the int/float requirement is enforced at
+  runtime - for an element or a field, ONE implementation every engine
+  shares (`dyn_incdec_elem` /
+  `dyn_incdec_member`, eval.cpp: the tree-walker, the VM's
+  IncDecElemCheckedV / IncDecMemberCheckedV and IncDecChainV's tier 3). A
+  flat array's element and a POD field have no `LValue`, so a rooted one
+  is read, checked and stored back as `+= 1` stores it; until 2026-10-05
+  all four copies raised NotLValueEx there, so every `a[i]++` under -nti
+  failed. The
   **inferencer** types it (`type_of` = `operand ± 1`) and the **check pass**
   rejects a non-lvalue, a `const`, or a non-int/float operand (bool included) at
   compile time — `var b=true; b++` is a `TypeMismatchEx`, not a silent int.
   The **resolver** counts it as a write (`count_write`), so a `++`'d var is not
   auto-const-promoted; the **inliner** refuses to inline an expression body that
   reassigns a SCALAR param (`func f(x)=>x++` — `mutates_a_param`), since the
-  param is a by-value copy (a mutation *through* a param — `p.x++`, `a[i]++` —
-  is allowed: that already has reference semantics, so inlining matches the
-  call). Lexing is maximal-munch, so `--1` is decrement-of-`1` (a compile error,
-  like C), not `-(-1)`.
+  param is a by-value copy (a mutation *through* a param — `a[i]++` — is
+  allowed: an array is a reference, so inlining matches the call; through a
+  struct param - `p.x++` - the argument is temp-bound instead, since a
+  struct is a value). Lexing is maximal-munch, so `--1` is
+  decrement-of-`1` (a compile error, like C), not `-(-1)`.
 - **Dict access: throw-on-missing-read, insert-on-write, or default.**
   `TypeDict::subscript(what, key, for_write)` and `MemberExpr::do_eval` (which
   share the logic) handle a missing key by: returning the dict's default (a
@@ -2572,17 +7077,85 @@ the atomic-refcount churn from copy-heavy array/dict code. **Gotcha:**
 fresh count, never the original's (else it would never be freed). `use_count()`
 keeps shared_ptr's meaning (handles sharing the pointee), so the `> 1` COW tests
 are unchanged.
+**⛔ A COUNTED OBJECT IS FREED THROUGH `destroy_counted`, NEVER A BARE
+`delete` (2026-10-12).** Freeing an object releases what it holds, so a
+CHAIN - a linked list of class nodes, arrays or dicts nested 100k deep,
+a `box` of a struct holding the next box - was freed by RECURSION, a few
+C++ frames per link: a 20000-node list overflowed a debug build's stack
+and a 1M-deep one a release build's (RULE 1: a SIGSEGV), wherever its
+head was dropped, program exit included. `intrusive_ptr::destroy` and
+`sobj_release` (the flat class array's raw counts) call
+`destroy_counted` (intrusiveptr.h): up to `DESTROY_MAX_DEPTH` (32)
+deletions nest as before, a deeper one is QUEUED, and the outermost one
+empties the queue before it returns - the recursion is bounded, the
+order of destruction changes, and nothing else does (no destructor runs
+program code). A new place that drops a count to 0 by hand must call it
+too. The depth rule is ONE non-template function (`destroy_any`, fed a
+typed `destroy_delete<T>`): a branch in the template is a coverage
+element per counted type, and no program queues a string. Nets: the
+`release:` `-rt` case (200 deep, the coverage unit) and
+`tests/functional/92_long_chain_release.my` (watched failing:
+ASan stack-overflow with `destroy` back to `delete`). The VALUE walks
+(print, `==`, hash, the deep copies, the `.myv` codec) still recurse
+per level of a deep value - a separate open item.
 
-- **`SharedStr`** (`sharedstr.h`): immutable `intrusive_ptr<StrObj{string}>` +
-  `off`/`len` slice view (StrObj just wraps the string so it can carry the
-  count). Slices are
-  cheap views; strings are never mutated in place. Copies are forbidden
-  (`= delete`), only moves —
-  enforcing the no-accidental-copy intent.
+- **`SharedStr`** (`sharedstr.h`): an `intrusive_ptr<StrObj{string}>` plus an
+  `off`/`len` WINDOW (StrObj just wraps the string so it can carry the count).
+  Copies are forbidden (`= delete`), only moves — enforcing the
+  no-accidental-copy intent.
+  **THE WINDOW MODEL (2026-08-06):** EVERY SharedStr is a window over a
+  shared, APPEND-ONLY buffer — what a slice always was; a "full" string is
+  just the window that covers the whole buffer. Because the buffer only ever
+  GROWS (the one in-place mutation is `TypeStr::append`), a window taken at
+  any moment keeps denoting the same characters forever — that single fact is
+  the entire soundness argument, and it is what gives strings their
+  documented VALUE semantics with **no copy-on-write clone at all**: after
+  `var b = a; a += "!"`, `a`'s window grew and `b`'s did not, so `b` still
+  reads "hi" while sharing the buffer. Three things to preserve: `len` is
+  AUTHORITATIVE for both forms (so `size()` is a field read, not a load
+  through `obj`); `append` may grow in place ONLY when `owns_whole_buffer()`
+  (this window ends where the buffer ends — otherwise it would swallow the
+  bytes past a PREFIX window, so it rebuilds); and `after_inplace_append()`
+  must BOTH resync `len` AND drop `obj->hash_valid`, because the StrObj's
+  cached hash is the hash of the WHOLE buffer — without that, a string used as
+  a dict key and then appended to lands under a stale hash and becomes
+  findable by NO key while still printing and comparing equal.
+  Before this, `append` grew the shared string with NO test, so an alias, a
+  bound parameter, an array element and even `clone()` saw a later `+=`,
+  contradicting the README. The naive fix (`use_count() == 1`) is WRONG and
+  was measured: the compound path copies the value out of the slot first, so
+  the count is never 1 and every append rebuilds — 28_str_concat **+18268%
+  Ir**, O(n²).
 - **`SharedArrayObj`** (`sharedarray.h`):
-  `intrusive_ptr<SharedObject{ vec, set<live slices> }>` +
-  `off`/`len`/`slice`. A slice registers itself in the parent's `slices` set
-  (and unregisters on
+  `intrusive_ptr<SharedObject{ vec, registry of live slice handles }>` +
+  `off`/`len`/`slice`/`group`. **⛔ A SLICE FOLLOWS PYTHON'S RULE
+  (question 3, plans/open-language-questions.md, 2026-10-18): it is a NEW
+  array when TAKEN, and every later copy of it - an assignment, an
+  argument, an element stored or read back, a capture, a struct field - is
+  the SAME array.** Internally it stays a lazy copy-on-write VIEW: every
+  handle carries the window, and `group` names WHICH slice it is among the
+  views of its storage (the copy constructor keeps it; a slice expression
+  takes a fresh one, `new_slice_group`, renumbered densely before the
+  per-storage counter would wrap). The storage's registry is keyed by
+  group, so a write through ANY handle - `materialize_slice()` - finds its
+  siblings and reseats the whole group onto ONE fresh copy, and a write to
+  the storage - `clone_aliased_slices(idx)` - materializes each
+  overlapping group once. Four rules a new site must keep: **a write
+  through a slice calls `materialize_slice()`, never
+  `clone_internal_vec()`** (that one copies THIS handle only - `clone()`
+  and building a fresh array from a handle; used for a write it gives the
+  writer a private copy, the pre-2026-10-18 rule); **an op that changes a
+  slice's window acts on the whole group** (pop/erase used to narrow one
+  handle's window - they materialize now); **an empty slice is a fresh
+  group** (`arr_empty_slice`), never the shared `empty_arr`, whose copies
+  would all be ONE array; and **a raw bit-copy of a slice handle is
+  forbidden** (#94's borrow declines it) - an unregistered handle is not
+  moved by a materialization. A foreach over a slice marks -1 and checks
+  for a shift only once the slice was materialized under it
+  (`fe_shifted`; the JIT's inline ArrEpochCheck tests the slice byte).
+  Net: `tests/functional/96_slice_alias.my`, the `slice:` `-rt` cases and
+  `slice_group_identity`. A slice registers itself in its storage's
+  registry (and unregisters on
   move/destroy — **and on `operator=`**: a copy/move *assign* into a
   slice-holding value must first `slices.erase(this)` from its OLD `shobj`, or
   that set keeps a **dangling pointer** to a value that now holds a different
@@ -2592,7 +7165,7 @@ are unchanged.
   path and freed the memory, so the stale registration became a genuine
   use-after-free — UBSan-caught during an array COW). Writing through an
   array-element `LValue`
-  (`LValue::get_value_for_put` in `eval.cpp`)
+  (`LValue::write_target` in `eval.cpp`)
   triggers COW: if the container is a slice, or is aliased (`use_count > 1` /
   has live slices), it is
   cloned first so the write doesn't bleed across logically-distinct arrays.
@@ -2620,9 +7193,46 @@ are unchanged.
   join (direct SharedStr reads), foreach (a tree-walker do_iter branch
   + the VM LoadElemValue strs arm), clone/const-clone stay flat
   (strings are immutable - a handle copy IS the deep copy); sum/min/max
-  promote a LOCAL handle copy (the caller keeps flat; min/max's old
+  walk a `general_copy()` (the caller keeps flat; min/max's old
   `!= general` guard mis-read the union for strs AND structs - a
   latent pre-existing struct-array InternalError, fixed the same way).
+  **⛔ A PROMOTION IS IN PLACE, ON THE SHARED STORAGE (#53b,
+  2026-09-25).** It used to RESEAT the handle it ran on, so a cold op
+  through one variable left every alias on the old storage: `var f =
+  e; pop(f)` shrank f and not e, breaking "assignment aliases" for
+  exactly the two flat kinds that promote. A SLICE handle is
+  materialized first (every handle of the slice), then promoted in
+  place like any array. A READ-only general walk
+  must use `general_copy()`, never `get_vec()` on a handle copy - the
+  copy shares the storage, so it would promote the caller's array.
+
+- **Flat CLASS storage (`Storage::objs`, plans/class-and-box.md step 2)**
+  - `ovec_type` (sharedarray.h), a vector of `StructObject *`, each
+  non-null entry an OWNED count (null is `none`): 8 bytes per element of
+  an `array<C>` / `array<C?>` of a class. sharedarray.h cannot see
+  `StructObject` complete, so the count moves through the out-of-line
+  `sobj_retain` / `sobj_release` (types/arr.cpp.h); `obj_elem_value` /
+  `obj_elem_ptr` / `is_obj_elem` (structtype.h) convert an element to a
+  value and back. The strs model again: creation is TYPE-driven
+  (`ArrHint::flat_c`, set_array_repr_hint) and VALUE-driven for a
+  literal of class instances (`build_array_from_values` mode 6 - so a
+  constant's array is flat, built before inference); any class instance
+  or `none` fits, anything else PROMOTES in place, and every op without a
+  flat arm promotes through `get_vec()`. Flat arms: arr_elem_at/boxed,
+  flat_store_core, append (arr_push_value), pop, reverse, clone,
+  clone_to_mutable / make_const_clone (each element through the walk, so
+  a constant's instances are frozen in place), the `.myv` array record
+  (v34's `objs` kind) and the cycle guard's `cyc_any_child` (the array
+  itself is not keyed: a cycle through it passes through a keyed class
+  instance). An element is READ as a value (no LValue), so a store
+  THROUGH it (`a[i].v = 5`) is rooted by the instance itself: a class
+  instance read as a value is a location (`store_rooted` in the
+  tree-walker, `vm_member_lvalue_ref` and the chain store's final member
+  step in the VM) - `CannotChangeConstEx` for a constant's. The JIT's
+  boxed-element READ tier has an arm for it (class step 4: retain the
+  object, store the pointer and the `t_struct` tag; a null entry
+  declines); the other element tiers decline the kind to their helpers.
+  `array_storage()` reports `"class"`.
 
 - **Flat (unboxed) int/float/bool storage.** `SharedObject` carries a `Storage
   kind` (`general`/`ints`/`floats`/`bools`) and an **anonymous union** of `vec`
@@ -2648,15 +7258,43 @@ are unchanged.
   `d[0]="x"` would wrongly hit the flat-array error on an already-`dyn` var).
   Creators honor it: `range`, `builtin_array` (1-arg `flat_i`/`flat_f`/`flat_b`
   → flat `0`/`0.0`/`false` fill, replacing the old `array(N)` rewrite;
-  `general` → general),
+  `general` → general; any other element type the call's `ctype` names
+  is filled with its ZERO VALUE, a fresh one per element -
+  `annot_zero_value` (types/fit.cpp.h), the run-time twin of the
+  parser's `T x;` zero code, which the inferencer also asks, at the
+  call, to refuse an element type with none: choice 6,
+  plans/strict-container-types.md),
   `make_array`, `keys`/`values` (`dict_extract` — a scalar dict's keys/values
   build a flat `array<int>/<float>/<bool>` straight from the dict, no
   per-element boxing; the big win for `keys()`/`values()` of a large dict, and
-  why `bench/27_dict_keys_values` beats CPython — only the bound form
-  `var k = keys(d)` gets the hint, an inline `keys(d)` arg stays general),
-  `LiteralArray::do_eval`, and `LiteralObj::do_eval` (a flat baked
-  literal bound to an `array<dyn>` dest is made general via
-  `make_general_array_clone`).
+  why `bench/27_dict_keys_values` beats CPython — the bound form
+  `var k = keys(d)` takes the variable's hint (`set_array_repr_hint`), and
+  since rule 4 (2026-11-21, plans/strict-container-types.md) every other
+  position - an argument, a result, a field, an element - takes the hint
+  of the type the call has there (`stamp_ctypes`), so an `array<int>` is
+  flat wherever it is made; an inline `keys(d)` was general),
+  `LiteralArray::do_eval`, and - for a value baked at parse time, a
+  `LiteralObj` - the compiler itself: it REBUILDS the baked value in the
+  hinted storage (`widen_baked_value`, from `set_array_repr_hint`, the
+  parser's `stamp_literal_annot` and `stamp_literal_repr`), so
+  `LiteralObj::do_eval` / LoadLiteralObjV convert nothing and the `.myv`
+  literal pool carries no hint (v41). **⛔ A folded value takes the hint only where
+  its UNFOLDED node would (#97, 2026-10-24):** `LiteralObj::takes_hint`
+  (set by `cse_materialize` from the node it replaces: a container literal,
+  or a call to one of `builtin_takes_arr_hint`'s builtins - the one list,
+  shared with the inferencer's stamp). `set_array_repr_hint` and the
+  parser's `stamp_literal_annot` stamp a LiteralObj only when it is set -
+  they stamped every one, so a folded `clone(K)` / `sort(K)` / `a + b`
+  bound to a `dyn` variable was general where `-nc` kept it flat, and a
+  write the program refused under `-nc` succeeded. **And where it takes
+  the hint, the value is REBUILT in that storage (2026-11-11)** - the
+  parse folded it with no destination, and the run-time conversion this
+  replaced handled only an EMPTY array for a flat hint, so a folded
+  `var v = values({"a": 1})` stayed general where `-nc` built it flat:
+  the same RULE 2 difference in the other direction
+  (`tests/functional/109_folded_builtin_storage.my`). A new pass that
+  stamps a baked value's hint must rebuild the value too; nothing
+  converts it later.
   The fixpoint propagates the destination type through direct aliases
   (`var b = a`), so they agree. Value-driven flat (`dflt`) is the fallback for
   contexts the hint doesn't cover. The flat fast paths (each branches on
@@ -2668,9 +7306,16 @@ are unchanged.
   `writelines`, `TypeArr::{subscript (rvalue read), to_string, eq, add}`,
   `Subscript::eval_int`/`eval_float`, the array-spread reads
   (idlist/`foreach`-tuple, via `arr_elem_boxed`), and the flat subscript-store
-  `try_flat_subscript_store` (`eval.cpp`: `a[i] = v` / `a[i] OP= v` writes the
-  scalar straight into the flat vector — gated on a side-effect-free lvalue
-  *chain* via `no_side_effects`). `arr_elem_at`/`arr_elem_boxed` box a flat bool
+  (`subscript_store` -> `flat_store_core`, `eval.cpp`: `a[i] = v` /
+  `a[i] OP= v` writes the scalar straight into the flat vector). ⛔ A STORE
+  EVALUATES ITS BASE AND KEY ONCE, LEFT TO RIGHT, AND STORES TO WHAT THEY
+  NAMED (2026-10-05): this path was gated on a side-effect-free lvalue chain
+  (`no_side_effects`), and an impure one (`a[f()][0] += 1`) fell to the
+  general path, which evaluated the lvalue AGAIN and found no `LValue` in a
+  flat element - NotLValueEx in the tree-walker while the VM stored it. The
+  VM's inc-dec chain mirrored the gate (`allow_flat`/`allow_pod`, gone in
+  myv v27). `member_store` is the POD-field twin.
+  `arr_elem_at`/`arr_elem_boxed` box a flat bool
   element as a real `bool`; `sum` of an `array<bool>` returns an int (counts the
   trues). `clone_internal_vec`, `make_const_clone`, and
   `clone_to_mutable` are kind-aware so clone/COW/const keep flat. `size()` is
@@ -2683,9 +7328,9 @@ are unchanged.
   Since the storage stays int-typed and an alias-affecting write can't change
   its representation without promotion, that **throws a `TypeErrorEx`** (message
   `flat_array_violation_msg`) — declare the array `dyn` from the start, or
-  promote an existing one with the **`dynarray(a)`** builtin
-  (`builtin_dynarray`: a fresh general copy, typed `array<dyn>`, usable in any
-  position; `clone`/`deepclone` deliberately preserve the layout). `runtime()`
+  promote an existing one with a cast, **`cast<array<dyn>>(a)`** (a fresh
+  general copy, typed `array<dyn>`, usable in any position - see THE CAST
+  below; `clone`/`deepclone` deliberately preserve the layout). `runtime()`
   does *not* promote — it only relabels the static type, not the storage.
   `array_storage(a)` reports the element-type name
   `"int"`/`"float"`/`"bool"`/`"struct"`/`"general"` (tests pin it). **Gotcha:**
@@ -2694,13 +7339,156 @@ are unchanged.
   `get_view()`/`get_vec()` (now they'd throw on flat anyway). `array()` is a
   **non-const** builtin (never folds to a baked literal, so `array(N)` is always
   a runtime call the hint reaches, and a huge `array(1000000)` isn't baked). See
-  `plans/typed-arrays.md` (approach B) and
-  `plans/type-driven-specialization.md`.
+  `plans/archived/typed-arrays.md` (approach B) and
+  `plans/archived/type-driven-specialization.md`.
 - **`DictObject`** (`shareddict.h`): the value handle is
-  `intrusive_ptr<DictObject>` (the object inherits `RefCounted`); the map is a
-  **`std::unordered_map<EvalValue, LValue>`** inside it — an O(1) hashmap (NOT a
-  sorted tree), keyed by `std::hash<EvalValue>` (→ `EvalValue::hash()` →
-  `Type::hash`) and `EvalValue::operator==`.
+  `intrusive_ptr<DictObject>` (the object inherits `RefCounted`); the map is
+  an **`OrderedHashMap<EvalValue, LValue>`** (`orderedmap.h`) inside it — an
+  O(1) chained hashmap keyed by `std::hash<EvalValue>` (→
+  `EvalValue::hash()` → `Type::hash`) and `EvalValue::operator==`, whose
+  entries also form a list in **INSERTION ORDER** (#50, maintainer
+  2026-10-12): every walk over a dict - foreach, `keys`, printing, a copy,
+  the `.myv` writer - visits that list, so the order is the PROGRAM's,
+  identical in every engine, standard library and image (a
+  `std::unordered_map`'s order was libstdc++'s or libc++'s, and a rebuilt
+  map - a deep copy, a load - came out differently, so a folded dict and
+  the same dict built at run time printed in two orders). A store over an
+  existing key keeps its place; an erased key inserted again goes last; `==`
+  and `hash` ignore the order. The node never moves until erased (held
+  `LValue*`s rely on it), its hash is cached (a copy hashes nothing), and
+  the equality test keeps libstdc++'s argument order (the looked-up key on
+  the left).
+- **⛔ A CONTAINER CARRIES ITS OWN TYPE (Q2, plans/typed-containers.md,
+  increment 1, 2026-11-17).** `SharedObject::ctype` / `DictObject::ctype`:
+  the type an array or a dict was MADE with, an interned `TypeAnnot`
+  (`annot_intern`, structtype.h; equal types are one pointer, so comparing
+  them is a pointer compare), or null (UNTYPED). The compiler stamps
+  every node that makes one (`Construct::ctype`, copied by
+  `copy_base_fields`): a literal gets the type `stamp_literal_coerce`
+  builds it for (a fixed place's, the variable it is assigned to - which
+  `set_array_repr_hint` now gives an inferred variable too - its parent
+  literal's element type, else its own), `array<dyn>` / `dict<dyn,dyn>` in
+  a place declared `dyn`; a container-building builtin gets it through
+  `ArgLocs::ctype` (`builtin_builds_container`, and the `ctyped_*`
+  wrappers at registration, so every engine stamps alike); a baked
+  mutable value is restamped (`ctype_restamp`, copied when another node
+  already typed the shared value) - ONLY when it stands for a node that
+  types its container by its place, a literal, such a builtin's call or
+  an array sum (`LiteralObj::typed_by_place`, the parser's
+  `node_typed_by_place`, `takes_hint`'s twin). A folded USER function's
+  result keeps the type its function made it with, as the unfolded call
+  does: restamped by a `dyn` place, it accepted a store `-nc` refused
+  (RULE 2, `tests/functional/125`). Any OTHER mutable container a bake
+  would hold untyped - an element or a field of a literal, `get!` of
+  one: typed where its literal was made, which the value no longer says
+  - is not baked at all (`bake_untypable`, parser.cpp; a deferred fold
+  keeps it as a witness), so it runs as it does unfolded. UNTYPED: a
+  constant's (read-only - no store can change it), an empty literal
+  nothing filled, and a literal a fit check examines where it lands or
+  whose place's type is unknown here
+  (an indirect call's argument, a store into a `dyn` container) - it is
+  meant to take its type there (increment 3). Copies keep the type
+  (`clone_internal_vec`, the dict's copy constructor, the mutable and
+  const clones); an empty slice of a typed array is a fresh array of its
+  type. Two walks set it (`stamp_ctype_rec`): the top only for a
+  literal (what it holds is not its to type), and along the annotation
+  for a builtin's result and a baked value - a container nested under a
+  `dyn` element stays UNTYPED in both (only `dyn` reaches it, and it keeps
+  the storage its own values gave it; `stamp_literal_coerce` leaves a
+  literal nested there untyped too, and `literal_fits` lets any literal
+  fit a `dyn` place, so `array<dyn> a = [[1]]` takes its declared type
+  under `-nc` as it does folded). The VM's MakeArrayV / MakeDictV /
+  MapFilterV / StampTypeV name theirs by a ref into `Chunk::ctypes` in
+  `target2`; MakeStructArrayV derives `array<P>` from its def. `a + b`
+  on arrays copies `a` UNTYPED (`ctype_sum_copy`) and the sum takes its
+  static type after the append (StampTypeV, the tree-walker's Expr04),
+  so what `b` appends is not checked against `a`'s narrower type - and,
+  since nothing else holds that copy, it may change STORAGE when `b`'s
+  elements do not fit it (`[1] + [1.5]` is float storage, `arr_sum_join`).
+  The copy is named by `g_arr_sum_copy` for the duration of one `+`
+  (`ArrSumScope`, at the three places that make it: Expr04's
+  `num_binop_loc(..., sum)`, BinOpV, `jit_boxed_binop`); an array a NAME
+  holds keeps its storage - a reference count cannot tell the two apart,
+  since the engines differ on whether a compound store copies the slot.
+  `.myv` v43 stores all of it. **A new place that makes a container
+  must stamp it**, or it is untyped where the static type says
+  otherwise; `tests/int/126_container_types.my` prints the type every
+  creation shape gets under every engine.
+  **⛔ INCREMENT 2: A STORE THROUGH `dyn` CHECKS THE CONTAINER'S OWN
+  TYPE.** The inferencer marks a store whose place type is `dyn` or not
+  known (`Construct::ct_store` on the lvalue node; on an append / push /
+  insert's args, and on any call through a function value, read through
+  `ArgLocs::ct_store`); codegen carries it as `Instr::ct_checked`
+  (opflags 0x80 on StoreElemValue, DictStore, StoreElem2V,
+  StoreElemChainV and StoreLValueChainV, ML_CHECKed per family), the JIT
+  helpers as `STORE_WORD_CHECKED` in their operator word. The check is
+  ONE function, `ct_fit` (types/fit.cpp.h): convert as a typed store does
+  (int into float), then `value_fits`. A plain `=` is checked BEFORE the
+  element is reached (`ct_store_pre` - a dict's auto-vivified key must
+  not stay behind a refusal), a compound's result at the write (`ct_rmw`,
+  `flat_store_core`'s `ct`). Two checks need no mark, because every
+  engine runs the same C++ for them: a NEW dict key is checked wherever
+  it is inserted (`ct_fit_key` - a default dict's read inserts too), and
+  `TypeArr::add` (`+=`) checks and converts each element against the
+  array's own type. The JIT's inline element-store tier keeps a checked
+  store inline only for an untyped or the canonical `array<dyn>`
+  (`annot_dyn_array()`, one pointer compare - JD_storev_ctype), so
+  `array<dyn>` code stays fast; the nested-store tier hands a checked
+  store to its helper. Statically checked stores pay nothing. **A new
+  store path must take the mark** (and a new in-place builtin that
+  stores a value, the ArgLocs check), or a `dyn` name writes a misfit
+  into a typed container again;
+  `tests/functional/125_container_type_stores.my` stores every form
+  through `dyn`, refused and fitting.
+  **⛔ INCREMENT 3: A CONTAINER ENTERS A TYPED PLACE BY ITS OWN TYPE
+  (decision A, made EXACT by rule 1 - plans/strict-container-types.md).**
+  `fits` (types/fit.cpp.h) checks a TYPED, mutable container by its
+  ctype (`ct_enters`): every component the place types must be the
+  container's exactly (`ct_exact`: `dyn` is a type of its own, the `?`
+  included; only a component the place leaves out - a generic `array` -
+  matches any). An UNTYPED
+  one is checked by what it holds, and a read-only one too. Every place
+  a value ENTERS calls **`value_enters`** (value_fits, then
+  `fit_adopt`: an untyped mutable container that fits TAKES the place's
+  type, along the annotation, stamp_ctype; first `adopt_detach` makes
+  a slice among them an ordinary array - its whole group - and gives
+  the live slices of an array their own copies, since the type is kept
+  on the storage a slice shares and a slice is an array of its own; a
+  GENERIC component - `array<array>`'s element - types nothing,
+  `ctype_names`, since it checks no store) - the binds (`bind_param`,
+  `bind_fault`), the struct fields, `check_fit[_loc]` (CheckFitV and
+  every FitSpec store) and `ct_fit` / `ct_fit_key`. **A new entry site
+  calls value_enters, never value_fits**, or an untyped container
+  stays untyped while a typed path reaches it, and a store through a
+  `dyn` alias then writes past the place's type. `fit_needed` counts an
+  UNFILLED component (`[]` nothing wrote) for the same reason: that
+  container is untyped, and the check is where it takes its type.
+  `tests/functional/126_container_entry.my`.
+  **⛔ RULE 1 (strict-container-types.md increment 3): THE STATIC SIDE IS
+  EXACT TOO.** `static_type_elem_compat` (statictype.cpp) matches a
+  component only by equality (an UNFILLED one - `none` - matches any),
+  so no implicit conversion between container types is assignable. What
+  keeps ordinary programs compiling is that a container-making
+  expression is typed for its place: a literal, a builtin's new
+  container (`literal_into` / `fresh_fits` - a non-opt `dyn` component
+  fits, the place's fit check examines it; a `dyn?` one only a nullable
+  component), each element literal a multi-assignment unpacks
+  (`idlist_elem_types`' `into`). An element contribution to an INFERRED
+  container keeps a numeric element type when the value is a `dyn`
+  (`TypeSym::round_elem_dyn`, the element twin of `coerces_dyn`) and
+  makes the element nullable when the value is an explicit `none`
+  (choice 7, its bits 4 / 8). A container a NAME may hold must have its
+  variable's exact type (`check_alias_exact`, the check pass;
+  `new_container_expr` decides what is new - not `sort` / `rev_sort` /
+  `reverse`, which return their argument). A typed literal's element
+  widening is CHECKED at run time in every engine (`literal_elem_widen`,
+  the VM's CoerceNumV): a `dyn` element that does not fit refuses while
+  the literal is built - except at compile time, where no element is a
+  `dyn` and a misfit is inference's to report. And a template is
+  instantiated only for a signature settled all the way down
+  (`has_unknown`), since an `array<?>` instance refuses what its
+  argument settles to; for that a literal with an unsettled element is
+  itself unsettled (the join would drop the element).
 - **Universal `hash()` (deep, by value).** `Type::hash` returns `size_t`; the
   base throws, the leaves (`int`/`bool`/`float`/`str`) hash directly, and
   `none` + the containers/structs hash deeply (`hashing.h` combiners,
@@ -2717,13 +7505,16 @@ are unchanged.
   compile time. **String hashes are cached** on `StrObj`
   (`mutable hash_cache`/`hash_valid`, computed lazily — strings are immutable),
   so repeated string-key probes don't recompute; a *slice* hashes its sub-view
-  on demand. No cycle guard (matches `==`/`to_string`).
+  on demand. A value that CONTAINS ITSELF hashes too: a back edge hashes as
+  its depth on the walk (`cyc_backedge_hash`), the one choice consistent
+  with `==`'s shape rule - see THE CYCLE GUARD below. A value with no cycle
+  hashes exactly as it did before the guard (pinned by an `-rt` case).
 - **Flat-scalar arrays cache their hash incrementally** (`SharedObject::
   hash_cache`/`hash_valid`). `TypeArr::hash` returns the cache when valid;
   `append` **maintains** it in O(1) (`arr_append_maintain_hash` — an append is
   one more `hash_combine` step), and every other mutation **invalidates** it
   (`invalidate_hash` at `pop`/`insert`/`erase`/`sort`/`reverse`/`+=`, the flat
-  element store, and `get_value_for_put`). Caching is restricted to a non-slice
+  element store, and `LValue::write_target`). Caching is restricted to a non-slice
   **int/float/bool** array (`hash_cacheable`): its elements are scalars, so the
   only way to change its hash is a mutation OF that array, all of which are
   instrumented. A **general/struct** array is *not* cached — a nested mutation
@@ -2736,7 +7527,7 @@ are unchanged.
   mutation (a stale cache fails it loudly). (An order-dependent removable hash —
   polynomial / Rabin-Karp — could also make `a[i]=v` O(1), but it weakens the
   hash, taxes the write path, and still can't do O(1) insert/erase; rejected for
-  B. See `plans/hash-and-dict.md`.)
+  B. See `plans/archived/hash-and-dict.md`.)
 - **Any-type dict keys, frozen on insert.** Because `hash` is total, an array/
   dict/struct/`none` can be a key. A key would corrupt the map if mutated after
   insertion (its hash would change, leaving it in the wrong bucket — COW does
@@ -2745,7 +7536,7 @@ are unchanged.
   **`make_const_clone(key)`** — a deep read-only freeze. Scalars/strings are
   returned as-is (cheap); only a container key pays a one-time clone.
   `MemberExpr` keys are interned strings (already immutable), so they need no
-  freeze. See `plans/hash-and-dict.md`.
+  freeze. See `plans/archived/hash-and-dict.md`.
 - **Deep-const read-only flag.** Both `SharedObject` (arrays) and `DictObject`
   carry a `readonly` bool (`is_readonly()`/`set_readonly()`). It backs `const`
   values: `make_const_clone()` (`eval.cpp`) sets it on every array/dict in the
@@ -2766,7 +7557,18 @@ are unchanged.
   `builtin_sum` also has an all-int fast path that accumulates a raw `int_type`
   in a tight loop — skipping `num_bin_op`'s promotion check and the per-element
   virtual `TypeInt::add` — and falls back to the general loop at the first
-  non-int element, so a mixed int/float array still promotes correctly.)
+  non-int element, so a mixed int/float array still promotes correctly.
+  **An EMPTY sum is decided by the STATIC type (#48)**: it used to return
+  `none` into a slot inference had proven numeric (RULE 1). The inferencer
+  stamps the result kind on the call's args `arr_hint`
+  (`stamp_sum_identity`: `flat_i` -> 0, `flat_f` -> 0.0 - the channel
+  every engine and the `.myv` already carry into `ArgLocs`, and `sum`
+  reads it for nothing else); unstamped, flat numeric STORAGE decides the
+  same way, and anything else raises `InvalidArgumentEx`. Storage alone
+  could not answer: `keys(d)` of an empty `dict<int,int>` was a GENERAL
+  array inline (flat since rule 4, 2026-11-21 - the static stamp stays,
+  since a `-nti` run's storage follows nothing). The seed is `sum_seed`, which also turns a one-term bool sum
+  into the `int` its static type says.)
 - **Getting a mutable copy of a const: `clone()` vs `deepclone()`.** Two helpers
   in `eval.cpp` make mutable copies (scalars/strings returned as-is):
   `make_mutable_clone` builds a fresh mutable *top* but **shares** any read-only
@@ -2781,6 +7583,92 @@ are unchanged.
   obtain a fully mutable version of a const. (`deepclone` is *not* a const
   builtin: it yields a mutable value that must be copied fresh per eval anyway,
   so folding it would only bloat the tree.)
+- **⛔ EVERY RECURSIVE WALK OVER A VALUE GRAPH GOES THROUGH THE CYCLE GUARD,
+  `cyclewalk.h` (2026-10-08; README *Values that contain themselves*;
+  plans/reference-cycles.md Part A).** Arrays, dicts and class instances
+  are references (and a struct's field may hold one), so a value can
+  contain itself (`append(a, a)`, `n.next = n`), and every
+  recursion over one - printing, `==`, `hash`, the deep copies, freezing a
+  constant or a dict key, the compiler's walks over a constant's value, the
+  `.myv` writer - overflowed the C stack on it (RULE 1: a SIGSEGV in a
+  release build). **A NEW walk over an `EvalValue`'s children uses the same
+  machinery, or it is that crash again.** What it gives you:
+  - `cyc_key(v, k)` names a container that CAN hold a reference (a
+    general-storage array by its storage and window, a dict, a class
+    instance or box<P> with reference fields) and answers false for
+    everything else - a flat array, a POD struct, a string, a scalar, a
+    FUNCTION, which no walk enters (it prints `<function>`, compares by
+    identity, is shared by every copy), and a struct VALUE. A value is
+    walked THROUGH, never pushed: copy-on-write may share one object
+    between two independent copies, so keyed by its address two equal
+    copies printed, compared and hashed differently until a write split
+    them (2026-10-09), and no cycle passes through a value alone. A walk
+    that treats "not keyed" as "a leaf" must still descend into a struct
+    value (`cyc_reaches_cycle` does). Push only what it keys; a missed
+    container is the crash, a keyed flat array is wasted work.
+  - `CycStack` + the RAII `CycGuard` (exception-safe: a throw mid-walk
+    still pops) for a one-value walk; a container met while on the stack is
+    a BACK EDGE, answered without entering it. A STACK, not a memo: a
+    container shared at two places but not on the path is walked at each,
+    as before (so a DAG is still copied twice).
+  - the answers, one per walk kind: rendering writes `[...]` / `{...}` /
+    `Name(...)` / `box(Name(...))` (`cyc_render()`, and the decompiler's
+    own `Renderer::value`, coderender.cpp, with a local stack); `hash`
+    hashes a back
+    edge as its DEPTH, `cyc_backedge_hash` (`cyc_hash()`) - a CLASS
+    instance hashes and compares by identity before any guard, entering
+    no field, so no cycle passes through one there; `==` uses the PAIR
+    stack,
+    `cyc_eq()` - a back edge when the lhs is on it as an lhs or the rhs as
+    an rhs, equal iff at the same depth, which is the one rule `hash` can
+    agree with; the deep copies (`clone_to_mutable`,
+    `make_const_clone_rec`) link a container met AGAIN to its one copy -
+    a back edge to the copy in progress, and since question 10 (Python's
+    deepcopy rule) any container already copied, flat arrays and boxes
+    included, so the copy has the source's shape (`CycCopyStack` is a
+    memo keyed by `cyc_copy_key`: an array's storage plus its slice
+    group, never its window); the
+    compiler's walks (`static_type_from_value`,
+    `keep_in_value`, `cs_eval_value`, `reflect_typeof`, `shape_of`,
+    `collect_value_descs`) answer their TOP (`dyn`, the site's abstract
+    object, `NumShape::other`); the writer throws a MyvError.
+  - the three stacks of the walks that run through `Type`'s virtuals are
+    function-local statics. A walk that asks a NEW question in the middle
+    of one - a dict looking a key up during `==`, hashing a container key
+    during `hash` - must run it under `CycFreshScope`, or the key's own
+    comparison reads the outer walk's stack.
+  - `==`'s identity fast path (`a` compared with itself) answers "equal"
+    without entering only while every pair on the stack is an identity
+    pair, or when the container reaches no cycle
+    (`CycPairStack::identity_ok`, memoized per top-level comparison).
+    Anywhere else the answer would depend on where the walk started, `==`
+    stops being transitive and `hash` cannot agree with it - `clone(a) != a`
+    for a ring `a` is the documented consequence. The search is the one
+    real cost of the guard (two arrays sharing a 401-container sub-array:
+    3k -> 91k Ir per `==`); the plan file's cost table has the rest. A dict compares each
+    value under `CycFlip`, keeping the operand ORDER unordered_map's
+    `operator==` always used (other's value on the left), which a builtin
+    exception value's missing `eq` makes observable.
+  **LEAKS.** Reference counting cannot free a cycle, and LeakSanitizer and
+  the INT census report one, which is correct for a cycle the PROGRAM
+  built: a test breaks its cycles before it ends (pop / erase) and says so
+  in its header. A cycle NO program can break - a frozen one (a cyclic
+  constant, a cyclic dict key) and a compile-time bake - is kept by
+  `cyc_keep_until_exit` and emptied by `cyc_release_kept`, which the first
+  keep registers with `atexit`: it runs after `main` and before the census
+  and LeakSanitizer read the heap (LIFO; a keep before the census mark is
+  in its baseline instead). **It runs after the VmProgram or the AST has
+  freed every struct DEF**, so its walk (`exit_key` / `exit_children`)
+  reads no def: through `cyc_key` it read `is_pod()` of freed memory for
+  any kept cycle reaching a struct - a heap-use-after-free at exit in
+  every engine (2026-10-09). `DictObject::release_at_exit` exists for that
+  drain only. This is a stopgap until plans/reference-cycles.md part B
+  (reclaiming cycles) is designed - never a way to make a test pass.
+  Nets: `tests/functional/83_cyclic_values.my`, the `cycle:` `-rt` cases
+  (one pins a non-cyclic value's hash to the pre-guard binary's numbers),
+  the `repl:` echo case, `myv_cyclic_const_refused` and `driver_checks`;
+  each guard was watched failing with its back-edge check removed (the
+  plan file has the table).
 - The non-const `intptr(symbol)` builtin exposes the underlying object pointer;
   the test suite uses it
   to assert exactly when two slices do/don't share storage. If you change COW
@@ -2790,7 +7678,8 @@ are unchanged.
 ## Custom struct types
 
 User-defined value types (`struct Point { int x; int y; }`). Full design +
-phasing: `plans/structs.md`. **Status: complete (all 8 phases)** — decl,
+phasing: `plans/archived/structs.md`. **Status: complete (all 8
+phases)** — decl,
 construction, field/const access, inference, const-folding, COW; the POD
 C-layout; nested (recursive) POD; flat `array<PodStruct>` storage; M8-style
 *direct* (unboxed) field access; and construct-in-place append. A flat struct
@@ -2821,13 +7710,34 @@ but the per-element `StructObject` allocation is gone (build overhead
   fields (`struct_field_target` resolves each edge by `struct_def`, the
   root's own name, or a `const_ctx` lookup for an intermediate forward ref). An
   **`opt`** field (e.g. `dyn? next`) breaks the cycle (it can terminate with
-  `none`) and is allowed — the way to write a linked list / tree.
+  `none`) and is allowed — the way to write a linked list / tree. **A non-opt
+  `box<S>` field is an edge to S too** (a box always holds a value): `struct
+  T { box<T> me; }` used to be accepted, and its zero value (`T t;` -
+  `zero_box_init` <-> `build_zero_struct_init`) recursed until the parser's
+  stack overflowed, even in a function never called.
 - **`StructObject`** holds EITHER `bytes` (POD: a `def->size` C-laid-out buffer;
   `pod_get`/`pod_set` load/store a typed scalar or an inline nested struct at a
   field offset) OR `fields` (boxed). A POD field WRITE goes through
-  `try_pod_struct_store` (a direct byte store, mirroring
-  `try_flat_subscript_store`); a POD field READ in `MemberExpr` returns a value
+  `member_store` (a direct byte store, the twin of `subscript_store`); a
+  POD field READ in `MemberExpr` returns a value
   (no per-field LValue). `==` is `memcmp` for POD, field-wise for boxed.
+  **⛔ A STORE THROUGH BYTES NEEDS A PLACE, NOT AN LVALUE (2026-10-05).**
+  A field of a FLAT struct array's element (`ps[i].x = v`) and a field of
+  a POD struct embedded inline (`p.inner.x = v`) live in bytes no
+  `LValue` covers, and a READ of either returns a COPY - so every store
+  path that evaluated the base and wrote the copy raised NotLValueEx, in
+  every engine, while README called the layout transparent. A store
+  walks to a **`PodPlace`** (eval.h: the struct's first byte + its def)
+  instead: `pod_place_elem` enters it at a flat element (bounds, the
+  index's type, readonly and the slice/alias COW, exactly as the element
+  store does), `pod_place_rooted_field` / `pod_place_step` descend inline
+  POD fields, and `pod_place_store` / `pod_place_incdec` write. The
+  tree-walker's `member_target` (member_store, the dyn inc-dec) and the
+  VM/JIT's shared `vm_chain_walk` (StoreLValueChainV, IncDecChainV) both
+  carry one, so the engines cannot drift. A place is entered only from
+  an `LValue` (a variable, a global, a capture, or a chain from one), and
+  the store runs OUTSIDE the walk's caret catch, so a compound op's error
+  keeps the whole-expression caret (`op_caret`).
 - **Flat `array<PodStruct>`** — `SharedArrayObj::Storage::structs`: a contiguous
   byte buffer + the element `StructTypeDef*` + cached `stride` (so the template
   never needs `StructTypeDef` complete). Created value-driven (a literal of
@@ -2839,8 +7749,11 @@ but the per-element `StructObject` allocation is gone (build overhead
   `static_type_from_value`); **`foreach` reuses one `StructObject`** across
   iterations
   (overwrite-in-place with a `use_count` COW guard, so a captured element keeps
-  its value). Cold ops (insert/sort/map/...) **auto-promote** to a general array
-  via `get_vec()`'s `promote_structs_to_general()`, so every existing array op
+  its value) - in the VM too since #110: `vm_struct_elem_into` copies the
+  next element over the loop variable's own object when that slot is its
+  only holder (`use_count() == 1`). Cold ops (insert/sort/map/...) **auto-promote** to a general array
+  via `get_vec()`'s `promote_structs_to_general()` - IN PLACE, so every alias
+  sees it (#53b, see the strs bullet) - so every existing array op
   works with no dedicated case and nothing throws. `array_storage` reports
   `"struct"`.
 
@@ -2870,7 +7783,15 @@ but the per-element `StructObject` allocation is gone (build overhead
   (construction) and `.CONST`-accessible; `t_struct` (non-trivial, `>= t_str`,
   `intrusive_ptr<StructObject>`) is an **instance**. `TypeStruct` /
   `TypeStructType` in `src/types/struct.cpp.h`; wired through `ValueU`,
-  `TypeToEnum`, `TypeNames`, `AllTypes`.
+  `TypeToEnum`, `TypeNames`, `AllTypes`. **The inferencer types the
+  descriptor used as a VALUE (`var dyn t = P; f(P)`) `dyn`**, as a builtin
+  used as a value: its TypeSym (`struct_type` set) keeps the `dyn` its
+  declaration gives it, because `commit_round` skips it like a
+  function's (#95; the reset and the finalize loop leave a `dyn` alone).
+  Committed, it took the round's empty accumulator and finalized as
+  `none`: a `dyn` parameter refused it as "may be none", and a template
+  or lambda given one was never instantiated, so the VM called a
+  chunk-less base and aborted while `-tw` ran it.
 - **`structtype.h`** defines `StructTypeDef` (owned by its `StructDeclStmt`
   under the tree-walker; under `-vm`, `vm_compile` MOVES ownership into the
   `VmProgram` so it outlives the AST teardown — the decl keeps a raw `def`
@@ -2898,8 +7819,8 @@ but the per-element `StructObject` allocation is gone (build overhead
   checks all come from the shared machinery. `CallExpr::do_eval` →
   `construct_struct` builds the boxed instance; `coerce_struct_field`
   coerces a numeric field and **runtime-validates** each field's type (guarding
-  a `dyn`-laundered value; the `dynarray`-style escape hatch is just declaring
-  the field `dyn`). `type_of(Point(..))` is `StaticTypeKind::Struct`
+  a `dyn`-laundered value; the escape hatch is just declaring the field
+  `dyn`). `type_of(Point(..))` is `StaticTypeKind::Struct`
   (`statictype.h`'s
   reserved `Struct` kind + `struct_def`/`struct_name`;
   `StaticTypeArena::struct_ty`).
@@ -2918,14 +7839,272 @@ but the per-element `StructObject` allocation is gone (build overhead
   `static_type_from_value` all
   handle a struct value. Outside a `const` decl, construction is left a runtime
   `CallExpr` so the inferencer gives the precise field errors.
-- **Value semantics**: COW like arrays/dicts (`StructObject::readonly` backs a
-  deep `const`; plain assignment aliases; `clone()` shallow, `deepclone()`
-  deep). `==`
+- **⛔ A STRUCT DECLARATION HAS ONE DEFINITION, WHICH ITS ORIGINAL NODE
+  OWNS (2026-11-15).** `StructDeclStmt::clone` SHARES `def` (the clone's
+  `def_owner` stays null): a struct declared in a function is one type,
+  however many copies of that function exist - a template's instances, an
+  inlined or specialized body, the typed copy a constant call runs
+  (question 5). It used to copy the definition, so each copy made
+  instances of ANOTHER struct: `t(1) == t("s")` was false for a template
+  `t` returning its own `Q(1)`; a copy's `Q q = Q(x);` was refused
+  ("'q' is declared 'Q' but is assigned 'Q'" - the annotation named the
+  original's def); and a constant call's instance read a definition that
+  died with the parse-time copy (heap-use-after-free). So the ORIGINAL
+  declaration must outlive every value of its struct, and one place can
+  break that: a declaration inside a function LITERAL written in a
+  constant expression, which a bake frees (cse_materialize, a struct's
+  const member) or a late fold retires (#96) while the value lives on -
+  `const c = map(pure func(x) { struct Q { int a; } return Q(x); }, K);`.
+  `collect_def_owner_funcs` (parser.cpp) finds such a literal (the
+  outermost one around the owning declaration, when the value names its
+  def - `collect_value_defs`) and the callers treat it as a literal the
+  value NAMES (#47): a bake detaches it into `baked_funcs`, pDeferFold
+  keeps no literal (the node stays and runs) and does not cache the
+  value. A new place that frees a constant expression while keeping its
+  value must ask it too. **⛔ The AST INLINER was a second such place, with
+  no constant in sight (2026-11-16):** every inlining engine CLONES an
+  argument into the body it pastes (a substitution, or the `$a = arg`
+  temp) and the call it replaces dies with the original - so `app(func(v)
+  { struct E { int n; } return E(v).n; }, x)` with an inlinable `app` left
+  a pasted function building instances of a definition freed with the
+  call: a heap-use-after-free in codegen, in every engine with the
+  inliner on. A call with such an argument stays a call
+  (`arg_owns_struct_def`, beside `binds_none` in the three engines). **A
+  pass that CLONES a subtree and drops the original must ask whether the
+  original owns a definition.** **And whatever lists a program's structs lists
+  the OWNING declarations, over the complete walk** (`for_each_child_of`):
+  `vm_compile`'s `take_structs` and `-vd`'s `collect_structs` (disasm.cpp)
+  are the same walk on purpose - the image round trip compares the two
+  lists, and a per-declaration list repeats a shared definition while a
+  statement-only walk misses one declared in a function literal.
+- **A TYPE ALIAS IS A CONST BOUND TO A DESCRIPTOR (maintainer chose it,
+  2026-11-15; README *Type aliases*).** `const T = S;` - the type
+  positions (`T t;`, `func f(T p)`, `array<T>`) resolve T through
+  `lookup_struct_type`, which accepts any const bound to a
+  `StructTypeDef *`, and `T.K` / a const-declaration construction fold at
+  parse time. Three pieces make the rest work, and a new consumer of a
+  struct NAME must work for an alias too: **the declaration is KEPT**
+  (`ShouldConstSymbolExistAtRuntime` lists a descriptor, and
+  `alias_literal` makes its initializer a `LiteralObj` of the descriptor,
+  whatever expression named the struct), so a construction that runs at
+  run time - `-nti`'s dyn call, the tree-walker - reads T (dropped like a
+  scalar, it was "Undefined variable 'T'" in every engine); **the
+  inferencer gives T's TypeSym the struct** (`bind_type_aliases`, off that
+  literal - a multi-declaration's element, or a struct it spreads to
+  every target), so every reader of
+  `TypeSym::struct_type` - construction, named arguments, `T.CONST`, the
+  literal-argument stamps - treats T as S; and **a catch clause names the
+  struct through that symbol** (`resolve_catch_types`, question 25: the
+  clause keeps the name as written - rewritten to the struct's own name
+  by the parser, as it was until 2026-11-17, `catch (T)` was refused
+  wherever that name is not the struct: inside `func f(S)`, or for an
+  alias of a struct a function declared - and `hoist_globals` binds a
+  top-level alias BEFORE any function body is walked, since functions
+  come first in a block), refused like a type position when a binding
+  hides the alias (`const_struct_binding`). Four more, each a bug until the
+  review of that change: **a construction through a GLOBAL alias reads it
+  first in the VM** (`CallExpr::ctor_alias`, stamped from
+  `TypeSym::type_alias`; codegen's `emit_ctor_guard`, a LoadGlobalV before
+  the arguments - in `compile_boxed_expr` for the planned and checked
+  constructors, per element of a struct-array literal, before an
+  append's in-place fields): the ctor ops build from the stamped def and
+  never read the callee, so a construction that ran before `const T = S;`
+  built an instance where the tree-walker raised UnboundSymbolEx (RULE
+  2). A struct's own name binds at scope entry and a local or captured
+  alias is read only after its declaration, so neither is guarded - **a
+  new lowering that consumes a constructor call without going through
+  `compile_boxed_expr` must emit the guard itself**. **A zero value's
+  constructor call names the alias where the struct's own name does not
+  name the struct** (`struct_name_here`, parser.cpp): `T t;` is `S(0)` by
+  name, and inside `func f(S)`, or for an alias of a struct declared in a
+  pure function, `S` is a parameter or nothing at all. **And the
+  warning tier's struct names are every struct and alias declared at any
+  depth** (`collect_struct_names`, resolver.cpp, by name): a construction
+  through an alias, or of a struct declared in a function, was "a callee
+  we cannot analyse" and drew the "might fail" warning. **A struct
+  field written through an alias (`T s;`) is S's field**: the field
+  parser stores the resolved struct's own name (`FieldDef::struct_ty`),
+  and `field_static_type` asks `struct_def` first (`pod_ctor_arg_safe`
+  asks nothing else) - by the written name the field was `dyn` and typed
+  code using it was refused. Net:
+  `tests/functional/120_type_alias.my`, the `type alias` `-rt` entries,
+  a row of `unbound_call_warnings`.
+- **⛔ A STRUCT IS A VALUE (maintainer, 2026-10-08;
+  plans/struct-value-semantics.md).** Every copy is independent and SHALLOW
+  (an array / dict field stays a shared reference); until then an
+  assignment ALIASED a boxed struct while a flat array's element read was a
+  copy. The copy is made at the WRITE, never at the move:
+  **`struct_own(LValue *&holder)`** (eval.h) returns the object the holder
+  may write in place, cloning it (shallow, mutable) into the holder first
+  when its count is above one, the holder is BORROWED (#94: the caller's
+  slot holds the count) or the object is read-only (a constant's). Every
+  write INTO a struct goes through it, holder by holder down the chain:
+  the tree-walker's `store_walk` (member_store, subscript_store's base,
+  the dyn inc-dec, a mutating builtin's first argument -
+  `store_base_value`, `sort` / `reverse` and an indirect call's
+  `indirect_lv_arg0` included), the VM's `vm_member_store` /
+  `vm_member_lvalue(_ref)` / `vm_chain_walk` (which an in-place builtin's
+  CHAIN form and an indirect call's `A0::chain` walk too, #32), and the
+  JIT's inline field store, which declines on
+  `memberv_shared` / `memberv_borrowed` / `memberv_readonly`. Three rules
+  a new write path must obey: **own the holder BEFORE deriving any pointer
+  into the object** (a pointer taken earlier points into the object the
+  holder no longer holds); **use the holder struct_own hands back**, never
+  the one passed in (an array element is detached first,
+  `LValue::write_target`, and may then live in new storage); and **a pass
+  must never make two names one slot** where one is written through a
+  member - the AST inliner temp-binds such a parameter
+  (`param_member_written`), and `collapse_locals` counts a write THROUGH a
+  local as a write of it. The bytecode inliner is safe only because its op
+  whitelist admits no store-through op. A field of a VALUE is not a
+  location (`member_store_step` passes `rooted` only for a slot). A
+  `const` PARAMETER's struct is read-only at compile time when its type is
+  known (`check_const_param_store`): its walk follows struct-VALUE member
+  steps only, and stops at a step into a reference (a box's value, a field
+  of a box<P> or a class instance) - refused only when that reference IS
+  the parameter; no engine enforces const on a
+  parameter at run time. `StructObject::readonly` still backs a deep
+  `const`. `==`
   is structural between same-`def` instances (`TypeStruct::eq`); `hash`
   combines the field hashes (see *Universal `hash()`* above), so a struct can be
-  a dict key. **Deferred** (plans/structs.md): `var` fields (call-site
-  field inference), `opt` scalar fields, methods, and empty structs.
+  a dict key. **Deferred** (plans/language-deferred.md): `var` fields
+  (call-site field inference), `opt` scalar fields, methods, and struct
+  SUBTYPING (`assignable` accepts equal struct types only).
+- **A FIELD-LESS struct is SUPPORTED, not deferred** (settled 2026-08-13 —
+  the docs had said "rejected at decl time" while the parser accepted it,
+  untested, since the feature shipped). `struct Unit {}` — and a struct
+  declaring only `const` members, since consts are type-level — parses to a
+  zero-field descriptor, and `compute_layout` returns EARLY with
+  `layout = boxed, size = 0`. That early return is the load-bearing part:
+  a field-less struct is never POD, so an `array` of it is a general array
+  and **the flat-struct path's stride is never 0**. WATCHED FAILING —
+  making a zero-field struct `Layout::pod` (which the archived plan
+  proposed as "size 0, trivially POD") does not merely change
+  `array_storage`, it is **undefined behaviour**: UBSan reports "null
+  pointer passed as argument 1, which is declared to never be null" at
+  eval.cpp's flat-struct copy. Construction,
+  equality (always true within a type), `hash`, dict-key use, `clone`/
+  `deepclone`, `Unit u;` zero-init, `throw`/`catch` and `.myv` round-trip
+  all work and are pinned by the `struct:` empty-struct tests. The useful
+  case is a payload-less exception marker type.
 
+- **⛔ A CLASS IS A STRUCT WITH REFERENCE SEMANTICS
+  (`StructTypeDef::is_class`, plans/class-and-box.md, step 1 2026-10-08).**
+  `class Name { ... }` parses as a struct declaration (`kw_class`,
+  `pAcceptStructDecl`) and its instances are the same `StructObject` with
+  the same `t_struct` tag - EVERY difference is decided by
+  `def->is_class`, never by a second type tag. Six rules, each the place a
+  new struct-handling site must ask:
+  - **`struct_own` hands back the object itself** (never a copy, never
+    `write_target`), and throws `CannotChangeConstEx` for a read-only one.
+    Every write path already funnels through it. The JIT's inline
+    field-store tier leaves out its two VALUE guards (`memberv_shared`,
+    `memberv_borrowed`) for a class def at compile time, and for a
+    `boxed` instance at run time (a `box<P>`'s def is the struct's).
+  - **A class is never POD** (`compute_layout` returns boxed): POD is what
+    may be embedded BY VALUE - inline in a struct, flat in an array - so
+    every `is_pod()` consumer treats a class as a pointer with no change.
+  - **`==` and `hash` are identity.** `hash` uses `StructObject::ident`, a
+    number from `g_class_ident` (structtype.h) - NOT the address, which
+    would make a class-keyed dict's iteration order differ between runs,
+    engines and a `.myv` load. The counter restarts at 0 in the
+    ParseContext ctor (a program's constants) and at
+    `CLASS_IDENT_RUN_BASE` where a run starts (`vm_run`, the root
+    `Block::do_eval`), so every engine numbers its instances alike; a
+    copy (`clone`) is a new number. A collision costs a probe: `==` is the
+    pointer compare.
+  - **Identity must not be duplicated or merged by a compile-time pass.**
+    So a class instance is made at compile time ONLY by a `const`
+    declaration's initializer (`CallExpr::in_const_decl`, also set for a
+    struct's const member); a pure function cannot construct one (the
+    parser refuses a class it can name, the construct dispatch one named
+    later); `Identifier::names_class` makes a function impure
+    (`func_body_is_pure`), so no fold, CSE or unroll merges two
+    constructions; and `cse_key_rec` refuses a class construction, so two
+    `const` declarations are two objects. `make_const_clone` keeps a class
+    instance's identity: a dict KEY's is left alone (`key` true - its hash
+    does not change with its fields), a constant's is frozen IN PLACE.
+  - **The loop transforms treat a class field as shared storage**
+    (`fr_member_of_value` is false for a class base; `th_val` is false for
+    a class) - `y.n = 1` may change `x.n` when they are one instance.
+  - **`.myv` v33**: a StructDef's `is_class`, and the `cls` value record -
+    an instance written once with its number, later occurrences as a
+    reference to it, so identity and hash survive a load. The loader now
+    also checks every stored struct value against its def (class or not,
+    POD or not, its size or field count).
+  An `array<C>` holds references, flat (*Flat CLASS storage* above), and
+  a struct or class may name ITSELF in a field's annotation
+  (`array<Tree> kids`, `ParseContext::decl_self`, consulted by
+  `lookup_struct_type` - a type annotation otherwise needs a declared
+  struct). `opt` is allowed on a class-typed field (a null reference) and
+  still not on a struct-typed one; a forward reference is checked by the
+  inferencer's `check_opt_struct_fields` (`FieldDef::loc`, compile-only).
+  The same function refuses a field type no struct or class of the
+  program takes ("'Nope' is not a type", at `FieldDef::type_loc`) - only
+  when `Inferencer::closed_world` (set by `infer_types`): a REPL input
+  may be followed by the one declaring it, and a parse-time call's copy
+  holds only the structs the call reaches (until 2026-11-13 such a field
+  compiled and its constructor refused every value at run time).
+  Net: `tests/functional/81_class_reference_semantics.my`, the `class:`
+  `-rt` entries, the class `alias:` layer case, the `driver_checks` image
+  case.
+
+- **⛔ A BOX IS A REFERENCE TO ONE VALUE - TWO REPRESENTATIONS, ONE SET
+  OF HELPERS (plans/class-and-box.md, step 3, 2026-10-08; README
+  *Boxes*).** `box(v)` (a run-time builtin, never folded) and the prefix
+  `*` (`DerefExpr`, `ConstructType::deref`, a LOCATION). A `box<P>` of a
+  struct is a `StructObject` with `boxed` set - every class rule above is
+  asked of the OBJECT through `StructObject::is_ref()` (class def or
+  boxed), so a new site that asks `def->is_class` about an instance is
+  wrong for boxes; a box of a scalar or a string is the `t_box` value kind
+  (`BoxObj`, structtype.h; `src/types/box.cpp.h`). Rules a new site must
+  keep:
+  - **Every engine goes through `box_make` / `box_load_want` /
+    `box_store` (eval.h).** `*b` checks the box against the one the
+    inferencer proved (`DerefExpr::want`, the VM's LoadBoxV `b`): a box a
+    `dyn` laundered into a `box<int>` place raises at the `*`, so a typed
+    consumer of the result never reads a misfit. `box_store` checks the
+    box's own element kind. The JIT (class step 4) reads or writes an
+    int / float box IN PLACE behind the box tag and the BoxObj's kind
+    byte - the kind compare IS the want check, so an arm that skips it
+    reads a misfit's raw payload - and calls the same helpers for every
+    other shape.
+  - **A `box<P>` of a POD struct is a reference that is POD** - the one
+    such object (a class is never POD). A store path that meets a
+    reference instance as a VALUE (an element of a flat reference array,
+    a field) holds it (a local `LValue`, then struct_own hands back the
+    object itself) or enters its bytes as a place (`pod_place_ref`);
+    `vm_member_lvalue_ref` returns null for its POD field rather than
+    index the empty `fields`. Watched: without it `bps[1].x = 50` was
+    NotLValueEx in the tree-walker and a vector-index abort in the VM.
+  - **A copy that is a VALUE consumes no identity number**
+    (`StructObject(o, value_copy_t)`): `*bp` reads one, `box()` copies a
+    struct in with one - so how many copies an engine makes cannot move
+    the identity numbers a hash depends on.
+  - **A rebuild in place must ask `boxed`.** The constructors' H1 reuse
+    (`vm_struct_ctor`, the planned ctor, the C4e establish, the JIT's
+    inline guard) overwrites the object its destination slot holds when
+    the def matches - and a box<P> has P's def. Without the test a `dyn`
+    variable or a temp that last held `box(P(..))` turned the next
+    `P(..)` into a box (`tests/functional/94_struct_reuse_boxed.my`).
+  - **Flat struct storage holds VALUES, so it asks `is_ref()` beside the
+    def.** A box<P> has P's def and P's bytes: an array literal that
+    began with a P value (`build_array_from_values`), a store and an
+    append through a `dyn` name (`flat_store_core`, `arr_push_value` /
+    `arr_elem_fits`) packed it into the bytes, and a write through the
+    element no longer reached the box (2026-11-14,
+    `tests/functional/117_box_in_struct_array.my`).
+  - **A store through `*` writes shared storage**: `lvalue_chain_root`,
+    `fmi_base_id`, `fr_base_id` and `fr_store_reaches_shared` walk through
+    a `DerefExpr`, and `fr_immutable` never treats `*b` as invariant.
+  - **The zero value of `box<T> n;` calls the BUILTIN** -
+    `Identifier::builtin_only`, which the inferencer and the resolver bind
+    to the builtin table whatever a scope declares (a program may have its
+    own `box`).
+  Net: `tests/functional/84_boxes.my`, the `box:` / `box ti:` `-rt`
+  entries, the `box:` layer cases, the `repl: box` case.
+
+## Error model
 ## Error model
 
 `errors.h` defines an `Exception` base (`name`, `msg`, `loc_start`, `loc_end`)
@@ -2941,30 +8120,240 @@ and two macros:
   "Static type inference"). Plain `Exception`s (not `RuntimeException`s), so
   **not catchable** from script; each carries a custom interned message + `Loc`.
   A statically provable type error is reported here, before the program runs.
+- **The ASSIGNABLE-SHAPE rule (maintainer's call, 2026-08-06).** When
+  not-an-lvalue is decidable from the target's SHAPE, it is a COMPILE failure
+  (`SyntaxErrorEx`, from `pExpr14` in the PARSER - so it needs no type
+  information and no pass a flag can disable); when it depends on a runtime
+  VALUE it stays the catchable `NotLValueEx`. Exactly five forms can denote a
+  location: `Identifier`, `IdList`, `Subscript`, `MemberExpr`, `DerefExpr`
+  (`*b`, a box's value). A literal, a
+  call result, an arith/compare/logical chain, a ternary and a SLICE are
+  values, so `s[0:1] = v` / `(a+b) = 3` / `f() = 3` are refused at compile
+  time. So is an OPTIONAL member `a?.f` (a value - none when `a` is none),
+  as the target of `=`, a compound assignment AND `++` / `--`
+  (`pRefuseOptionalTarget`, 2026-10-05). **ONE helper, `pRefuseUnassignable`,
+  applies the rule to all three** - the `++`/`--` operand skipped the
+  four-form half until 2026-10-05, so typed code got the inferencer's
+  TypeMismatchEx and -nti's `f()++` / `(a+1)++` / `s[0:1]++` failed at
+  run time in the tree-walker and at compile time in the VM. Typed code got a NullabilityEx for
+  `++`/`+=` but a plain store for `=` in the tree-walker, which the VM
+  refused to compile (NotLoweredEx), and with -nti the tree-walker raised
+  NotLValueEx even for a non-none base. A CONST element target lands
+  there too, because the parser already
+  folded `K[0]` to its literal - which is right: it IS decidable. **So does
+  every other element or field of a constant (2026-10-07):** a MemberExpr
+  target with `is_const` (`K.k = v`, `P.CONST = v` - a member is not
+  folded, so it reached run time as NotLValueEx), and a subscript whose
+  FOLD fails with KeyNotFoundEx / OutOfBoundsEx (`K["missing"] = v` used to
+  fail with the READ's error). The parser cannot tell a store from a read
+  when it folds the subscript, so that error is DEFERRED
+  (`ParseContext::pending_fold`, the node marked `nc_folds`): a target is
+  refused by `pRefuseUnassignable`, and otherwise `pExpr14` rethrows it when
+  its expression ends - each `pExpr14` owns the entries added inside it, so
+  an index parsed inside `K["z"][i]` cannot rethrow its base's error. The
+  one expression not parsed through `pExpr14`, a foreach container, checks
+  the same way. The same
+  const reached through a PARAMETER is not folded, keeps its Subscript shape,
+  and still raises the runtime `NotLValueEx`. This closed two divergences: the
+  tree-walker reported a slice target as `TypeErrorEx` "does NOT support slice
+  operator []" (misleading - the type slices fine, the RESULT is not a
+  location), and the no-fail codegen could lower neither a slice nor an
+  arithmetic target, so the VM raised a NON-catchable `InternalErrorEx` where
+  the tree-walker raised a catchable `NotLValueEx`.
+- **A STORE THROUGH A VALUE HOLDS ITS ROOT (maintainer's call,
+  2026-10-06).** An element or field of ANY expression is a location, and
+  `f()[0] = v` is `{ var t = f(); t[0] = v; }` (README, *Storing through a
+  value*). The tree-walker raised NotLValueEx for an array or struct (and
+  stored into a dict), the VM refused to compile it, and an inlined `f`
+  made it a store through a variable. Both engines now HOLD the root:
+  eval.cpp's `hold_store_base` wraps a non-`LValue` root in a caller-owned
+  `LValue` (and `MemberExpr::access` takes `rooted`, true for every store,
+  so a boxed field of a held struct is an lvalue for the store's length);
+  the codegen's `hold_store_base` compiles it into a FRESH temp, after the
+  rvalue and before the keys, named as a local base of `StoreLValueChainV`
+  / `IncDecChainV` (the rvalue-root kind 3 is gone, myv v30). **It had to
+  be every base expression, not only a call** - a ternary, a literal, an
+  element of a value. **And the AST inliner leaves a call at a store root
+  a CALL** (`store_root_call`, resolver.cpp: an assignment or inc-dec
+  target's root, an in-place builtin's first argument): inlined, the
+  body's expression - a name, an element - takes the call's place and the
+  store lands in THAT location, which is not the held copy for a flat
+  struct element (a read is a copy; a slice view's copy is the same slice
+  since question 3, so that case is now only conservative). **The
+  in-place builtins follow the rule** (`append(f(), x)`):
+  the tree-walker holds a value first argument (`lv_builtin_target`,
+  types.cpp), the VM compiles it into a fresh temp (the path the sort
+  family had), and the element / member forms hold a non-location element
+  or field (`vm_builtin_elem_target`, `vm_member_lvalue`'s `hold`) - they
+  raised NotLValueEx. That temp target exposed a use/def row reading
+  AppendV's DUAL `a` as one literal: a call site at pool index > 0 hid the
+  read, and E1 dropped the call's write. **Every STATEMENT store compiler declines a held
+  root** (`as_container_base`), so such a statement reaches gen_stmt's
+  discarded-expression fallback and the two value forms above - keep it
+  so: the inc-dec value form's read + mutate (`incdec_lvalue_pure`)
+  evaluates the lvalue TWICE, and a held root is a fresh object at each
+  evaluation. A routing of the statement form straight to the chain op
+  made an inlined `++fresh()[1]` read 8 from a second `[9, 8]`. Pinned by
+  `tests/functional/75_store_through_value.my`.
+- **`UncatchableRuntimeException` (2026-08-08) — a RUNTIME exception a
+  script may NEVER handle.** `RuntimeException` used to conflate two
+  unrelated things: *"travels the VM/JIT conveyance, so it gets frames and a
+  caret"* (an IMPLEMENTATION property) and *"a `catch` clause may name it"*
+  (a LANGUAGE property). They are split now, because the two channels out of
+  a JIT fragment are NOT equal: `g_vm_jit_exc` is typed on `RuntimeException`
+  and re-raises through `vm_raise` (frames + the baked caret), while a plain
+  `Exception` is not carried at all and propagates as a raw C++ throw through
+  JIT-generated code — which has **no unwind information**, so the unwinder
+  finds no handler and calls `std::terminate`. That was a real SIGABRT
+  (`var c = func[zz]() => zz;`, exit 134).
+  Members: **`InternalErrorEx`** (an interpreter-BUG tripwire — `get_vec()`
+  on a flat array, `pod_get` field validity, a `default:` over a closed enum,
+  the codegen-proved arms in vm.cpp; it must RENDER, never abort),
+  **`UndefinedVariableEx`** (REPL-only since FIX-1 #130 makes it a compile
+  error in a script) and the two REBIND errors, **`CannotRebindConstEx`** /
+  **`CannotRebindBuiltinEx`** (REPL-only at run time too: a script's rebind
+  is the resolver's compile error below; as plain `Exception`s they once
+  printed no backtrace and ran no `finally`). Declared with
+  `DECL_UNCATCHABLE_EX`. **An error a RUN can raise must be one of these
+  two kinds - a catchable or an uncatchable `RuntimeException` - never a
+  plain `Exception`, which only compile time may throw.**
+  **Enforcement is BOTH ways**: naming one in a catch clause is a COMPILE
+  error (`is_uncatchable_ex_name`, checked in the parser's catch-clause
+  parse), and `is_catchable()` is tested by BOTH matchers
+  (`vm_catch_match`, `do_catch`) **before any name comparison**, so the
+  parenless catch-all cannot swallow one either. Both halves are
+  sabotage-pinned.
+- **A STORE INTO A BUILTIN OR A CONST NAME IS A COMPILE ERROR, decided by
+  the BINDING (2026-10-06, the resolver's `check_rebind`).** An assignment,
+  compound assignment or inc-dec target (each `IdList` member too) that
+  resolves to a builtin, or to a const binding - a `const` declaration
+  (`FuncState::const_slots`, `const_global_slots`), a struct name, an
+  explicit `pure func` name - is refused with the target's caret, even in
+  code that never runs. A local is answered at the write; a global or a
+  builtin once the escaped uses are stamped (`check_rebinds`). **NOT the
+  parser's `Identifier::is_const`:** that mark says the name was found in
+  the const scope, which a parameter, a capture, a foreach or a catch
+  variable of the same name does not change - codegen deciding stores on
+  it made the VM refuse a rebind of such a binding while the tree-walker
+  stored it. Codegen no longer emits a rebind throw (ThrowKind lost both,
+  myv v31). The REPL keeps its top-level names in the map, so there the
+  store raises when it runs.
+- **`OutOfMemoryEx` (2026-10-05, catchable - the maintainer's choice) IS
+  ALSO A `std::bad_alloc`,** and `main` installs a `new_handler`
+  (`ml_out_of_memory`) that throws it. `operator new` may only throw a
+  bad_alloc, and as a RuntimeException every catch already in place - the
+  VM dispatch, each JIT status helper, a script's `catch` - conveys it, so
+  no site needed a new arm. Two halves: a builtin that builds a result to
+  a SIZE the program gives reserves it whole first (`reserve_or_oom`,
+  evaltypes.cpp.h - a count past `max_size()` or a refused reservation is
+  OutOfMemoryEx at the size argument; `make_array` reserves before its
+  first callback), and growth (`s += s`) raises where the allocation is
+  refused. UNDER ASAN its own throwing `operator new` aborts on a refusal
+  whatever the options say (the sanitizer cannot call the new_handler), so
+  `reserve_or_oom` first asks the NOTHROW form (`ML_RESERVE_PROBE`, ASan
+  builds only), which `allocator_may_return_null=1` - set by
+  `__asan_default_options`, mylang.cpp, the one copy of that hook - makes
+  return null; past ASan's 1 TiB maximum it is not asked at all, since ASan
+  prints a pid-stamped warning before refusing such a request and two
+  engines' stderr could never agree. Growth under ASan still aborts. NOT
+  coverable: a refusal inside a `noexcept` path
+  (terminate) and the OS killing an over-committed process. Nets:
+  `tests/functional/66_out_of_memory.my` (sizes past every machine, so
+  nothing is touched), the `out of memory:` `-rt` cases, and
+  `driver_checks`' growth case under `ulimit -v` (non-ASan builds).
 - `DECL_RUNTIME_EX` — subclasses of `RuntimeException` (adds `clone()` +
   `[[noreturn]] rethrow()`):
   `DivisionByZeroEx`, `TypeErrorEx`, `OutOfBoundsEx`, `KeyNotFoundEx`,
   `NotLValueEx`, `NotCallableEx`,
   `AssertionFailureEx`, `CannotOpenFileEx`, `InvalidValueEx`. These are the ones
   script `try/catch`
-  can handle (matched by name).
+  can handle (matched by name; a clause may name one only if it is in
+  `is_catchable_ex_name`'s list).
 - **User exceptions are STRUCTS.** `throw <struct instance>`
   (`ThrowStmt::do_eval`, `eval.cpp`) wraps the instance in an
   `ExceptionObjectTempl` (`exceptionobj.h`) — a `RuntimeException` whose C++
   type name is `"DynamicExceptionEx"`, whose `dyn_name` is the **struct type's
-  name** (so `catch (T)` matches by type), and whose `data` EvalValue is the
+  name**, and whose `data` EvalValue is the
   struct itself. `throw` accepts only a struct instance, or a caught built-in
   exception object (re-throw); anything else is a `TypeErrorEx` (and a
   statically-known non-struct/non-exception throw is a compile-time
-  `TypeMismatchEx` from the inferencer). `do_catch` matches a catch clause by
-  the `dyn_name`/built-in `name` string, and `catch (T as e)` binds `e` to the
+  `TypeMismatchEx` from the inferencer).
+  **⛔ A CLAUSE CATCHES A STRUCT BY IDENTITY (question 25, 2026-11-16)**:
+  the inferencer's structural pass (`resolve_catch_types`, so -nti too)
+  resolves each clause name where the clause is written and stores the
+  `StructTypeDef *` in `AllowedExList::defs`; codegen copies it into
+  `Chunk::catch_keys` (the `.myv` stores it, v42), and BOTH matchers
+  (`do_catch`, `vm_catch_match`) compare it with the thrown instance's def
+  (`exc_struct_def`: null for a built-in exception or a box). A null def is
+  a built-in exception's name (`is_catchable_ex_name`, errors.h - which
+  then matches NO struct, even one named like it) or, in an OPEN world
+  only (the REPL, a parse-time copy: `closed_world` false), a name nothing
+  declares yet, which matches by name; in a script such a name is a
+  compile error. So a function's private struct is caught outside it only
+  by a catch-all, and `catch (dyn as e)` is the catch-all that binds (no
+  exList, an asId). Three rules the first version got wrong (2026-11-17):
+  **a built-in name catches no struct OBJECT, a `box<P>` included**
+  (`exc_struct_def`'s `is_struct`; a box, which a `dyn` can throw, has a
+  null def and compared its struct's name); **a clause resolves through
+  the name AS WRITTEN** (an alias's symbol - see *A TYPE ALIAS* above);
+  and **a call the COMPILER runs catches by identity too**: a function run
+  at parse time may not have been through the inferencer (an untyped run,
+  `-nti`, a name a typed copy does not declare), so `do_catch` resolves a
+  clause with no def in the const scope chain where it runs
+  (`const_scope_struct` - that chain is the lexical one), and a name bound
+  to no struct there catches nothing: its struct is declared further
+  down, so no instance exists yet. It compared names, so `const K = f(1)`
+  caught another function's private struct where `f(runtime(1))` did not.
+  `pt_collect` declares a clause's struct in a typed copy, whose own
+  inference then resolves it. `catch (T as e)` binds `e` to the
   **struct instance** (`exObj->get_data()`, so `e.field` works) when the
   exception carries one, else to a fresh `ExceptionObject` wrapper (the
-  payload-less built-in case — printable/re-throwable). The catch variable is
-  typed `dyn` by the inferencer (member access resolved at runtime). `finally`
-  runs via a scope guard; `rethrow` re-throws the saved exception with the
-  rethrow site's `Loc`. (The old `exception()`/`ex()`/`exdata()` builtins were
-  removed once structs existed — a struct field IS the payload.)
+  payload-less built-in case — printable/re-throwable). The catch variable
+  has the struct's type when its clause names ONE struct (an annotated
+  symbol, `ann_struct`), and is `dyn` otherwise. `finally`
+  runs via a scope guard; `rethrow` re-throws a COPY of the saved exception
+  with the rethrow site's `Loc` (the saved one stays as caught, for a second
+  `rethrow` and for the chain below). (The old `exception()`/`ex()`/`exdata()`
+  builtins were removed once structs existed — a struct field IS the
+  payload.)
+- **IMPLICIT EXCEPTION CHAINING (question 12, Python's `__context__`).** An
+  exception LEAVING a catch body, or a `finally` that runs while one
+  propagates, remembers the exception that body handled:
+  `RuntimeException::context`, set by the ONE shared rule
+  `exc_note_context` (eval.cpp) - a clone of the handled exception, its
+  backtrace dropped, attached at the chain's TAIL (escapes run innermost
+  first, so each outer handled exception is older than everything already
+  in the chain); not when the leaving exception IS the handled one
+  (`serial`, copied by clone, or the same struct payload); at most
+  `EXC_CONTEXT_MAX` deep (`context_cut` records the refusal), so a
+  recursion through catch bodies costs no walk per escape beyond that.
+  `format_exception` prints the chain oldest first. The tree-walker calls
+  the rule from `run_handling_body` around each catch body and each
+  pending-exception finally. The VM calls it from `vm_dispatch_exc_body`
+  as it POPS a **chain marker** (`HandlerSite::chain`): codegen runs every
+  catch body under a guard region chaining to its try (with a finally the
+  guard was already there, #91), and splits the finally: the NORMAL exits
+  run one copy under no marker - the path that throws nothing pays nothing
+  (it measured +21% Ir on 72_exc_finally when the one shared copy pushed a
+  marker) - and each fin_pc names a RERAISE copy, entered only by the
+  dispatch, under a marker chaining to the region that parked the
+  propagating exception. For that the
+  dispatch now PARKS EVERY caught exception (`has_rethrow` is gone, myv
+  v38), and `Rethrow` / `jit_rethrow` raise a CLONE and leave it parked -
+  moving it out made a second `rethrow`, after an inner `try` caught the
+  first, abort the VM. **It is freed when the tree-walker frees its copy**
+  (the object census, `tests/int/12_census.my`, compares the engines):
+  a catch body's normal exit and every flow op leaving one emit
+  `SetPend` with `target2 = 1` (the JIT calls `jit_drop_caught`), and the
+  dispatch frees a marker's exception once it has chained it - the body
+  that handled it is over, or a new exception superseded it. A flow op's INLINED finally copy gets no marker: it
+  runs with nothing propagating. The value a `catch (T as e)` binds for a
+  payload-less exception is a FRESH `ExceptionObject` (name, data, serial):
+  no chain (a class payload holding it could close a reference cycle), and
+  no caret or frames - a COPY used to carry both, so a `throw` of it later
+  carets the old raise and spliced its frames under the new ones. `throw
+  e` inside the catch is still the handled exception, by serial, and
+  takes its chain from there.
 - Always pass `Loc start, end` to thrown exceptions where you can, so
   `mylang.cpp` can render the caret.
 
@@ -2975,7 +8364,12 @@ and two macros:
   `loc_end.col - 1`). A construct that ends with a closing token sets
   `end = <that token's loc> + 2` (e.g. `CallExpr`/`Subscript`/`Slice` through
   their `)`/`]`, array/dict literals through `]`/`}`). Keep this convention when
-  adding constructs, or carets will be off by one or two.
+  adding constructs, or carets will be off by one or two. **An expression
+  ends at its LAST PART's end** (a chain's last operand, a member's name, a
+  unary or inc-dec operand, an assignment's rvalue) - **never at the next
+  token's start** (`c.get_loc()` after consuming): that is right only when
+  exactly one space follows, so `d.zz     + 1` underlined the spaces and
+  `d.zz+1` one column too few (fixed 2026-10-05; statements still use it).
 - **`Construct::eval`** stamps a node's `start`/`end` onto any escaping
   exception that has no loc yet — so an error gets the loc of the *innermost*
   node whose `eval` it traversed. Because `RValue()` and the type ops throw with
@@ -2987,6 +8381,141 @@ and two macros:
 - **Multi-line spans**: `dumpLocInError` (`mylang.cpp`) renders every source
   line in `[loc_start.line, loc_end.line]` with a caret row per line (start from
   `loc_start.col` to EOL, full middle lines, end line up to `loc_end`).
+- **`defined()`-GUARDED NARROWING (#135, 2026-08-09).** FIX-1 refuses a name
+  declared nowhere, which left no way to feature-test one. Dart's
+  promote-after-a-test is the model: the name that was CHECKED is tolerated
+  and nothing else — deliberately NOT "code the DCE will delete may say
+  anything", which would lose the typo protection wholesale. The guarded code
+  still VANISHES (`defined(x)` folds false, the DCE drops the branch); the
+  narrowing only lets it COMPILE. `collect_defined_guards` + a scoped
+  `guarded` stack in the resolver's `walk`, consulted at BOTH FIX-1 sites —
+  the in-walk one and the `escaped_refs` one, which needs the answer recorded
+  on the EscapedRef at PUSH time because it runs after the walk.
+  **⛔ TESTING IT NEEDS A COMPILE-ONLY ORACLE.** A tolerated name in a script
+  stays unresolved and throws `UndefinedVariableEx` at RUN time — the SAME
+  type the compile refusal throws — so a `tests` entry cannot tell "refused"
+  from "failed later", and a polarity case written there passes either way
+  (watched: with the else-arm polarity broken, that version stayed green).
+  The polarity cases run parse+infer+resolve only.
+- **COMPILE WARNINGS — the THIRD tier (step 7, 2026-08-09).** The rule is
+  PROVE -> fail, SUSPECT -> warn, `--strict` -> enforce. `prove_unbound_calls`
+  refuses what it can prove; `warn_unbound_calls` reports the residue it
+  DECLINED — a conditional call, a conditional read, a call in a loop body —
+  in GCC's spirit ("this variable might be uninitialized"). The two cannot
+  double-report **by construction**: the prover THROWS on everything it
+  proves, so anything reaching the warning pass is exactly what it could not.
+  Warnings are **COLLECTED** into `g_warnings` (inferencer.h), not printed at
+  the raise site: the compiler has no diagnostic stream, and a pass writing to
+  stderr directly would be untestable and would interleave with the script's
+  own output. The driver drains the list and renders each with the same caret
+  machinery an error uses; `-rt` reads the vector instead. **A warning that
+  cannot be located is barely a warning** — the test asserts every one carries
+  a loc and a message. It is TRANSITIVE and resolves write-once aliases
+  exactly like the error tier — the two share `build_reachable_reads` and
+  `callee_of` and differ only in which paths count. The one-hop case in that
+  table expected ZERO until the call-graph fixpoint landed, and the pin
+  worked as intended: it FAILED the moment the behaviour improved, instead of
+  letting the improvement go unnoticed. Keep writing them that way.
+  **IT HAS TWO STRENGTHS, and the WORDING is the contract (#146,
+  maintainer-set 2026-08-09).** `"this call MAY fail: g is not bound until
+  later"` means the callee is KNOWN and provably reaches `g` on some path —
+  only whether that path runs is open. `"this call MIGHT fail: the callee is
+  not known here, and g is not bound until later"` covers the shapes no
+  cheap analysis can bound — a container element, a parameter, a REASSIGNED
+  name — and **is allowed to be a false positive**, which is exactly what
+  "might" announces. Two things keep the weak arm from being noise, and both
+  are sabotage-pinned: it fires only for a global that SOME function
+  actually reads (an opaque callee cannot fail on a global nobody touches),
+  and `call_is_opaque` excludes BUILTINS and STRUCT CONSTRUCTIONS — `print`
+  is C++ and `P(1)` binds fields, so counting either as "a callee we cannot
+  analyse" warns on nearly every program (removing that exclusion makes
+  `runtime(0)` itself warn, watched). Measured over samples/ + bench/ +
+  tests/functional/: **ZERO** warnings, while 76_funcval_dispatch — which
+  has exactly this call shape — warns the moment one of its globals moves
+  below the call. **A test of this tier must assert the STRENGTH, not just
+  the count**: the two arms are both one warning, so a bare count lets a
+  "might" satisfy a case that means the definite statement (the `needle`
+  field in the `unbound_call_warnings` table).
+- **⛔ NO INPUT MAY CRASH THE INTERPRETER (#137, 2026-08-09).** Every `.my`
+  file ends in a DEFINED outcome — a compile refusal, a thrown exception, or a
+  clean run. Two real crashes were found by simply trying degenerate inputs:
+  an **EMPTY program** (also a comment-only file, or one the DCE empties like
+  `if (false) { print(1); }`) had no `Frame`, and `EnterNative` formed
+  `ctx.frame->slots` on the null pointer — UB, and SILENT in a release build
+  because nothing reads it; and **~800 levels of nesting** blew the C stack of
+  the recursive-descent parser (a SIGSEGV in release, an ASan DEADLYSIGNAL in
+  debug). Fixed by refusing to JIT a frameless chunk (plus an `ML_VM_CHECK`
+  stating the invariant at the one line that would form the bad address) and
+  by `ParseContext::MAX_NEST`, a scoped depth cap in `pExpr01`, `pStmt` **and
+  `pBlock`** — a bare `{ ... }` reaches `pBlock` from its own loop and never
+  through `pStmt`, so the statement guard alone left `{{{...}}}` unbounded —
+  **and `pTypeAnnot`** (a type annotation recurses on its own,
+  `array<array<...>>`; unguarded until 2026-10-12, a 20000-deep one
+  overflowed the stack). A new recursive parse function takes a
+  `NestGuard`. **And what a function on the recursion path keeps on
+  the stack is paid once per level, up to MAX_NEST:** under ASan every
+  local has its own slot, so `pExpr14_body` at ~6 KB made 256 levels of
+  `[[[...]]]` overflow macOS's 8 MB stack (2026-10-21). Work done after
+  the recursive call lives in a noinline helper (`pExpr14_tail`).
+  **⛔ A LEVEL IS A LEVEL OF THE TREE, NOT ONLY OF THE PARSER'S RECURSION
+  (#98, 2026-10-24):** every later pass walks the tree recursively, so any
+  syntax that nests nodes counts - a unary operator, the ternary's else
+  arm, `??`, an assignment's value, a lambda's `=> body` (each a
+  `NestGuard` around its recursive call) and a postfix chain (`f()()`,
+  `a[0][0]`, `a.b.c`: `NestSteps`, one level per step, given back when
+  the chain ends). None of them was counted, and 20000 of any overflowed
+  the stack in the parser or the inferencer. An arrow body takes TWO
+  levels, the Block and ReturnStmt it desugars to, as `{ return e; }`
+  does: at one, 250 nested lambdas ran three `Inferencer::check` frames
+  (7.3 KB each under clang ASan) per level and overflowed 8 MB, where
+  every other shape fits in 6. `nesting_limit_runs` runs
+  each shape at the deepest depth the parser takes through every engine;
+  a pass that is superlinear in depth shows there as time (the callee-set
+  analysis asked `type_of` of a chain's whole subtree at every level -
+  `cs_can_hold_func` is memoized per no-type-change window now,
+  `CsHoldMemoScope`). Since codegen's recursive frames are ~20 KB per
+  level under clang ASan and arm64 ASan frames ~1.6x that, macOS links
+  with a 16 MB main-thread stack (both build systems). So does a WASI
+  build (a-Shell; the Makefile, by `$(CXX) -dumpmachine`, since `uname`
+  says Darwin there too): `-z stack-size`, plus `--stack-first` so that
+  an overflow traps instead of overwriting the data below the stack.
+  **The oracle is the debug+ASan+UBSan lane; a release build hides all of
+  this.** When you add a runtime path, ask what it does with a program that has
+  no statements, no slots, or absurd depth.
+- **⛔ ONE OP CAN NEED TWO CARETS, AND `locs` HOLDS ONE (#127, 2026-08-08).**
+  A container store `g[0] = v` has two error spans: an OOB / key / type error
+  carets the WHOLE lvalue (`g[0]`), an UNBOUND-GLOBAL base carets only `g` —
+  because in the tree-walker they come from different nodes (the Subscript vs
+  the base `Identifier::do_eval`). `Chunk::locs` is keyed by pc, so it can
+  carry only one of them, and the VM reported the whole subscript for every
+  store form; the CHAIN stores, whose per-step carets live in `chain_locs` and
+  which therefore record NO `locs` entry, reported **no location at all** — a
+  backtrace reading "line 0". The fix is a SECOND pc-keyed table,
+  **`Chunk::base_locs`** (bytecode.h, `base_loc_at`), fed by
+  `CgInstr::base_node_idx` which the emit sites set through
+  `add_base_node(kind, base)` — a no-op for a non-global base, so the table
+  stays sparse. **When you add a store-like op, give it a base caret**: the
+  emit site has the base expression in hand from `as_container_base`, and it
+  is one line. Full note: *docs/vm-ops.md*, `Chunk::base_locs`.
+  **A user CALL op needs THREE (RULE 2, 2026-09-20):** the whole call
+  (`locs`), its argument list (`base_locs` - an arity error), and the ONE
+  ARGUMENT a bind coercion rejected (`Chunk::arg_locs`, one span per
+  argument; the bind records the parameter index in `Exception::bind_arg`
+  and every engine's call-site stamp selects on it - the JIT's at run
+  time, in emitted code). Only a CALL-SITE bind records the index: a
+  builtin callback's parameter index names no argument of the builtin
+  call, so its coercion keeps the builtin's list. `docs/vm-ops.md`,
+  `Chunk::arg_locs`; the record is *RULE 2, refined* in
+  docs/jit-optimizations.md.
+  **A COMPOUND store needs one more (RULE 2, 2026-09-25):** reaching the
+  element carets the LVALUE (`locs` / its pool), the OPERATION (div0, a
+  negative shift, a type error) the WHOLE `lv OP= rhs` - `Chunk::op_locs`.
+  `apply_compound_op` marks such a loc-less throw `Exception::op_caret`,
+  a store core must LEAVE it loc-less (never stamp its lvalue/step caret
+  on it), and every stamp site selects on the flag (`vm_stamp_caret`, the
+  JIT's `emit_exc_stamp`). A new store op with a compound form records
+  `op_node_idx` (`add_op_node`) and stamps through `vm_stamp_caret`.
+  `docs/vm-ops.md`, `Chunk::op_locs`.
 - **Context keywords**: `break`/`continue`/`return`/`rethrow` outside their
   valid context (gated by `pFlags` in `pStmt`) raise a clear `SyntaxErrorEx`
   ("... only allowed in a loop", etc.), not a generic "unexpected token".
@@ -2998,7 +8527,26 @@ and two macros:
   `get_data()` via `to_string`). The payload struct references its
   `StructTypeDef` (owned by the AST), so `main` (`mylang.cpp`) declares the
   `root` AST **outside** the `try` — unwinding must not free the def before the
-  catch handler renders the value.
+  catch handler renders the value. **A struct thrown during the PARSE** (a
+  folded `pure` call) has no `root` to keep it: the statements parsed so far
+  die as it unwinds, so `pBlock` replaces the payload by its rendering
+  (`freeze_exception_payload`) while every enclosing block is alive - it
+  was a heap-use-after-free in main's render (2026-10-11). **⛔ pBlock's
+  catch is the SECOND net; the first is where the exception LEAVES THE
+  CONSTANT EVALUATION (2026-11-16):** `do_func_call`'s catch (eval.cpp)
+  calls `freeze_exception_chain` when the call was made in a const
+  context by the compiler itself - its caller's context is inside no
+  function invocation (`ctx_in_function`), so no script `try` can still
+  handle the struct - before ANY node the compiler holds has died. By the
+  time pBlock's catch ran, a parse function's local could already be
+  gone: `var x = (pure func() { struct E { int n; } throw E(1); })();`
+  freed the literal owning `E` on the way, and pBlock's own freeze read
+  the freed definition. The same freeze covers a fold in the OPTIMIZERS
+  (AutoConst runs a constant call; ef903383 and its follow-up stopped
+  `fold_block` and a decided `if` from freeing statements during the
+  unwind, and this makes the report independent of what a future fold
+  holds in a local). A call a RUNNING function made is never frozen: a
+  `try` in that function may catch the struct and read its fields.
 - **Backtrace frames are LAZY (2026-07-18 profile #3).** A captured
   `BacktraceFrame` holds `{const FuncDescriptor *desc, Loc call_site}` — NO
   strings; `format_backtrace` stringifies from the program-lifetime
@@ -3042,7 +8590,37 @@ and two macros:
   inlined code) emits the chain once and sets the flag, and `do_func_call`'s
   catch (a real call made *from* inlined code) flushes the call-site chain
   unconditionally and sets the flag so the enclosing `CallExpr` doesn't re-emit.
-  `format_backtrace` is untouched. See `plans/function-inlining.md`.
+  The flag describes the frame the exception is CURRENTLY in, so recording a
+  physical frame (`Exception::push_frame`, every engine's one entry point)
+  resets it - otherwise a callee's virtual frame suppresses its caller's
+  (#38 repro B). **The VM reads the chain per OP, and an op whose carets
+  live in a POOL has no node to read it from** (#38 repro C): such an op
+  INHERITS the chain of the innermost node it was compiled for
+  (`CgInstr::inl`, stamped by the six `compile_*` dispatchers and
+  `gen_stmt`) - which is what the tree-walker's per-ancestor
+  `Construct::eval` flush amounts to. A new codegen entry point that
+  compiles a node outside those dispatchers must stamp it too, or its
+  pooled ops drop the frames. `format_backtrace` is untouched. See
+  `plans/archived/function-inlining.md`.
+  **⛔ AN INLINED CALL'S VALUE USED AS AN OPERAND CARETS THE CALL (#68,
+  2026-11-20).** The expression engine's spliced body stands where the
+  call stood, so an error the ENCLOSING operation raises about it - the
+  divisor of a division by zero, the operand of a type error - took the
+  body's span (`100 / sq(x - 2)` careted `x * x` inside sq, and the
+  tree-walker printed `inv(x) at line 1`), and the VM's boxed op, whose
+  node WAS the operand, took the body's inlined-at chain too (an extra
+  `sq(x)` frame). The spliced root now carries its call
+  (`Construct::inline_call`, the splice's `InlineCtx`, which gained
+  `call_end`), and `inline_operand_span` turns the operand's span into
+  the call's at every place an operation carets its operand: the
+  boxed ladder (`num_binop_loc`, `Expr02`), the typed division and
+  modulo, and codegen's recorded caret. A boxed `BinOpV` / `CmpV` /
+  `UnaryV` takes the CHAIN node for its chain and the operand as its
+  loc twin (`loc_node_idx`), as the typed ops already did. Not a chain
+  DEPTH test: the inliner re-tags a substituted argument at every
+  splice, so its chain can be deeper than its parent's without being a
+  call. Pinned by `tests/backtrace/inlined_operand*.my` (both fail on
+  the previous build).
 - **Tests** pin caret spans via the `test` struct's
   `ex_col`/`ex_line`/`ex_col_end`/`ex_line_end` (each checked only when nonzero;
   see the "err loc:" tests in `tests.cpp`); the "backtrace:" `extra_checks`
@@ -3052,8 +8630,8 @@ and two macros:
 
 `mylang` with no FILE/`-e` on a TTY (or `--repl` to force it off a TTY, for
 testing) runs the REPL (`run_repl`, launched from `mylang.cpp`). Full design +
-status: `plans/repl.md`. Four TUs, split so the logic is headless-testable
-behind a thin terminal shell:
+status: `plans/archived/repl.md`. Four TUs, split so the logic is
+headless-testable behind a thin terminal shell:
 
 - **`repl.{h,cpp}` — `ReplEngine`**, the headless evaluation core. Holds the
   persistent interpreter state: a persistent **const-eval `EvalContext`** + a
@@ -3072,7 +8650,11 @@ behind a thin terminal shell:
   is normally suppressed (a decl, `print`, `if`/loop, void call), **except** when
   the last statement is a plain VALUE LOOKUP - a bare variable, a member/
   subscript access, or the `none`/`null` literal (`repl_echo_none`) - so
-  `nn`/`none` echo `=> <none>` while `print(x)`/`func f(){}` stay quiet. Errors
+  `nn`/`none` echo `=> <none>` while `print(x)`/`func f(){}` stay quiet.
+  **The shape is read off the input's TOKENS** (`repl_value_lookup`), the
+  node only locating the statement: by echo time the tree is folded, and a
+  void call `w()` folded to a `none` literal looked exactly like a written
+  `none` (it echoed `=> <none>` until 2026-10-10). Errors
   are caught per input and the loop
   continues — **including a lexer error**: the lexer can throw
   (`InvalidTokenEx`, e.g. `2_`, or an unterminated single-line string), so every
@@ -3099,7 +8681,39 @@ behind a thin terminal shell:
     unterminated token). A multi-line string that **closes** at the start of a
     line is itself a value, so the statement can be terminated there even with
     no following code token (`closed_string`); a line that **opens** one that
-    continues gets no `;` (`open_at_end`).
+    continues gets no `;` (`open_at_end`). **The `;` goes where the CODE
+    ends**, after its last character and before a trailing `#` comment
+    (appended to the line it was INSIDE the comment, so the statement ran on
+    into the next line), and **a block `}` right after a value** (the
+    `open_value` state, which spans lines) gets that statement's `;` in
+    front of it - `if (c) { print(3) }` had no `;` before its `}`, since
+    only line ends were terminated. **And no `;` follows a block `}`
+    whose next code line starts with `else` / `catch` / `finally`**
+    (`next_continues`): a chain written `}` / `else {` on two lines, as
+    a script may. **Nor after a statement HEADER** - the `)` of an if /
+    while / for / foreach / catch or of a function's parameter list
+    (`func f(`, `func (`, `func [c] (` - `repl_header_paren`; a `'H'`
+    entry on the bracket stack, so a header spanning lines works), a
+    trailing `else` / `try` / `finally`, or `struct NAME` / `class NAME`
+    - and `is_incomplete` keeps such an input open
+    (`repl_ends_in_header`): a `;` there gave the statement an EMPTY body
+    and ran the next line on its own, so `if (k == 2)` / `print(x)`
+    printed whatever k was and `while (n < 2)` / `n++` never ended
+    (2026-11-07), and a function or a struct with its `{` on the next
+    line had no body (2026-11-14). **The operators a line ending in
+    keeps going are ONE set, `repl_continuation_op`**, which both the
+    `;` insertion and `is_incomplete` ask (the latter kept its own copy,
+    which missed `?`, `??`, `?.` and `:`).
+  - **A chain the next line may continue stays open (the Joiner,
+    lineedit.h):** `ReplEngine::may_continue` - the input ends with the
+    `}` of a top-level `if` / `else if` / `try` / `catch` block that
+    spans lines, or with an `if` whose last branch is a BRACE-LESS
+    statement on a later line (`brace_less_if_open`, read off the
+    terminated text) - keeps the editor open, a new line at the END of the
+    buffer; an empty line submits (the editor drops it). The cooked reader
+    reads ONE line ahead instead and keeps it (`carry`) for the next
+    input when `continues_chain` says it is not an `else` / `catch` /
+    `finally`, so piped input groups exactly as before otherwise.
   - **`EvalContext::allow_redeclare`** (set only on the REPL global scope) makes
     a re-declaration rebind the global instead of throwing `AlreadyDefinedEx`
     (the script rule is unchanged — the resolver still catches same-scope dups
@@ -3117,7 +8731,11 @@ behind a thin terminal shell:
     `replhelp.cpp`), `:trace [<cat>...] on|off` (toggle the diagnostic
     tracer), `:globals` (a table of every global — vars/consts/funcs/structs —
     with its inferred/declared type, merging the runtime scope with the const
-    context so folded const SCALARS still appear), `:type <expr>` (a committed
+    context so folded const SCALARS still appear; a CLONE's row says what it
+    is for - a template instance its inferred parameter and return types, a
+    `name$sN` specialization the values in `FuncDeclStmt::spec_args`, which
+    `build_specialization` records and the `specialize` trace prints too),
+    `:type <expr>` (a committed
     global's inferred static type via `ReplInfer::global_type`, else the
     runtime structural type of the expression evaluated in a throwaway child
     scope), `:show <function>` (the optimized-AST decompiler, `coderender.cpp`
@@ -3167,7 +8785,7 @@ behind a thin terminal shell:
     pure core is unit-tested with a synthetic suggester (`suggestion()` +
     accept); the gray rendering lives in `read_line` (untested, like the rest of
     the TTY shell). A navigable dropdown completion menu is still deferred (see
-    `plans/repl.md`).
+    `plans/archived/repl.md`).
   - **Reverse history search (`Ctrl-R`).** `class HistorySearch` (lineedit.h) is
     the **pure** analogue of `LineEditor` for searching: a query + a ranked,
     de-duplicated match list + a selected index, driven by `feed()` one byte at
@@ -3242,7 +8860,7 @@ behind a thin terminal shell:
   list (names + descriptions) has one source of truth, `trace_categories_help()`
   (`trace.cpp`), rendered as an aligned bullet list by `:trace help` and the
   `trace`/`:trace` entries alike. Pure/headless, so it is unit-tested (`replhelp:`
-  extra_checks). See `plans/repl-introspection.md`.
+  extra_checks). See `plans/archived/repl-introspection.md`.
 - **`coderender.{h,cpp}`** — `render_func_code(fn)` /
   `render_construct_code(c)`, the optimized-AST **"decompiler"**: it unparses
   the FINAL tree (after parse/fold/inference/`resolve_names`/`specialize_types`)
@@ -3250,8 +8868,19 @@ behind a thin terminal shell:
   code gone, folded consts as literals, inlined call bodies spliced in
   (annotated `inlined f`), flat-array element types as `array<int>`,
   typed-scalar/annotation hints as the var's type. A precedence-aware
-  expression printer + statement walker, with a comment fallback for any
-  unhandled node (best-effort, NOT round-trippable). Backs the `show(f)` builtin
+  expression printer + statement walker (best-effort, NOT round-trippable).
+  **Its expression renderer is an EXHAUSTIVE switch over `ConstructType`
+  with no `default`**, so a new node kind is a build error
+  (`-Werror=switch`) until it is given a rendering - the dynamic_cast ladder
+  it replaced ended in a comment naming the node, which is how `break`,
+  `continue`, `throw`, `rethrow`, a lambda value and a multi-assignment
+  target rendered as `/* BreakStmt */` and friends. Only a statement kind in
+  an operand position (which no tree builds) keeps that comment. A function
+  with no name renders as the lambda expression `func [caps] (params) ...`,
+  wherever it appears. A float renders with the fewest digits that read
+  back as the same double (`fmt_float`; `%g` kept six), inside a baked
+  constant too: `Renderer::value` writes a LiteralObj's value in its print
+  form but for the floats. Backs the `show(f)` builtin
   (a **dev-only** builtin — see the reflection-builtins note below; reserved in
   scripts) and the REPL `:show <name>` (which also renders the `<name>$N`
   clones). It
@@ -3268,7 +8897,7 @@ behind a thin terminal shell:
   (`:show 2 + 3 * 4` → `14`; `:show <expr>` parses + `resolve_names`'s the arg
   non-committing). `:show` output is **syntax-highlighted** via `highlight_line`
   (extended to color C-style block comments and treat `$` as an id char — the
-  `f$0` names). See `plans/repl-introspection.md`.
+  `f$0` names). See `plans/archived/repl-introspection.md`.
 - **`trace.{h,cpp}`** — the **diagnostic tracer** ("MyLang's mind"): a per-
   category bitmask (`TraceCat`: infer/inline/specialize/template/autoconst/
   autopure/arrays/fold) in `g_trace_mask`, the hot guard `trace_enabled(c)`,
@@ -3283,7 +8912,7 @@ behind a thin terminal shell:
   its per-input capture stream (a `TraceSinkGuard` in `do_eval`) so an enabled
   trace narrates into the REPL output just above the result (and is testable);
   a script leaves it at `cerr` so trace never corrupts stdout. OFF by default,
-  so scripts/tests are unaffected. See `plans/repl-introspection.md`.
+  so scripts/tests are unaffected. See `plans/archived/repl-introspection.md`.
 
 `run_repl` (in `repl.cpp`) drives it: history loaded/saved to
 `~/.mylang_history`, colors gated on a TTY + `NO_COLOR` (passed into the
@@ -3330,9 +8959,39 @@ locals all happen and are inspectable (`:analyze`).
   inferred commit vs "is declared" for an annotated one). All `pinned` branches
   are no-ops in the one-shot path, so scripts/tests are byte-identical. A
   rejected input rolls back (`infer_input` restores the global scope + pins the
-  half-built syms). **An uninitialized `var a;` commits as `dyn?`, not `none`**
-  (`pin_new`): a script infers a plain `var`'s type from later uses
-  (`var a; a = 3` → `int?`; a conflicting `a = "x"` is an error), but the REPL
+  half-built syms). **So does one a LATER stage refuses:** the optimizers can
+  RAISE (a constant call folded at compile time - `h(0)` dividing by zero is a
+  script's compile error), and `do_eval` catches that, reports it and calls
+  `ReplInfer::reject_input()`, which restores the same snapshot
+  (`Inferencer::last_input`: the global scope and the template-instance
+  cache, so a later input cannot reuse an instance like `h$0` by name that
+  was never bound). It escaped `do_eval` until 2026-10-10 and ended the
+  session - and `main` rendered a thrown struct after `~ReplEngine` freed its
+  definition (a use-after-free). **A refused input must leave NOTHING
+  behind, and three places used to keep part of it:** the struct tables
+  (`struct_by_name` / `declared_structs` are in the snapshot -
+  `check_opt_struct_fields` re-checks every declared struct per input, so
+  one refused struct refused every later input); the committed SYMBOL of a
+  redefined function or struct (`declare_funcdecl` / `declare_structdecl`
+  bind a FRESH `TypeSym` over a pinned one, `redeclare_fresh` - rewriting
+  the pinned object in place survived the scope restore, so a refused
+  `func f` ran from then on); and the PARSER's commits to the persistent
+  const context (`ConstSnapshot` in repl.cpp, restored on a parse, type or
+  optimizer refusal - a refused `pure func`, const or struct stayed what a
+  later input folded or resolved). It restores every saved binding's VALUE
+  in place: telling a rebound slot by its map node's ADDRESS passed in the
+  debug build and failed in an optimized one, whose allocator handed the
+  erased node straight back to the redefinition. **An input that FAILS
+  WHILE RUNNING is half-committed on purpose** - the statements that
+  completed keep their run-time bindings - so the type side must match:
+  `ReplInfer::forget_unbound` gives back each global the input (re)bound
+  that no COMPLETED top-level statement declared (`repl_declared_names`),
+  or a committed type stood for a name the run never defined (`var dyn? q
+  = nope()` failed, and `q.v` was refused as a possibly-none base instead
+  of "Undefined variable 'q'"). **An uninitialized `var a;` commits as
+  `dyn?`, not `none`** (`pin_new`): a script infers a plain `var`'s type from
+  later uses (`var a; a = 3` → `int?`; a conflicting `a = "x"` is an error),
+  but the REPL
   commits each input before seeing the next and so cannot defer — a `none`
   commitment would reject *every* later assignment (`a = 1`), so an
   unconstrained, un-annotated, non-`dyn`/non-param var is committed `opt dyn`
@@ -3350,7 +9009,13 @@ locals all happen and are inspectable (`:analyze`).
   persistent global (never slotted into "main", never auto-const-promoted — the
   open-world soundness point); nested function locals slot/inline/specialize
   normally. `eval` runs the input's elems directly in the persistent global
-  scope, so globals persist and nested calls build their own frames.
+  scope, so globals persist and nested calls build their own frames. **The
+  top level still gets a FRAME when the inliner gave it slots**: a call
+  inlined into a top-level statement takes its argument temps (`$a0`) and
+  its callee's locals as new slots of main's frame (`root->slot_count`),
+  which a script's root `Block::do_eval` builds - so `do_eval` builds one
+  for the input's run (until 2026-10-10 it did not, and such a call read
+  "Undefined variable '$a0'").
 - **`render_analysis`/`anno_code`** moved from `mylang.cpp` to `analyzer.cpp`
   (an `ostream` param) so `-a` and `:analyze` share one renderer.
 
@@ -3359,8 +9024,193 @@ sequence of `(input, expected-substring)` steps, so the persisted global scope
 AND the cross-input type commitment / `:undef` reset / per-input optimizers are
 exercised; the **`lineedit:`** / **`highlight:`** `extra_checks` feed byte
 scripts / strings to the pure cores. Only `read_line`'s few syscalls are not
-unit-tested. **Not yet (Phase 5):** an IRB-style dropdown completion menu,
-reverse-search / bracketed paste, and the Windows raw-input backend.
+unit-tested. **Not built:** an IRB-style dropdown completion menu, and the
+Windows raw-input backend (the editor is termios-only; on Windows the REPL
+falls back to line-at-a-time input).
+
+## Testing an AST TRANSFORM (the differential does NOT cover it)
+
+> **⛔ THE TREE-WALKER-vs-VM DIFFERENTIAL CANNOT VALIDATE AN AST
+> TRANSFORM.** A transform that rewrites the tree (LICM, the slice hoist,
+> the counted-loop rewrite, M8, inlining, auto-const, DCE) runs BEFORE
+> either engine sees the tree, so both engines faithfully execute the same
+> WRONG tree and agree perfectly. The project's main correctness net is
+> blind here by construction. This is not hypothetical: subscript LICM
+> shipped with a real bug in its first version and the 1481-test
+> differential was fully green on it.
+
+**The only oracle is the same program with the transform OFF.** Hence the
+per-pass kill switches (`OptPass` / `g_opt_disabled`, inferencer.h; CLI
+`--no-opt licm,slice-hoist,for-range,typed,all`) - the same-binary A/B
+lever the JIT has as `-nj`, one layer up. Three nets use them, and a new
+AST transform joins **all three** on the day it is written:
+
+1. **`opt_layer_equivalence` (`-rt`)** - a corpus run through EVERY
+   single-pass-off configuration, plus the all-off one - and the
+   inliner's own switch `-ni`, alone and with all passes off - on BOTH
+   engines, requiring identical stdout AND identical exception behaviour. A
+   divergence names the pass and the layer. Give a new transform a bit in
+   `OptPass`, a case in the corpus, and cases for whatever its gates
+   REFUSE (a refusal that silently stops refusing is the dangerous
+   direction).
+2. **`tests/nested_fuzz`** - its `noopt` engine (on by default) re-runs
+   each random deep-nested program with every transform disabled, on both
+   engines. Random programs hit gate COMBINATIONS no hand-written case
+   covers.
+3. **A shape test** (`hoist_subscript_shapes` / `hoist_slice_shapes`) -
+   asserting the transform FIRED where it should and did NOT where it
+   must not. Equivalence alone is satisfied by a transform that never
+   fires.
+
+> **⛔ AND PROVE THE TEST CATCHES THE BUG.** Write the test, then REINTRODUCE
+> the defect and confirm it FAILS. The first version of the layer-equivalence
+> corpus PASSED with the LICM bug put back - its case used a scalar element,
+> which the pass skips, so it exercised nothing. A test for a bug you have
+> not watched it catch is decoration. (Same rule as "prove the code ran" for
+> a perf measurement, applied to correctness.)
+
+> **⛔ THE VACUOUS-TEST TRAP: THE OPTIMIZER EATS YOUR TEST SHAPE.** The
+> reintroduce-the-defect proof above keeps catching the SAME failure: a
+> test whose shape never REACHES the code under test, because an earlier
+> pass transformed it away - the test then passes with the defect in,
+> vacuously. One session (2026-08-02) hit this FIVE times. Before writing
+> any test of a VM/JIT/codegen path, defeat the known shape-eaters UP
+> FRONT instead of rediscovering them one reintroduction at a time:
+>
+> 1. **A tail call `return f(x)` never reaches codegen as a call** - the
+>    AST tail-inliner splices it first. Use `var r = f(x); return r;`.
+> 2. **Const-folding deletes const-arg constructs at PARSE time.** A
+>    literal-bounds slice of a const (`C[1:4]`) folds to a baked literal -
+>    no live runtime slice exists; a 0-arg pure call folds away entirely
+>    (no args == const args). Defeat with `runtime()` in an operand.
+> 3. **A store/read must sit INSIDE a JIT-compiled run** to exercise an
+>    emitted tier - a short literal array's single store never compiles.
+>    Fill the array in a loop first, then exercise the shape.
+> 4. **The "same" source can lower to a DIFFERENT op**: `a[i] = true` is
+>    StoreElemInt, `a[i] = i < n` is StoreElemValue; `M[k][j]` fuses to
+>    LoadElem2Int only when the pcs are adjacent, and LICM hoists the row
+>    unless the outer index varies with the inner loop. Check `-vd` for
+>    the opcode the test actually produces.
+> 5. **Attribute counters PER SHAPE, never program-wide** - a decline
+>    case's ordinary stores otherwise mask (or fake) the signal. And an
+>    env-gated tool toggled by one test leaks into the next: save/restore.
+> 6. **Const-ARG specialization eats "runtime" values derived from a
+>    param.** `f(9)` specializes to `f$s0` with `n = 9` propagated, and
+>    auto-const then folds a write-once local (`var z = n - n`) to a
+>    LITERAL operand - so a test of a runtime-slot guard (a div-by-zero
+>    divisor) silently exercises the emit-time literal path instead;
+>    three divisor-guard cases were vacuous exactly this way. Defeat by
+>    making the local write-TWICE (`var z = 1; z = n - n;` - blocked
+>    from promotion), or by calling with a non-const argument.
+> 7. **SHRINKING A BENCH TO PROBE IT CHANGES WHICH OPTIMIZATION
+>    APPLIES.** 64_struct_create with `500000 * scale` replaced by a
+>    literal `300` lowers its loop to the TOP-TESTED form, which C4e
+>    refuses - so the probe showed H1 guards in `-vdj` that the real
+>    bench does not have (a runtime bound gives the counted `for.step`
+>    form, where C4e fires). A whole mechanism was nearly built for
+>    that phantom. Keep the bound RUNTIME when probing a loop, and
+>    diff `-vd` between the probe and the original before believing
+>    the probe.
+> 8. **A CALL is not a call by the time codegen sees it.** Testing what
+>    an op does to a slot's DATAFLOW (a kill, a barrier, a liveness
+>    edge) with `p = mk(i)` exercises nothing: a small callee is
+>    inlined by the AST inliner or spliced by the bytecode inliner, and
+>    the reads afterwards then read the INLINED BODY's own slot, not
+>    the one the call would have written. C4d's KILL sabotage passed
+>    against exactly this - 4 emitted guards either way. Use a shape
+>    that survives to codegen (a plain `p = q` MoveV took the same
+>    sabotage from 4 guards to 2), or check `-vd` for the op the test
+>    actually produces.
+> 9. **A call's FIRST descent never takes the emitted push** (#97 inc
+>    2, 2026-09-19). The record high-water gate sends every call at a
+>    new depth through the C++ tier; only a WARMED re-descent runs the
+>    emitted site, its record-less fork and its -2 conveyance. So an
+>    exception-path test whose callee throws on the first call
+>    exercises the C++ tier only - which is how a warmed call's callee
+>    frame rendered `[1] mid(n) at line 0` under BOTH `OFF=norec` and
+>    the default, unseen by `norec_enum` (2272 first-descent programs)
+>    and every corpus throw. Throw on iteration N > 1 of a loop
+>    (`vm_warmed_throw_backtrace_parity`), and compare the BACKTRACE,
+>    not just the exception type. A leaked REFERENCE on such a path is
+>    invisible to every value check and to LSan (aliases never copy,
+>    pooled objects are reachable): `refcount(x)` - the dev-only
+>    instrument - read twice, asserting the DIFFERENCE grows by zero.
+>
+> The mechanical safeguards, both mandatory: an **EMITTED-code counter**
+> (the `g_jit_store_fast` pattern - the helper's counter also counts
+> declines, so it cannot prove the fast path ran), and the
+> reintroduce-the-defect run, which is what catches whatever this list
+> does not yet name. When it does, ADD THE NEW EATER HERE.
+
+**A caret/backtrace check needs the same treatment**: an AST transform can
+move a `Loc` without changing any value, so compare the rendered error
+POSITION across layers too, not just the exception type.
+
+## ⛔ THE TWO HARD LANGUAGE RULES (maintainer-set, 2026-08-08)
+
+These are not guidelines. A change that violates either is wrong, however
+much it wins on a benchmark.
+
+### RULE 1 — THERE IS NO UNDEFINED BEHAVIOR IN MyLang. EVER.
+
+Every program has a DEFINED outcome, decided either at **compile time**
+(a refusal) or at **run time** (a specified value, or a thrown
+exception). There is no third category. C and C++ answer "read an
+uninitialized variable" with UB — an unpredictable value, no diagnostic;
+that is explicitly one of the things this language exists to not do.
+
+Concretely, when you find a construct with no defined answer, the fix is
+ALWAYS one of:
+ - reject it at compile time, or
+ - give it a specified value, or
+ - throw a specified exception at run time.
+
+Never: "it happens to read 0", "it depends on the allocator", "the slot
+holds whatever was there". A `none` sitting in a slot that inference
+proved is an `int` is UB by this rule even though no memory is unsafe —
+it was found printing `1` under the JIT, aborting `ML_VM_CHECK` under
+`-nj`, and throwing `TypeErrorEx` in the tree-walker (see the brace-less
+body note under *Invariants & hazards*).
+
+### RULE 2 — AN OPTIMIZATION MAY NEVER CHANGE OBSERVABLE BEHAVIOR
+
+`--no-opt all` + `-nc` + `-tw` at one end, and the full VM + JIT + every
+transform at the other, must be **observably identical in every
+respect** — printed output, the exception raised, the message, the
+**caret span**, the **backtrace**, and the exit code. An optimization may
+change exactly TWO things, both properties of the ENVIRONMENT rather
+than of the program (maintainer-set, 2026-09-23):
+ - **how long the script takes**, and
+ - **how much memory it has** - for variables, big containers, and
+   RECURSION DEPTH. A faster engine may also be a roomier one: the
+   depth at which a runaway recursion overflows is unspecified and MAY
+   differ between engines and configurations.
+
+What may NOT differ is what happens when memory runs out: a recursion
+that is too deep raises the catchable `StackOverflowEx`, in every
+engine - never a crash. (The tree-walker, which recurses on the C
+stack, is the one documented exception, README *StackOverflowEx*.)
+So a test of overflow compares the OUTCOME, never the depth -
+`driver_checks`'s *overflow* case masks the number.
+
+This is stronger than "the tests agree", and it is the reason the
+engine differential exists. It applies to:
+ - the AST transforms (const-fold, auto-const/pure, inline, specialize,
+   DCE, LICM, for-range, M8) — see *Testing an AST TRANSFORM*, whose
+   `--no-opt` kill switches are the oracle for exactly this rule;
+ - the engines (tree-walker vs VM vs VM+JIT);
+ - the stored image (`.myv` must render errors identically to source).
+
+Two violations of this rule have already been fixed and are the canonical
+examples: **const-eval changed SCOPING** (`if (1) func g() {...} g();`
+worked by default and threw under `-nc`), and **const-fold ignored a
+name binding** (`func abs(x) { return 42; } print(abs(-1), abs(runtime(-1)));`
+printed `1 42` — the same call resolving to two different functions).
+Both were "the parse-time const evaluator has its own, wrong, notion of
+what a name means". **Expect more of that shape and look for it.**
+
+A caret or a backtrace that differs between engines is a RULE 2
+violation, not a cosmetic issue.
 
 ## Optimizations must generalize (the bar is a compiler, not an example)
 
@@ -3449,12 +9299,13 @@ the proof. Before calling it done:
 >    chunk carries none of it.
 > 7. **The ONLY exceptions are the REPL and the `-rt` test harness** (they
 >    retain the AST for their own reasons — decompilation, differential
->    testing). A plain script run (`mylang file.my`, `-vm`, and the eventual
->    `.myv`) has ZERO AST at runtime.
-> 8. **The endgame is a serializable `.myv` file** (`mylang -c file.my` →
->    binary, run with no AST). That is IMPOSSIBLE while any `Construct*`
->    survives codegen. So this rule is not aspirational polish — it is the
->    load-bearing invariant the whole VM exists to satisfy.
+>    testing). A plain script run (`mylang file.my`, `-vm`, `.myv`) has ZERO
+>    AST at runtime.
+> 8. **This is what makes the `.myv` file possible** (`mylang -c file.my` →
+>    binary, run with no AST — SHIPPED, see the format section). It would be
+>    IMPOSSIBLE while any `Construct*` survived codegen. So this rule is not
+>    aspirational polish — it is the load-bearing invariant the whole VM
+>    exists to satisfy.
 > 9. **When you find a construct that isn't natively lowered, NATIVIZE IT.** Do
 >    not add a node-holding op. Do not relocate the node. Extract its loc/data
 >    to a pool and emit real bytecode. (Since the no-fail contract landed, an
@@ -3464,8 +9315,509 @@ the proof. Before calling it done:
 >     pointers, NO indexes, NO tables — the AST is FREED and the script runs on
 >     bytecode + pooled data alone.**
 >
-> **THE RULE IS NOW FULLY SATISFIED AND MACHINE-PROVEN** (2026-07-15,
-> plans/vm-ast-free-runtime.md): the call model runs on the serializable
+> **THE `.myv` STORED-BYTECODE FORMAT (`serialize.{h,cpp}`; the byte-level
+SPEC is docs/myv-format.txt — read it before touching the format; design +
+phases in plans/archived/myv-serializer.md) — THE ENDGAME ARTIFACT.**
+`mylang -c file.my [-o out.myv] [--strip-source]` runs the full pipeline
+(run-side flags: `--source ROOT`, `-f`/`--force` - see the SOURCE
+REFERENCE below)
+(parse → infer → optimize → `vm_compile(root, jit=false)`) and writes the
+VM image; `mylang file.myv` runs it with NO lexer, NO parser, NO optimizer
+— the file argument is detected by CONTENT (`myv_is_image`, the "MYLV"
+magic), never by extension. `-vd file.myv` disassembles a LOADED image via
+**`disassemble_image`** (disasm.cpp), the loaded twin of
+`disassemble_program` — the ROUND-TRIP ORACLE.
+**ONLY the VM image is stored, never native code:** the JIT rewrites code
+IN PLACE (inserting `EnterNative`, deleting originals) against fragments
+that cannot be relocated, so `-c` compiles with `jit=false` (the new
+`vm_compile(root, jit)` / `vm_precompile_all(root, jit)` parameter) and the
+LOADER re-runs the tier — **`vm_jit_loaded_image`** (vm.cpp) mirrors
+`vm_precompile_all`'s TWO PASSES: recompute every chunk's `native_leaf`
+(derived from the ops - `jit_chunk_is_native_leaf`, so it is never stored),
+then jit each body with a `JitCtx` REBUILT from the image (global slot →
+descriptor resolved BY NAME through `global_func_names`, plus the newly
+serialized `VmProgram::global_slot_reassigned`), then main. That is what
+makes a loaded image's `-vd` byte-identical to a fresh compile's.
+**The format** (all little-endian, fixed records, NO compression - the
+no-deps rule): magic + `MYV_FORMAT_VERSION` (exact match) + an endian mark
++ a **BUILTIN-SET FINGERPRINT** + the **SOURCE REFERENCE** + the string
+table, then a TABLE OF CONTENTS (v20: the struct and descriptor counts),
+structs, descriptors, chunks (root first), globals. **The loader reads in
+three phases - IDENTITY (a shell per struct and descriptor, from the
+counts), CONTENT (the records, in file order), WIRING (layouts, deferred
+checks) - so a cross-table index resolves wherever it appears (#52: a
+struct's const member naming a function). Nothing may read a SHELL's
+fields during CONTENT**: the `func` value case defers its capture-free
+check to WIRING, since a shell's empty capture list would pass it
+vacuously (plans/myv-table-ordering.md).
+Cross-references
+are INDICES or NAMES, never pointers: a `UniqueId*` is a string index (the
+loader re-interns), a `Builtin` is its NAME (`vm_lookup_builtin` re-resolves;
+an unknown name is refused), struct defs / descriptors are table indices.
+Values go through a recursive codec (none/bool/int/float/str/array WITH its
+storage kind + readonly/dict + default/struct instance/struct descriptor/
+FuncObject/class instance/builtin, the last by NAME since v39) that ABORTS
+on an unlisted type - an image is never silently lossy. **A struct
+reference may name one of the BINARY's reflection structs (StructField /
+StructLayout / Type) by a reserved number (v40)**, as a struct value's def
+or a member key's bake: a folded `type(x)` is a constant Type instance,
+which no program's struct table holds, so `-c` refused every program that
+asked one, and a member read on a reflection value (`layout(S).fields`)
+lost its bake without a word (found 2026-11-11 by
+`driver_checks`' round trip, which covers tests/int too since). Struct
+LAYOUT is recomputed at load (`compute_layout`), never stored.
+**THE COMPACT INSTRUCTION ENCODING (v3, 2026-07-29).** The fixed 27-byte
+field-wise record was 37% of an image; an instruction is now
+`op:u8 flags:u16 [the present fields]`, where the flags word gives a
+per-field WIDTH CODE - `pa`/`pb` 3 bits each (0 = at its default and NOT
+stored, else 1/2/4/8 bytes), `target`/`target2` 2 bits each (0/1/2/4
+bytes), one bit each for `aop` and `opflags`, and bits 12-15 RESERVED
+(the reader REFUSES a nonzero, so a later version can spend them without
+a v3 reader misreading the file). Chosen from a CENSUS over bench/ +
+samples/ (3483 instructions): `target` present 95% / one byte in 97% of
+those, `target2` default 48%, `pa` default 32% + one byte 66%, `pb`
+default 54% - so the dominant instruction is 5-6 bytes, not 27. Two
+notes: (1) it is SELF-DESCRIBING on purpose - a per-opcode "which fields
+does this op use" table would save the flags word, but this codebase has
+a history of per-opcode tables going stale when an op is added
+(`visit_use_def`, `op_writes_scalar`, `visit_pc_fields`) and here a stale
+entry would mean SILENT DATA LOSS in a stored image; (2) `pa == -1` is
+both "unset slot" and the literal -1, which is NOT ambiguous on disk -
+the field is not stored and the reader's default restores exactly -1,
+while `opflags` separately says whether the operand is a literal (pinned
+by the round-trip test's edge-value program: a `-1` literal, every int
+width, 8-byte float payloads). Still NOT in-format compression (no
+dictionary, no entropy coding, no cross-field bit packing; every field is
+a plain little-endian integer at a byte boundary, O(1) decode, two
+compiles byte-identical) - the no-compression decision record stands.
+Measured: shopping's code section 4741 -> 1086 bytes, the image
+10243 -> 6588 (-36%); gcd is now 1.14x its source, shopping 2.44x.
+**DERIVED POOLS ARE NOT STORED (v4, same day).** `boxed_ops` is a pure
+function of the final code + the loc side table, so the image holds none
+of its 49-byte entries: `read_chunk` calls **`build_boxed_ops`** - now
+exported from codegen.h for exactly this - once a chunk is read (LAST,
+since it needs `locs`), the same rebuild-a-derived-twin shape
+`catch_uids` already used. The point is SINGLE SOURCE OF TRUTH as much as
+bytes: the loader runs the function CODEGEN runs, so the pool the JIT
+bakes `&boxed_ops[target2]` against cannot drift from what a compile
+produced. `target2` (the pool index) is still stored and simply
+overwritten with the identical value. The `Operand` read/write codec fell
+out of serialize.cpp with it - the derived pool was its only user, which
+`-Werror=unused-function` pointed out. **The obvious oracle is
+INSUFFICIENT and the test says so:** `-vd` prints only each entry's
+`target` + `aop`, so byte-identical dumps do NOT cover the rebuilt
+operands or carets - the round-trip test compares the pools
+FIELD-FOR-FIELD (both Operands' live union member per `lit_kind`, both
+Locs) over the root and every function chunk, and COUNTS them so an edit
+to its program cannot make the check vacuously pass on two empty pools;
+separately, a `dyn` div0 in a JIT'd loop (whose caret the JIT stamps
+straight from `boxed_ops[i].start/end`) renders byte-identically from an
+image and from source. Measured: shopping 6588 -> 5641, gcd 1957 = 1.08x
+its source; cumulative from v1 shopping -56%, gcd -60%.
+**⛔ AND `ref_slots` IS DERIVED TOO (v18, 2026-09-22) - THE ONE POOL WHOSE
+STORED COPY WAS DANGEROUS, NOT MERELY REDUNDANT.** It decides what a frame
+pop RELEASES, what the return arms scan, what the frameless gate counts.
+`myv_fuzz` flipped ONE bit of the stored list (`[1, 2]` -> `[0, 2]`,
+small-1305): the temp two closures were built in went unlisted, the
+release scan skipped it, and the image ran to the right answer while
+LeakSanitizer reported both at exit - the failure mode the format text
+used to call "accepted" for a wrong list. It is not accepted; it is gone:
+`myv_read` calls `compute_ref_slots` (codegen.h) right after
+`compute_nonneg_slots`, with the descriptor's seeds from `ref_seeds_of` -
+the SAME function `compile_func_body` uses, so the two seed sets cannot
+drift - and the record left the format. The placement rule is
+nonneg_slots': after `vm_verify_program` (the walk reads operands),
+before the JIT (which bakes the list into its release arms).
+`myv_round_trip` compares the derived lists entry-for-entry on every
+chunk and counts them; `myv_ref_slots_derived` tampers the writer-side
+lists and requires the loaded ones to be the pristine derivation
+(watched: with the rebuild removed, or its seeds dropped, both it and the
+round trip fail - the JIT's release arms differ). **A pool that a
+mutation can turn into a wrong LIFETIME decision is not a bytes question;
+derive it.**
+**⛔ AND A PRIMARY FACT STORED TWICE MUST BE CHECKED, NOT MADE ONE (v19,
+2026-09-22 - learned in two steps the same day).** `root_slot_count` is
+the root chunk's `slot_count` written a second time in the globals
+section, and the two had different consumers: the loader pushed main's
+WINDOW from the second record while the JIT baked main's frame size into
+its return arm from the chunk's (`ck.slot_count + ck.n_temps`, #97 step
+2b). One byte in the chunk's copy (myv_fuzz fat-316, 26 -> 145) made the
+exception path release a frame of a different size than the one pushed;
+LeakSanitizer reported the escaped reference after the uncaught throw.
+The FIRST fix dropped the second record - "derive it from the chunk" -
+and the very next fuzz run answered with fat-311: the chunk's copy
+mutated 22 -> 101, now undetectable, and the register cache took the
+TEMPS for locals (the count is what partitions the frame), pinned one
+that also held a reference at another pc, and leaked it. `slot_count`
+is PRIMARY data with no derivation, unlike `ref_slots` above: for such a
+fact a redundant copy is not waste, it is the only way a mutation can be
+SEEN. So both copies are written and `vm_verify_program` refuses an
+image whose two disagree - the rule the function chunks already had
+(`slot_count == frame_size`). **Derive what has a derivation; duplicate
+and CHECK what does not.** Pinned by `myv_root_slot_count_checked` (both
+copies tampered, each a refusal by name; watched: both accepted with the
+check out).
+**THE DELTA-CODED LOC TABLE (v5, same day).** `{u32 pc, u32 line, u32
+col, u32 line, u32 col}` = 20 bytes per entry, ~19 of them zero (over
+bench/ + samples/, 969 entries: the pc delta never exceeded 19, the
+widest caret column was 99), became FOUR bytes - `pcd` u8 (pc - prev_pc),
+`lined` i8 (start.line - prev_line), `col` u8, `ecol` u8 (end.col,
+IMPLYING end.line == start.line). NO odd widths: a field is EITHER one
+byte OR a reserved sentinel byte (255, or -128 for the signed one)
+followed by a plain 4-byte little-endian int32 - `put_u8_esc` /
+`put_i8_esc`. **Nothing in this format is a 5-byte (or any
+non-multiple-of-8-bit) integer needing a shifted top byte** - the
+maintainer's explicit constraint, which also rules out LEB128/varints
+(byte-granular but bit-TAGGED, the same variable-length machinery the
+16-byte-instruction experiment rejected). Folding the end LINE into
+`ecol`'s escape is what got 4 bytes rather than 5: 97.7% of entries end
+on the line they start, so a dedicated end-line byte would serve 22
+entries of 969; a multi-line span costs 4+8 and the (unreachable)
+all-four-escaped worst case 24. ON-DISK ONLY - the loader rebuilds the
+same `vector<LocEntry>`, so `loc_at`'s binary search is untouched.
+**The `-vd` oracle is again INSUFFICIENT** (the dump prints
+`pc -> start.line:col`, NEVER `end` - half of every caret), so
+`myv_locs_equal` compares tables ENTRY-FOR-ENTRY naming the first
+mismatch, and the new `myv_loc_escapes` test forces BOTH escapes (a
+statement indented 320 columns; a 200-line gap between two throwing ops),
+ASSERTS they were taken so it cannot pass vacuously, and compares. It
+caught a real trap on its first run: **`myv_read` runs the load-time JIT,
+which inserts EnterNative and REMAPS every pc including the loc table's**
+- so any test comparing a written image against an in-memory program must
+write FIRST, then `vm_jit_loaded_image` the in-memory side (what
+`myv_round_trip` already did). Measured: the loc section 796 -> 212,
+the image 5641 -> 5057; **gcd 1765 = 0.98x its source, an image SMALLER
+than the .my**; cumulative from v1 shopping -61%, gcd -64%.
+**NARROW POOL LOCS (v6, same day).** Every caret pool writes its Locs
+through ONE function, so narrowing `Writer::locv`/`Reader::locv` from two
+`u32`s (8 bytes) to **`u16` line + `u8` col (3 bytes)** - same whole-byte
+sentinel escapes to a plain 4-byte int32 - shrank `member_keys`,
+`builtin_calls`, `call_sites`, `emplace_sites`, `incdec_sites`,
+`incdec_chains`, `chain_locs`, `throws`, `boxed_ctors` and
+`inline_frames` at once. `u16` for the line, NOT a byte, because these
+Locs are ABSOLUTE: unlike the loc TABLE's they have no ordering
+relationship to delta against, and a one-byte line would escape in any
+file over 254 lines. Measured over bench/ + samples/: 1618 pool Locs,
+widest line 206, widest column 77, so nothing escapes in practice
+(12944 -> 4854 bytes corpus-wide). The escape test now covers ALL FOUR
+Loc escapes in one program - the table's (col > 254, line delta > 127)
+and a pool's (col > 254, line > 65534) - via a 320-column indent plus
+65600 filler lines before an indented `append(arr, s.v + 1)` whose carets
+land in builtin_calls/member_keys; it ASSERTS each of the four fired and
+compares tables AND pools entry-for-entry (`myv_pool_locs_equal`). A
+65605-line source compiles in 9ms, so `-rt` stays at 0.7s. Measured:
+shopping 5057 -> 4327 = **1.60x** its source, **gcd 1580 = 0.87x**;
+cumulative from v1 shopping **-66%**, gcd **-68%**.
+**THE BUILTIN-SLOT HAZARD (found + fixed here):** `SymbolsType` is a
+`std::map<const UniqueId *, ...>` keyed by the interned POINTER, so the
+builtin table's slot order differed PER PROCESS - a baked
+`SymKind::builtin` slot would resolve to a DIFFERENT builtin after a load.
+`build_builtin_table_once` now sorts by NAME (deterministic given the
+builtin SET), and the image carries `builtin_set_fingerprint()` (count + a
+name hash) so a binary with a different set is refused instead of silently
+calling the wrong builtin. `-c` also registers `argv` before compiling, so
+the compile sees exactly the run's builtin set.
+**THE SOURCE REFERENCE (v2, 2026-07-29) - the image does NOT embed the
+program text.** v1 embedded the whole source so an error could quote the
+offending line; that made the text the second-largest section of an image
+(21% of samples/shopping) and meant a `.myv` could never be smaller than
+its `.my`. It now stores a `MyvSourceRef` (serialize.h): `root` (the
+project root) + `rel` (the source path relative to it) + `abs` (the
+compile-time absolute path) + a **CRC32** and byte SIZE of the file -
+~100 bytes instead of the program. `myv_source_ref(path)` builds it at
+`-c` time; the ROOT is the compile-time CWD when the source lives under
+it, else the source's OWN directory, so `rel` is ALWAYS non-empty and an
+image is RELOCATABLE (a `rel` full of `..` hops would not be).
+`resolve_source` (serialize.cpp) then decides at LOAD time: `--source
+ROOT` given -> look ONLY under it (an explicit root that lacks the file
+is a mistake worth reporting, not a reason to fall back to a stale
+absolute path); else the stored `abs`, then `root/rel`. A file that is
+THERE but whose size/CRC32 differs is REFUSED with a warning (a caret
+drawn on the wrong text is worse than no caret) unless `-f`/`--force`,
+which uses it and warns that carets may be misplaced. An ABSENT file is
+SILENT - shipping an image alone is ordinary. `MyvSource` carries
+`{lines, name, warning}`; the driver prints the warning to stderr and
+passes `name` into `format_exception`, which now takes an optional
+`src_name` and renders " at FILE, line L, col C" (a plain SCRIPT run
+passes its path too, so the two forms agree; `-e`/the REPL pass "" and
+are unchanged). CRC32 is the textbook reflected form computed a bit at a
+time in `crc32_of` (no table to carry; it runs twice per file lifetime).
+`--strip-source` now stores NO reference at all - so such an image also
+leaks no local paths. Path math is hand-rolled (`is_absolute`/`cwd_path`/
+`join_path`, `getcwd` behind an `#ifdef _WIN32`): `<filesystem>` would
+need `-lstdc++fs` on the older GCCs CI still builds with.
+Errors from an image are byte-identical to the source run when the
+reference resolves (pinned by a byte-compare); with no usable source the
+located header + backtrace still name file/line/func, `errfmt`'s
+no-source mode. Compiling twice is byte-identical (pinned). A
+corrupt/truncated/incompatible file is a clean `MyvError`.
+**THE LOADER IS HOSTILE-INPUT HARDENED (#137), in THREE layers, and the
+layering is the point** - each bounds a different KIND of field, and the
+first two cannot see what the third checks:
+(1) **`Reader::countv`** - an element count, by the bytes REMAINING
+    (and **`Reader::uid_req`** beside it: a NAME its record cannot do
+    without - a struct's, a field's, a parameter's - refused in its null
+    form, 0xFFFFFFFF; myv_fuzz fat-259/fat-309, 2026-10-04: a nameless
+    struct loaded cleanly and crashed the `throw` that rendered it. The
+    names that may be null, and the forms that need the rest, are listed
+    in docs/myv-format.txt under `uid`);
+(2) **`Reader::sizev`** - a STANDALONE count that no record array follows
+    (a chunk's `slot_count`/`n_temps`, its dict/dyn iterator and try-region
+    slices, a descriptor's `frame_size`), by the WHOLE FILE. These had no
+    bound at all, and the failure was a HANG, not a crash: one mutated top
+    byte made `n_dyn_iters` 234 million and the run sat there building the
+    slice, with a BYTE-IDENTICAL disassembly either way;
+(3) **`vm_verify_program` -> `verify_chunk`** - every INSTRUCTION OPERAND,
+    against the table it indexes. This is the layer the byte-level ones
+    structurally cannot do: the format stores instructions field-wise, so
+    the reader cannot know which field is a pool index, a frame slot or a
+    pc. Run BEFORE the load-time JIT, which bakes pool ENTRY ADDRESSES into
+    machine code. It also bounds the pc-KEYED side tables - `locs`,
+    `base_locs`, `inline_ctxs` - which look harmless (they are only ever
+    binary-searched for an exact match) but are REMAPPED by indexing
+    (`l.pc = remap[l.pc]`), and a closure's CAPTURE descriptors, which
+    `read_sym` turns into frame/global/capture/builtin slot reads. Plus the
+    STATIC CROSS-FIELD facts: a boxed op's `aop` must be one `vm_num_binop`
+    can dispatch (asked of the dispatch's OWN tables via
+    `vm_aop_dispatchable`, so the two cannot drift); a def a byte-level path
+    writes through must be POD; a ctor's arg count must FIT its def (`<=`,
+    not `==` - a trailing `opt` field is skippable at the call site, which
+    the suite caught the moment `==` was tried); and a baked ctor plan's
+    per-field byte offset plus ITS OWN store width must land inside the
+    instance (the width matters: a blanket 8 falsely refuses a trailing
+    bool). **And ONE PATH property (2026-09-21): the HANDLER-STACK
+    BALANCE** (`handler_balance_fault`, codegen.h) - `PopHandler` is a
+    bare `pop_back()` on a stack every frame of the activation shares,
+    so a chunk that can reach one with nothing of its own pushed pops
+    the caller's handler, or an empty vector (myv_fuzz: ONE opcode byte,
+    a SEGV in the assert-free build). No operand bound sees it; a
+    forward dataflow of the depth over the CFG does (+1/-1 through
+    push/pop, joins must agree, a region's exceptional entries seeded at
+    its push depth). It runs on stored images and, ASSERTS-only, on
+    every chunk codegen emits, so the rule and the compiler cannot
+    drift apart. **⛔ AND A BOUND THAT ONLY LOOKS COMPLETE (same day):
+    `a_reg`/`b_reg` skip the frame-slot bound when the operand's lit
+    flag is set - right for an op that READS the flag (StoreElemInt,
+    `read_int_operand`), a hole for one that reads `a_slot()` /
+    `b_slot()` unconditionally (DictStore, StoreElemValue, StoreMemberV,
+    StoreElem2V: codegen materialises their literals into temps, so a
+    set flag never comes from a compile). One mutated `opflags` bit
+    and the handler indexed the frame with the payload. Those rows use
+    `a_slot_only`/`b_slot_only`, which REFUSE the flag; and a
+    `chain_locs` entry a two-level op dereferences as a PAIR
+    (`chain_pair`: StoreElem2V, whose index was not bounded at all, and
+    the LoadElem2 reads) must hold two. **When you bound an operand,
+    read the HANDLER, not the encoding: what the VM does with the field
+    is the contract, and the encoding can say "literal" about a field
+    the VM never asks.** **AND THE CONVERSE (2026-09-22): AN OPERAND NO
+    HANDLER READS IS STILL AN OPERAND.** A planned StructCtorV's `a`
+    dual is its computed-argument MINI-RUN, consumed by NO handler and
+    by exactly one analysis - `visit_use_def`'s `run(base, cnt)`, which
+    ITERATES the count. Nothing bounded it, so nothing could trip at
+    run time, and the failure was a HANG at load: a burst mutation made
+    the count 0x73A07676 and the load-time liveness walked two billion
+    uses per op (myv_fuzz small-938). The verifier runs the same
+    `run()` bound on it now, and a `-1` base must carry a zero count.
+    **Bound what the ANALYSES read, not only what the VM reads.**
+**⛔ AND A FOURTH SHAPE ALL THREE LAYERS MISS BY CONSTRUCTION: A
+CONSTRUCTOR THE LOADER ITSELF CALLS (2026-08-25).** The three layers
+bound what an image CONTAINS. They cannot bound an argument the READER
+supplies: `read_value`'s `func` case built
+`FuncObject(desc, nullptr)`, whose ctor ran `get_root_ctx(nullptr)` -
+`while (ctx->parent)` on a null pointer - so `mylang prog.myv`
+SEGFAULTED for any image whose pool holds a FUNCTION value, i.e. on a
+VALID image of our own making, not a hostile one. **A `pure func` in a
+const array (`const OPS = [sq];`) is the whole reproducer**, and no net
+saw it for one reason worth generalising: **no corpus program produced
+that record**, so `myv_fuzz` mutated an image that never contained a
+`func` value and `myv_round_trip` round-tripped one too. The fat fuzz
+corpus now ends with exactly that shape, and `driver_checks` runs the
+image and compares it to the source run (watched failing: `img 139`).
+A ctx-less closure is capture-free - the reader now REFUSES any other
+kind rather than trusting the writer's assertion - and gets a null
+`capture_root`, for which `do_func_call` substitutes the CALLER's root.
+**When a loader hands a value to a runtime constructor, the constructor's
+PRECONDITIONS are part of the format's trust model.**
+**⛔ AND A FIFTH, ON A VALID IMAGE AGAIN, AND ONLY THROUGH THE SCRIPT
+DRIVER (2026-09-22): THE LOADED PROGRAM MOVES AFTER THE JIT RAN.** A
+JIT'd root chunk is ADDRESS-BAKED - every NorecSite's `caller` (which the
+record-less tier's retarget writes into a record's `ret_chunk`) and the
+fragment -> chunk map name main's `Chunk` object - and `main()` moves the
+VmProgram out of `myv_read`'s return slot into the variable it keeps
+outside the `try` (`prog = myv_read(...)`; it must outlive the catch
+handlers). The compile path called `jit_norec_rebind` after its identical
+move; the load path did not, so `mylang prog.myv` resumed main at a
+stack address that had gone out of scope on ANY image whose main takes a
+SWITCHED call (recursion past the sync depth cap, an exception across a
+call: 12_deep_switch, 07_exceptions, 23_baked_callee - ASan, or a wild
+read in a release build that happened to print the right answer). Three
+nets could not see it: `-rt` runs in-process and initialises its
+`VmProgram loaded = myv_read(...)` (guaranteed elision, no move);
+`myv_fuzz` runs the driver but its corpus has no switched call from
+main; `driver_checks` had no deep image. **The rebind is the MOVE's job
+now** - `VmProgram`'s move constructor and move assignment call
+`jit_norec_rebind(root)` (vm.h states the contract), the harness's
+explicit rebind loop is gone, and a caller cannot forget what the type
+does for it. Pinned in-process by `vm_program_move_rebinds` (a
+move-constructed and a move-assigned program's sites must name the
+object it lives in; watched: the assignment's rebind alone removed
+fails it, both removed kills the whole suite in the harness) and
+end-to-end by the `driver_checks` deep-image case (watched failing).
+**And the net that found it is now a rule: run EVERY corpus image
+against its source run after a loader change** (`tests/functional/*` +
+`samples/*`, stdout+rc compared; skip the two stdin-driven samples and
+`rand_sort`) - `myv_round_trip` compares DUMPS, and a dump cannot see a
+stale pointer.**
+**TIER 2 - THE PROVENANCE GATE (`ML_UNTRUSTED_CHECK`, defs.h).** A few facts
+no load-time pass can decide, because they belong to the VALUE in a slot and
+not to the image: a flat array's storage-kind union tag, a struct field index
+against the def the instance actually holds. Those sites check at RUN time,
+gated on `g_untrusted_bytecode` - set by `myv_read`, FALSE for bytecode this
+process compiled. **NOT tied to `ASSERTS`**, deliberately: the build that most
+needs the check is an optimized, assert-free release running a shipped image,
+which is exactly the one an assert-gated check abandons. `UNTRUSTED_CHECKS=0`
+is the A/B lever, not a shipping config. Measured (`OPT=1 ASSERTS=0` both
+sides, interleaved `--baseline`): suite geomean **1.006x**, the affected
+struct/array benches scattered 0.95-1.05x with no consistent penalty - but
+callgrind says the branch is REALLY there, **+9.4% Ir on 65_struct_field_sum**
+and +2.2% on 58_structs, flat elsewhere. The instruction-vs-time divergence
+again: a perfectly-predicted branch on a hot-cached global retires free beside
+the real work (the same finding as the guard-elision family). Judge it on the
+wall clock, and remember which number is which.
+
+**⛔ A `noexcept` JIT HELPER MUST NOT THROW - AND SEVERAL DID (#142).** The
+emitter gives a `void`-returning helper NO status test (that is what makes it
+cheap), so an exception leaving one is `std::terminate`: the process dies with
+no message, no caret, no backtrace. Four did - `jit_arr_len`,
+`jit_load_elem_bool`, `jit_load_str_char`, `jit_member_fact_audit` - because
+they read their base through `get_ref<T>()`, which THROWS on a type miss, and
+because `read_int_slot` / `read_float_slot` / the planned ctor's arms ended in
+a throwing `getval<T>()` behind an `ML_VM_CHECK` that a release compiles out.
+Two of them also indexed a string or a flat array with a compile-PROVEN index
+and no bound - a WILD READ, which is worse than a throw and is fatal in the
+interpreter too.
+**⛔ AND AN AUDIT OF OUR OWN CODEGEN IS A FALSE ALARM ON A DISK IMAGE.**
+`jit_ret_audit` and `jit_member_fact_audit` assert things about what
+CODEGEN emitted (that `ref_slots` lists every slot the emitted code can put
+a reference in; that a proven slot holds the struct it was proven to hold).
+On bytecode read off a disk that premise simply does not hold, so the
+assertion is not a bug report - it aborts the process over an image the
+loader deliberately accepted. Both now return early when
+`g_untrusted_bytecode`. A wrong `ref_slots` does NOT only leak a reference,
+though (it was believed to, until myv_fuzz small-390, 2026-10-06): the JIT
+writes a slot OFF the list with two raw stores, so a returned reference
+written there takes no retain, and the callee's frame frees it under the
+caller - a double free. `ref_slots` is derived at load, and its one stored
+input, a call's scalar-result bit, is honored only when the loader can
+justify it (`myv_derive_ref_slots`, serialize.cpp; docs/myv-format.txt).
+**The rule:** in a helper the emitter cannot get a status from, a type miss or
+a bad index takes a DEFINED fallback (`none`, `0`), never a throw. The type
+test costs nothing - `get_ref` performs it anyway; only the miss branch
+changes. And **fix the INTERPRETED TWIN in the same change**: `ArrLen`,
+`LoadStrChar` and `LoadElemBool` each have a hand-inlined copy in `vm.cpp`'s
+dispatch with the identical hazard, and the unbounded index there is a wild
+read even though the interpreter may legally throw.
+**⛔ A FIFTH, FOUND BY THE FUZZER A MONTH LATER (fat-676, 2026-09-22),
+AND THE TIER ITSELF WAS THE THROWER.** `jit_load_struct_elem` (the
+whole-`p` foreach bind) was `void noexcept` on the argument that its base
+is an inference-proven flat struct array. On an image the base is
+whatever the mutated operand names, and `flat_structs()`'s
+ML_UNTRUSTED_CHECK - the provenance tier, doing exactly its job - threw
+the InternalErrorEx that then hit the `noexcept` boundary: `terminate
+called after throwing an instance of 'InternalErrorEx'`, exit 134, on
+an image the interpreted twin renders cleanly. So the two halves of
+#142 must be applied TOGETHER: a helper reached from emitted code with
+no status either takes a defined fallback OR becomes a STATUS helper
+(`extern "C" int`, `catch (RuntimeException &)` ->
+`g_vm_jit_exc.reset(e.clone())`, the emitter's `test eax` after the
+call) - and a status helper is a CONVEYING op, so it leaves
+`op_never_exits` (the NATIVE_LEAF bar: a leaf's direct caller ignores
+the callee's status) for `op_fully_native`'s convey family, beside
+LoadElemValue. `myv_struct_elem_base` requires the emitted helper to
+have RUN (`g_jit_op_run`) and the right exception out of `vm_run`;
+watched: the void shape terminates the whole suite. Reach note: no
+corpus program emitted `load.selem` at all until
+`tests/functional/27_struct_whole_p.my` (a whole-`p` bind needs a VALUE
+use of `p`; every corpus foreach read fields only), so the leaf-bar
+move costs nothing measurable.
+**⛔ AND A TRIPWIRE ON A CODEGEN-PROVEN ARM IS A FALSE ALARM ON AN
+IMAGE, LIKE THE AUDITS ABOVE (fat-845 / fat-260, same day).**
+`read_float_slot`'s "a `th==f` operand holds a float" and
+`vm_unpack_elem_body`'s "the base is an array" are `ML_VM_CHECK`s that
+state an interpreter INVARIANT for bytecode we compiled - and on an
+image the proof is input, so they aborted the debug lane where the
+assert-free build gave the defined answer (0.0; TypeErrorEx). The
+spelling for that case is the `ml_untrusted_bytecode()` idiom (defs.h):
+`ML_VM_CHECK(ml_untrusted_bytecode() || <invariant>)`, the tripwire
+kept for our own bytecode and silent for a loaded image, so the
+outcome is the SAME in every build (`myv_untrusted_proven_arms`,
+watched aborting both ways). When a fuzz finding is a DEBUG-ONLY abort
+on an image, ask which side of that line the assertion is on before
+calling it harmless.
+**⛔ AND A SIXTH (2026-10-21, myv_fuzz seed 249888766): A HELPER HANDED A
+SLOT INDEX READS THE FRAME, AND THE EMITTER MAY KEEP THAT SLOT IN A
+REGISTER.** ForStepElemInt's gate-decline tier, `jit_for_step_elem`,
+took the loop counter's slot number and stepped `ctx->frame->at(i)` -
+but `pick_visit_op` lets the op keep the counter pinned, so the slot
+held whatever was there before the loop (a `none`, in a slot nothing had
+written) and `getval<int_type>` threw through `noexcept`. Not an image
+bug: `for (...) { var e = a[i]; ... }` over a slice aborted the default
+engine. A slow tier gets a pinned value AS A VALUE, read through the
+cache-aware `read_slot` before the call (as `jit_elem_int_value` gets
+the stepped counter), or the op flushes first. Before handing a helper
+a slot index, ask whether `pick_visit_op` lets that slot live in a
+register at this pc.
+
+Two producer-side rules fell out: **only PRE-JIT bytecode is storable**
+(`myv_write` ML_CHECKs it - the JIT rewrites code in place and fragments
+are not serialized, so a post-jit image names fragments that do not
+exist), and `vm_jit_loaded_image` iterates **this program's** chunks, not
+the process-global `g_func_chunks` (which nothing prunes, so it re-JIT'd
+freed programs' chunks). Measured over 2000 mutations of two images: **0
+crashes and 0 hangs in the LOAD**, from 19 hangs / 20 crashes. **AND THE
+BUILD TYPE NO LONGER CHANGES THE ANSWER** - `OPT=1` and `OPT=1 ASSERTS=0`
+now behave IDENTICALLY on the corrupt corpus, where before the assert-free
+build turned named aborts into SIGSEGVs. That is the point of doing this
+at LOAD: a check that runs once, in every build, beats one that a release
+flag removes. What
+remains, deliberately, is a structurally VALID image whose VALUES are
+nonsense: it can still trip a runtime `ML_CHECK` (a named abort, never a
+SIGSEGV) or loop forever - proving a slot's type at every pc would be a
+bytecode type-checker, and halting is undecidable. `-rt`'s
+`myv_corrupt_refused` is the net: it writes 0xFFFFFFFF over every
+4-byte-aligned word and requires each load to be a clean Exception,
+knowing nothing about which words are counts or indices. The BROAD net is
+**`tests/myv_fuzz BINARY`** (stdlib-only, like `nested_fuzz`): five
+mutation modes over a small and a fat image, a crash always failing the
+run and `--triage` telling a non-terminating PROGRAM (legitimate - it
+loads cleanly) from a hang in the LOADER (a bug). **Run it after any
+format or loader change**, against BOTH a debug (ASan+UBSan) and an
+`OPT=1 ASSERTS=0` build - they catch different things, and it found the
+tier-2 throw-through-noexcept and the codegen-audit false alarm below
+within minutes of being checked in. A finding is SAVED, because an image
+embeds its SOURCE PATH (its seed replays it only through `tests/run`, on a
+build of the same commit - tests/CLAUDE.md). Its sibling
+**`tests/repl_fuzz BINARY`** does the same for the REPL - a THIRD front
+end that shares almost none of the script path (its own incremental
+inferencer with cross-input type commitment, retained per-input ASTs, an
+open world of map-resident redefinable globals, and a dozen `:` commands
+that parse arbitrary text). Its generator is TEMPLATE-based, not
+byte-random: random bytes bounce off the lexer, while these reach the
+passes that hold state ACROSS inputs. Run it under **RECYCLE=1 + ASan** -
+the REPL retains ASTs, so it is where a stale-node identity bug would
+live, and that is the detector CLAUDE.md already names for the class. Verified:
+83/84 of bench/ + samples/ run identically from an image (the one
+exception, rand_sort, calls `rand()`), and since dicts keep insertion
+order (#50) a loaded image's dicts iterate exactly as the written ones
+(the order a const dict printed in used to be the one difference between
+a loaded image's `-vd` and a fresh compile's). Sizes vs the source (after v3's compact
+instructions, v4's dropped derived pool, v5's delta locs, v6's narrow
+pool Locs): fib 2.26x, shopping 1.60x, gcd 0.87x - SMALLER than its
+source (v1 was 4.7x / 4.76x / 2.72x). The REPL is out of scope
+(it retains ASTs).
+
+**THE RULE IS NOW FULLY SATISFIED AND MACHINE-PROVEN** (2026-07-15,
+> plans/archived/vm-ast-free-runtime.md): the call model runs on the serializable
 > **`FuncDescriptor`** (funcdesc.h) — `FuncObject::func` points at it, never
 > at a `FuncDeclStmt`; params bind from its `ParamDesc` snapshot, captures
 > snapshot via its resolved kind/slot list (`read_sym`), backtraces and the
@@ -3478,8 +9830,8 @@ the proof. Before calling it done:
 > `memset(0)`ed by the Construct class `operator delete` — and
 > `Construct::live_nodes == 0` is ML_CHECKed. The VM then runs with the AST
 > provably gone. The historical inventory lives in
-> `plans/vm-fallback-elimination.md`; the descriptor/teardown design in
-> `plans/vm-ast-free-runtime.md`.
+> `plans/archived/vm-fallback-elimination.md`; the descriptor/teardown design in
+> `plans/archived/vm-ast-free-runtime.md`.
 
 MyLang's performance philosophy is a two-front strategy, in this deliberate
 order — the same order a real C/C++ compiler works in:
@@ -3503,7 +9855,8 @@ order — the same order a real C/C++ compiler works in:
    operand reads saved ~1 instruction/iteration, 0.03%, because it only trades
    a well-predicted monomorphic vcall for an equal-length inline branch; the
    per-node dispatch can only be removed *wholesale*, which is what a VM does).
-   Target: **5-10x CPython**.
+   The target was **5-10x CPython**; with the native tier it was crossed
+   (10.25x on 2026-07-28, see the JIT sections).
 
 The VM does **not** replace the runtime value/scope model — it reuses
 `EvalValue`, `EvalContext`, `Frame`/slots, the global/builtin tables,
@@ -3511,1155 +9864,137 @@ The VM does **not** replace the runtime value/scope model — it reuses
 strategy* (a flat instruction stream + a switch loop) layered over the same
 runtime, not a second interpreter — which is what keeps it small and correct.
 
-**Status: Phase 5 in progress** (register machine over frame slots —
-resolved-local int/float/mixed scalar loops run native at top level, inside
-function bodies via a `do_func_call` hook, and NESTED — nested loops + `if` in a
-loop body compile directly into the chunk; array element read/write `a[i]` /
-`a[i]=v` / `a[i][j]` (and a subscript **inc-dec** `a[i]++`/`d[k]++`/`a[i]--` →
-`StoreElemInt`/`Float` with a constant 1 for a flat array, or a `DictStore` with
-a boxed 1 + the compound op for a dict — `== x[k] += 1`, the subscript's loc for
-its caret) and a scalar builtin/call in an expression are native. The subscript
-STORE ops **`DictStore`/`StoreElemValue`** are **AST-free**:
-`vm_subscript_store`
-(the shared `Type::subscript(for_write)` + `slot_rmw`) handles ANY base type, so
-the `is<Dict>`/`is<Array>` guard + `node->eval` fallback were dropped and its
-not-an-lvalue caret is now a `Loc` pair (from the loc side table, recorded by
-`extract_locs` from `node` = the `Subscript`), not an `Expr14`-cast node. A
-flow-free statement runs as a fallback within an otherwise-native loop so
-array-building loops (matrix/sieve) go native; recursion stays neutral; **suite
-geomean 0.75x, VM ~1.3x faster than the tree-walker**). A **boxed (dyn/string)
-value tier** then removed the `node->eval` fallback for scalar `dyn`/string
-expressions — assign / compound-assign / comparison / logical `&&`/`||` over
-locals, globals, captures, builtins, literals, subscripts (`a[i]` via the
-runtime `Type::subscript`), members (`obj.f` / `d.k` via a shared
-`member_read` factored out of `MemberExpr::do_eval`), and **slices**
-(`a[i:j]` / `s[i:j]` → **`SliceV`**, via the runtime `base.get_type()->slice()`
-— the same COW-registered sub-view path as `Slice::do_eval`, absent bounds
-passed as `none`; ~2x on `bench/15`/`16` array-slice, `29` fully native) —
-and **`foreach` over an array** lowers to a counted loop (snapshot + `ArrLen`
-+ a per-element load + the
-fused `ForLoopStep`, −64% instructions): a flat `array<int>`/`array<float>`
-reads the raw scalar (`LoadElemInt/Float`, stamped `ForeachStmt::elem_th`), and
-a **GENERAL element (`array<str>` / `array<array>` / `array<dict>` /
-`array<dyn>`)** binds the element's existing `EvalValue` into the loop var via
-**`LoadElemValue`** — **box-free (no box/unbox)**, matching the tree-walker's
-general `elem = view[i].get()`, ~1.7x on a general-array foreach loop; the
-inferencer stamps `ForeachStmt::container_is_array`. Both the **single-var**
-(`foreach (e in a)`) and the **INDEXED 2-var** (`foreach (i, e in indexed a)`)
-forms are native: for indexed, the index var IS the loop counter (the body
-reads it) and the element loads into the 2nd var. A flat **`array<bool>`** binds
-each element as a REAL bool (not 0/1) via **`LoadElemBool`**
-(`ForeachStmt::elem_is_bool`), so `print(x)`/`str(x)` show `true`/`false` and
-`x == true` holds — matching `arr_elem_boxed`'s bool case. A **foreach over a
-proven STRING**
-(`ForeachStmt::container_is_str`) is the same counted-loop shape with two string
-ops: **`StrLen`** (the char count
-bound, once) and **`LoadStrChar`** (bind char i as a fresh 1-char string, box-
-free — matching `SharedStr(string(&view[i], 1))`); single-var and indexed 2-var
-both native (`str.len`/`load.strchar` in `-vd`). Neither op can throw (i is
-loop-bounded), so both are node/loc-free. A **flat `array<PodStruct>` foreach**
-whose body reads the loop var
-ONLY as SCALAR FIELDS (`p.x`) is native via a **DIRECT read**: the loop var is
-NEVER materialized — the counted loop runs and each `p.field` compiles to
-**`LoadStructFieldInt`/`LoadStructFieldFloat`**, a scalar read STRAIGHT from the
-array element's bytes (`vm_struct_field_int/float`), skipping the per-iteration
-`StructObject` + `memcpy` the tree-walker's reused-object foreach pays (**~4x**
-on `65_struct_field_sum`). The inferencer stamps
-`ForeachStmt::container_struct_def`; the codegen's `struct_fe_body_ok` proves
-every loop-var use is a scalar-field READ (a whole-`p` use or a `p.field` WRITE
-— which must NOT hit the array, `p` is a copy — falls back to the tree-walker's
-reused-`StructObject` bind), and a per-body `sfe` mapping makes
-`compile_int/float_expr` emit the direct read for `p.field`. The
-**STRICT-UNPACK**
-`foreach (x, y in
-pairs)` over a proven `array<array<int>>` / `array<array<float>>` (flat
-sub-arrays) is native too: the outer array iterates counted, and per element a
-**`UnpackElemInt`/`UnpackElemFloat`** op reads `pairs[i]` (a general element = a
-flat sub-array), strict-checks its length == the loop-var count `N`, and writes
-its `N` scalars into the consecutive loop-var slots (`base..+N-1`) — matching
-`do_iter`'s strict destructure (same two `TypeErrorEx`s, same container loc, via
-the loc side table so the op is `node`-free). **Storage-kind guarded:** the
-BOX-FREE raw read (`flat_ints`/`flat_floats`) fires only when the sub-array's
-`skind()` actually IS that flat kind; ELSE (a MIXED-numeric literal like
-`[int, float]`, which inference types `array<float>` by int|float join but
-builds GENERAL storage, or a flat array of the OTHER scalar kind) it binds each
-element's ACTUAL boxed value via `vm_arr_elem` — so an int stays an int under
-`UnpackElemFloat`, byte-identical to `bind_loop_var` (blindly reading
-`flat_floats()` on the general sub-array asserted/crashed — a fixed bug).
-Stamped by the inferencer as `ForeachStmt::unpack_elem_th` (i/f). A
-**general / dyn / str / mixed** sub-array (`array<array<dyn>>`,
-`array<array<str>>`) — where the flat scalar path doesn't apply — is the
-**`UnpackElemValue`** variant (`ForeachStmt::unpack_elem_value`): same op shape,
-each element binds its boxed value via `vm_arr_elem`. This variant ALSO carries
-the **`indexed` unpack** `foreach (i, name, price in indexed products)`
-(shopping's F-2b shape): the index var is the loop counter and the unpack
-targets follow it (`unpack_base = base + 1`, width `N - 1`). The inferencer's
-`accumulate_foreach` was fixed to type an indexed 3+var loop's targets as the
-sub-array's ELEMENT type (`dyn`/`str`), not the whole sub-array — matching
-`do_iter` (which destructures the element), a latent front-end bug shopping
-survived only because it used the vars in lenient builtins (`rpad`/`str`), never
-arithmetic. A **`_` placeholder or a non-consecutive slot layout** (the loop
-vars don't land in one contiguous run — a `_` gets NO slot) takes the
-**`UnpackElemTargets`** variant: same op shape, but the per-position target
-slots live in the **`Chunk::unpack_targets`** pool (`-1` for a `_`, which is
-skipped) and each element binds box-free via `vm_arr_elem` (flat or general —
-so it covers int/float/str/dyn sub-arrays uniformly). Handles the non-indexed
-`foreach (a, _, c in pairs)` AND the indexed `foreach (i, _, v in indexed
-rows)`. A non-local target still falls back. `20_foreach_unpack` (flat) 0.80x,
-`75_indexed_unpack` (indexed str) 0.71x vs the tree-walker.
-**Dict `foreach (k, v in d)` / `foreach (k in d)`** is native via a **LIVE
-dict iterator** — a dict has no O(1) index, so it is NOT the counted-loop
-but a while-shaped loop over two ops: **`DictIterInit`** pins the dict
-(an `intrusive_ptr` copy → alive for the loop, matching the tree-walker's
-lifetime-extended `cval`) and sets the `unordered_map` iterator to `begin()`;
-**`DictIterNext`** tests it (→ end_pc on end), binds the key (and value,
-`.put(it->first)`/`.put(it->second.get())` — like the array general case), and
-`++`s. The per-loop iterator STATE lives in a **`vm_run_chunk`-local
-`std::vector<DictIterState>`** (`{intrusive_ptr<DictObject> dict; iterator;}`)
-sized by **`Chunk::n_dict_iters`** and indexed by a codegen-assigned `iter_id`
-(monotonic, never reset → nested/sequential dict foreachs get distinct slots); a
-mid-loop `return`/exception releases it when the frame unwinds — no cleanup op.
-Advance is BEFORE the body: the visited sequence is identical to the
-tree-walker's range-for, and the only difference (`++it` timing) is observable
-only under mutation-during-iteration, which is UB in both engines (dicts don't
-COW, so a body write hits the same map either way — a snapshot would DIVERGE, so
-we DON'T snapshot). The inferencer stamps `ForeachStmt::container_is_dict` for a
-1/2-var (key[+value]) loop over a proven `Dict` type — and the **INDEXED** form
-`foreach (i, k[, v] in indexed d)` too: `ids[0]` is an int index counter
-(`LoadImmInt 0` before the loop, `IntBin += 1` at each `continue` point, so it
-holds the iteration number during the body, matching `do_iter`), and the
-key/value follow it. Fixing this also fixed a **latent front-end mis-typing**:
-`accumulate_foreach` typed an indexed dict's two targets as a destructured
-element (both the KEY type), but `do_iter` binds `ids[1]=key`, `ids[2]=value`
-(count==2) — so `v` was wrongly `str` for a `dict<str,int>`; now key + value
-are typed distinctly (the tree-walker hid it by binding dynamically). A `dyn`
-container falls back; `_`/keys-only bind a slot of `-1` (skip). ~1.5x on
-`62_dict_word_count`
-(0.71x→0.64x vs the tree-walker).
-**A `foreach (<ids> in [indexed] <dyn>)`** — the
-container's static type is `dyn`, so array-vs-dict can't be proven — is native
-via a runtime-dispatching LIVE iterator, **`ForeachDynInit`**/**`ForeachDynNext`**
-(like the dict pair, over a **`Chunk::n_dyn_iters`** `DynIterState` pool),
-**GENERAL over the id list**: any var count, the `indexed` form, and `_`
-placeholders. Init
-pins the container, records the loop shape (`in.a.lit` packs
-`nvars | indexed << 8`; the per-var frame slots — `-1` == `_` — are an
-`unpack_targets` pool entry, `in.b`), and chooses ONCE — an
-array (`{idx, size}`) or a dict (`{it}`), else throws `TypeErrorEx` (loc side
-table); Next binds BOX-FREE from the state and advances, exactly as
-`do_iter`: `indexed` binds `targets[0]` = the iteration counter; an ARRAY
-element binds a single remaining var (`vm_arr_elem` → `arr_elem_at`) or is
-STRICT-unpacked into N remaining vars (the same non-array / wrong-length
-`TypeErrorEx`s, container caret via the side table, recorded on the Next op);
-a DICT binds key [, value [, `none`-padded further vars]] (`do_iter`'s
-count-2 padding). The inferencer stamps `ForeachStmt::container_is_dyn`
-for ANY foreach over a `Dyn` container (a non-local — global/capture — loop
-var still falls back, rare). An `opt` container is compile-REJECTED
-(`NullabilityEx`), so "unproven container" has no valid-script residue.
-This is the **F-2a** win — a `dyn`-param function dispatched
-indirectly (its param never gets a concrete container type, e.g. phonebook's
-`cmd_view`) now iterates natively instead of an `EvalStmt` fallback.
-**Related fix:** a 1-var `indexed` foreach (`foreach (i in indexed a)`) has
-NO value var — `do_iter`'s single-bind read `ids->elems[1]` OUT OF BOUNDS
-and ABORTED (container hardening; UB in a plain release); it now binds
-nothing beyond the index, consistent with the dict path. **~1.8x
-CPython** on `66_dyn_foreach` (single-var; VM 0.59x the tree-walker) and **~3x
-CPython** on `74_dyn_foreach_kv` (2-var dict; VM 0.54x the tree-walker) — the
-box-free bind is the win. **User-function calls** go
-native via `CallV`: a call
-proved a user function (`CallExpr::vm_direct_func`, a Func static type — not a
-struct constructor / builtin) that devirtualized to a global slot evaluates its
-args into a register run (a `VmArgs` view over the caller's frame slots — no
-per-call allocation) and calls `vm_call_func` → `do_func_call` with the VALUES
-(no `node->eval` of the call). An **INDIRECT call of a func VALUE** (a closure /
-lambda / func-valued var — a plain `CallExpr` with `vm_direct_func` but no
-global slot) goes native via **`CallValueV`**: the callee EXPRESSION is compiled
-into a temp (callee-first, matching the tree-walker), then the args run, and the
-op reads the temp's `FuncObject` and `vm_call_func`s it — so
-`11_closure_counter` (1.09x → 1.00x, no longer a VM loss) and `12_higher_order`
-(0.54x) go native. This covers both an EXPRESSION-position value call and a
-**discarded call STATEMENT** `fn(args);` (F-3, phonebook's `cmdfunc(data)` — a
-func picked from a dict/array and dispatched; `gen_stmt` + the loop-body stmt
-compiler route a plain-`CallExpr` statement to `try_native_value_call` after the
-`Direct{Call,BuiltinCall}Expr` handlers, its result discarded). Modest speed
-(the call is `do_func_call`-bound, both engines), but it removes phonebook's last
-live `EvalStmt` (`76_funcval_dispatch` VM 0.93x vs the tree-walker). A **baked const array/dict/struct literal** (a `LiteralObj` —
-what a fully-const `var a = [1,2,3]` / `d = {}` folds to) materializes via
-**`LoadLiteralObjV`**, which calls the shared **`eval_literal_obj`** (the
-immutable-share vs fresh-mutable-clone logic + the general/flat_s `arr_hint`
-cases, factored out of `LiteralObj::do_eval`) from a `Chunk::literal_objs` pool
-entry — AST-free, byte-identical to the tree-walker. A **plain assignment to a
-GLOBAL-table slot** `g = <expr>` (a top-level var a function reads — the write
-counterpart of `LoadGlobalV`) goes native via **`StoreGlobalV`** (`target` = the
-`GlobalFuncTable` slot, `a` = the value temp): it writes `gfuncs->slots[target]`
-+ `defined[target]=1`, which for a plain assign is byte-identical to the
-tree-walker's decl (bind + define) AND reassign (`slot_rmw(op==assign)` ==
-`put(RValue)`). A **compound** `g += x` and **inc-dec** `g++`/`g--` (a global
-statement, lowered to `g += 1`/`-= 1`) use the SAME op with `aop` = the base op
-(`Op::invalid` == plain assign): it requires the slot already `defined` (else
-`UndefinedVariableEx`) then copy-modify-stores via `num_bin_op`, identical to
-`CompoundV` (the compound rhs is a boxed operand — a complex rhs falls back).
-The
-compound/inc-dec variant carries a `node` for its caret (div/undefined, via the
-loc side table); the plain assign is node-free. Compile in `compile_boxed_stmt`
-(the gate now also accepts a `SymKind::global` lvalue; a global `IncDecExpr`
-statement is handled at its top). An **INT/FLOAT-TYPED** global (needs
-`coerce_to_decl_type`'s numeric widen / dyn-narrow throw) and a `const` global
-(must throw `CannotRebindConstEx`) fall back to `EvalStmt`; a **non-scalar-typed
-global** (`array<int> g`, `str g`, …) is native (its coerce is a no-op — see the
-typed-decl note below).
-Script-only (no `SymKind::global` in the REPL), so never emitted there; **not**
-a pure-target retarget candidate (it writes the table, not a temp). A closure
-**CAPTURE write** `cap = v` / `cap += v` / `cap++` (a counter `start++`) is the
-exact analog — **`StoreCaptureV`** writes `(*ctx->captures)[target]` with the
-same plain/compound/inc-dec `aop` split, no defined check (a capture is always
-defined - snapshot at closure creation). So a closure BODY is now fully native
-(the capture write was its last `EvalStmt`); 0-bench (the `do_func_call` call
-overhead, engine-neutral, dominates a counter loop) but it completes the
-slot-write family (local / global / capture). An **array LITERAL**
-`[a, b, ..]` whose elements aren't all const (a fully-const *scalar* one is a
-baked `LoadConstV`) builds native via **`MakeArrayV`**: the element expressions
-compile into a
-register run (the same contiguous-run pattern native calls use for args, via
-`emit_args_range`), and the op builds the array through the tree-walker's shared
-**`build_array_from_values`** core — flat (int/float/bool) or general per the
-`ArrHint` carried in `target2`, box-free, never throwing (so `node`-free) — and
-is retargeted straight into the lvalue slot for `var a = [..]` (no `MoveV`). A
-**flat STRUCT-array literal** `[P(a,b), P(c,d)]` (`ArrHint::flat_s`, F-4) lowers
-to the **FUSED `MakeStructArrayV`** (`try_make_struct_array`) when every element
-is a same-POD-struct ctor with all-scalar field args: the N structs' field args
-compile INTERLEAVED into one run (struct i's field j at `base + i*M + j`,
-`M = nfields`), and `vm_make_struct_array` coerces them STRAIGHT into a
-contiguous flat byte buffer — **no intermediate `StructObject` per element** —
-then builds the mode-5 flat array. This **BEATS** the tree-walker's
-`LiteralArray::do_eval` (which allocates N `StructObject`s then packs them):
-`77_struct_array_lit` VM **0.85x** vs the tree-walker (was ~1.2x SLOWER under the
-earlier per-element `StructCtorV`+`MakeArrayV` lowering — the `EmplaceStruct`
-pattern for a whole literal). A MIXED / nested-struct-field / non-scalar-arg
-literal declines the fused op and falls to per-element `StructCtorV` +
-`MakeArrayV` (`build_array_from_values` packs the run VALUE-DRIVEN, the def off
-the first element), and a still-unliftable one to `EvalStmt`. The `StructCtorV`
-arg gate (shared `is_typed_scalar_arg`) accepts a scalar LITERAL (not only a
-`th`-stamped operand), so an auto-const-folded arg (`var a=1; [P(a,a)]`, whose
-folded literal has no `th`) lowers too. So a per-iteration array literal
-(`22_multi_assign` 1.05x→0.89x; matrix/sieve/wordcount) no longer falls back to
-`EvalStmt`. A **dict LITERAL** `{k0: v0, ..}` is the twin **`MakeDictV`**: the
-key/value pairs compile INTERLEAVED into the run (`[k0,v0,k1,v1,..]`, key at
-even/value at odd), and the op builds via the shared **`build_dict_from_pairs`**
-(which freezes each key). Both share **`compile_to_run_slot`** (factored out of
-`emit_args_range`) to place each element in its run slot. Dict-literal loops
-(`25_dict_member` 0.63x, `62_dict_word_count` 0.69x vs the tree-walker) go
-native. A **CLOSURE** `func [caps] (params) {..}` in expression position (a
-returned / var-bound / call-arg lambda, `id == null`) builds via
-**`MakeClosureV`**: `make_intrusive<FuncObject>(def, &ctx)` snapshots the
-captures from `ctx` — byte-identical to `FuncDeclStmt::do_eval` for a lambda —
-where `def` is a program-lifetime **`FuncDescriptor*`** from a
-`Chunk::closure_defs` pool (the `Instr` holds only the index, and the pool
-holds NO `Construct*`; the ctor never throws for a resolved closure, so no
-loc). A **top-level `func f(..){}` decl
-STATEMENT** bound into a hoisted GLOBAL slot reuses the same op — `gen_stmt`
-emits `MakeClosureV` (the `FuncObject`) + **`StoreGlobalV`** (write the slot +
-mark `defined`), byte-identical to `FuncDeclStmt::do_eval`'s global-bind
-`slots[slot] = LValue(func, false); defined = 1` (a capturing named func / the
-REPL map falls back). So the **whole function/closure path is native** — decl
-BIND, closure CREATE, capture read/write, indirect CALL, and the compiled body —
-via `MakeClosureV` + `StoreGlobalV`/`StoreCaptureV` + `CallV`/`CallValueV`.
-Removing the per-func-decl `EvalStmt` cut the bench-suite fallback count 54→24.
-A **`const` DECL of an arr/dict/func kept as a runtime symbol** (`const x =
-<LiteralObj>`; const SCALARS are inlined, so never here) goes native via
-**`DeclConstV`**: materialize the rvalue then BIND the slot as a **const
-`LValue`** (`LValue(v, true)`) — a LOCAL (`target2==0`) or GLOBAL (`==1`) slot.
-Binding const (not a plain `put`) is what keeps a later rebind throwing
-`CannotRebindConstEx` (a rebind, having no `pInConstDecl`, stays `EvalStmt` and
-throws via the tree-walker). The codegen (`compile_boxed_stmt`) recognizes it by
-`Expr14::fl & pInConstDecl` — which distinguishes a DECL from a REASSIGN (a
-const reassign is a RUNTIME error, not caught at compile time, so the codegen
-does see it and must leave it to the tree-walker).
-A **`struct P {..}` decl** binds the same way — `gen_stmt` bakes the type
-descriptor (a trivial `t_structtype` value holding the program-lifetime
-`StructTypeDef*`) into the const pool -> **`LoadConstV` + `StoreGlobalV`**.
-The tree-walker binds it `const`, but that flag is unobservable at runtime (a
-reassign `P = x` is a compile-time `CannotRebindConstEx`, `isconst` folds), so a
-plain `StoreGlobalV` is differential-identical (a REPL map-resident struct falls
-back). A standalone POD construction `P(x, y)` builds via **`StructCtorV`**: the
-field args compile into a register run, then `construct_struct_from_values`
-coerces them into the POD bytes (the `StructTypeDef*` is a `Chunk::struct_defs`
-index, so node-free). It's gated on **every arg a typed scalar** (`th==i/f`) —
-the inferencer already rejected a non-fitting typed arg, so `coerce` can't throw
-and no per-arg loc is needed; a **nested POD-struct-field arg** (`L(P(1,2),
-P(3,4))`) is accepted too (`pod_ctor_arg_safe`: the nested `StructCtorV`
-produces exactly that struct type, so the parent's `coerce` can't throw), while
-a `dyn` arg falls back to the tree-walker, which reports the exact arg loc (the
-`append`-fused ctor is `EmplaceStruct`). A **BOXED (non-POD) construction**
-`B(a, x)` with runtime args — an `array`/`dyn`/`opt` field makes B boxed (a
-const-arg one folds to a `LiteralObj`) — is **`StructCtorBoxedV`**
-(`CallExpr::vm_struct_boxed_def`, copied onto the `DirectCallExpr` in
-`devirtualize_calls`): the field args compile into a register run, then
-`construct_struct_boxed_from_values` mirrors `construct_struct`'s boxed loop
-(coerce + emplace, none-fill omitted trailing opt fields). Here a field coerce
-CAN throw (a dyn-laundered wrong value), so the **per-arg carets** are pooled in
-a new serializable `Chunk::boxed_ctors` (`{def, ArgLoc[]}`) and the throw
-reports the offending arg's caret — byte-identical to the tree-walker, AST-free.
-The POD path exposed a latent VM bug: `a[i] =
-<struct>` into a **flat struct array** has no boxed element LValue, so the
-general `StoreElemValue` path (`subscript(for_write)`) wrongly raised
-`NotLValueEx`; `vm_subscript_store` now byte-stores a flat POD-struct element
-directly (bounds/type-check/COW/`memcpy`), mirroring `try_flat_subscript_store`.
+**THE OP INVENTORY LIVES IN `docs/vm-ops.md`** - which source construct
+becomes which opcode, what its operands mean, which pool carries its caret,
+and which shapes deliberately decline to a slower tier; plus the side tables
+and the `-vd` dump's contents. The authoritative opcode LIST is
+`ML_FOR_EACH_OPCODE` in `src/bytecode.h`; that file explains what they are
+for. **Read the entry for a construct before changing how it lowers.**
 
-**The residual container-STORE family (all now native).** A **struct field
-store** `s.f = v` / `s.f OP= v` → **`StoreMemberV`** (`vm_member_store`: a POD
-field coerces + byte-stores, a boxed field takes the field LValue + `slot_rmw`),
-gated on the inferencer's `MemberExpr::base_struct`; a **nested store**
-`a[i][j] = v` → **`StoreElem2V`** (`vm_nested_subscript_store` reads `a[i]` as a
-reference then stores `[j]` into it — a FLAT inner via the shared
-`flat_store_core`, a GENERAL inner via the element LValue; COW writes back
-through the inner element), the generic N-level `a[k0]..[kn] = v` →
-**`StoreElemChainV`** (`vm_subscript_chain_store` over a key temp run). Both are
-AST-free with **PER-STEP subscript carets** in the **`Chunk::chain_locs`** pool
-(a `{Loc,Loc}` per step, inside-out; a pointer, deref only on the throw path so
-the hot store stays cheap): an INTERMEDIATE `a[9]` OOB carets the inner
-subscript, the FINAL store the outer — byte-identical to the tree-walker's
-per-node stamp (this replaced an earlier single-outer-loc imprecision where an
-inner throw showed the whole `a[i][j]` span). **A store's base may be a GLOBAL
-or CAPTURE container**, not only a
-frame local: `as_container_base` (codegen) returns a slot **KIND** (0 local / 1
-global / 2 capture) which the store ops carry in `in.target`, and
-`vm_store_base`
-(vm.cpp) forms the base `LValue*` from the frame / the `GlobalFuncTable` /
-`ctx->captures` (an undefined global → `UndefinedVariableEx`) — so `a[i]=v` /
-`d[k]=v` / `s.f=v` targeting a top-level container a function reads, or a
-captured one, go native. **`StoreElemValue` is the UNIVERSAL store**:
-`vm_subscript_store` now handles a **flat scalar** base too (via the shared
-`flat_store_core`, factored out of `try_flat_subscript_store` alongside
-`flat_writable_array`), so it dispatches **flat / general / dict** at runtime
-exactly like the tree-walker's `try_flat`→general. The codegen emits it as the
-**catch-all** for any container-slot base a fast path didn't take — a proven
-GENERAL array, a **DYN / captured / unproven** base, or a flat int array whose
-index isn't int-compilable (the flat `StoreElemInt` path rolls back and falls
-through) — while a **proven flat int/float array keeps its unboxed
-`StoreElemInt`/`StoreElemFloat`** (the catch-all excludes `th==f && base_array`,
-left to `compile_float_stmt`). A **GENERAL nested lvalue-chain store** mixing
-MEMBER and SUBSCRIPT steps (`a[i].f=v`, `q.p.x=v`, `s.f[i]=v`, `d.a[0].f=v`) →
-**`StoreLValueChainV`** (`try_native_chain_store` decomposes the lvalue into a
-slotted base + a `Chunk::chain_steps` list — a member is a `member_keys` pool
-index, a subscript a pre-evaluated key temp, each with its own node loc). The
-runtime walk (`vm_chain_lvalue_store_op`) carries `cur` as EITHER an `LValue*`
-ref OR a plain VALUE — exactly the tree-walker's chained `do_eval`, where an
-immutable intermediate (a POD field, a readonly instance) is a value READ
-(`member_read_core`) the walk continues on, only failing `NotLValueEx` at the
-FINAL store (so `q.p.x` on nested-POD carets the whole lvalue, not the inner
-step). The final step dispatches: a struct → `vm_member_store` (POD byte / boxed
-field), a **DICT member `d.f=v` → `vm_subscript_store(memId)`** (== `d["f"]=v`,
-auto-vivify), a subscript → `vm_subscript_store`. Each step's throw uses ITS
-node's loc (a subscript-only chain keeps the tuned `StoreElem2V`/
-`StoreElemChainV`; a single `s.f`/`a[i]` keeps `StoreMemberV`/`StoreElemValue`).
-So a member-in-the-middle nested store — which WORKS for boxed structs / dict
-values, throws for POD — is native, byte-identical incl. carets. **P8 exceptions
-are now fully native** (see
-`plans/vm-exceptions.md`): try/catch/finally + throw + rethrow + all
-flow-crossing-try (incl. nested-finally chaining) are native ops. **G1
-(2026-07-17): a VM-RAISED exception NEVER C++-throws, cross-frame included.**
-`vm_raise` (the shared raise for `Throw`/`Reraise`/`Rethrow`/`EndFinally`'s
-reraise and the IntBin/FloatBin div0 pair) dispatches to a SAME-frame handler
-first (the un-cold fast path — routing it through the cold walk cost a
-measured +12% on 42_exceptions), else runs the native FRAME WALK
-(`vm_unwind_walk`) directly: pop in-VM records (capturing their backtrace
-frames), dispatch at the first frame with a handler (the caller refreshes the
-cached `code` pointer), or convert to the `g_vm_exc_pending` SIGNAL at the
-activation's BOUNDARY record — pointer work end to end, no landing pad, no
-exception clone (69_exc_crossframe 0.564x VM-wall, my/py 1.43x → **0.80x** —
-the last CPython-losing bench now wins). Backtraces are byte-identical,
-inclusive of INLINED virtual frames (`Chunk::inline_ctxs`, flushed by
-`vm_flush_inline`). The boundary catch remains ONLY for the TYPE-SYSTEM C++
-throws the VM can't pre-detect (OOB / KeyNotFound / a boxed `TypeErrorEx`):
-a same-frame catch of those is native (boundary dispatch), a cross-frame one
-pays one landing-pad to the boundary before the walk takes over.
+Two consequences of it are load-bearing everywhere, so they are stated here:
+the codegen is **NO-FAIL** (every construct lowers or the compiler throws
+`NotLoweredEx` — there is no fallback opcode and no path back to the AST, so
+a gap is a loud compile refusal, never a silent tree-walk), and **a new op
+that writes a frame slot must join `visit_use_def` AND be classified in
+`op_writes_scalar`**, while one with a pc field must join
+`visit_pc_fields` — those tables are audited, and their consumers run at
+different pipeline stages (see THE AUDIT-TABLE STAGE TRAP).
 
-A **multi-assign destructure of an array LITERAL** — `a, b, c = [e0, e1,
-e2]` (an `Expr14` whose lvalue is an `IdList`) — is lowered by
-**`try_multi_literal_store`** (codegen) NOT by building the array and unpacking,
-but by compiling each element into a snapshot temp and **distributing** the
-snapshots to the target slots — **eliminating the array alloc entirely** (the
-real win; box-free for int/float elements). Snapshot-FIRST makes it swap-safe
-(`a, b = [b, a]`), matching the tree-walker's build-then-bind. Only when the
-rvalue is a `LiteralArray` of EXACTLY the target count and every target is a
-real (non-`_`), resolved-local, non-const, non-coerced identifier; a `_`
-placeholder, an arity mismatch (a runtime strict error), a non-literal array
-(`a,b = f()`), or a typed/const target all fall back to the strict
-`handle_single_expr14` `EvalStmt` (byte-identical under the differential).
-A **SCALAR SPREAD** `a, b, c = <non-array scalar>` (the sibling
-`try_multi_scalar_spread`) compiles the rvalue ONCE and **`MoveV`s (copy/alias)
-it to every target** — no array, no runtime destructure-vs-spread branch. Gated
-on a provably-non-array rvalue (a proven int/float `th`, or a scalar `Literal` —
-int/bool/float/str/none, NOT `LiteralObj`); an array/dyn rvalue falls back to
-the strict destructure. So `var a,b,c = 0` / `= "hi"` / `= x` (int `x`) are
-native. **Effect: `22_multi_assign` 0.89x → 0.18x** (the per-iteration
-array alloc was the whole cost). Every OTHER IdList destructure — an array
-VALUE (`x, y, z = arr`, `= products[pnum]`), a const array literal (a folded
-`LiteralObj`), a `dyn` rvalue — is the catch-all **`MultiUnpackV`**
-(`try_multi_unpack`), tried after the two eliding paths: it compiles the rvalue
-into a temp and the op runs the tree-walker's STRICT destructure — an array
-value is length-checked and its elements distributed **box-free** via
-`vm_arr_elem` (skind-dispatched: sound for a general/flat/dyn element), a
-non-array SPREADs to every target. AST-free: the target slots (with `-1` for
-`_`) live in the **`Chunk::unpack_targets`** pool, and the strict-length caret
-in the loc side table records the enclosing `Expr14`'s span — matching the
-tree-walker, whose loc-less IdList lvalue makes the error inherit the Expr14
-loc via `Construct::eval`. So the WHOLE IdList branch is native (no residual
-`EvalStmt`); a typed/const target still falls back. **Effect: `73_multi_unpack`
-(the array-value form) 0.30x vs the tree-walker.** A
-**`return <expr>;`** likewise lowers to a
-`ReturnV` that compiles the return expression (so `return f(x)` → CallV) then
-sets flow={ret,value} and stops the chunk. A **ternary VALUE** (`cond ? a : b`)
-compiles to a branch producing one arm into a slot, and a **`CachedCallV`**
-(a `CachedCallExpr`) routes through the caller frame's per-frame `PureCache` —
-together these make a recursion-unroll return native, so **`fib` runs fully
-native** (a plain CallV would BYPASS the cache and recompute the exponential).
-A **read-only builtin** with the VALUE ABI (`Builtin::func_v` — args
-pre-evaluated, no `node->eval`; set by `make_const_builtin_v`, which also
-registers a generic adapter as the tree-walker's `func`) dispatches natively via
-`CallBuiltinV`. **`func_v` is AST-FREE**: instead of an `ExprList *`, it takes an
-**`ArgLocs`** (`evalvalue.h`) — the whole-args caret + per-arg carets
-(`arg(i)->start/end`) + the array-repr `arr_hint`, i.e. EXACTLY the source-loc
-data a builtin's error messages used to reach through the arg nodes, and nothing
-executable. The tree-walker adapter builds it from the real `ExprList`
-(`build_arglocs`, types.cpp); the VM builds it (`vm_build_arglocs`, vm.cpp) —
-today from `dc->args` (the node), next from a serializable `Chunk` pool — so a
-migrated builtin holds NO AST pointer, and its carets are byte-identical in both
-engines. A **mutating builtin** (append/pop/insert/erase/intptr) uses the
-**lvalue ABI** (`Builtin::func_lv` — a UNION with `func_v`, discriminated by
-`DirectBuiltinCallExpr::lvalue_arg0`): it gets arg0 as an `LValue*` target,
-dispatching via **`CallBuiltinLV`** when arg0 is a slotted identifier
-(local/global/capture — the op forms the `LValue*` straight from the table). The
-value args (1..n) — the `rest` args, i.e. the **TAIL ARGS BY VALUE** (everything
-after the arg0 lvalue) — come in one of three forms, decided **PER-OP** (the VM
-reads `in.b.is_lit` — a valid `b` = a compiled rest run = this op is rest-native
-— NOT a per-builtin flag): (1) a **rest-native** builtin (`insert`/`erase`,
-`make_builtin_lv_v` + `lvalue_rest_native`, ALWAYS) has them pre-evaluated in
-`rest`/`n_rest` (the VM compiles a register run, base in `Instr::b`;
-`vm_call_builtin_lv_rest` copies by value) — **zero `node->eval`**; (2) a
-**rest-native-CAPABLE** builtin (`append`/`push`, `lvalue_rest_capable`) has its
-single value arg pre-evaluated too, but only in the PLAIN case — the codegen
-compiles the value into a rest run PER-OP and marks that op, while the ctor case
-(`EmplaceStruct`) and the subscript-target case (`CallBuiltinLVElem`) stay
-self-eval (see below); (3) a **self-eval** call (`rest == nullptr`) reads its
-args off `exprList` — the tree-walker's append/push (so construct-in-place fires),
-`pop`/`intptr` (no value args), `sort`/`reverse` (their cmp arg), and any
-append/push op the codegen left self-eval (a ctor-fallthrough, a subscript
-target). This **per-op** design is what lets `append`'s three call shapes coexist
-(a plain `append(a, x)` is rest-native = no `node->eval`, `append(a, P(..))`
-= `EmplaceStruct`, `append(a[i], x)` = `CallBuiltinLVElem`).
-**`append(struct_arr, Ctor(args))` fuses to an
-`EmplaceStruct` op (Phase 2b)**: the inferencer stamps a POD struct construction
-with `CallExpr::vm_struct_ctor_def`; the codegen recognizes append/push of such
-a ctor, compiles the ctor's field-arg VALUES into a register run, and emits
-`EmplaceStruct` (arg0's `LValue*` by slot kind + the run base in `b`);
-`vm_emplace_struct` (eval.cpp) coerces those values straight into the flat
-`array<Struct>`'s bytes — **no temp `StructObject`** (a non-flat `array<dyn>`
-target falls back to build+append, matching the tree-walker). So a
-`append(pts, Point(i, i*2))` build loop is fully native. **`EmplaceStruct` is
-AST-FREE** (the `Chunk::emplace_sites` pool: the ctor's POD def + the
-container-arg caret + the per-field coerce carets + the callee name, indexed
-by the kind-packed `Instr::a`; the whole-args caret rides the loc side
-table), so a struct-append chunk serializes with an empty `node_table`.
-An **AST builtin**
-(defined/type/…, needs the arg node) keeps the union null (its call site
-falls back whole) — EXCEPT `defined`, now fully lowered: only a bare
-`Identifier`
-can evaluate to the `UndefinedId` sentinel (`Identifier::do_eval` is its sole
-producer), so `defined(<non-identifier expr>)` is exactly "evaluate the arg
-(effects/throws included), then `true`" (`try_native_defined_expr`: compile
-the arg + `LoadConstV true`, AST-free), and a wrong-arity `defined(a, b)` —
-which throws BEFORE evaluating any arg — is a bare
-`ThrowRuntimeV(bad_args)` → `InvalidNumberOfArgsEx` with the args caret.
-With `try_fold_defined` (identifiers) + `DefinedGlobalV` (globals), every
-`defined` form is now fold/native.
-**The read-only builtin migration to `func_v` is
-complete** (see `plans/builtin-abi-migration.md`): every read-only builtin whose
-args are plain values now dispatches via `CallBuiltinV`. **`sort`/`rev_sort`/
-`reverse`** — whose arg0 is an `LValue` (slice write-back + a const's copy) —
-migrated to a **const-capable lvalue ABI**: `make_const_builtin_lv` registers a
-custom `func` (the tree-walker / const-eval path, `sort_arr`/`reverse_arr`,
-eval's arg0 as value-or-lvalue) PLUS a `func_lv` (`sort_lv`/`reverse_lv`,
-handed arg0's slot `LValue*` by the VM's `CallBuiltinLV`), sharing a
-`sort_core`/`reverse_core` so both engines behave identically and a const-array
-sort still folds at parse time. They're now in `is_lvalue_arg_builtin` (so the
-VM devirtualizes to `CallBuiltinLV`, and AutoConst/the specializer correctly
-treat arg0 as a write position — no unsound const substitution into a sort).
-**`map`/`filter`** — which must validate arg0 (the function) and throw BEFORE
-evaluating arg1 (a TESTED order the eager value ABI would break) — go native via
-a two-op sequence in **`compile_boxed_expr`** (`try_native_map_filter`): compile
-arg0 into a temp, **`CheckFuncV`** (throws with arg0's caret if it isn't a
-function, BEFORE arg1's code runs), compile arg1, **`MapFilterV`** (calls the
-shared **`vm_map_filter`** in generic.cpp.h, declared in eval.h — map builds a
-fresh array, filter keeps truthy elements; array→array, dict→dict — the SAME
-core the tree-walker's `builtin_map`/`builtin_filter` now call). The
-devirtualize pass sets `DirectBuiltinCallExpr::map_filter_kind` from the callee
-name. So the residual old-ABI (`func`, node-based) floor is now exactly ONE
-principled group — the **AST builtins** (`defined`/`isconst`/`isconstdecl`/
-`type`/`decltype`/`typestr`/`kindstr`/`show`: an unevaluated / node-property
-operand, inherently node-based).
-**A SUBSCRIPT lvalue target `append/push/pop(a[i], d[k])` goes native too
-(Phase 2c, `CallBuiltinLVElem`)**: the codegen compiles the index and records
-the base slot; the handler forms the element `LValue*` by calling the runtime
-`Type::subscript(base, idx, for_write=false)` directly — the SAME COW the
-tree-walker's `Subscript::do_eval` uses — then `func_lv`. Still fallbacks: a
-MEMBER target (`append(s.f, x)`), `insert`/`erase` with a subscript target, a
-NESTED base (`a[i][j]`), and struct construction. **THE DEFAULT
-FLIPPED 2026-07-18**: a script/`-e` run executes on the VM (both documented
-conditions long met — full parity + the VM ~2.2x the tree-walker on the
-bench geomean, suite 5.0x CPython); `-tw` selects the tree-walker, `-vm` is
-accepted as the explicit default (pre-flip scripts/CI), the two are
-mutually exclusive. The REPL and parse-time const-eval remain tree-walker
-by design (they need the AST). `tests/nested_fuzz.py`'s tw lane passes
-`-tw` explicitly; `bench/run.py` runs the VM by default (`--tw` for the
-tree-walker; `--vm --baseline <same post-flip binary>` still gates VM vs
-tree-walker — the baseline now gets `-tw`). Implemented in its **own files** — `bytecode.h` (the `OpCode`
-enum — named `OpCode`, since `Op` is already the operator enum in
-`operators.h` — plus `Instr`/`Chunk`), `codegen.{h,cpp}` (`codegen_program`,
-AST→`Chunk` lowering), `vm.{h,cpp}` (`vm_execute` + the `g_exec_engine`
-harness switch) — never woven into `eval.cpp`. The build-out is strictly
-incremental behind three safety pillars: an **AST-fallback opcode**
-(`OpCode::EvalStmt`, and later `EvalExpr`, whose handler is just
-`node->eval(ctx)`) so the VM executes the *whole* language from day one; a
-**differential test harness** (the `tests` table reruns under the VM and must
-match the tree-walker — see "Tests"); and a **performance gate** (`bench/run.py
---vm --baseline`, `cur/base` = VM/tree-walker — see "Benchmarks"). We replace
-fallbacks with native opcodes one small, fully-tested step at a time — never a
-big-bang 10k-LoC drop; a temporary, *tracked* scaffolding regression from the
-smallest sensible step is acceptable, an accidental one is not.
-**Phase 0** lowered the optimized root to one `EvalStmt` per top-level statement
-+ `Halt`, building the root `EvalContext`/`Frame`/`GlobalFuncTable` exactly as
-`Block::do_eval`'s root path — byte-identical to `root->eval(nullptr)`.
-**Phase 1** added native control flow (`Jump`/`JumpIfFalse`/`LoopBackEdge`) and
-flattened **top-level `if`/`while`** to jumps; conditions/bodies still fell back
-(one `do_eval` each). (`JumpIfFalse` and its Phase-1 gen_if/gen_while flatten
-forms are since DELETED; `LoopBackEdge` is DELETED too — once the no-fail
-codegen removed every fallback body, nothing could set a brk/cont/ret
-FlowState inside a chunk and codegen had already stopped emitting it, so
-the VM's only remaining FlowState use is ReturnV's value hand-off to
-do_func_call — see plans/vm-native-call-stack.md Phase A.)
-**Phase 2** is a **REGISTER machine over the frame slots** (the VM's registers
-ARE the resolved-local slots — NO value stack), with fused superinstructions:
-`IntBin` (3-address `dst = a <arith> b`, operands = slot or int immediate) and
-`JumpUnlessIntCmp` (fused compare+branch). A `while` whose condition is an int
-compare and whose body is int assignments (compound `s += i*i`, plain
-`x = a*b+1`, `++`/`--`) compiles with **no tree-walker fallback**; **nested
-expressions** use scratch temp slots (`compile_int_expr` + a temp register
-allocator above the resolved locals; `Chunk::n_temps` grows the frame). Anything
-else (a bare/bool leaf plain-assign, a global/capture operand, a call) falls
-back to Phase 1. **Bool-safety:** a plain assign's rhs must be `definitely_int`
-(arith/neg/int-literal, never a leaf id or comparison — both can be bool), since
-writing an int into a bool slot would corrupt it. **Float** loops compile too
-(`FloatBin`/`JumpUnlessFloatCmp`, operands promote), as do **mixed** int/float
-loops (each condition/statement dispatched by its own kind) and **counted `for`
-loops** — the last via a **fused `ForLoopStep`** superinstruction (`i += step` +
-test + branch in one dispatch, matching the tree-walker's raw-C `ForRangeStmt`
-counter; a naive 3-op encoding regressed +28%, the fused op wins). A counted
-loop's **bound AND step may be non-trivial** — `for (i; i < len(s); i++)`,
-`i < f()`, `i += st[0]` —
-not just a slot/immediate: `try_native_for_range` compiles each once into
-a reserved temp (the for-range specializer proved them loop-immutable) that
-`ForLoopStep` re-reads each iteration, so a `len()`-bounded counted loop (and
-nested forms) goes native instead of falling back — e.g. `30_str_index_iterate`
-1.03x→0.80x vs the tree-walker. **The temps compile AFTER the loop's `init`**,
-matching `ForRangeStmt::do_eval`'s init → bound → step order — compiling the
-bound first evaluated it BEFORE a side-effecting init that changed it (a real
-wrong-result `-vm` divergence, pinned by the "init evaluates BEFORE the
-once-read bound" test). A general (non-range) `for` also lowers with **no
-cond** (`for (;;)` — an unconditional loop exiting via break/return, like the
-tree-walker) and with a **BOXED increment** (`out += "x"`, a dyn `d++` — the
-same three-tier statement dispatch as any body statement). This is where
-the VM *wins*: `01_while_loop` −50%, a nested int loop −61%, a pure-float loop
-−71%, `03_int_arith` (top-level `for`) −72% instructions. **Phase 4** ran these
-loops inside **function bodies** too (via `do_func_call`); since the NATIVE
-CALL STACK landed (see its section below) a VM->VM call never goes through
-`do_func_call` at all - the chunk is stamped on the function's
-**`FuncDescriptor`** (stored in `g_func_chunks`, keyed by descriptor) and
-the dispatch loop pushes/pops call records itself. **Compilation is AOT, not
-lazy** (`vm_precompile_all`, run by `vm_compile`): it walks `collect_funcs`
-(which recurses via the COMPLETE `for_each_child_of`, so a func declared in a
-try body / slice / anywhere is not missed) and compiles EVERY function body
-UPFRONT, stamping each descriptor's `vm_chunk` + `vm_chunk_tried`, so
-`do_func_call` reads a precomputed pointer and never compiles at call time
-(the maintainer's no-lazy rule + a `.myv`-serialization prerequisite; the lazy
-`vm_func_chunk` miss path is a never-hit safety net). The per-function compile
-+ gate is the shared **`codegen_func_body`** (codegen.cpp) — the single source
-of truth for "which functions have bytecode", used by BOTH the precompile AND
-the `-vd` dump, so `-vd` faithfully shows the real compiled chunk set. A
-**dead base template is the ONLY exclusion** from that set: the inferencer
-marks `FuncDescriptor::is_template_base` for a template NEVER used as a value
-(`!value_used` — all its calls are direct and were redirected to `name$N`
-instances, so the base never runs); a VALUE-used template (dict/var/arg-
-dispatched INDIRECTLY, e.g. phonebook's `cmd_*`) is NOT marked, so its base
-keeps its chunk (the indirect call runs the base body). So `55_float_sum` (a
-loop in a function) is −62%. **EVERY other callable body keeps its chunk**
-(post-teardown the chunk is the only way to run it): the old "has at least
-one REAL op" gate is dropped (an empty body is a bare `Halt` returning none),
-a ZERO-SLOT function (a param-less, local-less closure — `next_slot == 0`, so
-the resolver leaves it `resolved == false`) runs its chunk through a
-temps-only frame (`do_func_call`'s chunk hook is NOT gated on `resolved`),
-and the one genuinely un-compilable body — the pathological un-slottable
->64-param function (its blocks are never `scope_free`) — is a loud
-compile-time `NotLoweredEx`, never a silent tree-walk. A function chunk
-(`codegen_chunk`) whose body ends in a `ReturnV`
-OMITS the trailing `Halt`: `ReturnV` already `return`s from `vm_run_chunk`, so
-the `Halt` would be dead AND unreferenced (the codegen emits no jump to the
-chunk end past a return — an if whose branches all return leaves no merge
-`Jump`, a loop-exit targets the following op). A FALL-THROUGH body (`main`, a
-void function, a trailing loop/if) keeps the `Halt` as its implicit-return-
-`none` terminator + jump target. Recursion with arith stays ~neutral (`fib`
-−0.08%).
+**A NEW OPCODE MUST ALSO BE CLASSIFIED IN `verify_chunk`** (codegen.cpp,
+#137) — the post-load structural verifier that bounds every operand against
+the table it indexes. That switch has **no `default` case on purpose**, so
+adding an opcode FAILS THE BUILD (`-Werror=switch`) until it is classified;
+do not "fix" that error with a default. It is the same audit-table trap in
+its worst form — a stale entry there is not a lost optimization but SILENT
+acceptance of an unchecked operand from a hostile file. `vm_compile` runs
+the verifier over its own output under ASSERTS, so a mis-classification
+fails the whole suite rather than a `.myv` in the field; that net caught
+three wrong entries the day it was written, and one real defect (the
+bytecode splice emitting a `MoveV` into frame slot **-1** when the callee's
+result is discarded).
 
-**Phase 5** widens native coverage: array element read/write
-(`a[i]` / `a[i]=v` → `LoadElem`/`StoreElem`, mirroring the flat-array
-subscript/store incl. COW; a dict subscript stays a fallback via the inferencer-
-set `Subscript::base_array`), and **nested control flow** — the loop codegen
-emits the body directly into the chunk with backpatching, so nested loops and an
-`if` in a loop body go native (this is the broad win: many benchmarks wrap their
-work loop in a `for(rep)` amplifier whose body — a loop — used to force the
-whole thing to fall back). **Loop CONDITIONS are as capable as `if`
-conditions:** `emit_cond_jumps` (the while/for helper) now falls through to the
-boxed `JumpUnlessTrueV` path (the same one `if` uses) for a condition that isn't
-a `TypedScalarExpr` — a **bool VARIABLE** (`while (flag)`), a bool var in a `&&`
-conjunct (`while (flag && j < N)`, split per-conjunct so the bool one boxes and
-the comparison stays a native `JumpUnlessIntCmp`), a `||` chain, or a dyn/string
-truthiness test. Before, a bool-var loop cond bailed the WHOLE loop to an
-`EvalStmt`; `try_native_for` was unified onto the same helper so a general
-`for` gets it too. A **var-initialized loop** (`for (var k = i; ...)`) also goes
-native: `emit_init` falls through to a boxed move (`compile_boxed_stmt`) before
-`EvalStmt` — the raw int-store path rejects a bare-identifier rhs (it can't
-prove int-not-bool for a raw store, since a bool is `th==i` too), but a boxed
-move preserves the real type. A **15-level randomly-nested if/while/for
-(optimized + general) spine lowers with ZERO `EvalStmt` fallback** (see the
-`vm/codegen: deep 15-level nest` test + `bench/*/68_nested`, ~4x CPython; and
-the `tests/nested_fuzz.py` differential fuzzer, which generates thousands of
-random deep-nested programs + their Python twins and checks tree-walker == VM ==
-CPython).
-**Suite geomean 0.61x, VM ~1.6x faster than the
-tree-walker** (improved from 0.82x as the container-STORE residuals — struct
-field, nested `a[i][j]`, global/capture base, and the universal dyn-base
-`StoreElemValue` — went native, so matrix/dict/struct benches no longer fall
-back: `68_nested` 0.22x, `65_struct_field_sum` 0.22x vs the tree-walker). The
-register choice (over a stack machine, which the
-already-M8-optimized tree-walker would beat) is also the right IR for the
-eventual native x86-64 codegen. Full roadmap + phase order:
-`plans/bytecode-vm.md`.
+The register choice (over a stack machine, which the already-M8-optimized
+tree-walker would beat) is also the right IR for the native x86-64 tier.
+Design record: `plans/archived/bytecode-vm.md`.
 
-**Build the VM FOUNDATIONS before optimizing a construct — do NOT bolt a native
-op onto an incomplete architecture.** A native lowering that lacks the
-architecture-level features it needs ends up SLOWER than the M8 tree-walker, not
-faster — proven: the `foreach` nativization (a `ForeachBind` op) *regressed*
-(19_foreach_indexed 0.27x→0.30x, geomean 4.02→4.01) and was reverted. Two root
-causes, both foundational: **(1) it referenced the AST** (`Instr::node =
-ForeachStmt*`), which is wrong on its own terms — a `node` pointer can't be
-serialized (no `__pycache__`-style dump), can't be JIT'd to machine code, and is
-8 dead bytes in a 64-byte `Instr` (2× an `EvalValue`; size + I-cache locality
-matter here exactly as they do for `EvalValue`) — AND having the node made it
-*easy* to reuse the tree-walker's boxing binding path instead of doing the work
-in registers. **(2) Box/unbox + shuffled temporaries** (`arr_elem_boxed`
-boxes a flat scalar, `bind_loop_var` builds a 48-byte `LValue`), which is the
-SAME per-element cost the tree-walker already pays in `do_iter` — so the VM
-only added dispatch overhead. **The VM NEVER needs to box/unbox.** A flat
-int/float/bool loop var reads the raw scalar into its register slot; a
-GENERAL loop var just binds the array element's *existing* `EvalValue` into its
-slot (a copy, no box, no unbox) — which is not slower than the tree-walker, only
-not as fast as the flat path. A construct only earns a native op once the
-foundation exists to lower it to slot/constant-pool operands with no AST
-reference and no round-trip boxing; **do NOT rush a construct-by-construct win —
-the goal is outstanding end-state results, not an immediate delta.** The
-foundations to build first: an **AST-free instruction** (op-data in a constant
-pool as indices, loop vars as slot operands, locs in a `pc→loc` side table — so
-`Instr` drops the `node` field and shrinks), and a **box-free value/slot flow**.
-See `plans/vm-fallback-elimination.md` (the foreach negative-result note) and
-`[[vm-nativization-heuristic]]`.
+> **⛔ VERIFY NATIVE EMISSION AND EXECUTION WITH HARD EVIDENCE — DON'T ASSUME
+> "IT WORKS" (maintainer, 2026-07-21). ⛔** When you nativize a VM op (add it to
+> `jit_op_eligible` + an `emit_op` case) or emit ANY new machine code, you have
+> NOT finished until you have PROVEN, with hard evidence, that (1) the native
+> instructions you expect are actually EMITTED, and (2) they are actually
+> EXECUTED at runtime. **Be pessimistic: assume it does NOT work until the
+> evidence says otherwise beyond any doubt — VERY OFTEN it doesn't.** A passing
+> differential (`-tw` == `-vm`) proves only the RESULT is right, which the
+> INTERPRETER can produce — it does NOT prove your native code ran. The trap
+> that motivated this rule: six ops were "nativized" and claimed to "shrink
+> islands to 0", but a per-op runtime counter revealed FOUR of the six never
+> executed in common loop shapes (an op isolated by a boxed neighbour is
+> sub-`MIN_RUN` → no fragment → interpreted; the container gate's stale
+> `op_is_simple_island` whitelist classifies `MoveV`/`LoadConstV` as ISLANDS, so
+> their `jit_*` helpers are never called; and a `SubscriptV` container was
+> byte-identical to a `MemberV` one that ran, yet `SubscriptV` executed 0 times —
+> an unresolved discrepancy). The "island-op occurrences → 0" claim was the M1
+> container-plan (ELIGIBILITY) view — hypothetical, since the model isn't
+> flipped — NOT execution. **How to get the evidence, every time:** a PER-OP
+> runtime coverage counter (`g_jit_op_run[op]`, bumped inside the helper) + a
+> `jit:` TEST that runs a loop exercising the op and asserts BOTH the result AND
+> that the counter bumped; `-vdj` to read the actual emitted machine code;
+> `MYLANG_JITOPS`-style instrumentation to see per-op call counts on real
+> benches. If the counter doesn't bump, the op is nativized-but-dead — a real
+> gap, not a nitpick. This is the per-op form of the "prove the code ran" HARD
+> RULE (see *Benchmarks*); apply it to EVERY native-codegen change.
 
-**Foundation step 1 — the loc SIDE TABLE (`Chunk::locs`, done).** An op that can
-throw records its caret `Loc` in `Chunk::locs` (a `{pc,start,end}` vector,
-by pc, binary-searched by `Chunk::loc_at` on the throw path ONLY) instead of
-carrying an `Instr::node` AST pointer just for the error loc. A post-codegen
-pass, **`extract_locs` (codegen.cpp), runs on the FINISHED chunk** (so the
-codegen's rollback is untouched) and, for the ops whose ONLY use of `node` was
-the loc, records it and **NULLs `node`** — making them AST-free. It migrated the
-div/mod carets of `IntBin`/`FloatBin` (throw via `vm_throw_div0(chunk, pc)`,
-which uses `loc_at`, not `node`) and dropped the dead `node` from the
-non-throwing `JumpUnlessIntCmp`/`JumpUnlessFloatCmp`/`ForLoopStep`. So the whole
-register/loop CORE is now `node`-free. **The runtime `Instr` holds no live AST
-reference** (see *AST-node side table* below): a residual node is looked up by pc
-in the pc-keyed `node_table`, and the codegen-transient `node_idx` handle is
-nulled after codegen — so the bytecode has no AST pointer in its instruction
-stream.
-
-**Foundation step 2 — op-data into the CONST POOL (member key, started).**
-`DictLoadInt`/`DictLoadFloat` (the typed `d.k` / `d[k]` read) are now fully
-AST-free: a member's key is baked into `Chunk::consts` at codegen (`add_const`)
-and `Instr::a` carries its index as an immediate (`a.is_lit` distinguishes a
-member key from a subscript's key temp), so the handler needs no `MemberExpr::
-memId`. The PRESENT-key path stays `dict_present_value` (hot); the MISSING-key
-path (a default-dict insert or `KeyNotFoundEx`) now routes through the shared
-`Type::subscript(for_write=false)` - the tree-walker's exact logic - with its
-loc from the side table, NOT `node->eval_int/eval_float`. `extract_locs` records
-the caret + nulls the node. So DictLoad joined the register core as node-free.
-The same loc-side-table move then freed every op whose only remaining `node` use
-was the error caret: **`SubscriptV`** (`base[idx]` via `Type::subscript`) and
-the **boxed scalar ops `BinOpV`/`CompoundV`/`CmpV`** (their `num_bin_op` PMF is
-baked from `aop`; the catch does `vm_stamp_loc(chunk, pc, e)`), plus **`LogV`**
-(never throws - node was dead). The shared `vm_stamp_loc` helper (vm.cpp) does
-the cold-path `chunk.loc_at(pc, ...)` stamp for them all. **`LoadGlobalV`** is
-node-free too: its only use was the cold undefined-global error, whose NAME is
-in `gfuncs`'s slot->name list and its loc in the side table. **`MemberV`**
-(`base.member`) took the next op-data step - a **member-key pool** (`Chunk::
-MemberKey` = the name as a dict key + the interned uid + the optional flag +
-both carets member_read throws with), so the op is a bare pool index
-(`Instr::a`); `member_read` was factored into `member_read_core(dval, memId,
-memUid, optional, mstart, mend, bstart, bend)` shared by the tree-walker wrapper
-and the VM. **`CallV`/`CachedCallV`** are node-free too: the callee name (an
-undefined-slot error) is in `gfuncs`'s slot->name list, the caret in the loc
-side table (recording the callee-IDENTIFIER loc, matching the tree-walker's
-undefined-callee error), and the backtrace call-site loc - a PER-CALL value -
-is NOT looked up per call: `do_func_call` gained `(const Chunk *call_ck, size_t
-call_pc)` params and resolves `loc_at` in its EXISTING catch, on the error path
-only, so the hot success path pays no lookup (`vm_call_func`/`vm_cached_call`
-pass `&chunk, pc` not a `Loc`; fib stays 0.95x vs the tree-walker, and multi-
-frame backtraces are byte-identical). **The foreach / array-read ops
-(`LoadElem*`, `ArrLen`, `DictIter*`, `ForeachDyn*`, `UnpackElem*`,
-`LoadStructField*`) are now node-free too** (the loc side table; `LoadElem*`'s
-dead non-array `node->eval` else-branch - unreachable, `base_array` is proven -
-became an `InternalErrorEx` net). The builtin-call ops
-(`CallBuiltinV`/`LV`/`LVElem`) read the serializable `builtin_calls` pool and
-`EmplaceStruct` the `emplace_sites` pool, so the ONLY remaining `node` user
-is the single fallback op (`EvalStmt`) — `CallValueGenericV` reads the
-`call_sites` pool. P8
-exceptions are fully native (they no longer reach a fallback op). The FALLBACK-OP
-AUDIT (`plans/vm-fallback-elimination.md`) that followed found LIVE `EvalStmt`
-fallbacks in several more shapes — **F-1..F-4, all now NATIVE**: the multi-assign
-/ IdList forms (`MultiUnpackV`), the residual `foreach` shapes (2-var dyn
-container, indexed general-value unpack), the discarded-result indirect call
-(`CallValueV` as a statement), and the flat `array<PodStruct>` literal (the
-fused `MakeStructArrayV`). **The last residual was the reflection builtins**,
-resolved by what each needs (so the ONLY node-holder left is dev-only `show`):
-- **`show()` — DEV-ONLY builtin, now COMPILE-TIME-FOLDED** (the
-  `make_dev_builtin` category, `types.cpp`; `is_dev_builtin` /
-  `g_dev_builtins_allowed`, `eval.h`): it decompiles the AST — and since it
-  RETURNS a string, `fold_show_calls` (end of `specialize_types`, the final
-  tree) replaces the whole call with that string as a `LiteralStr`: a
-  directly-named top-level function renders via `render_func_code(decl)`, a
-  non-identifier expression via `render_construct_code(arg)` (the arg is never
-  evaluated, so folding moves no side effect — byte-identical to the runtime
-  builtin's answer over the same final tree). Self-gating: the callee must be
-  a resolved `SymKind::builtin` identifier, so the fold fires in
-  scripts/harness only; the REPL (map-resident builtins) keeps the runtime
-  builtin and its **`:show` meta-command is UNCHANGED**. `show` is still a
-  **compile-time error in a script** (`reject_dev_builtins`, structural pass,
-  `-nti` included; a user `func show` shadow is left alone). With the fold,
-  show NEVER reaches codegen — which is what allowed deleting the last
-  fallback op (see *THE NO-FAIL CODEGEN* below). The residue an identifier
-  arg that is NOT a named top-level function (a var holding a func) stays a
-  runtime call: fine under the tree-walker/REPL, a NotLoweredEx compile abort
-  under -vm (harness-only territory).
-- **`type`/`typestr`/`kindstr`/`decltype` — DONE (AST-free).** Two moves:
-  (1) the inferencer's `fold_type_query` already bakes the answer into `args[0]`
-  (a `LiteralStr`/`LiteralObj`) in the common case and sets **`CallExpr::tq_folded`**
-  — so both engines **ELIDE** the folded call (return the baked `args[0]`): the
-  VM at codegen (a plain `LoadConstV`/`LoadLiteralObjV`, no call), the
-  tree-walker in `CallExpr`/`DirectBuiltinCallExpr::do_eval`. The flag (not a
-  `dynamic_cast<Literal>` node check) is what makes it `-nti`-correct: under
-  `-nti` no fold runs, so a user's `typestr("hi")` is NOT elided and must report
-  `"str"`, not `"hi"`. (2) The rare NON-folded query (`-nti` / a still-`Unknown`
-  arg type) is a **dual-ABI builtin** (`make_builtin_customv`): a custom `func`
-  (tree-walker) and a `func_v` (the VM's `CallBuiltinV`), BOTH always building
-  the `Type`/string from the runtime VALUE (`make_runtime_type_value` /
-  `reflect_typeof` / `TypeNames`) — the folded literal never reaches them (it's
-  elided), so there is no node-based folded/non-folded ambiguity and the two
-  engines stay byte-identical. This also fixed a latent tree-walker `-nti` bug
-  (the old `dynamic_cast<LiteralStr>` heuristic wrongly returned a user
-  string-literal arg instead of its type). No new storage (struct defs are
-  already in `Chunk::struct_defs` + each value's own `def`; the folded `Type`
-  object is a serializable `LiteralObj`). So the reflection residual is now ONLY
-  the dev-only `show` (above), which deliberately keeps its AST.
-
-**Script-mode real-code fallbacks — a further sweep (all now NATIVE).** After
-F-1..F-4, a `ML_DBG_FB` audit hook in codegen `emit()` (compiled out by default;
-logs the rendered construct behind an `EvalStmt`)
-found the remaining SCRIPT-mode shapes a real program can hit, each now native:
-a **`foreach` over `array<bool>`** (`LoadElemBool`, a real-bool bind, above); a
-**nested / boxed struct construction** (`StructCtorV`'s widened
-`pod_ctor_arg_safe` gate + the new `StructCtorBoxedV`, above); a **bare
-discarded-value expression statement** (`s[3];`, `a[i:j];`, `x + y;` —
-`gen_stmt` compiles it into a scratch temp and drops the result, so an OOB /
-missing-key / type error still throws with the byte-identical caret; a bare LEAF
-identifier / scalar literal is skipped, since the tree-walker never RValue-s a
-discarded statement, so an undefined name stays its harmless `UndefinedId` no-op
-rather than a `LoadGlobalV` throw); and an **inc-dec used as a VALUE**
-(`y = x++`, `y = a[i]++` — `compile_boxed_expr`'s `IncDecExpr` case lowers it to
-read-lvalue + mutate (postfix) / mutate + read (prefix), reusing the statement
-compilers for the in-place mutation, gated by `incdec_lvalue_pure` on a side-
-effect-free lvalue so the two evals of the slot/index agree). This last one
-surfaced a **pre-existing tree-walker bug**: auto-const promoting a write-once
-INDEX var (`var i=1; a[i]++`) dropped its decl but `fold_reads` had no
-`IncDecExpr` case, dangling the promoted `i` — fixed by folding the READS in an
-inc-dec lvalue like an assignment lvalue. **Net: ALL of `bench/` and `samples/`
-lower with an EMPTY `node_table` (100% native, serializable) — the struct
-benches' last `EmplaceStruct` ctor node is gone too (its def + carets moved
-into the serializable `emplace_sites` pool).**
-
-**Error-path constructs → native throwing ops (`ThrowRuntimeV`).** The
-always-throwing constructs the tree-walker ran and threw on are now native: an
-UNRESOLVED name in an rvalue/callee position (`var y = foobar` /
-`undefined_fn()` / `undef(5)` / a `_` read), an assignment to a scalar LITERAL
-(`0 = 99`, `true = false`, a const-inlined `K = 6`) or a BUILTIN (`print = 5`),
-and a REQUIRES-lvalue builtin (`append`/`push`/`pop`/`insert`/`erase`/`intptr`)
-on a provably-non-lvalue arg0 (`append([1,2], 3)` — the only lvalues are
-id/subscript/member), and a **REBIND of a runtime `const`** (`const c = [..]; c
-= x` / `c += x`, a func/array/dict kept in a slot → `CannotRebindConstEx`; a
-const *scalar* is inlined, so its rebind hits the bad-lvalue throw instead). New
-op **`ThrowRuntimeV`** + a serializable
-`Chunk::throws` pool (`{ThrowKind, Loc, name}`) throws the pooled exception with
-the exact caret
-— byte-identical, AST-free. Codegen: an `SymKind::unresolved` id in
-`compile_boxed_expr` (a CALL with an unresolved callee throws before its args,
-matching `what->eval` first); a bad-lvalue in `compile_boxed_stmt` (rhs compiled
-FIRST for its side effects, then the throw, matching the tree-walker's rhs-then-
-target order); the same rhs-first + throw for a `const` rebind (the rhs's side
-effects run before `CannotRebindConstEx`, for both a plain and a compound
-rebind); a non-lvalue arg0 in `try_native_mutating_builtin` (gated by
-`builtin_requires_lvalue_arg0`, which EXCLUDES `sort`/`rev_sort`/`reverse` —
-they accept a value arg0 and sort the copy). The bare-LEAF guard keeps a
-discarded `foobar;` a no-op.
-
-**A DYN callee → a generic value-call (`CallValueGenericV`).** An indirect call
-of a `dyn` callee (`var dyn a = len; a("hi")`, `a(1)` on a non-func) is native.
-A dyn callee is resolved at RUNTIME and may be a `FuncObject`, a read-only
-`Builtin`, a MUTATING builtin (needs an lvalue arg), an AST builtin (`defined` —
-needs the unevaluated arg node), or a struct descriptor, so the dispatch is
-AST-dependent TODAY — the op
-KEEPS its CallExpr node (its args ExprList + callee caret), but the callee LOAD
-is native and a `FuncObject` body runs native (the do_func_call hook). The
-dispatch is the shared **`dispatch_call_value`** helper (`eval.cpp`) reused by
-BOTH the tree-walker's `CallExpr::do_eval` AND the op, so the two engines are
-byte-identical (FuncObject → do_func_call, Builtin → its ExprList ABI, struct →
-construct, else `NotCallableEx`). `extract_locs` records the op's CALL-SITE loc
-(for a FuncObject body's backtrace) WHILE keeping the node — the LAST
-non-fallback node-keeping op. A Func-TYPED callee still uses the leaner
-register-run `CallValueV`. **The LAZY-ARG rule (fork F1 step 1, LANDED
-2026-07-14):** a LAZY-ARG builtin — **`defined`/`isconst`/`isconstdecl`**,
-whose argument is a NODE property that is never evaluated (`decltype` turned
-out NOT lazy: like `type`/`typestr`/`kindstr` it is dual-ABI, its `func_v`
-builds from the runtime value, so the type queries stay usable as values;
-`show` was already script-rejected) — **cannot be used as a VALUE in a
-script** (only called directly): `var dyn f = defined;`, `[isconst]`, or
-passing one as an argument is a compile-time `SyntaxErrorEx`. Implemented as
-a COMPILE-TIME reject only (`is_lazy_builtin`/`mark_lazy_builtin`,
-types.cpp; the check rides the `reject_dev_builtins` walk, same
-`g_dev_builtins_allowed` gate — the REPL retains the AST, so the indirect
-form keeps working there, the `show` precedent). A runtime check in
-`dispatch_call_value` is unnecessary: a script can no longer produce such a
-value. Documented in README (`defined`, `isconst`). **Step 2 (LANDED
-2026-07-14) — the op is AST-FREE.** Two pieces:
-(1) **Every `Builtin` carries a `Kind` tag** (value / lvalue / map / filter /
-lazy / node — `evalvalue.h`; Builtin grows 16→24 bytes, still inside the
-24-byte `EvalValue` payload), so an indirect callee's ABI is decidable from
-the VALUE at runtime (a direct call knows it at compile time; an indirect
-one cannot). Every `make_*` registration stamps it.
-(2) **Args pre-evaluated + the `Chunk::CallSite` pool** (`b` = nargs |
-site << 12): the ArgLocs data (whole-args + per-arg carets, arr_hint) PLUS
-**arg0's LVALUE DESCRIPTOR** — the by-ref encoding. Frame slots can't hold
-an `LValue*`-boxed value (`LValue::type_checks`), so instead of
-materializing the tree-walker's raw arg value the dispatch RE-DERIVES
-arg0's `LValue*` from the descriptor, only when the callee turns out
-`func_lv` (the `CallBuiltinLV`/`LVElem`/`LVMember` model): forms none
-(a non-lvalue expr → null target → `NotLValueEx`), slot (id kind+slot; an
-undefined GLOBAL surfaces at the CONSUMER as the tree-walker's raw
-`UndefinedId` does), elem (base kind/slot + a RESERVED index temp; run[0]
-holds the element VALUE, filled by an ordinary `SubscriptV` at arg0's
-position so OOB/key throws keep argument order; the func_lv re-derive
-repeats the subscript — idempotent, and a between-args container mutation
-THROWS where the tree-walker's stale `LValue*` is UB — safer), member
-(member_keys idx; run[0] via `MemberV`), undef (a pooled name). So the
-SLICE WRITE-BACK, const, and literal-arg0 errors of an indirect
-`append`/`sort` are byte-identical to the direct call. A **`CheckCallableV`**
-op sits between the callee and the arg run (a non-callable callee throws
-`NotCallableEx` BEFORE the args evaluate, the tree-walker's order — the
-earlier FuncObject-only version was reverted for rejecting builtin callees;
-this one admits all three callable kinds). Dispatch: FuncObject →
-`vm_call_func` (run[0] filled with the derived RValue — an undefined name
-throws at BIND); struct → **`construct_struct_v`** (the values twin of
-construct_struct: full runtime arity + per-field coerce with pooled
-carets); Builtin → **`dispatch_builtin_values`** by Kind. **The EAGER-ARGS
-language rule:** an INDIRECT builtin call evaluates its args first, then
-the builtin's checks run — implemented in the ONE shared
-`dispatch_builtin_values` (eval.cpp) that BOTH engines call (the
-tree-walker's `dispatch_call_value` routes a `vm_dyn_callee`-stamped call
-with a non-lazy Builtin through raw left-to-right arg evals + the same
-dispatch; a DIRECT tree-walked call — const-eval, REPL, unspecialized —
-keeps the node ABI, so `map`'s validate-before-arg1 and `sort`'s custom
-arg0 are unchanged there). README documents the rule under `map`. Known
-corner (documented, not observable in well-formed code): an UNRESOLVED id
-in a non-arg0 position throws at its own position under the VM
-(`ThrowRuntimeV` in the run) but at the consumer in the tree-walker, so a
-LATER arg's side effects may run in one engine and not the other — both
-throw the same `UndefinedVariableEx`. **With this, `node_table`'s only
-user is the ONE fallback op** (`EvalStmt`).
-
-**Niche STATEMENTS → native (a further sweep).** Several residual real shapes
-went native: an **inc-dec STATEMENT on an int/float member/nested subscript**
-(`p.x++`, `a[i][j]++` == the compound store `lvalue += 1`, via
-compile_int_stmt's IncDecExpr handler → StoreMemberV / DictStore / StoreElem2V;
-gated on a PROVEN int/float lvalue — inc-dec is int/float-only, so a dyn field
-falls back), the **VALUE form** of those (`o = p.x++` — `incdec_lvalue_pure`
-widened to a member/nested lvalue), a **whole-`p` flat-struct-array `foreach`**
-(`foreach (var p in a)` using `p` as a value — **`LoadStructElemV`**
-materializes a fresh StructObject per iteration, byte-identical to the
-tree-walker's reused-object bind, so `append(o, p)` / `q = p` go native;
-scalar-field-only bodies keep the faster direct read), and a **compound
-multi-target assign** (`a, b += rhs` — `MultiUnpackV` gained a base op: each
-target reads its current value, applies the op with its element/scalar, writes
-back). A **dyn SCALAR** inc-dec (`d++` on a dyn/general local/global/capture) is
-native via **`IncDecCheckedV`** (reads the value, THROWS `TypeErrorEx` unless
-int/float — inc-dec is int/float-ONLY, unlike a compound `+= 1` which would
-concat a string — then ±1), and a **dyn ELEMENT** inc-dec `c[k]++`/`c[k]--` (a
-dyn dict / general array / dyn base — anything NOT a proven flat int/float
-element, which `compile_int/float_stmt` already handle) via
-**`IncDecElemCheckedV`**: it forms the element LValue via the runtime
-`subscript(for_write=false)` and does the same int/float-checked ±1, mirroring
-`IncDecExpr::do_eval`'s dyn read-modify-write (a flat scalar element has no
-LValue → `NotLValueEx`, exactly as the tree-walker). It is **AST-FREE**: its
-TWO distinct error carets — the SUBSCRIPT loc for a subscript-internal throw
-(`KeyNotFound`/OOB) vs the INC-DEC loc for its own `NotLValue`/`const`/
-`TypeError` — which a one-loc-per-pc side table can't hold, live in the
-serializable **`Chunk::incdec_sites`** pool (`Instr::b` = the index, O(1));
-the undefined-global-BASE caret comes from the loc side table
-(`vm_store_base`, node = null). A **dyn MEMBER** inc-dec `d.f++`/`d.f--` (a
-dyn/general base holding a struct or dict) is the exact twin,
-**`IncDecMemberCheckedV`**:
-it forms the member LValue like `MemberExpr::do_eval`'s rooted-base path (a
-mutable boxed STRUCT field or a DICT value is an lvalue; a POD field / readonly
-/ a missing dict key throws `NotLValueEx`/`KeyNotFoundEx`), int/float-checks,
-±1. Same pool-carried dual-loc (the MEMBER loc for a `KeyNotFound` vs the
-INC-DEC loc for `NotLValue`/`TypeError`), plus the member key
-(`memId`/`memUid` ride in the same `incdec_sites` entry). Both cover a
-proven-struct NON-numeric member
-too (`s.name++` on a str field → `TypeError`, `th != i/f` so it isn't the M8
-`StoreMemberV` path). An optional `d?.f++` still falls back (rare).
-
-**Non-tail block-body inline (`InlinedCallExpr`) → native.** A `y = f(args)`
-whose block-bodied `f` inlined with a residual that couldn't collapse to a
-ternary (a leading side-effecting statement, a reassigned local) is an
-`InlinedCall(Block(...))` — the callee's body run behind its OWN return
-boundary (a `return v` inside yields THIS expr's value, not the enclosing
-function's; `InlinedCallExpr::do_eval` swaps `ctx->flow`). The VM lowers it via
-a **scoped return boundary** in the codegen (an `inline_returns` stack, like the
-loop stack): `compile_boxed_expr` inits a result slot to `none` (a fall-through
-body yields none), compiles the body's statements inline, and `try_native_
-return` — gated on `inline_returns` — redirects each `return` to "**MoveV into
-the result slot + Jump to the body end**" instead of `ReturnV`-ing the whole
-chunk. A body statement/return that can't lower (a try crossed INSIDE the
-boundary) fails the whole inline → the tree-walker runs the `InlinedCallExpr`
-(byte-identical). This surfaced + FIXED a latent bug: `make_typed`
-(`specialize_types`) hand-copied base fields and **dropped `inline_ctx`**, so a
-specialized arith node inside an inlined body lost its inlined-at chain — the
-tree-walker hid it (the Block wrapper flushes) but the VM's flat body has no
-wrapper, so a backtrace crossing it dropped the virtual frame; `make_typed` now
-uses `copy_base_fields`. So an error inside a native InlinedCall shows the
-byte-identical virtual `f$0` frame.
-
-**Typed NON-SCALAR decls/assigns → native (a plain boxed store).** An
-explicitly-typed decl/reassign/compound whose declared type is `bool` / `str` /
-`array<…>` / `dict<…>` / a struct (`str s = ..`, `array<int> a = ..`,
-`Point p = P(..)`, `s += ".."`, and their global/capture/const forms) is now a
-plain `StoreGlobalV`/`StoreCaptureV`/`DeclConstV`/retarget store, NOT an
-`EvalStmt`. Sound because **`coerce_to_decl_type` is a no-op for every declared
-type EXCEPT `int`/`float`** (`eval.cpp` — it returns the value unchanged; the
-type is proven at compile time by the inferencer), and the tree-walker's
-decl path only calls the coerce for `DeclType::i`/`f` (`handle_single_expr14`).
-The `i`/`f` decline is gone too: a typed int/float PLAIN assign fed a boxed
-value now lowers to **`CoerceNumV`** (dst = `coerce_to_decl_type(src)` — the
-widen / pass-none / dyn-narrowing-throw, the exact function the tree-walker
-runs; for a LOCAL lvalue the op IS the store, a global/capture store coerces
-into a temp first; the Expr14-span caret rides the loc side table). Its live
-producer is the inferencer's `coerces_dyn` accumulator stamp — `var s = 0;
-s = s + d` was the last `EvalStmt` in a plain accumulator body (an EXPLICIT
-`int x = <dyn>` is compile-rejected, so it never reaches codegen). A COMPOUND
-(`s += d`) does NOT coerce (`handle_single_expr14` coerces `op == assign`
-only) and lowers as a plain `CompoundV`/`StoreGlobalV` compound.
-A typed array/dict keeps its FLAT
-storage (the `ArrHint` rides on the rvalue node, honored by `MakeArrayV`/
-`LoadLiteralObjV` regardless of the decl), and an uninitialized `array<int> a;`
-/ `str s;` / `Point p;` is already desugared (at parse) to a zero-value literal
-/ zero-struct ctor rvalue, so it lowers the same way.
-
-**The Tier-1 endgame (2026-07-14): `EvalToSlot` + `JumpIfFalse` are
-DELETED; `EvalStmt` is THE single fallback op.** The last live expression/
-statement roots went native first: **coalesce** `a ?? b` (a
-`compile_boxed_expr` case: MoveV lhs into the dst — reserved BELOW the
-scratch temps — + the new **`JumpIfNotNoneV`** op to skip the rhs, so the
-`??` short-circuit is preserved); **chained boxed comparisons**
-`x == y == z` (the `emit_boxed_chain` 2-operand limit removed — the chain
-loop already accumulates left-to-right like the tree-walker);
-**assignment as an EXPRESSION** `a = (b = x + 1) + 2` (an `Expr14` case in
-`compile_boxed_expr` for a resolved-local non-const id target: run the
-int/float/boxed STATEMENT compilers, then use the target's slot as the
-operand — this exposed and fixed a retarget-guard bug where the
-plain-assign retarget could steal an inner store's dst: it now requires
-`rslot >= temp_base`); and the **typed IdList destructure** `fa, fb =
-[1, 2]` with int/float-annotated targets (`try_multi_unpack` accepts
-them; a per-target coerce vector rides the serializable
-**`Chunk::unpack_coerce`** pool — parallel to `unpack_targets`,
-`Instr::b` indexes it — and MultiUnpackV runs `vm_coerce_decl_num` per
-store, same TypeErrorEx + caret as the tree-walker). With those native,
-the two per-fragment fallback ops became unreachable and were REMOVED
-(opcodes, handlers, `vm_eval_cond`, `eval_to_temp`, the Phase-1
-`gen_if`/`gen_while` flatten forms, disasm renders). Decline semantics
-now: an operand/condition/loop-init that can't lower fails its WHOLE
-statement to one `EvalStmt` (`emit_init` returns bool; `compile_native_if`
-failure → a whole-if `EvalStmt` in `gen_stmt`) — never a per-op node
-fallback. **R4 is now NATIVE too — `IncDecChainV`** (the impure-lvalue
-inc-dec VALUE form, `y = a[f()]++` / `++d[kf()]` / `a[f()][g()]++` /
-`a[f()].x++` / `mk()[0]++`): the codegen decomposes the lvalue into a
-root (a container slot, or a compiled RVALUE temp — kind 3, whose VALUE
-seed keeps the tree-walker's rvalue-ness, so `mk()[0]++` still throws
-NotLValueEx) plus member/subscript steps with each KEY compiled into a
-temp ONCE (side effects run exactly once, in source order), pooled in
-the serializable **`Chunk::incdec_chains`** (steps + tier + prefix +
-the `allow_flat`/`allow_pod` gates — `no_side_effects(final base)`,
-the tree-walker's own AST-shape-dependent try_flat/try_pod gate, so it
-is compile-time data — + carets). The runtime walk is the shared
-StoreLValueChainV intermediate walk (`vm_chain_walk`); the final step
-runs `vm_incdec_final` (eval.cpp) — IncDecExpr::do_eval's EXACT tier
-semantics: tier 2 (proven int/float) = the compound `±= 1`
-(flat_store_core / member-store / general-lvalue slot_rmw) then
-old = new ∓ 1 derived with NO re-read; tier 3 (dyn) = the checked
-read-modify-write. A follow-up closed the LAST real-code emitter: a
-**nested named func/struct decl inside a loop/if body** (a scoped
-global) now lowers via the shared `emit_func_decl`/`emit_struct_decl`
-(MakeClosureV/LoadConstV + StoreGlobalV — re-bound each iteration,
-exactly as the tree-walker re-evals the decl; gen_stmt already covered
-top-level/function-body decls, the loop/if body compiler did not).
-**THE NO-FAIL CODEGEN (2026-07-15, maintainer-directed): `EvalStmt` is
-DELETED — there is NO fallback op AT ALL.** Two moves made the codegen
-total: (1) **`show()` folds at COMPILE time** (`fold_show_calls`, end of
-`specialize_types` — the tree is final there, so the fold renders exactly
-what the runtime builtin rendered; show already RETURNED a string, so the
-call becomes a `LiteralStr`): a directly-named top-level function →
-`render_func_code(decl)`, a non-identifier expression →
-`render_construct_code(arg)`; self-gating on a `SymKind::builtin` callee,
-so it fires in scripts/harness only — the REPL (map-resident builtins)
-keeps the runtime builtin and **`:show` is untouched** (a meta-command,
-never codegen). A user `func show` shadow is `SymKind::global` → never
-folded. (2) The former decline NETS are **`throw_not_lowered` /
-`NotLoweredEx`** — an always-on (release included) compile ABORT naming
-the construct: every statement/expression either lowers or the compiler
-REFUSES loudly; a future gap cannot hide as a silent tree-walk. Flipping
-the nets flushed out + fixed the last REAL gaps, each now native: a
-typed `!x` as a VALUE (`Cat::lnot` → boxed UnaryV — undetected while
-expr bodies had no chunks), EMPTY loop/foreach bodies (the obsolete
-"all-fallback body" gate dropped), the loop-body DISCARD tier (any
-expression statement — a discarded `map(...)`, a ctor — compiles into a
-scratch temp; inert leaves skip, an unresolved/global bare id keeps its
-throw-or-noop semantics), an unresolved-lvalue assignment in a function
-(rhs side effects, then the pooled UndefinedVariableEx), zero-arg lvalue
-builtins (`intptr()` → pooled InvalidNumberOfArgsEx), the sort family
-with a VALUE arg0 (`sort(clone(a))` — materialized into a temp slot),
-the CHECKED POD ctor (`Point(dynval, 2)` — routed through
-StructCtorBoxedV's pooled per-arg carets; `construct_struct_boxed_from_
-values` dispatches on `is_pod`, and a non-qualifying `append(arr,
-P(dyn))` compiles the ctor as a rest VALUE), a dyn-base member store
-(`p.x = 5` in a dyn-param body — a single-MEMBER StoreLValueChainV;
-proven bases keep StoreMemberV/DictStore priority), and **foreach is
-UNIVERSAL** (the ForeachDyn ops lost their `container_is_dyn` gate —
-they runtime-dispatch array|dict exactly like `do_iter`, so they are the
-catch-all tried after the fast forms: a lone `_`, a 1-var indexed array,
-a >2-var none-padded dict all lower). **Deleted with the op:**
-`Chunk::node_table` + `node_at_pc`, the `Chunk::ast_nodes` pool (now a
-CODEGEN-object scratch; `build_node_table` became `verify_ast_free` —
-every `node_idx` must be nulled when codegen finishes), the disasm
-`node_table` section (the "NOT serializable" signal is now a compile
-refusal instead), and the `ML_DBG_FB` hook. `Chunk`'s only remaining
-`Construct*`-typed member is GONE too since the FuncDescriptor step
-(`closure_defs` holds descriptors).
-The `InlinedCallExpr` return-across-try residue is CLOSED: a `return`
-crossing trys INSIDE the inline boundary inlines each crossed try's
-handler-pop + finally at the return (bounded at the BOUNDARY, not the
-function — the same `inline_crossed_finallys` chaining a real return uses,
-with the value copied to a protected temp before the finallys), then yields
-via the boundary's MoveV+Jump. Flow across NESTED trys (any depth) was
-already fully chained by `inline_crossed_finallys` — pinned by a
-2-finally break/return test.
-None appear in `bench/` or `samples/` (both stay 100% native). The `_`-in-unpack
-/ indexed dict `foreach`, the ≥3-level SUBSCRIPT nested store, the **general
-member/subscript lvalue-chain store** (`a[i].f=v` / `q.p.x=v` / `d.a[0].f=v`),
-the dyn scalar/element/member inc-dec, `append` to a struct member, the common
-`InlinedCallExpr`, typed NON-scalar decls, EVERY `defined` form (fold /
-`DefinedGlobalV` / the non-identifier arg / wrong arity), and a
-runtime-`const` rebind are all now native (above).
-
-**The AST-NODE SIDE TABLE — `Chunk::node_table` (the indexed `ast_nodes` POOL is
-DROPPED).** A runtime-node op looks its `Construct*` up by **pc** in the
-pc-keyed **`node_table`** (`{pc, Construct*}`, sorted, binary-searched by
-`node_at_pc` on the COLD path only — SAME shape/cost as `locs` / `inline_ctxs`),
-NOT via a per-`Instr` index into a pool. The residual nodes are now ONLY the
-ONE fallback op (`EvalStmt`, `node->eval`).
-The builtin-call ops read the `builtin_calls` pool,
-`EmplaceStruct` the `emplace_sites` pool (ctor def + container/field carets),
-`CallValueGenericV` the `call_sites` pool (carets + arg0's lvalue
-descriptor — F1 step 2),
-`CheckFuncV`/`MapFilterV` and the flat int/float element stores the loc side
-table, and the checked inc-decs the `incdec_sites` / `incdec_chains`
-pools — all AST-free.
-**How it's built:** `Instr::node_idx`
-(a 4-byte index into a CODEGEN-TRANSIENT `Chunk::ast_nodes`, appended by
-`Codegen::add_ast_node`) is the SPLICE-STABLE handle codegen needs before an
-op's final pc is known (ops grow + roll back, and an index survives that where a
-pc would not); `extract_locs` nulls the loc-only ops' `node_idx` (their caret is
-in the loc side table) and a KEEP-list marks the genuine runtime-node ops; then
-**`build_node_table`** (post-`extract_locs`, pcs final) flattens each surviving
-`{pc → ast_nodes[node_idx]}` into `node_table`, NULLS every live `node_idx`, and
-CLEARS `ast_nodes`. So the finished chunk carries NO indexed pool and NO live
-per-`Instr` `node_idx` — the runtime uses `node_at_pc(pc)` (`node_idx` stays a
-codegen-only handle, always `-1` at runtime; one `Instr` layout, no codegen-vs-
-runtime split). A **fully-native chunk ends with an EMPTY `node_table`** — a
-non-empty one is EXACTLY the "this chunk still needs the AST, a `.myv` writer
-must keep it or reject" signal (`-vd` dumps it labelled *NOT serializable*).
-This is the ONE remaining non-serializable side table (the loc / member-key /
-catch-type / literal-obj / closure-def / struct-def / unpack-target / chain-locs
-/ inline-frames pools are all plain data or by-name-re-internable). The
-node-drop was ~orthogonal to the VM-exception work (see
-`plans/vm-fallback-elimination.md`).
-
-**A THIRD side table — `Chunk::inline_ctxs` (`pc → inline_frames index`, P8 Inc
-4).** Same shape/cost as `locs` (sorted, binary-searched, throw path only),
-populated by `extract_locs` from an op's `node->inline_ctx`: it records the
-"inlined-at" chain of any op spliced from an inlined body, so a backtrace
-crossing inlined code shows the virtual frames under the VM too
-(`vm_flush_inline`, flushed at `vm_raise` / a call-op signal-propagation / the
-boundary catch). **It is now SERIALIZABLE (no AST pointer):** the `InlineCtx*`
-chain is FLATTENED into the **`Chunk::inline_frames`** pool — each entry pure
-data (`callee_name` + `params` + `call_site` loc + a **parent index** into the
-same pool, `-1` == root; a parent always has a lower index) — and the side table
-maps `pc → a pool index`. `intern_inline_ctx` (codegen) flattens each op's chain
-in `extract_locs`, deduping shared chains via a memo (interning the parent
-first, so the pool is topologically ordered); `vm_flush_inline` walks the pool
-by parent index, pushing the SAME `BacktraceFrame`s a tree-walker
-`flush_inline_frames` over the `InlineCtx` chain would (byte-identical, single
-AND nested/recursion-unroll inlines). This is the analogue of the `chain_locs`
-per-step-loc pool — the last non-`locs` side table off the AST. (The tree-walker
-still uses the `InlineCtx*`-based `flush_inline_frames` directly, from
-`node->inline_ctx`.)
-
-**The disassembler dumps the WHOLE serializable image, not just funcs
-(`disasm.cpp`, `-vd`).** `disassemble_program` prints the program's custom TYPES
-(every `struct` def - name, POD byte-offset / boxed-slot layout, folded consts)
-first, then each chunk's code, then that chunk's POOLS + side tables (`consts`,
-`member_keys`, `incdec_sites`, `incdec_chains`, `emplace_sites`,
-`call_sites`, `catch_types`,
-`literal_objs`, `closure_defs`, `struct_defs`,
-`unpack_targets`, `chain_locs`, the pc-keyed `node_table` - labelled *NOT
-serializable* -, `locs`, `inline_ctxs` + its `inline_frames` pool - non-empty
-ones only). This is the audit surface for the `.myv` stored-bytecode endgame:
-everything a serialized file must hold is visible in the dump, and — now that
-`inline_ctxs` is flattened into the serializable `inline_frames` pool — a
-non-empty `node_table` is the ONE remaining section that says the AST can't yet
-be dropped for that chunk.
+**THE MODEL FLIP — native CONTAINERS with bytecode ISLANDS
+(`plans/archived/model-flip.md`, M1-M4a landed; M4b measured MOOT — see
+the end of this paragraph).** The endgame inversion of the JIT: flip
+"BYTECODE with native ISLANDS" (a bytecode chunk, some runs replaced by
+`EnterNative`, the interpreter driving between them) into "NATIVE with bytecode
+ISLANDS" — EVERY function becomes ONE `call`-able native BLOB; its
+un-nativizable regions become islands reached via `call vm_exec_block(from)`;
+the native code DRIVES, the interpreter is called only per-island (block-level
+dispatch, not per-op). This universalizes native `call <offset>` (not just leaf
+callees) and is the platform for the N7 unboxing arc. **The flip is a MILESTONE
+toward FULL-NATIVE AOT compilation, not primarily a short-term perf play**
+(maintainer, 2026-07-21): every function becomes a `call`-able native blob whose
+un-nativized regions are bytecode ISLANDS, and those islands become
+progressively RARER as we teach the JIT to emit more ops natively — EXACTLY like
+the AST→VM conversion removed its fallbacks (`EvalStmt`…) one op at a time until
+the codegen was no-fail. `vm_exec_block` is the general escape hatch that lets us
+ship the framework now and nativize ops incrementally; in the limit the islands
+vanish and the program is 100% native. So judge the arc by "are islands
+shrinking / is the call graph going native," not only by a single milestone's
+benchmark delta (loop containers measured marginal — see M4b — yet the framework
+is the point). Milestones **M1**
+(container-plan analysis + `-vd`, no runtime change — LANDED) → **M2**
+(`vm_exec_block` island executor — LANDED) → **M3** (whole-function container,
+simplest mixed shape — LANDED) → M4 (island-exit dispatch + branches/loops) → M5
+(native calls to EVERY function: the checked-return unwind + growable native
+stack) → M6 (delete-originals / `.myv`-ready). **M2:** `vm_exec_block(ctx, act,
+chunk, from_pc, *resume)` (vm.cpp) runs a single-entry interpreted ISLAND and
+hands control back to the container — chosen model **(b)**: reuse `vm_dispatch`
+unchanged (a `start_pc` param + a new `ExitBlock` terminator op that `return`s
+with the resume pc), and FLIP the current frame's `boundary` bit for the run so
+an island `ReturnV`/`Halt`/uncaught-throw hands back (set flow / signal) instead
+of popping the frame — the container owns the real return; a caught island
+exception continues. Returns `FellThrough`/`Returned`/`Raised`. **M3:**
+`jit_try_container` (jit.cpp, tried first in `jit_compile_chunk`) compiles a
+leaf STRAIGHT-LINE body that is exactly ONE contiguous island of simple boxed
+scalar ops (`op_is_simple_island`) ending in `ReturnV` into a container — ONE
+`EnterNative` at pc 0, the island as `call jit_exec_block(desc, island_pc)`
+(`emit_island_call`: `test rax; jns` → FellThrough continues / RAISED exits so
+`EnterNative` re-raises via the `g_vm_jit_exc` bridge), a native `ReturnV`, an
+inserted `ExitBlock` + pc/side-table remap. A straight-line container is a
+MECHANISM PROOF, not a win (the island runs interpreted either way — the win is
+M4's native loop around an island), so it is gated OFF for small bodies
+(`MIN_CONTAINER_ISLAND`). **M4a:** `jit_try_container` now admits NATIVE
+BRANCHES (the loop control — `emit_branch` + `label[]`/`fixups`, whole body so
+every target is fragment-local; a back edge may target the island START but not
+an interior), so a native LOOP iterates in machine code around a straight-line
+boxed island (only the island calls the interpreter). A loop container forms
+regardless of island size (the win); a straight-line one keeps the MIN gate.
+MEASURED −3.4% instructions on a synthetic loop (container vs `-nj`) — a real but
+MODEST win, LIMITED by the per-island `vm_dispatch` RE-ENTRY overhead. Still one
+island of simple boxed ops + no calls, so M1-M4a match NO bench/sample (real
+loops have a multi-island init+body / richer ops) — ZERO suite impact; M4a is a
+mechanism step + the M5 prerequisite. **M4b IS MOOT AS A PERF ITEM, MEASURED
+(2026-07-28, plans/archived/model-flip.md "the prize is collected"):**
+the nativize-ops
+arc got there from the other side. 100% of bench + sample chunks are
+container-READY, and `vm_dispatch`'s callgrind SELF cost is a CONSTANT 47
+instructions (invocation entry + Halt) across every hot bench — the
+interpreter loop does not execute in the steady state anywhere on the suite,
+so there is no dispatch left for a flip to capture. The runtime already IS
+"native driving, C++ helpers for the hard ops", reached by growing the islands
+to cover everything rather than by flipping the driver. The one nonzero
+residue is 70_exc_runtime_error's post-throw resume, an exception-PATH cost
+(#74's territory, not a flip target). What remains of the flip is the
+ARCHITECTURE milestone: M5-flip is largely subsumed by the M5b/c native sync
+(docs/jit-optimizations.md)
+calls, and M6 (delete-originals + `.myv`) has since landed. Proven
+by the `jit_container` `-rt` test (`g_jit_container_calls` coverage + a
+throw-from-island + a loop container) + differential + fuzzer + `-vdj`. Builds on
+`plans/archived/native-call-impl.md` (v1 native calls) and
+`plans/archived/native-aot.md` (approach A, the fragment ABI).
 
 ## Invariants & hazards (defense in depth)
 
@@ -4668,7 +10003,7 @@ This project deliberately builds many overlapping correctness layers (a
 *different* blind spots make a bug clear them all very unlikely). The rules
 below came out of a real, nasty bug — an MSVC-only, non-deterministic
 wrong-result in cross-input REPL template instantiation, root-caused via CI
-instrumentation (see `plans/function-templates.md`).
+instrumentation (see `plans/archived/function-templates.md`).
 
 - **A red test on ANY platform is a real bug — never route around it.** A
   one-platform CI failure you can't reproduce locally is NOT "flakiness" to
@@ -4698,6 +10033,15 @@ instrumentation (see `plans/function-templates.md`).
   the bug — and sampling the wrong lane turned a five-minute fix into a long,
   wrong "unreproducible heisenbug" hunt. Grep the FULL log for
   `AddressSanitizer`/`runtime error`/`Assertion`/backtrace frames, per job.
+  **Where the log cannot be fetched** (a cloud session's proxy refuses the
+  log and artifact hosts), read the job's ANNOTATIONS instead:
+  `gh api repos/{owner}/{repo}/check-runs/<job id>/annotations`. Every job
+  adds `.github/problem-matchers.json` after its checkout, so a compiler
+  error or warning (gcc, clang, MSVC, the linker), a sanitizer report and a
+  failed assertion become annotations, and `tests/run` prints an `::error`
+  annotation with the end of each failed test's log (`gh_annotate`). Until
+  2026-10-09 they held only "exit code 1": a Windows build stayed red for
+  five pushes with no way to read why.
 
 - **DO NOT BE LAZY. Do all the work, check everything, do not give up.** Every
   failing lane, every log, the exact SHA, the actual reproduction — not a
@@ -4718,6 +10062,13 @@ instrumentation (see `plans/function-templates.md`).
   (`id_sym`, `func_of_decl`, inferencer) are instead **scoped to one input**
   (cleared each `infer_input`) and re-resolved every pass, so no stale entry can
   survive — that combination is the fix for the bug above.
+  **A `FuncDescriptor` pointer has the same hazard** (2026-11-07): a
+  descriptor dies with its declaration when an optimizer drops a lambda,
+  so a pointer stamped earlier (`CallExpr::callee_desc`) can name a later
+  descriptor at the reused address. Such a stamp is a `DescStamp`
+  (syntax.h), pointer plus `FuncDescriptor::serial`, trusted only when
+  the live descriptor has that serial; a non-ASan build's bytecode
+  differed from an ASan build's until it was.
 
 - **`ML_CHECK` / `ML_CHECK_MSG` (`defs.h`) are the assertion layer.** Use them —
   not bare `assert` — to state an invariant the code RELIES ON but a wrong
@@ -4775,7 +10126,11 @@ instrumentation (see `plans/function-templates.md`).
   default** stack; Linux and macOS default to **8 MB**, which is why they never
   hit this. The **fix is a linker flag** — `CMakeLists.txt` sets
   `/STACK:8388608` (8 MB) for the MSVC build, giving Windows parity (legitimate
-  provisioning for an interpreter, not a workaround). This was a **Windows-CI-
+  provisioning for an interpreter, not a workaround). macOS gets 16 MB the
+  same way (`-stack_size`, CMake and the Makefile) for the compile passes'
+  per-level frames at the parser's nesting limit (#98, below), and so does
+  WASI (the Makefile: `-z stack-size`, `--stack-first`). This was a
+  **Windows-CI-
   only crash** the VM's ackermann test hit (exit 127), that **no Linux tool
   reproduces** (ASan and `ML_VM_CHECK` do not catch a stack-DEPTH overflow — it
   is not a slot-bounds bug); it surfaced only after P8 added a `try/catch` EH
@@ -4898,13 +10253,70 @@ instrumentation (see `plans/function-templates.md`).
    name in `g_dev_builtin_ids`, so the inferencer (`reject_dev_builtins`) makes a
    SCRIPT call a compile-time error while the REPL / test harness (which set
    `g_dev_builtins_allowed`) allow it. This keeps the AST out of serialized
-   script bytecode. **A builtin whose argument is a NODE property (never
+   script bytecode. **A test INSTRUMENT that must run under BOTH engines**
+   (`refcount(x)`, the use-count of a reference read in place) uses
+   `make_dev_builtin_lv<...>` instead — the lvalue ABI both engines
+   share (`CallBuiltinLV` in the VM), plus the dev-only reservation.
+   **A builtin whose argument is a NODE property (never
    evaluated — `defined`/`isconst`/`isconstdecl`) must additionally be wrapped
    in `mark_lazy_builtin(...)`** at registration: a script may only CALL it
    directly — using the name as a VALUE is a compile error (the F1 rule; an
    indirect dyn call could never reproduce the lazy semantics AST-free).
 3. Document it in `README.md` (const vs. non-const section) and add a test in
    `src/tests.cpp`.
+
+**⛔ A HIGHER-ORDER BUILTIN CALLS ITS CALLBACK THROUGH `VmInvoker::call`,
+AND THROUGH NOTHING ELSE (2026-08-14).** Construct one `VmInvoker inv(ctx,
+funcObj, exprList->start)` outside the loop and write `inv.call(args...)`
+per element —
+passing the arguments in whatever C++ types you already hold (a flat
+array's raw `int_type`, an `EvalValue`, a `SharedStr`). `call` boxes each
+argument exactly ONCE and picks the tier itself: the prepared window
+(one boundary frame for the whole loop) or `eval_func` when there is no
+activation to run one on. Do NOT hand-roll the
+`inv.ready() ? inv.invoke(argv, n) : eval_func(...)` ladder — all five
+existing sites did, each slightly differently, and the shared entry is
+what stops the sixth from inventing a sixth spelling. The third
+argument is the BUILTIN CALL's site (its argument list's start, which
+every engine has): a callback has no call op of its own, so it is what
+names the callback's backtrace frame - without it the frame was captured
+loc-less and its caller rendered "at line 0" in every engine (#44). It
+is required, not defaulted, for that reason. It is also a
+measured win, not just tidier: reaching the invoker through a
+`cmp2(EvalValue, EvalValue)` helper made `sort` box each operand TWICE
+(once for the helper's parameters, once into the argv), and removing that
+double boxing read −16.2% instructions and 0.89x wall clock on
+34_sort_custom_cmp. **An all-SCALAR argument list is written straight
+into the callee's window slots** (`VmInvoker::call_scalars`, #97,
+2026-09-25: 34 -16.1% Ir, 0.82x wall; `cb_raw` in `MYLANG_JITSTATS`).
+A flat array's element reaches it through `inv_call_elem` (arr.cpp.h).
+**It pays only when it REPLACES a boxing**: `make_dict`'s key is boxed
+anyway to become the dict key, and binding it raw on top measured +5
+Ir per call on 67 - so that site stays boxed, on purpose. After a raw
+bind the post-call release scan reads `Chunk::ref_slots_raw` (ref_slots
+with no parameter seeds - only the body's own writes can leave a
+reference); the two lists come out of ONE `compute_ref_slots` call and
+the bytecode splice extends both, so no site can derive one and not
+the other (#97 CB5). A builtin that only asks whether the callback's
+result is TRUE (a comparator, a predicate) calls `inv.test(...)`, which
+reads it in place and releases a reference result there (#97 CB7).
+**test()'s scalar path is INLINE (#84, `src/vminvoke.h`, included by
+types.cpp and vm.cpp):** bind, ONE fragment call (`jit_enter2`, rax:rdx)
+and the result read sit in the builtin's loop - for a body whose every
+return is an int or a bool (`Chunk::ret_truth_regs`) the truth is the
+payload the boundary return leaves in rdx, on the inline arm and after
+the C++ tier alike. ⛔ ONE CALL PER ELEMENT is the rule that governs it:
+when the inline function outgrew GCC's budget it became an out-of-line
+clone again (+12% Ir), and forcing it inline at every comparator site
+cost +17% cycles - keep it small, never let a second call appear.
+⛔ That was built in four shapes on 2026-08-14 and REJECTED at 1.20x
+slower - on a WSL2 box with no PMU, where "front-end/layout" could only
+be guessed. On native hardware the path is BACKEND-bound (top-down
+counters), and a SAME-BINARY A/B around the path - identical layout -
+measured -23% cycles. **When a result is better on every simulated
+metric and worse on the clock, measure top-down on the real CPU and
+A/B inside ONE binary before concluding "layout"**; the record is in
+`plans/top5-cpp-gap.md`.
 
 **Memory safety with user callbacks.** A builtin that drives a sort/search with
 a *user-supplied* callback must not assume the callback is well-behaved — it is
@@ -4920,7 +10332,59 @@ comparator-validity instrumentation that *hangs* on a non-ordering comparator.
 The default (no-comparator) path keeps `std::sort` — its `operator<` is a valid
 ordering for homogeneous types and throws `TypeErrorEx` for incomparable ones.
 Keep this distinction if you touch sorting or add another callback-driven
-algorithm. **Callback handle lifetime:** when a builtin keeps a raw
+algorithm. **The callback may also MUTATE the container being walked (#49,
+2026-09-25)** - five builtins read an array's length ONCE and indexed past
+its end after a `pop()` in the callback (`find`, `map`, `filter`,
+`make_dict`, and `sort`'s heapsort), and `map`/`filter` over a DICT walked
+an `unordered_map` the callback had just erased from (ASan UAF). The rule
+now: an ARRAY walk re-reads `size()` every step (`sum`'s key loop already
+did, #43); a DICT walk iterates a SNAPSHOT of its pairs taken before the
+first call; `sort` checks after every comparison that the array's length
+and storage kind are unchanged and raises `InvalidArgumentEx` otherwise
+(a strs array promoted by a non-string write DESTROYS the vector the sort
+holds a reference to). A new callback-driven builtin must pick one of
+these three, never a cached bound or a live iterator.
+**⛔ AND A FOREACH BODY IS THE SAME HAZARD, WITH THE SEMANTICS NOW
+IN THE LANGUAGE (#53, 2026-09-25; README *Modifying the container
+during the loop*).** An ARRAY loop runs over the length at its start,
+reads each element when its turn comes, and raises OutOfBoundsEx at
+the container when the body removed the next one - or, since #53
+OPTION 1, when it MOVED any element (pop / erase / an insert not at the
+end, through any alias or call): **every op that shifts elements IN
+PLACE must call `SharedArrayObj::note_shift()`** after its slice detach
+(today: `builtin_pop`, `builtin_erase_arr`, `builtin_insert_arr`); a
+new shifting op that forgets it lets a loop skip an element silently,
+since only the SHIFT EPOCH sees a shift that restores the length. The
+loop records `fe_mark()` (-1 for a slice view, which never shifts while
+it is one; once another name materialized the slice under the loop, the
+loop's handle moved with it and `fe_shifted` reads the fresh storage's
+epoch) and
+tests it per step - in C++ for the tree-walker and ForeachDynNext, as
+`ArrEpochMark`/`ArrEpochCheck` in the VM and JIT, emitted only when
+`struct_fe_body_inert(body, shift_only)` cannot prove the body
+harmless. And EVERY foreach
+element load re-checks the CURRENT length (the TW loop, LoadElemInt/
+Float/Value as always, LoadElemBool and LoadStructElemV since #53,
+ForeachDynNext's array bodies through an `oob` flag so the specialized
+bodies stay throw-free, the unpack core), and the struct DIRECT read
+(`p.x` off the array bytes at every use) is allowed only for a body
+`struct_fe_body_inert` (codegen.cpp) proves cannot change any array or
+run program code - otherwise `p` is bound whole, a COPY. A DICT loop
+walks a **`DictObject::Cursor`** (shareddict.h): live until the body
+RESTRUCTURES the dict, then a snapshot of the remaining keys, each
+looked up when its turn comes. **Every structural change - a new key,
+an erase - snapshots the linked cursors first (`will_restructure()`),
+and since #53 part B that is ENFORCED BY THE TYPE, not by convention:
+the map is private, `get_ref()` hands out a CONST reference only (a
+`static_assert` in types/dict.cpp.h pins it), the hook is private, and
+a mutation goes through `insert_new` / `insert_if_absent` /
+`erase_key` (each calls the hook, and only when a key is really added
+or removed), `find_mut` (a mutable ITERATOR for a VALUE store into an
+existing entry - no snapshot; it cannot add or remove a key) or
+`build_emplace` (a fresh dict under construction, ML_CHECKed
+cursor-free).** A new site that needs another mutation adds a method
+there; do not hand out the map. The cursor's `ML_CHECK` on the map size
+stays as the tripwire. **Callback handle lifetime:** when a builtin keeps a raw
 `FuncObject *` to the callback, the `shared_ptr` that owns it must outlive every
 call — an inline lambda (`find(a, x, func(e)=>…)`) has *no other owner*, so a
 raw pointer extracted from a `RValue()` temporary that goes out of scope before
@@ -4939,6 +10403,11 @@ overriding the
 needed virtuals in `src/types/xxx.cpp.h` (extend `TypeImpl<T>` for non-trivial
 types to inherit the
 type-erased lifecycle ops). Then `#include` the new `.cpp.h` in `types.cpp`.
+**A non-trivial type whose payload is a pointer to a `RefCounted` object
+joins `elemv_inline_ok`'s list in jit.cpp** (the RefCounted offset must
+be 0): every inline JIT tier copying a reference retains it by
+`inc [pointee]` whatever its type, and BoxObj met those tiers unverified
+from class step 3 to step 4.
 
 ### Adding an operator or keyword
 Add to the `Op`/`Keyword` enum and the matching `OpString`/`KwString` array
@@ -4949,9 +10418,142 @@ wire it into the right `pExprNN` level (or `pStmt`) in `parser.cpp`, add the
 `syntax.h`/`syntax.cpp`+`eval.cpp` for a statement),
 and cover it in `tests.cpp`. A **new `Construct` node must also implement
 `clone()`** (pure virtual) — usually a few lines using the shared helpers;
-omitting it is a compile error.
+omitting it is a compile error. **It must also stamp its `ConstructType`
+tag** (#102, 2026-08-25): the compile-pass walkers (`Inferencer::
+for_each_child`, the resolver's `for_each_child` / `for_each_child_slot`
+/ `fmi_children`) dispatch on `Construct::ct` with EXHAUSTIVE switches —
+no `default`, so `-Werror=switch` fails the build until the new kind is
+classified in each — and the `Construct` ctor ML_CHECKs the tag is not
+`other`, so an unstamped class aborts `-rt` on its first construction.
+This replaced the walkers' dynamic_cast chains, which were ~86% of
+compile Ir, and increment 2 then converted the per-node LADDERS inside
+the passes the same way - `ctag(e) == ConstructType::x` is exactly
+`dynamic_cast<X *>(e) != nullptr` for a leaf class (ctag is null-safe:
+null -> `other`, which no real node carries), so ~400 guarded arms in
+inferencer/resolver/codegen became tag tests via a scripted transform
+restricted to leaf classes and double-eval-safe operands. Casts to a
+BASE whose subtree is not a tag range (MultiElem/Literal) or to a
+CallExpr SUBCLASS (Direct/Cached/DirectBuiltin - they share the `call`
+tag) stay dynamic_cast. Total: 139.7M -> 23.8M on 83's compile, -83%.
+**The forms that BIND the result went next (2026-11-11): `if (auto *x =
+dynamic_cast<const X *>(e))` is `node_cast<const X>(e)`** (syntax.h) -
+a tag compare for a class with a `NodeTag` row, which a `final` node
+class (and CallExpr) has; a class with no row does not compile, and an
+ML_CHECK compares every answer with the dynamic_cast's in each build
+with assertions, so a wrong row aborts by name. 474 sites, emitted code
+identical corpus-wide (-vd 292/292, vdjcmp 225/225). It was done for the
+COVERAGE UNIVERSE: dynamic_cast tests its operand for null first, a
+branch gcov charged to every call site and almost no operand could
+take - about 1,000 uncoverable elements. **A new `final` node class
+gets a `NodeTag` row; write `node_cast`, not a leaf dynamic_cast.**
+The two family BASES whose subtree is a CONTIGUOUS tag range,
+`SingleChildConstruct` and `MultiOpConstruct` (`is_single_ct` /
+`is_multiop_ct`), go through it too since 2026-11-12 (`NodeIs`, 23
+sites; -vd identical over 300 programs): a new class joining either
+family must take a tag INSIDE its range, or the ML_CHECK aborts.
 
 ## Conventions
+
+- **MyLang is a NEW, actively-evolving language — nothing is written in stone;
+  FIX the design, don't work around it (maintainer-set, 2026-07-22).** The
+  language is not perfectly designed and is changing right now. When you hit a
+  problem whose real root cause is a language/design wart, do NOT silently code
+  around it — **PROPOSE the design change GENTLY to the maintainer (never do it
+  ALONE / unilaterally)**, ideally with a "for now" fix plus a note to reconsider
+  the interface later. Concrete example that set this rule: nativizing
+  `CallBuiltinV` in the JIT tripped over `InvalidNumberOfArgsEx` /
+  `InvalidArgumentEx` being **non-runtime** (non-script-catchable, `DECL_SIMPLE_EX`)
+  exceptions that the native code's `RuntimeException`-shaped conveyance could not
+  carry (→ `std::terminate`). The RIGHT fix was not to widen the native code to
+  support non-runtime exceptions, but to **make those two exceptions inherit from
+  `RuntimeException`** (`InvalidArgumentEx` is inherently DYNAMIC so it belongs
+  there permanently; `InvalidNumberOfArgsEx` is a *for-now* move — the deeper fix
+  is to give builtins FIXED arities, e.g. split `write(str[, file])` into
+  `write(str)` + `fwrite(str, file)`, so arity becomes a COMPILE-time check and
+  the runtime throw disappears). The bar: surface the language-level option,
+  recommend, and let the maintainer decide — same as any design fork.
+
+- **⛔ CLAUDE OWNS THE CASE MATRIX AND THE MAP (maintainer-set,
+  2026-08-02).** The maintainer runs this as a SIDE PROJECT with limited
+  time, and deliberately holds LESS context than Claude does about the
+  work in flight. Waiting for him to discover a hole is a failure of the
+  arrangement — the motivating case: the inline element-store tier landed
+  for INT and the float twin silently kept paying ~85 Ir per element
+  until HE noticed. Therefore:
+  - **When a change implements case X of a design, ENUMERATE the sibling
+    cases before calling it done**: type variants (int/float/bool/str/
+    dyn), op variants (load/store, single-level/nested, plain/compound),
+    engine variants (tree-walker/VM/JIT), creation vs mutation. Finish
+    the cheap ones in the SAME change; for the rest, END THE REPORT with
+    the explicit remaining-cases list and tracked tasks — UNPROMPTED.
+    "If we did it for X, either do it for Y or say Y is missing."
+  - **After each approved task, PROACTIVELY propose the next steps that
+    fit the same design** — including "there are N cases left to reach
+    the coherent state that unblocks the next level", when that is the
+    truth. Draw the whole map, honestly sized.
+  - This does NOT license unilateral scope-widening. The rule below
+    ("the maintainer prioritizes") stands: he sequences the work and
+    signs off on new directions. The division of labor is: **Claude
+    draws the map — completely; the maintainer picks the route.**
+    PARITY within an already-approved design (the float twin of a landed
+    int tier) is in scope by default; a NEW design is not.
+  - A task report that lands case X without the sibling-case list is an
+    INCOMPLETE report, the same way a behavior change without its README
+    update is an incomplete change.
+
+- **⛔ MyLang DOES NOT CODEGEN WHAT THE C++ STANDARD LIBRARY ALREADY
+  DOES (maintainer-set, 2026-08-14).** A builtin's ALGORITHM stays
+  hard-coded C++ - `std::sort`, the hash map, the string search. Do not
+  propose, and do not build, a JIT that EMITS a specialized copy of one
+  (a sort generated per comparator call site, a map/filter fused into
+  its callback). The maintainer's words: *"overkill for MyLang"*, and
+  *"I don't want MyLang to produce with codegen implementations of
+  everything that already exists in the C++ std library."*
+  **THE CONSEQUENCE IS A PERMANENT, ACCEPTED ASYMMETRY**, and it is why
+  bench/cpp is written the way it is: `std::sort` INLINES its comparator
+  and `builtin_sort_lv` structurally cannot, so the C++ twin is required
+  to hand its comparator to a `noinline` helper as a `std::function`
+  (see plans/archived/bench-fairness.md, the 2026-08-14 reversal). The
+  fairness fix goes on the BENCH side because the implementation is not
+  going to change.
+  **WHAT IS STILL ALLOWED, and the line is worth stating precisely:**
+  making the CALL CHEAPER is not reimplementing the algorithm. A typed
+  callback entry - entering a proven `(int,int)->bool` comparator with
+  two raw `int_type`s instead of two boxed `EvalValue`s bound through
+  the generic parameter path - leaves `std::sort` exactly where it is
+  and still calls the comparator once per comparison. That is in scope.
+  Emitting the sort is not.
+- **THE MICRO-STEP ORDER INSIDE A TASK IS YOURS — DON'T ASK
+  (maintainer-set, 2026-08-14).** The maintainer sequences work at the
+  HIGH level: optimization vs feature vs test coverage, and which task
+  comes next. Inside a task he has already chosen, the order of the
+  small steps is Claude's call, and the criterion is **whichever order
+  makes the work EASIER TO EXECUTE** — not which reads better in a
+  report. If the NET RESULT of the task is the same, do not stop to ask
+  permission to reorder.
+  The case that set this: the call-window work needed its
+  correctness ORACLE rewritten before the thing it verifies could
+  change (the test rests on a field the change deletes), i.e.
+  test-then-build instead of build-then-test. That was surfaced as a
+  fork for the maintainer; it is not one. Rewriting the oracle first IS
+  part of the task, so just do it in that order.
+  **What still goes to him:** a change to the LANGUAGE or the
+  ARCHITECTURE, a new direction, dropping a piece of the task, or a
+  result that contradicts the task's premise. Not "may I do step B
+  before step A".
+- **DON'T pick work by "highest value" — the MAINTAINER prioritizes; YOU pick
+  the SMALLEST step that makes progress in the chosen direction
+  (maintainer-set, 2026-07-19).** When deciding what to do next, do NOT rank
+  candidate tasks by estimated value/impact and choose the biggest win — that is
+  the maintainer's call, made on what is valuable to HIM. Your job, within the
+  direction he has set, is to take the SMALLEST incremental step that makes real
+  progress toward the goal (and keeps the tree green + tested). So when asked
+  "what next," propose the smallest concrete progress step in the CURRENT
+  direction — not a detour to a higher-value-but-different task. (This came up
+  when, asked for the next native-function step, the response drifted into a
+  higher-value value-model profiling detour instead of the smaller native-call
+  foundation step. Wrong: stay in the maintainer's chosen lane and shrink the
+  step.) Surfacing a value observation is fine; re-prioritizing on it is not.
 
 - **NEVER do anything LAZILY unless the maintainer explicitly asked for it.**
   As a decision heuristic, ~95% of the time on THIS project the right call is
@@ -5011,6 +10613,18 @@ omitting it is a compile error.
   ever disabled a fold that the positional form would get, the feature is a
   regression and would be better not used at all. Hold any sugar to the same
   bar: it may add spelling, never subtract capability.
+- **ASK before reverting a working optimization the maintainer asked for, even
+  if it measures perf-neutral.** (Maintainer, 2026-07-19.) If an optimization is
+  CORRECT (tests green) and the maintainer requested it (or it came out of
+  fulfilling their request), do NOT unilaterally revert it just because a
+  measurement says it's neutral — PRESENT the data and ASK. They may want it
+  kept anyway (it's a building block — e.g. a native dict store is a prerequisite
+  for the model flip), or want it IMPROVED (extend its reach), not dropped. This
+  compounds with the "distrust a surprising result" rule above: the very
+  measurement that says "neutral" may itself be the noisy/unproven artifact — a
+  perf-neutral finding is exactly when you should double-check before acting on
+  it. (Concrete case: the native dict store was reverted as "0%", which turned
+  out to be measurement noise hiding a real ~6.5%.)
 - **Interactive `git rebase -i` is permitted in this repo** (the environment's
   general "no interactive flags" restriction is waived here by the maintainer) —
   use it to keep history clean / bisectable, e.g. squashing a fix into the
@@ -5018,7 +10632,7 @@ omitting it is a compile error.
   `GIT_SEQUENCE_EDITOR` (rewrite the todo) and `GIT_EDITOR` (supply messages).
   `exp-work` is a topic branch whose history may be rewritten freely.
 - **Never edit a source file while a build that compiles it is running.** A
-  background `make`/`cmake` reads `src/` AND writes shared dep files (`.d/`) as
+  background `make`/`cmake` reads `src/` AND writes dep files (`.d/`) as
   it goes; editing during that window makes it compile a half-written file or
   corrupt a dep, producing a *bogus* "BUILD FAILED" that looks like a real
   regression and wastes a debugging cycle. Serialize: let a background build (or
@@ -5054,6 +10668,17 @@ omitting it is a compile error.
   change a clean `make clean && make` must show ZERO warnings on g++ AND clang
   (`make CXX=clang++`); MSVC's set is only visible on the Windows CI lane, so
   read its log after a build-touching change.
+  **WINDOWS IS LLP64: `long` is 32 BITS there** (64 on Linux/macOS), so any
+  `long`-typed conversion of an `int_type` value SILENTLY behaves differently
+  per platform — no warning, no test failure until the Windows lane runs.
+  `parser.cpp` parsed integer literals with `stol`, which made every literal
+  in `[2^31, 2^63)` a "Integer literal out of range" SYNTAX ERROR on Windows
+  alone (`const BIG = 4611686018427387903;` compiled everywhere else). Use
+  **`stoll`** — or the `sizeof(int_type)`-dispatched `if constexpr` chain that
+  `int()` (builtins/num.cpp.h) already uses, which is correct — and then
+  range-check the fit into `int_type`. The reason nothing caught it: the only
+  literal-range test used a value beyond `2^63`, which EVERY platform
+  refuses; when testing a LIMIT, cover the range on BOTH sides of it.
 - Every file starts with `/* SPDX-License-Identifier: BSD-2-Clause */`.
 - Core typedefs (`defs.h`): `int_type = intptr_t`, `float_type = double`
   (printf/snprintf with `%f`/`%.*f`; the comment warns to update the format

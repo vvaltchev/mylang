@@ -1,7 +1,7 @@
 # cross-frame throw: an exception raised DEPTH frames deep, caught at the top.
 # Measures the per-frame unwind cost of a throw that crosses many MyLang frames
 # (the case a SAME-FRAME-only VM mechanism does NOT speed up; see
-# plans/vm-exceptions.md). `deep` recurses (a non-inlined real call) and throws
+# plans/archived/vm-exceptions.md). `deep` recurses (a non-inlined real call) and throws
 # at the bottom.
 struct Err { int v; }
 

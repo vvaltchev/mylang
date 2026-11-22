@@ -1,0 +1,117 @@
+# Choice 6 (plans/strict-container-types.md; README, `array(n)`):
+# array(n) fills its elements with their type's ZERO VALUE - what `T x;`
+# gives - each one a fresh value, so the array holds what its static type
+# says. It filled `none`, so `var a = array(2); a[0] = "x"` made an
+# array<str> holding none: the tree-walker raised a TypeErrorEx reading
+# a[1] as a string, -nj one with no caret, and the JIT printed 0.
+#
+# The element type is the one the compiler found for the array (the
+# variable it is assigned to); with -nti there is none, and the elements
+# are none, so the typed results (and the stores that need them) are
+# asserted on a typed run only.
+
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+
+# ---- the original repro: the element type comes from a later store
+var a = array(2);
+a[0] = "x";
+if (typed) {
+    want("str later", len(a[1]), 0);
+    want("str later value", str(a), "[\"x\", \"\"]");
+}
+
+# ---- a declared element type, every kind of zero
+array<str> s = array(2);
+array<int> ints = array(2);
+array<float> fl = array(2);
+array<bool> bs = array(2);
+if (typed) {
+    want("str", str(s), "[\"\", \"\"]");
+    want("int", str(ints), "[0, 0]");
+    want("float", str(fl), "[0.000000, 0.000000]");
+    want("bool", str(bs), "[false, false]");
+    want("float storage", array_storage(fl), "float");
+}
+
+# ---- containers: a FRESH one per element, with its own type
+array<array<int>> m = array(3);
+array<dict<str, int>> ds = array(2);
+if (typed) {
+    append(m[0], 5);
+    ds[0]["k"] = 1;
+    want("nested", str(m), "[[5], [], []]");
+    want("nested storage", array_storage(m[1]), "int");
+    want("dicts", str(ds), "[{\"k\": 1}, {}]");
+}
+
+# ---- structs (flat when POD), a struct with containers, a box, a class
+struct P { int x; float y; }
+struct Q { str name; array<int> xs; P p; box<int> b; }
+class C { int v; }
+array<P> ps = array(2);
+array<Q> qs = array(2);
+array<box<str>> bx = array(2);
+array<C> cs = array(2);
+if (typed) {
+    append(qs[0].xs, 1);
+    want("pod", str(ps), "[P(x: 0, y: 0.000000), P(x: 0, y: 0.000000)]");
+    want("pod storage", array_storage(ps), "struct");
+    want("boxed fields", str(qs[1]),
+         "Q(name: \"\", xs: [], p: P(x: 0, y: 0.000000), b: box(0))");
+    want("boxed fields fresh", str(qs[0].xs), "[1]");
+    want("box", *bx[0], "");
+    cs[0].v = 7;
+    want("class fresh", cs[1].v, 0);
+    want("class distinct", intptr(cs[0]) != intptr(cs[1]), true);
+}
+
+# ---- a nullable element type, a dynamic array and an untyped one: none
+array<int?> oi = array(2);
+array<dyn?> od = array(2);
+var dyn dd = array(2);
+var un = array(2);
+want("opt int", str(oi), "[<none>, <none>]");
+want("dyn?", str(od), "[<none>, <none>]");
+want("dynamic", str(dd), "[<none>, <none>]");
+want("unfilled", str(un), "[<none>, <none>]");
+
+# ---- a struct that is not POD (a str field) with a field of every
+# other kind, and dynamic containers (a field names its whole type -
+# rule 5): each element its own zero value
+struct R { str s; bool b; float f; dict<str, int> d; opt array<int> o;
+           array<dyn> g; dict<dyn, dyn> h; }
+array<R> rs = array(2);
+array<array> gs = array(2);
+array<dict> hs = array(2);
+if (typed) {
+    want("struct kinds", str(rs[1]),
+         "R(s: \"\", b: false, f: 0.000000, d: {}, o: <none>, g: [], h: {})");
+    rs[0].d["k"] = 1;
+    want("struct fresh", len(rs[1].d), 0);
+    want("generic arrays", str(gs), "[[], []]");
+    want("generic dicts", str(hs), "[{}, {}]");
+}
+
+# ---- in a function: each call makes its own zero values
+func row(int n) {
+    array<str> r = array(n);
+    r[0] = "first";
+    return r;
+}
+var r1 = row(2);
+var r2 = row(3);
+if (typed) {
+    want("call 1", str(r1), "[\"first\", \"\"]");
+    want("call 2", str(r2), "[\"first\", \"\", \"\"]");
+}
+
+assert(bad == 0);
+print("ok");

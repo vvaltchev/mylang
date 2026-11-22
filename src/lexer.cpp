@@ -259,12 +259,19 @@ lexer_ctx::handle_space_or_op()
         }
 
         /*
-         * Maximal-munch: try a 3-char operator (`>>>`) first, then 2-char.
-         * Note: each requires its shorter prefixes to exist as operators too
-         * (`>>>` needs `>>` and `>`, `<=` needs `<`), because the 1-char `op`
-         * default above is what bootstraps the scan.
+         * Maximal-munch: try a 4-char operator (`>>>=`) first, then 3-char
+         * (`>>>`, `<<=`), then 2-char. Note: each requires its shorter
+         * prefixes to exist as operators too (`>>>=` needs `>>>`, `>>` and
+         * `>`; `<=` needs `<`), because the 1-char `op` default above is
+         * what bootstraps the scan.
          */
-        if (i + 2 < in_str.length() && is_operator(in_str.substr(i, 3))) {
+        if (i + 3 < in_str.length() && is_operator(in_str.substr(i, 4))) {
+
+            op = in_str.substr(i, 4);
+            i += 3;
+
+        } else if (i + 2 < in_str.length()
+                   && is_operator(in_str.substr(i, 3))) {
 
             op = in_str.substr(i, 3);
             i += 2;
@@ -305,8 +312,10 @@ lexer_ctx::handle_alphanum()
 
             tok_type = TokType::floatnum;
 
-        } else if (c == 'e') {
+        } else if (c == 'e' || c == 'E') {
 
+            /* `E` too (2026-10-05): float("1E5") read it, the lexer did not -
+             * a literal and float() take the same spellings (numtext.h) */
             tok_type = TokType::floatnum;
             float_exp = true;
             exp_sign_ok = true;
@@ -319,7 +328,7 @@ lexer_ctx::handle_alphanum()
 
     } else if (tok_type == TokType::floatnum) {
 
-        if (c == 'e') {
+        if (c == 'e' || c == 'E') {
 
             if (float_exp)
                 invalid_token(); /* a second 'e' in the same float */

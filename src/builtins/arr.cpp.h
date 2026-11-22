@@ -16,27 +16,27 @@
 #include <algorithm>
 
 /*
- * A flat (unboxed) array<int>/array<float> holds exactly one scalar kind, fixed
- * at creation from the proven static type. Storing a different type would need
- * an in-place flat->general conversion (promotion), which mylang deliberately
- * does NOT do - that is what type-driven representation buys (no GC-like
- * latency spikes; the representation is decided once, at creation). This is
- * reachable only by laundering a typed array through `dyn` and then mutating it
- * (`var dyn d = int_array; append(d, "x")`): the shared storage stays int-typed
- * even through the dyn alias, and an alias-affecting write can't change it.
- * Declare the array `dyn` from the start for a (general) polymorphic array.
- */
-static const char *const flat_array_violation_msg =
-    "Cannot store a value of a different type in a flat (typed) array; "
-    "declare the array dyn for a polymorphic array";
-
-/*
- * array(N)        -> N elements of `none` (general storage).
+ * array(N)        -> N elements of the element type's ZERO VALUE - the
+ *                    type the compiler made the array for (its ctype, the
+ *                    variable it is assigned to), each one fresh (choice 6,
+ *                    plans/strict-container-types.md); `none` when that type
+ *                    is nullable or nothing typed it (an unfilled array,
+ *                    -nti).
  * array(N, value) -> N elements all equal to `value`. The fill value drives the
- *                    storage (value-driven, see plans/typed-arrays.md): an int
+ *                    storage (value-driven, see plans/archived/typed-arrays.md): an int
  *                    -> flat int, a float -> flat float, else general. For a
  *                    callback-built array use make_array().
  */
+/* n copies of `x`, reserved first (reserve_or_oom) */
+template <class Vec>
+static Vec filled(int_type n, typename Vec::value_type x, const ArgLoc *at)
+{
+    Vec v;
+    reserve_or_oom(v, static_cast<uint64_t>(n), at);
+    v.assign(static_cast<size_t>(n), x);
+    return v;
+}
+
 EvalValue builtin_array(EvalContext *ctx, const ArgLocs *exprList,
                         const EvalValue *args, size_t nargs)
 {
@@ -66,22 +66,48 @@ EvalValue builtin_array(EvalContext *ctx, const ArgLocs *exprList,
          * `none`.
          */
         if (hint == ArrHint::flat_i)
-            return SharedArrayObj(SharedArrayObj::ivec_type(n, 0));
+            return SharedArrayObj(filled<SharedArrayObj::ivec_type>(n, 0, arg));
         if (hint == ArrHint::flat_f)
-            return SharedArrayObj(SharedArrayObj::fvec_type(n, 0.0));
+            return SharedArrayObj(
+                filled<SharedArrayObj::fvec_type>(n, 0.0, arg));
         if (hint == ArrHint::flat_b)
-            return SharedArrayObj(SharedArrayObj::bvec_type(n, 0));
+            return SharedArrayObj(filled<SharedArrayObj::bvec_type>(n, 0, arg));
+
+        /* the element type's zero value, a fresh one per element (a
+         * container, a struct, a box is a value of its own) */
+        const TypeAnnot *ea = exprList->ctype
+            ? exprList->ctype->elem.get() : nullptr;
+        const bool zero = ea && !ea->opt;
+        /* (the compiler refuses an element type with no zero value - a
+         * `dyn` one included - so only an image's ctype can name one: it
+         * is filled with none, below) */
+        if (zero && annot_zero_value(ea, nullptr)) { /* INT-COV-EXEMPT: image */
+            std::vector<EvalValue> zs;
+            reserve_or_oom(zs, static_cast<uint64_t>(n), arg);
+            for (int_type i = 0; i < n; i++) {
+                EvalValue z;
+                annot_zero_value(ea, &z);
+                zs.push_back(std::move(z));
+            }
+            const StructTypeDef *sd = nullptr;
+            const ArrHint h = annot_arr_hint(exprList->ctype, sd);
+            return build_array_from_values(zs.data(), zs.size(), h, sd,
+                                           ctx->const_ctx);
+        }
 
         SharedArrayObj::vec_type vec;
-        vec.reserve(n);
+        reserve_or_oom(vec, static_cast<uint64_t>(n), arg);
 
         for (int_type i = 0; i < n; i++)
             vec.emplace_back(none, ctx->const_ctx);
 
-        return SharedArrayObj(move(vec));
+        return SharedArrayObj(std::move(vec));
     }
 
-    const EvalValue &v = args[1];
+    /* a destination proven array<int> / <float> / <bool> holds that element
+     * type: a `dyn` fill value widens or is refused (a bool filled an
+     * array<int> as bools, a string as a general array) */
+    const EvalValue v = flat_hint_value(args[1], hint);
 
     /*
      * Flat storage for a scalar fill value, unless the destination is
@@ -91,26 +117,26 @@ EvalValue builtin_array(EvalContext *ctx, const ArgLocs *exprList,
     if (hint != ArrHint::general) {
 
         if (v.is<int_type>())
-            return SharedArrayObj(
-                SharedArrayObj::ivec_type(n, v.get<int_type>()));
+            return SharedArrayObj(filled<SharedArrayObj::ivec_type>(
+                n, v.get<int_type>(), arg));
 
         if (v.is<float_type>())
-            return SharedArrayObj(
-                SharedArrayObj::fvec_type(n, v.get<float_type>()));
+            return SharedArrayObj(filled<SharedArrayObj::fvec_type>(
+                n, v.get<float_type>(), arg));
 
         if (v.is<bool>())
-            return SharedArrayObj(
-                SharedArrayObj::bvec_type(n, v.get<bool>() ? 1 : 0));
+            return SharedArrayObj(filled<SharedArrayObj::bvec_type>(
+                n, v.get<bool>() ? 1 : 0, arg));
     }
 
     /* General fill: every element is (a copy of) the value. */
     SharedArrayObj::vec_type vec;
-    vec.reserve(n);
+    reserve_or_oom(vec, static_cast<uint64_t>(n), arg);
 
     for (int_type i = 0; i < n; i++)
         vec.emplace_back(v, ctx->const_ctx);
 
-    return SharedArrayObj(move(vec));
+    return SharedArrayObj(std::move(vec));
 }
 
 /*
@@ -160,11 +186,28 @@ EvalValue builtin_make_array(EvalContext *ctx, const ArgLocs *exprList,
      * general from the start; otherwise optimistic flat. mode: 0 = empty,
      * 1 = ints, 2 = floats, 4 = bools, 3 = general. */
     int mode = exprList->arr_hint == ArrHint::general ? 3 : 0;
+    const uint64_t un = static_cast<uint64_t>(n);
+
+    /* The result is reserved BEFORE the first call (reserve_or_oom), so a
+     * refused size runs no callback: the storage the destination's type
+     * names, else ints - the likeliest kind, and the probe that the size
+     * can be served at all. A reservation of the wrong kind is released
+     * (`release`) when the elements turn out to be another. */
     if (mode == 3)
-        gvec.reserve(n);
+        reserve_or_oom(gvec, un, arg0);
+    else if (exprList->arr_hint == ArrHint::flat_f)
+        reserve_or_oom(fvec, un, arg0);
+    else if (exprList->arr_hint == ArrHint::flat_b)
+        reserve_or_oom(bvec, un, arg0);
+    else
+        reserve_or_oom(ivec, un, arg0);
+
+    auto release = [](auto &v) {
+        std::remove_reference_t<decltype(v)>().swap(v);
+    };
 
     auto spill_to_general = [&]() {
-        gvec.reserve(n);
+        reserve_or_oom(gvec, un, arg0);
         if (mode == 1)
             for (int_type x : ivec) gvec.emplace_back(EvalValue(x), false);
         else if (mode == 2)
@@ -172,29 +215,47 @@ EvalValue builtin_make_array(EvalContext *ctx, const ArgLocs *exprList,
         else if (mode == 4)
             for (unsigned char x : bvec)
                 gvec.emplace_back(EvalValue(static_cast<bool>(x)), false);
-        ivec.clear();
-        fvec.clear();
-        bvec.clear();
+        release(ivec);
+        release(fvec);
+        release(bvec);
         mode = 3;
     };
 
-    VmInvoker inv(ctx, funcObj);   /* prepared per-loop invoker (vm.h) */
+    /* prepared per-loop invoker (vm.h); the call site names the frame */
+    VmInvoker inv(ctx, funcObj, exprList->start);
 
     for (int_type i = 0; i < n; i++) {
 
-        const EvalValue iv(i);
-        const EvalValue r = inv.ready() ? inv.invoke(&iv, 1)
-                                        : eval_func(ctx, funcObj, iv);
+        /* a destination proven array<int> / <float> / <bool> holds that
+         * element type: a `dyn` callback's bool widens, a misfit raises
+         * (it built a general array holding it) */
+        const EvalValue r = flat_hint_value(inv.call(i),
+                                            exprList->arr_hint);
 
         if (mode == 0) {
+            /* the first element names the storage; release a reservation
+             * made for another kind before reserving this one */
             if (r.is<int_type>()) {
-                mode = 1; ivec.push_back(r.get<int_type>());
+                mode = 1;
+                reserve_or_oom(ivec, un, arg0);
+                ivec.push_back(r.get<int_type>());
             } else if (r.is<float_type>()) {
-                mode = 2; fvec.push_back(r.get<float_type>());
+                mode = 2;
+                release(ivec);
+                reserve_or_oom(fvec, un, arg0);
+                fvec.push_back(r.get<float_type>());
             } else if (r.is<bool>()) {
-                mode = 4; bvec.push_back(r.get<bool>() ? 1 : 0);
+                mode = 4;
+                release(ivec);
+                reserve_or_oom(bvec, un, arg0);
+                bvec.push_back(r.get<bool>() ? 1 : 0);
             } else {
-                mode = 3; gvec.reserve(n); gvec.emplace_back(r, false);
+                mode = 3;
+                release(ivec);
+                release(fvec);
+                release(bvec);
+                reserve_or_oom(gvec, un, arg0);
+                gvec.emplace_back(r, false);
             }
         } else if (mode == 1 && r.is<int_type>()) {
             ivec.push_back(r.get<int_type>());
@@ -209,10 +270,10 @@ EvalValue builtin_make_array(EvalContext *ctx, const ArgLocs *exprList,
         }
     }
 
-    if (mode == 1) return SharedArrayObj(move(ivec));
-    if (mode == 2) return SharedArrayObj(move(fvec));
-    if (mode == 4) return SharedArrayObj(move(bvec));
-    return SharedArrayObj(move(gvec));
+    if (mode == 1) return SharedArrayObj(std::move(ivec));
+    if (mode == 2) return SharedArrayObj(std::move(fvec));
+    if (mode == 4) return SharedArrayObj(std::move(bvec));
+    return SharedArrayObj(std::move(gvec));
 }
 
 /*
@@ -246,43 +307,11 @@ EvalValue builtin_array_storage(EvalContext *ctx, const ArgLocs *exprList,
             return SharedStr(string("struct"));
         case SharedArrayObj::Storage::strs:
             return SharedStr(string("str"));
+        case SharedArrayObj::Storage::objs:
+            return SharedStr(string("class"));
         default:
             return SharedStr(string("general"));
     }
-}
-
-/*
- * dynarray(a): return a fresh, mutable GENERAL (polymorphic) copy of array `a`.
- * This is the explicit, manual way to "promote" a flat (statically-typed)
- * array<int>/array<float> into one that can hold any element type - there is no
- * automatic runtime promotion (the representation is fixed at creation from the
- * proven static type). Reading via arr_elem_at, so the source is never promoted
- * in place; an already-general array is just copied. Shallow (top-level):
- * nested arrays keep their own representation. Not const (a fresh mutable value
- * that must be re-copied per eval). Compare `var dyn d = [1,2,3]`, where the
- * dyn declaration already builds general from the start.
- */
-EvalValue builtin_dynarray(EvalContext *ctx, const ArgLocs *exprList,
-                           const EvalValue *args, size_t nargs)
-{
-    if (nargs != 1)
-        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
-
-    const ArgLoc *arg = exprList->arg(0);
-    const EvalValue &e = args[0];
-
-    if (!e.is<SharedArrayObj>())
-        throw TypeErrorEx("Expected array", arg->start, arg->end);
-
-    const SharedArrayObj &arr = e.get<SharedArrayObj>();
-    const size_type n = arr.size();
-    SharedArrayObj::vec_type gvec;
-    gvec.reserve(n);
-
-    for (size_type i = 0; i < n; i++)
-        gvec.emplace_back(arr_elem_at(arr, i), false);
-
-    return SharedArrayObj(move(gvec));
 }
 
 /*
@@ -314,6 +343,9 @@ static void arr_append_maintain_hash(SharedArrayObj &arr, const EvalValue &elem)
  * `is_const` is the general-path element flag (ctx->const_ctx from the
  * builtin; false from the VM's runtime op).
  */
+static bool arr_push_value(SharedArrayObj &arr, const EvalValue &elem,
+                           bool is_const);
+
 bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const)
 {
     if (!lval || !lval->is<SharedArrayObj>() || lval->is_const_var())
@@ -324,11 +356,75 @@ bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const)
     if (arr.is_readonly() || arr.is_slice())
         return false;
 
+    return arr_push_value(arr, elem, is_const);
+}
+
+/*
+ * Does `elem` fit the storage of `arr`? The SAME rules arr_push_value
+ * applies (the push is the authority - an ASSERTS build checks the two
+ * agree on every push): a flat scalar kind takes its own scalar and the
+ * ones that widen into it, a flat POD-struct array a POD instance of its
+ * def, and the general and string kinds anything (a string array
+ * promotes).
+ */
+static bool arr_elem_fits(const SharedArrayObj &arr, const EvalValue &elem)
+{
     switch (arr.skind()) {
     case SharedArrayObj::Storage::ints:
-        if (!elem.is<int_type>())
+        return elem.is<int_type>() || elem.is<bool>();
+    case SharedArrayObj::Storage::floats:
+        return elem.is<float_type>() || elem.is<int_type>() ||
+               elem.is<bool>();
+    case SharedArrayObj::Storage::bools:
+        return elem.is<bool>();
+    case SharedArrayObj::Storage::structs: {
+        if (!elem.is<intrusive_ptr<StructObject>>())
             return false;
-        arr.flat_ints().push_back(elem.get<int_type>());
+        const StructObject &o = *elem.get<intrusive_ptr<StructObject>>();
+        /* a VALUE of the def: a box<P> shares P's def but is a
+         * reference */
+        return o.is_pod() && !o.is_ref() && o.def == arr.flat_structs().def;
+    }
+    default:                /* general; strs and objs promote */
+        return true;
+    }
+}
+
+/* arr_push_value's refusal - which arr_elem_fits must agree with */
+#ifndef NDEBUG
+static bool arr_push_refused(bool fits)
+{
+    ML_CHECK(!fits);
+    return false;
+}
+#else
+#define arr_push_refused(fits) false
+#endif
+
+/*
+ * Append `elem` to a MUTABLE, NON-SLICE array in place, keeping its
+ * storage when the element fits; false (and the array untouched) for a
+ * flat-storage mismatch - the dyn-launder error, which the caller raises.
+ */
+static bool arr_push_value(SharedArrayObj &arr, const EvalValue &elem,
+                           bool is_const)
+{
+    ML_CHECK(!arr.is_readonly() && !arr.is_slice());
+#ifndef NDEBUG
+    const bool fits = arr_elem_fits(arr, elem);
+#endif
+
+    switch (arr.skind()) {
+    case SharedArrayObj::Storage::ints:
+        /* #96: a bool WIDENS into numeric storage (the promotion chain
+         * bool <= int <= float) - the same rule as the element store
+         * (flat_store_core) and the decl/struct-field coerces. */
+        if (elem.is<int_type>())
+            arr.flat_ints().push_back(elem.get<int_type>());
+        else if (elem.is<bool>())
+            arr.flat_ints().push_back(elem.get<bool>() ? 1 : 0);
+        else
+            return arr_push_refused(fits);
         break;
     case SharedArrayObj::Storage::floats:
         if (elem.is<float_type>())
@@ -336,21 +432,23 @@ bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const)
         else if (elem.is<int_type>())
             arr.flat_floats().push_back(
                 static_cast<float_type>(elem.get<int_type>()));
+        else if (elem.is<bool>())
+            arr.flat_floats().push_back(elem.get<bool>() ? 1.0 : 0.0);
         else
-            return false;
+            return arr_push_refused(fits);
         break;
     case SharedArrayObj::Storage::bools:
         if (!elem.is<bool>())
-            return false;
+            return arr_push_refused(fits);
         arr.flat_bools().push_back(elem.get<bool>() ? 1 : 0);
         break;
     case SharedArrayObj::Storage::structs: {
         if (!elem.is<intrusive_ptr<StructObject>>())
-            return false;
+            return arr_push_refused(fits);
         const StructObject &o = *elem.get<intrusive_ptr<StructObject>>().get();
         auto &sv = arr.flat_structs();
-        if (!o.is_pod() || o.def != sv.def)
-            return false;
+        if (!o.is_pod() || o.is_ref() || o.def != sv.def)
+            return arr_push_refused(fits);
         const size_t at = sv.buf.size();
         sv.buf.resize(at + sv.stride);
         std::memcpy(sv.buf.data() + at, o.bytes.data(), sv.stride);
@@ -368,11 +466,22 @@ bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const)
             arr.get_vec().emplace_back(elem, is_const);
         }
         break;
+    case SharedArrayObj::Storage::objs:
+        /* the strs model again: a class instance or none stays flat, any
+         * other value (through a `dyn` alias) promotes */
+        if (is_obj_elem(elem)) {
+            arr.flat_objs().push(obj_elem_ptr(elem));
+        } else {
+            arr.promote_objs_to_general();
+            arr.get_vec().emplace_back(elem, is_const);
+        }
+        break;
     default:                              /* general */
         arr.get_vec().emplace_back(elem, is_const);
         break;
     }
 
+    ML_CHECK(fits);
     arr_append_maintain_hash(arr, elem);
     return true;
 }
@@ -403,7 +512,7 @@ EvalValue builtin_append(EvalContext *ctx, const ArgLocs *exprList,
         throw CannotChangeConstEx(arg0->start, arg0->end);
 
     if (arr.is_slice())
-        arr.clone_internal_vec();
+        arr.materialize_slice();
 
     /* The element to append is the pre-evaluated `rest[0]` - append is now
      * REST-NATIVE (no node->eval): the tree-walker via append_tw (which delegates
@@ -412,7 +521,16 @@ EvalValue builtin_append(EvalContext *ctx, const ArgLocs *exprList,
      * S(..))`) needs the ctor NODE, so it lives in append_tw (tree-walker) and
      * EmplaceStruct (VM); a plain value hits the flat/general paths below. */
     ML_CHECK(rest && n_rest == 1);
-    const EvalValue &elem = rest[0];
+    /* Q2: an append through `dyn` (ArgLocs::ct_store): the element fits
+     * the array's own type - converted as a typed store converts it */
+    EvalValue checked;
+    const EvalValue *ep = &rest[0];
+    if (exprList->ct_store) {
+        checked = ct_fit_value(lval->get(), rest[0], exprList->start,
+                               exprList->end);
+        ep = &checked;
+    }
+    const EvalValue &elem = *ep;
 
     /* The shared core (arr_append_fast) does every SUCCESS path - flat
      * int/float/bool/POD-struct-match and general - with the hash upkeep.
@@ -442,8 +560,9 @@ static EvalValue append_tw(EvalContext *ctx, ExprList *exprList)
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
 
-    const EvalValue a0v = arg0->eval(ctx);
-    LValue *target = a0v.is<LValue *>() ? a0v.get<LValue *>() : nullptr;
+    LValue hold;
+    EvalValue a0v = store_base_value(ctx, arg0, hold);
+    LValue *target = lv_builtin_target(a0v, hold, arg0);
 
     /* Construct-in-place: only a mutable FLAT struct array + a struct-ctor arg
      * (try_construct_into_struct_array returns false otherwise). Mirrors the
@@ -453,7 +572,7 @@ static EvalValue append_tw(EvalContext *ctx, ExprList *exprList)
         if (!arr.is_readonly() &&
             arr.skind() == SharedArrayObj::Storage::structs) {
             if (arr.is_slice())
-                arr.clone_internal_vec();
+                arr.materialize_slice();
             if (try_construct_into_struct_array(ctx, arr, arg1)) {
                 arr.invalidate_hash();   /* built in-place; nothing to fold in */
                 return target->get();
@@ -463,7 +582,12 @@ static EvalValue append_tw(EvalContext *ctx, ExprList *exprList)
 
     /* Any other value: self-eval it and delegate to the rest-native core (which
      * takes an AST-free ArgLocs - build it from the ExprList). */
-    const EvalValue val = RValue(arg1->eval(ctx));
+    const EvalValue val = literal_widen(RValue(arg1->eval(ctx)),
+                                        exprList->widen_of(1));
+    /* #49: checked against the declared element type where it may misfit
+     * (ExprList::arg_fit) - the VM's CheckFitV on the argument */
+    if (const FitSpec *f = exprList->fit_of(1))
+        check_fit_loc(val, *f, arg1->start, arg1->end);
     ArgLoc locbuf[2];
     ArgLocs al = build_arglocs(exprList, locbuf, 2);
     return builtin_append(ctx, &al, target, &val, 1);
@@ -495,8 +619,14 @@ EvalValue builtin_pop(EvalContext *ctx, const ArgLocs *exprList, LValue *target,
 
     const size_type n = arr.size();
 
+    ML_INT_ONLY(int_vc_size(IntVc::pop_empty, IntVc::pop_one, n);)
     if (!n)
         throw OutOfBoundsEx(arg->start, arg->end);
+
+    /* popping a slice pops the slice every name holding it shares
+     * (question 3): it becomes an ordinary array first. It used to
+     * narrow THIS handle's window only. */
+    arr.materialize_slice();
 
     arr.invalidate_hash();   /* pop removes the last element */
 
@@ -511,29 +641,27 @@ EvalValue builtin_pop(EvalContext *ctx, const ArgLocs *exprList, LValue *target,
         case SharedArrayObj::Storage::bools:
             last = EvalValue(static_cast<bool>(arr.flat_bools()[last_i]));
             break;
+        case SharedArrayObj::Storage::objs:
+            last = obj_elem_value(arr.flat_objs()[last_i]);
+            break;
         default:
             last = arr.get_vec()[last_i].get();          break;
     }
 
-    if (arr.is_slice()) {
-
-        /* Shrink the view by one (shares the parent storage, stays flat). */
-        lval->put(SharedArrayObj(arr, arr.offset(), arr.size() - 1));
-
-    } else {
-
-        arr.clone_aliased_slices(last_i);
-        switch (arr.skind()) {
-            case SharedArrayObj::Storage::ints:
-                arr.flat_ints().pop_back();   break;
-            case SharedArrayObj::Storage::floats:
-                arr.flat_floats().pop_back(); break;
-            case SharedArrayObj::Storage::bools:
-                arr.flat_bools().pop_back();  break;
-            default:
-                arr.get_vec().pop_back();     break;
-        }
+    arr.clone_aliased_slices(last_i);
+    switch (arr.skind()) {
+        case SharedArrayObj::Storage::ints:
+            arr.flat_ints().pop_back();   break;
+        case SharedArrayObj::Storage::floats:
+            arr.flat_floats().pop_back(); break;
+        case SharedArrayObj::Storage::bools:
+            arr.flat_bools().pop_back();  break;
+        case SharedArrayObj::Storage::objs:
+            arr.flat_objs().pop();        break;
+        default:
+            arr.get_vec().pop_back();     break;
     }
+    arr.note_shift();   /* #53: a foreach over it raises next step */
 
     return last;
 }
@@ -553,6 +681,7 @@ EvalValue builtin_top(EvalContext *ctx, const ArgLocs *exprList,
     const SharedArrayObj &arr = e.get<SharedArrayObj>();
     const size_type n = arr.size();
 
+    ML_INT_ONLY(int_vc_size(IntVc::top_empty, IntVc::top_one, n);)
     if (!n)
         throw OutOfBoundsEx(arg->start, arg->end);
 
@@ -569,20 +698,12 @@ EvalValue builtin_erase_arr(LValue *lval, int_type index)
 
     arr.invalidate_hash();   /* any erase changes the array's hash */
 
-    if (arr.is_slice()) {
+    /* erasing from a slice erases from the slice every name holding it
+     * shares (question 3): it becomes an ordinary array first. It used
+     * to narrow THIS handle's window for a first or last element. */
+    arr.materialize_slice();
 
-        /* Erasing the first/last element of a slice is just a narrower view. */
-        if (index == 0) {
-            lval->put(SharedArrayObj(arr, arr.offset() + 1, n - 1));
-            return true;
-        }
-        if (static_cast<size_type>(index) == n - 1) {
-            lval->put(SharedArrayObj(arr, arr.offset(), n - 1));
-            return true;
-        }
-        arr.clone_internal_vec();   /* middle: own the data, keep-flat */
-
-    } else if (static_cast<size_type>(index) == n - 1) {
+    if (static_cast<size_type>(index) == n - 1) {
 
         /*
          * Erasing the LAST element shifts nothing: only a slice that actually
@@ -617,6 +738,7 @@ EvalValue builtin_erase_arr(LValue *lval, int_type index)
             auto &v = arr.get_vec();     v.erase(v.begin() + at); break;
         }
     }
+    arr.note_shift();       /* #53: a foreach over it raises next step */
     return true;
 }
 
@@ -631,42 +753,64 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
     arr.invalidate_hash();   /* any insert changes the array's hash */
 
     if (arr.is_slice())
-        arr.clone_internal_vec();          /* keep-flat; standalone, off=0 */
+        arr.materialize_slice();
     else if (static_cast<size_type>(index) != n)
         arr.clone_all_slices();
 
     const size_type at = arr.offset() + index;
+    /* #53: an insert that is not at the end MOVES the elements after it,
+     * so a foreach walking this storage raises at its next step (an
+     * insert AT the end is an append - not visited, no raise). */
+    const bool shifts = static_cast<size_type>(index) != n;
 
-    /* Flat in-place insert when the value matches the kind. A non-fitting value
-     * on a flat array is the dyn-laundering case - it errors below rather than
-     * promoting (an array<dyn> was built general by type-driven creation). */
-    if (arr.skind() == SharedArrayObj::Storage::ints && val.is<int_type>()) {
+    /* Flat in-place insert when the value matches the kind (#96: a bool
+     * WIDENS into numeric storage, like the element store and append).
+     * A non-fitting value on a flat array is the dyn-laundering case -
+     * it errors below rather than promoting (an array<dyn> was built
+     * general by type-driven creation). */
+    if (arr.skind() == SharedArrayObj::Storage::ints &&
+        (val.is<int_type>() || val.is<bool>())) {
         auto &v = arr.flat_ints();
-        v.insert(v.begin() + at, val.get<int_type>());
+        v.insert(v.begin() + at, val.is<bool>()
+            ? (val.get<bool>() ? 1 : 0)
+            : val.get<int_type>());
+        if (shifts) arr.note_shift();
         return true;
     }
     if (arr.skind() == SharedArrayObj::Storage::floats &&
-        (val.is<float_type>() || val.is<int_type>())) {
+        (val.is<float_type>() || val.is<int_type>() || val.is<bool>())) {
         auto &v = arr.flat_floats();
         v.insert(v.begin() + at, val.is<int_type>()
             ? static_cast<float_type>(val.get<int_type>())
-            : val.get<float_type>());
+            : val.is<bool>()
+                ? (val.get<bool>() ? 1.0 : 0.0)
+                : val.get<float_type>());
+        if (shifts) arr.note_shift();
         return true;
     }
     if (arr.skind() == SharedArrayObj::Storage::bools && val.is<bool>()) {
         auto &v = arr.flat_bools();
         v.insert(v.begin() + at, val.get<bool>() ? 1 : 0);
+        if (shifts) arr.note_shift();
         return true;
     }
 
-    /* A struct array has no flat insert fast path: fall through to get_vec(),
-     * which promotes it to general first (the cold-path cost). */
+    /* A struct or flat-STRING array has no flat insert fast path: fall
+     * through to get_vec(), which promotes it to general first (the
+     * cold-path cost, in place so every alias sees it). Both are
+     * VALUE-driven storage that may lose flatness but never rejects - a
+     * strs array used to land in the throw below for ANY value, a string
+     * included, so `insert(split(s, " "), 1, "x")` was a TypeErrorEx. */
     if (arr.skind() != SharedArrayObj::Storage::general &&
-        arr.skind() != SharedArrayObj::Storage::structs)
+        arr.skind() != SharedArrayObj::Storage::structs &&
+        arr.skind() != SharedArrayObj::Storage::strs &&
+        arr.skind() != SharedArrayObj::Storage::objs)
         throw TypeErrorEx(flat_array_violation_msg);
 
     auto &v = arr.get_vec();
     v.insert(v.begin() + at, LValue(val, false));
+    if (shifts)
+        arr.note_shift();
     return true;
 }
 
@@ -704,6 +848,7 @@ EvalValue builtin_range(EvalContext *ctx, const ArgLocs *exprList,
 
             step = val2.get<int_type>();
 
+            ML_INT_ONLY(if (step == 0) int_vc(IntVc::range_step_zero);)
             if (step == 0)
                 throw InvalidValueEx("Expected integer != 0", arg2->start, arg2->end);
         }
@@ -714,57 +859,103 @@ EvalValue builtin_range(EvalContext *ctx, const ArgLocs *exprList,
     }
 
     /*
+     * The elements are start + k*step for every k >= 0 strictly before end -
+     * counted first, in unsigned arithmetic (the span of two ints always
+     * fits). A loop stepping `i += step` until it passed end WRAPPED when the
+     * value after the last one left int, landed back below end and never
+     * stopped: range(2^63 - 2, 2^63 - 1, 5) grew until memory ran out.
+     */
+    typedef uint64_t u64;
+    u64 count = 0;
+
+    if (step > 0 && start < end)
+        count = (u64(end) - u64(start) - 1) / u64(step) + 1;
+    else if (step < 0 && start > end)
+        count = (u64(start) - u64(end) - 1) / (u64(0) - u64(step)) + 1;
+
+    ML_INT_ONLY(int_vc_range(start, end, step, count);)
+
+    /* element k, computed modulo 2^64 - exact, since it fits int */
+    auto elem = [start, step](u64 k) {
+        return static_cast<int_type>(u64(start) + k * u64(step));
+    };
+
+    /*
      * range() is all-int, so flat int by default. If the destination is
      * dynamically typed (arr_hint == general, set by the inferencer), build a
      * general array instead - it is created in its final representation, never
      * promoted later.
      */
+    const ArgLoc *sized = exprList->arg(n == 1 ? 0 : 1);   /* the end */
+
     if (exprList->arr_hint == ArrHint::general) {
 
         SharedArrayObj::vec_type vec;
-        if (step > 0)
-            for (int_type i = start; i < end; i += step)
-                vec.emplace_back(EvalValue(i), false);
-        else
-            for (int_type i = start; i > end; i += step)
-                vec.emplace_back(EvalValue(i), false);
-        return SharedArrayObj(move(vec));
+        reserve_or_oom(vec, count, sized);
+        for (u64 k = 0; k < count; k++)
+            vec.emplace_back(EvalValue(elem(k)), false);
+        return SharedArrayObj(std::move(vec));
     }
 
     SharedArrayObj::ivec_type ivec;
+    reserve_or_oom(ivec, count, sized);
 
-    if (step > 0) {
+    for (u64 k = 0; k < count; k++)
+        ivec.push_back(elem(k));
 
-        for (int_type i = start; i < end; i += step)
-            ivec.push_back(i);
+    return SharedArrayObj(std::move(ivec));
+}
 
-    } else {
-
-        for (int_type i = start; i > end; i += step)
-            ivec.push_back(i);
+/*
+ * #97 CB4: call a callback on element i, a FLAT int/float/bool element
+ * RAW (VmInvoker::call_scalars binds it in place, no boxed argv - the
+ * map/filter arms of CB2, shared by find's and sum's key). The kind is
+ * read per call: the callback is script code and may promote the array
+ * (a non-scalar store), after which the general arm serves.
+ */
+static EvalValue inv_call_elem(VmInvoker &inv, const SharedArrayObj &arr,
+                               size_type i)
+{
+    const size_type at = arr.offset() + i;
+    switch (arr.skind()) {
+        case SharedArrayObj::Storage::ints: {
+            const int_type v = arr.flat_ints()[at];
+            return inv.call(v);
+        }
+        case SharedArrayObj::Storage::floats: {
+            const float_type v = arr.flat_floats()[at];
+            return inv.call(v);
+        }
+        case SharedArrayObj::Storage::bools: {
+            const bool v = arr.flat_bools()[at] != 0;
+            return inv.call(v);
+        }
+        default:
+            return inv.call(arr_elem_at(arr, i));
     }
-
-    return SharedArrayObj(move(ivec));
 }
 
 EvalValue
 builtin_find_arr(const SharedArrayObj &arr,
                  const EvalValue &v,
                  FuncObject *key,
-                 EvalContext *ctx)
+                 EvalContext *ctx,
+                 Loc site)
 {
     /* Read elements without promoting flat storage (arr_elem_at). */
     const size_type n = arr.size();
 
     if (key) {
 
-        VmInvoker inv(ctx, *key);   /* prepared per-loop invoker (vm.h) */
+        /* prepared per-loop invoker (vm.h); `site` names the frame */
+        VmInvoker inv(ctx, *key, site);
 
-        for (size_type i = 0; i < n; i++) {
+        /* #49: the size is re-read per step - the key is arbitrary script
+         * code and may shrink the array under us (`n`, read once, then
+         * indexed past its end: an OOB read). */
+        for (size_type i = 0; i < arr.size(); i++) {
 
-            const EvalValue e = arr_elem_at(arr, i);
-            const EvalValue r = inv.ready() ? inv.invoke(&e, 1)
-                                            : eval_func(ctx, *key, e);
+            const EvalValue r = inv_call_elem(inv, arr, i);
             if (r == v)
                 return static_cast<int_type>(i);
         }
@@ -861,6 +1052,16 @@ static void comparator_heapsort(Vec &vec, Cmp cmp)
  * exprList (`rest == nullptr`: the tree-walker). `rest` outlives this call (the
  * caller's stackbuf / register run), so the cmp FuncObject stays alive.
  */
+/* #49: the comparator changed the length or storage of the array being
+ * sorted - the defined error (cold: out of the per-comparison path) */
+[[noreturn]] static ML_COLD void
+sort_modified_fail(const ArgLocs *exprList)
+{
+    throw InvalidArgumentEx(
+        "sort(): the comparator modified the array being sorted",
+        exprList->start, exprList->end);
+}
+
 static EvalValue
 sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lval,
           bool reverse, const EvalValue *rest = nullptr)
@@ -872,31 +1073,32 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
 
     if (!val0.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
+    ML_INT_ONLY(int_vc_size(IntVc::sort_empty, IntVc::sort_one,
+                            val0.get<SharedArrayObj>().size());)
 
     /*
      * Sorting a `const` (a read-only value, or a const-declared variable)
      * sorts a fresh copy and returns it, leaving the original untouched -
-     * rather than mutating it in place. clone() yields a mutable copy.
+     * rather than mutating it in place. clone() yields a mutable copy -
+     * which is never stored back: the promotion write-back below put the
+     * sorted COPY of a flat struct array into the variable holding the
+     * constant (`var k = K; sort(k, cmp);` sorted k).
      */
-    if (val0.get<SharedArrayObj>().is_readonly()) {
+    if (val0.get<SharedArrayObj>().is_readonly()
+            || (lval && lval->is_const_var())) {
         val0 = val0.clone();
-    } else if (lval && lval->is_const_var()) {
-        val0 = val0.clone();
+        lval = nullptr;
     }
 
     SharedArrayObj &arr = val0.get<SharedArrayObj>();
 
-    if (arr.is_slice()) {
-
-        arr.clone_internal_vec();
-
-        if (lval)
-            lval->put(arr);
-
-    } else {
-
+    /* a slice is sorted / reversed as the array every name holding it
+     * shares (question 3): `arr` is a handle of it, so materializing
+     * moves the variable's handle too */
+    if (arr.is_slice())
+        arr.materialize_slice();
+    else
         arr.clone_all_slices();
-    }
 
     arr.invalidate_hash();   /* sort reorders -> order-dependent hash changes */
 
@@ -997,53 +1199,81 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
          * the unboxed int/float vector when flat - no promotion.
          */
         /* Prepared per-loop invoker (VmInvoker, vm.h): the comparator frame
-         * is pushed once; each comparison rebinds two slots. Falls back to
-         * eval_func when unavailable (tree-walk / const-eval). */
-        VmInvoker inv(ctx, funcObj);
-        auto cmp2 = [&](const EvalValue &a, const EvalValue &b) {
-            if (inv.ready()) {
-                const EvalValue argv[2] = { a, b };
-                return inv.invoke(argv, 2).is_true();
-            }
-            return eval_func(ctx, funcObj, make_pair(a, b)).is_true();
+         * is pushed once; each comparison rebinds two slots. `call` picks
+         * the tier itself (prepared window / eval_func) and boxes each
+         * argument ONCE, so each arm below hands it the elements in their
+         * NATIVE storage type - the shared `cmp2(EvalValue, EvalValue)`
+         * helper this replaced boxed a flat int comparison's operands
+         * twice, once for its own parameters and again into the argv. */
+        VmInvoker inv(ctx, funcObj, exprList->start);
+
+        /*
+         * #49: the comparator is arbitrary script code and may MUTATE the
+         * array being sorted - the heapsort indexes a vector sized once, so
+         * a pop() read past its end, and a string array promoted to general
+         * storage by a non-string write destroyed the very vector being
+         * sorted. Like Python's "list modified during sort", a comparator
+         * that changes the array's length or storage is an error: checked
+         * after every comparison, before the sort touches the storage
+         * again. (An in-place element write keeps both, so it is merely
+         * observed - every index stays in bounds.)
+         */
+        auto sort_kind = arr.skind();
+        /* Per comparison: the KIND first (a promotion destroys the vector
+         * the arm holds, so its size must not be read after one), then the
+         * held vector's own size against its size at the start - both
+         * inline. arr.size() here was an out-of-line kind switch per
+         * comparison: +7.7% Ir on 34_sort_custom_cmp. */
+        auto guard = [&](const auto &held, size_t held_n) {
+            if (arr.skind() != sort_kind || held.size() != held_n)
+                sort_modified_fail(exprList);
         };
 
         switch (arr.skind()) {
             case SharedArrayObj::Storage::ints: {
                 auto &v = arr.flat_ints();
+                const size_t vn = v.size();
                 comparator_heapsort(v, [&](int_type a, int_type b) {
-                    const bool lt = cmp2(EvalValue(a), EvalValue(b));
+                    const bool lt = inv.test(a, b);
+                    guard(v, vn);
                     return reverse ? !lt : lt;
                 });
                 break;
             }
             case SharedArrayObj::Storage::floats: {
                 auto &v = arr.flat_floats();
+                const size_t vn = v.size();
                 comparator_heapsort(v, [&](float_type a, float_type b) {
-                    const bool lt = cmp2(EvalValue(a), EvalValue(b));
+                    const bool lt = inv.test(a, b);
+                    guard(v, vn);
                     return reverse ? !lt : lt;
                 });
                 break;
             }
             case SharedArrayObj::Storage::bools: {
                 auto &v = arr.flat_bools();
+                const size_t vn = v.size();
                 comparator_heapsort(v, [&](unsigned char a, unsigned char b) {
-                    const bool lt = cmp2(EvalValue(static_cast<bool>(a)),
-                                         EvalValue(static_cast<bool>(b)));
+                    const bool lt = inv.test(static_cast<bool>(a),
+                                             static_cast<bool>(b));
+                    guard(v, vn);
                     return reverse ? !lt : lt;
                 });
                 break;
             }
             case SharedArrayObj::Storage::strs: {
                 /* Directly over the SharedStr vector - stays flat, no
-                 * promote (see the no-cmp strs note). Each compare boxes
-                 * two handle copies for the callback. */
+                 * promote (see the no-cmp strs note). Each compare copies
+                 * two handles for the callback (a SharedStr is move-only,
+                 * so the copy is explicit). */
                 auto &v = arr.flat_strs();
+                const size_t vn = v.size();
                 comparator_heapsort(v,
                                     [&](const SharedStr &a,
                                         const SharedStr &b) {
-                    const bool lt = cmp2(EvalValue(SharedStr(a)),
-                                         EvalValue(SharedStr(b)));
+                    const bool lt = inv.test(SharedStr(a),
+                                             SharedStr(b));
+                    guard(v, vn);
                     return reverse ? !lt : lt;
                 });
                 break;
@@ -1060,10 +1290,13 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
 
                 if (promoting && lval)
                     lval->put(val0);
+                sort_kind = arr.skind();       /* general, now */
+                const size_t vn = vec.size();
 
                 comparator_heapsort(vec,
                                     [&](const LValue &a, const LValue &b) {
-                    const bool lt = cmp2(a.get(), b.get());
+                    const bool lt = inv.test(a.get(), b.get());
+                    guard(vec, vn);
                     return reverse ? !lt : lt;
                 });
                 break;
@@ -1074,16 +1307,21 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
     return arr;
 }
 
-/* `func` entry (tree-walker / const-eval): eval arg0 - an lvalue or a value -
+/* `func` entry (tree-walker / const-eval): arg0 - an lvalue or a value -
  * and PRE-EVAL the cmp arg (sort_core is now AST-free: it takes ArgLocs + the
- * cmp via rest, never a node). */
+ * cmp via rest, never a node). arg0 is a STORE base (store_base_value): a
+ * struct a member step enters is owned first, so `sort(s.a)` on a copy
+ * sorts that copy's field (a plain read handed the field of the struct
+ * the copy still shared, 2026-10-08); a value is held. */
 static EvalValue
 sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
 {
     const size_t n = exprList->elems.size();
     if (n == 0)
         throw InvalidArgumentEx(exprList->start, exprList->end);
-    const EvalValue val0_lval = exprList->elems[0]->eval(ctx);
+    LValue hold;
+    const EvalValue val0_lval =
+        store_base_value(ctx, exprList->elems[0].get(), hold);
     LValue *lval = val0_lval.is<LValue *>() ? val0_lval.get<LValue *>()
                                             : nullptr;
     EvalValue cmp;   /* pre-evaluated cmp arg (sort(a, cmp)) */
@@ -1097,8 +1335,20 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
     return sort_core(ctx, &al, RValue(val0_lval), lval, reverse, rest);
 }
 
-/* `func_lv` entry (VM CallBuiltinLV): arg0's slot LValue* is handed in (never
- * null - CallBuiltinLV fires only for a slotted-id arg0). sort is REST-NATIVE-
+/* arg0's VALUE for a func_lv entry. The target is null exactly when there
+ * is no arg0: an INDIRECT call with no arguments (`var dyn f = sort;
+ * f();` - dispatch_builtin_values and the VM's two dyn-callee sites pass
+ * a null target then, as every func_lv is told to expect). The core's own
+ * arity check then raises the direct call's error; reading the null
+ * target was a null LValue member call (UBSan/ASan, every engine). */
+static inline EvalValue lv_arg0_value(LValue *target)
+{
+    return target ? RValue(EvalValue(target)) : EvalValue();
+}
+
+/* `func_lv` entry (VM CallBuiltinLV, and an indirect call's values
+ * dispatch): arg0's LValue* is handed in - null for an indirect call with
+ * no arguments (lv_arg0_value). sort is REST-NATIVE-
  * CAPABLE: the cmp arg is pre-evaluated in `rest[0]` (n_rest == 1) so sort_core
  * does zero node->eval; a `sort(a)` with no cmp has an empty rest run (n_rest ==
  * 0), which sort_core's no-cmp branch never reads. */
@@ -1106,7 +1356,7 @@ static EvalValue
 sort_lv(EvalContext *ctx, const ArgLocs *exprList, LValue *target,
         const EvalValue *rest, size_t n_rest, bool reverse)
 {
-    return sort_core(ctx, exprList, RValue(EvalValue(target)), target,
+    return sort_core(ctx, exprList, lv_arg0_value(target), target,
                      reverse, rest);
 }
 
@@ -1132,8 +1382,7 @@ EvalValue builtin_rev_sort_lv(EvalContext *ctx, const ArgLocs *exprList,
     return sort_lv(ctx, exprList, target, rest, n, true);
 }
 
-/* reverse core - `lval` (or null) as in sort_core (slice write-back). Preserves
- * the original reverse (no const-copy: reverse has no 'const' contract). */
+/* reverse core - `lval` (or null) as in sort_core (slice write-back). */
 static EvalValue
 reverse_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0,
              LValue *lval)
@@ -1146,19 +1395,28 @@ reverse_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0,
     if (!val0.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
 
+    /*
+     * README `reverse(array)`: like sort(), a const argument (a read-only
+     * value, or a const-declared variable) is cloned and the CLONE is
+     * reversed and returned - the original is left untouched. It used to
+     * reverse in place, so `var k = K; reverse(k);` reversed the constant
+     * K itself, seen through every other name holding it.
+     */
+    if (val0.get<SharedArrayObj>().is_readonly()
+            || (lval && lval->is_const_var())) {
+        val0 = val0.clone();
+        lval = nullptr;      /* the clone is returned, never stored back */
+    }
+
     SharedArrayObj &arr = val0.get<SharedArrayObj>();
 
-    if (arr.is_slice()) {
-
-        arr.clone_internal_vec();
-
-        if (lval)
-            lval->put(arr);
-
-    } else {
-
+    /* a slice is sorted / reversed as the array every name holding it
+     * shares (question 3): `arr` is a handle of it, so materializing
+     * moves the variable's handle too */
+    if (arr.is_slice())
+        arr.materialize_slice();
+    else
         arr.clone_all_slices();
-    }
 
     arr.invalidate_hash();   /* reverse changes the order-dependent hash */
 
@@ -1184,6 +1442,11 @@ reverse_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0,
             reverse(v.begin(), v.end());
             break;
         }
+        case SharedArrayObj::Storage::objs: {
+            auto &v = arr.flat_objs().v;    /* a reorder: no count moves */
+            reverse(v.begin(), v.end());
+            break;
+        }
         default: {
             /* struct promote reseats the local handle - write back (see
              * sort_core's default). */
@@ -1202,13 +1465,16 @@ reverse_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0,
     return arr;
 }
 
-/* `func` entry: eval arg0 (lvalue or value); build ArgLocs for the core. */
+/* `func` entry: arg0 (lvalue or value) as sort_arr's - a store base;
+ * build ArgLocs for the core. */
 static EvalValue
 reverse_arr(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
         throw InvalidArgumentEx(exprList->start, exprList->end);
-    const EvalValue val0_lval = exprList->elems[0]->eval(ctx);
+    LValue hold;
+    const EvalValue val0_lval =
+        store_base_value(ctx, exprList->elems[0].get(), hold);
     LValue *lval = val0_lval.is<LValue *>() ? val0_lval.get<LValue *>()
                                             : nullptr;
     ArgLoc locbuf[1];
@@ -1221,11 +1487,64 @@ EvalValue builtin_reverse(EvalContext *ctx, ExprList *exprList)
     return reverse_arr(ctx, exprList);
 }
 
-/* `func_lv` entry (VM CallBuiltinLV): arg0's slot LValue* handed in. */
+/* `func_lv` entry (VM CallBuiltinLV, an indirect call): arg0's LValue*
+ * handed in, null when there is no arg0 (lv_arg0_value). */
 EvalValue builtin_reverse_lv(EvalContext *ctx, const ArgLocs *exprList,
                              LValue *target, const EvalValue *rest, size_t n)
 {
-    return reverse_core(ctx, exprList, RValue(EvalValue(target)), target);
+    return reverse_core(ctx, exprList, lv_arg0_value(target), target);
+}
+
+/*
+ * #48: the sum of an EMPTY array. The static type of `sum(a)` is the
+ * element type (the key_func's return type with one), NON-opt - so the
+ * `none` this used to return put a none in a slot inference had proven
+ * numeric (RULE 1). The inferencer decides the answer from that type and
+ * stamps it on the args list (stamp_sum_identity): flat_i -> int 0,
+ * flat_f -> float 0.0. Unstamped (no inference, or `sum` reached as a
+ * function VALUE), the array's own flat numeric storage decides the same
+ * way. Anything else - a str/array/struct/dyn sum - has no identity to
+ * give, so it is an InvalidArgumentEx, like `max` of an empty array.
+ */
+static EvalValue
+sum_of_nothing(const ArgLocs *exprList, const SharedArrayObj &arr,
+               bool keyed)
+{
+    if (exprList->arr_hint == ArrHint::flat_i)
+        return EvalValue(static_cast<int_type>(0));
+    if (exprList->arr_hint == ArrHint::flat_f)
+        return EvalValue(static_cast<float_type>(0));
+    if (!keyed) {
+        switch (arr.skind()) {
+        case SharedArrayObj::Storage::ints:
+        case SharedArrayObj::Storage::bools:
+            return EvalValue(static_cast<int_type>(0));
+        case SharedArrayObj::Storage::floats:
+            return EvalValue(static_cast<float_type>(0));
+        default:
+            break;
+        }
+    }
+    const ArgLoc *arg0 = exprList->arg(0);
+    throw InvalidArgumentEx("sum() of an empty array has no value "
+                            "(only a numeric sum starts from 0)",
+                            arg0->start, arg0->end);
+}
+
+/*
+ * #48: the accumulator's seed - a COPY of the first term (`+=` mutates the
+ * accumulator in place, and the term may be an array the caller or a
+ * callback still references), with a BOOL promoted to int. The static
+ * type of a bool sum is int (it counts the `true`s), and every later
+ * `+` promotes anyway - but a ONE-term sum never reached a `+`, so
+ * `sum([5], func(x) => x > 1)` returned `true` into a slot proven int.
+ */
+static EvalValue
+sum_seed(const EvalValue &first)
+{
+    if (first.is<bool>())
+        return EvalValue(static_cast<int_type>(first.get<bool>() ? 1 : 0));
+    return first.clone();
 }
 
 EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
@@ -1241,6 +1560,7 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
 
     const SharedArrayObj &arr = val0.get<SharedArrayObj>();
+    ML_INT_ONLY(int_vc_size(IntVc::sum_empty, IntVc::sum_one, arr.size());)
 
     /*
      * Flat (unboxed) fast path: sum the int/float vector directly, with no
@@ -1255,7 +1575,7 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
         const size_type off = arr.offset(), n = arr.size();
 
         if (n == 0)
-            return none;
+            return sum_of_nothing(exprList, arr, false);
 
         if (arr.skind() == SharedArrayObj::Storage::ints) {
             const auto &iv = arr.flat_ints();
@@ -1281,65 +1601,16 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
         return EvalValue(acc);
     }
 
-    /* A flat-strs array reaches the general path via promotion on a local
-     * HANDLE copy (the caller's array keeps its storage): sum of strings
-     * concatenates through the general `+=` loop, as it always did. */
-    SharedArrayObj marr = arr;
-    if (marr.skind() == SharedArrayObj::Storage::strs)
-        marr.promote_strs_to_general();
-    const ArrayConstView &view = marr.get_view();
-
-    if (view.size() == 0)
-        return none; /* sum of an empty array is none, like min()/max() */
-
-    if (nargs == 1) {
-
-        const EvalValue &first = view[0].get();
-
-        /*
-         * Fast path for an all-int array: accumulate raw int_type in a tight
-         * loop, skipping num_bin_op's promotion check and the per-element
-         * virtual TypeInt::add dispatch. Overflow wraps (-fwrapv), exactly as
-         * TypeInt::add does. The first non-int (a float, say) breaks out and
-         * the general loop below resumes from there, so a mixed array still
-         * promotes correctly (int accumulator -> float via num_bin_op).
-         */
-        if (first.is<int_type>()) {
-
-            int_type acc = first.get<int_type>();
-            size_type i = 1;
-
-            for (; i < view.size(); i++) {
-                const EvalValue &e = view[i].get();
-                if (!e.is<int_type>())
-                    break;
-                acc += e.get<int_type>();
-            }
-
-            if (i == view.size())
-                return EvalValue(acc);
-
-            EvalValue val(acc);
-            for (; i < view.size(); i++)
-                num_bin_op(val, view[i].get(), &Type::add);
-            return val;
-        }
-
-        /*
-         * General path. Seed the accumulator with a *copy* of the first elem:
-         * num_bin_op with Type::add mutates the accumulator in place (array
-         * `+=` appends to it), so aliasing view[0] would mutate the input array
-         * - and would be rejected outright when the input is a read-only const.
-         */
-        EvalValue val = first.clone();
-
-        for (size_type i = 1; i < view.size(); i++) {
-            num_bin_op(val, view[i].get(), &Type::add);
-        }
-
-        return val;
-
-    } else {
+    /*
+     * The key_func form. Elements are read with arr_elem_at, which never
+     * promotes flat storage - get_view() below is GENERAL-ONLY and threw
+     * InternalErrorEx on every flat array (#43: `sum([5,1,4], f)` failed in
+     * every engine). The callback goes through VmInvoker::call, the one
+     * entry a higher-order builtin may use. The size is re-read each step:
+     * the callback is arbitrary script code and may resize the array, and
+     * the index must stay in bounds whatever it does.
+     */
+    if (nargs == 2) {
 
         const ArgLoc *arg1 = exprList->arg(1);
         const EvalValue &val1 = args[1];
@@ -1347,17 +1618,79 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
         if (!val1.is<intrusive_ptr<FuncObject>>())
             throw TypeErrorEx("Expected function", arg1->start, arg1->end);
 
-        FuncObject &funcObj = *val1.get<intrusive_ptr<FuncObject>>().get();
-        EvalValue val = eval_func(ctx, funcObj, view[0].get());
+        if (arr.size() == 0)
+            return sum_of_nothing(exprList, arr, true);
 
-        for (size_type i = 1; i < view.size(); i++) {
-            num_bin_op(
-                val,
-                eval_func(ctx, funcObj, view[i].get()),
-                &Type::add
-            );
-        }
+        VmInvoker inv(ctx, *val1.get<intrusive_ptr<FuncObject>>().get(),
+                      exprList->start);
+
+        /* Seed with a COPY of the first result, as the 1-arg path does:
+         * `+=` mutates the accumulator in place, and a callback may return
+         * an array it still references. */
+        EvalValue val = sum_seed(inv_call_elem(inv, arr, 0));
+
+        for (size_type i = 1; i < arr.size(); i++)
+            num_bin_op(val, inv_call_elem(inv, arr, i), &Type::add);
 
         return val;
     }
+
+    /* Any other storage reaches the general path through a general COPY
+     * (the caller's array keeps its storage - a promotion is in place on the
+     * shared storage now, #53b): sum of strings concatenates through the
+     * general `+=` loop, as it always did, and a flat struct array's
+     * elements raise the TypeErrorEx their `+` does (get_view() on the
+     * flat storage itself was an InternalErrorEx). */
+    const SharedArrayObj marr =
+        arr.skind() != SharedArrayObj::Storage::general ? arr.general_copy()
+                                                         : arr;
+    const ArrayConstView &view = marr.get_view();
+
+    if (view.size() == 0)
+        return sum_of_nothing(exprList, arr, false);
+
+    const EvalValue &first = view[0].get();
+
+    /*
+     * Fast path for an all-int array: accumulate raw int_type in a tight
+     * loop, skipping num_bin_op's promotion check and the per-element
+     * virtual TypeInt::add dispatch. Overflow wraps (-fwrapv), exactly as
+     * TypeInt::add does. The first non-int (a float, say) breaks out and
+     * the general loop below resumes from there, so a mixed array still
+     * promotes correctly (int accumulator -> float via num_bin_op).
+     */
+    if (first.is<int_type>()) {
+
+        int_type acc = first.get<int_type>();
+        size_type i = 1;
+
+        for (; i < view.size(); i++) {
+            const EvalValue &e = view[i].get();
+            if (!e.is<int_type>())
+                break;
+            acc += e.get<int_type>();
+        }
+
+        if (i == view.size())
+            return EvalValue(acc);
+
+        EvalValue val(acc);
+        for (; i < view.size(); i++)
+            num_bin_op(val, view[i].get(), &Type::add);
+        return val;
+    }
+
+    /*
+     * General path. Seed the accumulator with a *copy* of the first elem:
+     * num_bin_op with Type::add mutates the accumulator in place (array
+     * `+=` appends to it), so aliasing view[0] would mutate the input array
+     * - and would be rejected outright when the input is a read-only const.
+     */
+    EvalValue val = sum_seed(first);
+
+    for (size_type i = 1; i < view.size(); i++) {
+        num_bin_op(val, view[i].get(), &Type::add);
+    }
+
+    return val;
 }

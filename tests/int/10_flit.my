@@ -1,0 +1,35 @@
+# INT-ENGINES: default
+# INT-CONFIGS: default ; MYLANG_INT_CHOOSE=fpool@0/flit#0=1,fcall@0/flitgate=1
+#
+# INT test (#107 P3): the C4b FLOAT LITERAL POOL is an enumerated
+# decision (`flit_choice`). A literal the pool would hold may instead stay
+# inline (`<run>/flit#<i>`, pick 1), and a run whose loop calls a helper -
+# which the cost gate refuses - may take the pool anyway
+# (`<run>/flitgate`, pick 1: what MYLANG_JIT_FORCE=flit does; the call
+# epilogue restores the pool). Neither may change a result, so the second
+# configuration forces both and the asserts below are the same.
+
+func fpool(int n) {                     # a pure float loop: pooled
+    var x = 0.5;
+    for (var i = 0; i < n; i++) x = x * 1.25 + 0.75;
+    return int(x) % 1000;
+}
+func fcall(int n) {                     # a libm helper in the loop: gated
+    var x = 0.5;
+    for (var i = 0; i < n; i++) x = pow(x * 1.25 + 0.75, 0.5) + 0.125;
+    return int(x * 1000);
+}
+var a = fpool(int(runtime(40)));
+var b = fcall(int(runtime(40)));
+print(a, b);
+assert(a == 328 && b == 1888);
+
+var ev = int_events("flit_choice");
+foreach (e in ev) print(e);
+func has(arr, needle) {
+    foreach (e in arr)
+        if (find(e, needle) != none) return true;
+    return false;
+}
+assert(has(ev, "key=\"fpool@0/flit#0\" n=2 dflt=0"));
+assert(has(ev, "key=\"fcall@0/flitgate\" n=2 dflt=0"));

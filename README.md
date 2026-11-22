@@ -21,6 +21,7 @@ as well.
   * [Maintainance](#maintainance)
     * [Building MyLang](#building-mylang)
     * [Testing MyLang](#testing-mylang)
+    * [Compiled scripts (.myv)](#compiled-scripts-myv)
   * [Syntax](#syntax)
     * [Core concepts](#core-concepts)
     * [Declaring variables](#declaring-variables)
@@ -28,6 +29,7 @@ as well.
     * [Declaring constants](#declaring-constants)
       - [Automatic const promotion](#automatic-const-promotion)
     * [Type system](#type-system)
+      - [Values that contain themselves](#values-that-contain-themselves)
     * [Conditional statements](#conditional-statements)
       - [Const evaluation](#const-evaluation-of-conditional-statements)
     * [Classic loop statements](#classic-loop-statements)
@@ -43,10 +45,15 @@ as well.
       - [Pure functions](#pure-functions)
       - [Automatic pure promotion](#automatic-pure-promotion)
     * [Structs](#structs)
+      - [Type aliases](#type-aliases)
+    * [Classes](#classes)
+    * [Casts](#casts)
+    * [Boxes](#boxes)
     * [Exceptions](#exceptions)
       - [Custom exceptions](#custom-exceptions)
       - [Re-throwing an exception](#re-throwing-an-exception)
       - [The finally clause](#the-finally-clause)
+      - [An exception raised while handling another](#an-exception-raised-while-handling-another)
   * [Builtins](#builtins)
     * [Const builtins](#const-builtins)
       - [General builtins](#general-builtins)
@@ -112,6 +119,79 @@ better, right? :-)
 [GoogleTest]: https://github.com/google/googletest
 [Boost.Test]: https://www.boost.org/doc/libs/1_75_0/libs/test/doc/html/index.html
 
+### Compiled scripts (.myv)
+
+MyLang can store a compiled script and run it later with no source, no
+parsing and no optimizer passes:
+
+```
+./mylang -c script.my                 # writes script.myv
+./mylang -c script.my -o out.myv      # explicit output path
+./mylang -c script.my --strip-source  # store no source reference
+./mylang script.myv                   # run it (detected by content)
+./mylang --source ~/proj script.myv   # find the source under another root
+./mylang -f script.myv                # trust a source the CRC32 rejects
+./mylang -vd script.myv               # disassemble a stored image
+```
+
+What a `.myv` holds is the **bytecode VM image** — the instructions and
+their data pools (constants, source locations for error carets, struct
+type definitions, function descriptors). It does **not** hold machine
+code: the native compiler runs again when the file is loaded, so an image
+is portable across machines and keeps working as the native tier
+improves. One program cannot be stored: a constant that contains itself
+(see [Values that contain themselves](#values-that-contain-themselves)) is
+refused with a `MyvError`, and no file is written.
+
+#### Where the source line in an error comes from
+
+An image does **not** embed your program text. It stores a small *source
+reference* instead — the path (relative to the project root, plus the
+absolute one) and a **CRC32** of the file. When an error needs to print
+the offending line with a caret under it, the interpreter looks for that
+file and uses it **only if the CRC32 still matches**, so the caret can
+never be drawn on text that has moved:
+
+- **File there and unchanged** → the error looks exactly as it would from
+  a normal source run, byte for byte:
+
+  ```
+  DivisionByZeroEx: Division by zero at sub/boom.my, line 2, col 16:17
+
+      return n / d;
+                 ^
+
+  Backtrace (most recent call first):
+    [0] inner(n, d) at line 2
+    [1] main()      at line 8
+  ```
+
+  (Running a *script* names the file the same way; `-e` and the REPL have
+  no file, so they print just `at line L, col C`.)
+- **File missing** → the error still names the file, the line, the column
+  and the full backtrace; only the quoted line and caret are gone. No
+  warning: shipping an image without its source is an ordinary thing to
+  do.
+- **File changed since it was compiled** → a warning, and the file is
+  *refused* (no caret) — pass `-f` / `--force` to use it anyway and accept
+  that carets may point at the wrong place.
+- **Source tree moved / another machine** → point `--source ROOT` at the
+  new project root; the stored *relative* path is resolved under it.
+
+`--strip-source` stores no reference at all, so such an image carries no
+local paths and its errors never quote source.
+
+The binary layout is specified byte by byte in
+[docs/myv-format.txt](docs/myv-format.txt).
+
+An image is tied to the interpreter that wrote it: a different format
+version, a different endianness, or a binary with a different set of
+builtins is refused with a clear message asking you to recompile from
+source. A truncated or corrupted file is refused the same way rather than
+misbehaving. Compiling the same source twice produces byte-identical
+files — from the same directory, since the stored source paths are part
+of the image (`--strip-source` makes an image path-independent).
+
 ### The interactive REPL
 
 Run `mylang` with no file argument on a terminal to drop into an interactive
@@ -132,8 +212,10 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 Definitions — variables, constants, functions, structs — **persist across
 inputs** (the global scope is expandable), and const-folding done in one input
 still applies in the next; each input is otherwise evaluated by the real
-interpreter. You don't type semicolons (they're inserted automatically), and a
-multi-line block stays open until it's balanced, auto-indented as you go:
+interpreter. You don't type semicolons (they're inserted automatically - at
+the end of each statement's line, before a trailing `#` comment, and before
+the `}` of a block closed on the same line, as in `if (c) { print(x) }`), and
+a multi-line block stays open until it's balanced, auto-indented as you go:
 
 ```
 >> func fib(n) {
@@ -143,6 +225,47 @@ multi-line block stays open until it's balanced, auto-indented as you go:
 >> fib(10)
 => 55
 ```
+
+A line that ends a statement's header - `if (c)`, `while (c)`, `for (...)`,
+`foreach (...)`, `catch (...)`, `else`, `try`, `finally` - gets no `;` and
+keeps the input open for the body on the next line, braced or not. So does
+a line that ends a function's parameter list (`func f(a)`, `var g = func
+(x)`) or in `struct NAME` / `class NAME`: the `{` (or a function's `=>
+expr`) may stand on the next line, as in a script.
+
+An `if` (or a `try`) whose block closes on a line of its own may still go
+on with an `else` (`catch`, `finally`) on the next line, as in a script -
+and so may an `if` whose last branch is a brace-less statement on a line
+after its header (`if (c)` / `print(x)`) - so
+the input stays open there: type the `else`, or press Enter on the empty
+line to run it - any other line runs with it (Python's REPL asks the same
+empty line after a block). One closed on the line where it started (`if (c)
+{ print(x) }`) runs at once, and a chain that ends with a plain `else` or a
+`finally` cannot go on, so it runs at once too:
+
+```
+>> if (n < 0) {
+..   print("negative")
+.. }
+.. else {
+..   print("not negative")
+.. }
+not negative
+```
+
+An input that fails prints its error, and the session goes on. An input
+refused before it runs defines nothing: a syntax or type error, or an error
+raised while it is compiled - a constant call such as `h(0)` is evaluated
+then, as in a script, so `func h(x) => 10 / x` makes `h(0)` a division by
+zero reported before anything of that input runs. An input that fails while
+running keeps what its statements defined before the error, and the
+declarations after it define nothing (`var a = 1; var b = xs[9]; var c = 2`
+with a one-element `xs` defines `a` only).
+
+A name declared nowhere is not refused at the prompt, since a later input may
+declare it: it is reported when the input runs, as an undefined variable
+marked at the name, wherever the name stands - read, assigned into
+(`zz[0] = 1`) or handed to an in-place builtin (`append(zz, 1)`).
 
 The line editor is hand-rolled (no `readline`/`reline` dependency, in keeping
 with the no-dependencies rule): live syntax highlighting, command history
@@ -183,8 +306,12 @@ inspecting the language and its compiler:
   one (`:help :trace`, `:help globals`, …) — the leading `:` is optional.
 - **Reflection** — `:globals` prints a table of every global (variables,
   consts — *including* folded const scalars — functions with their signatures,
-  and structs) with its inferred/declared type; `:type <expr>` shows a global's
-  inferred static type, or any expression's runtime type without committing it.
+  and structs) with its inferred/declared type; a template instance shows
+  the types it was made for (`f$0 : func f(int a, int b) -> int`), a
+  specialization the constants
+  (`f$s0 : func f(int x, int mode) with mode = 1`). `:type <expr>` shows a
+  global's inferred static type, or any expression's runtime type without
+  committing it.
   `:show <function>` "decompiles" a function's final optimized AST back into
   code (folded consts, inlined bodies, dead code gone), and its `name$N` clones
   too. (These build on the reflection *builtins* `globals()`, `typestr()` /
@@ -218,7 +345,9 @@ documentation below.
 
 **Comments.** A `#` starts a line comment (to end of line). A `/* ... */` is a
 block comment that **may span multiple lines**. (Both are also recognized by the
-syntax highlighter, across lines.)
+syntax highlighter, across lines.) As in C, a `/` directly followed by `*`
+opens a block comment even where the `*` was meant as the box operator
+(see *Boxes*): write `a / *b`, not `a/*b`.
 
 ### Core concepts
 
@@ -227,7 +356,9 @@ and you're willing to use `{ }` braces, you'll be automatically able to use it.
 No surprises. Strings are immutable like in `Python`, arrays can be defined using
 `[ ]` like in `Python`, and dictionaries can be defined using `{ }`, as well.
 The language also supports array-slices using the same `[start:end]` syntax used
-by `Python`.
+by `Python`, with Python's rule: a slice is a new array, and once you have it,
+assigning it or passing it shares it like any other array (see **Array**
+below).
 
 Said that, `MyLang` differs from `Python` and other scripting languages in several
 aspects:
@@ -240,6 +371,9 @@ aspects:
     is explicitly re-declared using `var`, in a nested block.
 
   - All expression statements must end with `;` like in `C`, `C++`, and `Java`.
+    An extra `;` is an empty statement and does nothing, wherever a statement
+    may start: `{ f(); };`, `x = 1;;` and a block that begins with `;` are
+    all fine.
 
   - `true` and `false` are the two values of a real `bool` type (so
     `type(true) == "bool"`, distinct from `int`). `bool` sits at the bottom of
@@ -256,7 +390,27 @@ aspects:
 
   - The assignment operator `=` can be used like in `C`, inside expressions, but
     there's no such thing as the comma operator, because of the array-expansion
-    feature.
+    feature. The full C set of compound assignments is supported: `+=` `-=`
+    `*=` `/=` `%=` and (int-only, like their binary forms) `<<=` `>>=` `>>>=`
+    `&=` `|=` `^=` — each behaves exactly like `x = x OP rhs`, except that
+    the target is evaluated only once. Every assignment evaluates its
+    right-hand side first, then the target's container and each key, left
+    to right and once each, and stores to the location they named:
+    `a[f()] += g()` calls `g`, then `f`. `++`/`--` evaluate their operand
+    once too. The value of an assignment is the value it stored: the
+    right-hand side converted to the type the target is declared or
+    inferred to have (`var z = (fa[0] = 3)` with an `array<float>` `fa`,
+    or into a `float` variable or field, makes `z` the `float` `3.0`; a
+    `dyn` right-hand side is converted too, a `TypeError` when it does
+    not fit, as for a typed variable receiving one; a `dyn` target
+    converts nothing), and for a compound assignment the result it
+    stored. That holds for every target - a variable, an
+    element, a field, a dict key, a chain of them. A multi-assignment
+    (`a, b = [5, 6]`, see *array expansion*) is the exception: it is a
+    statement and has no value. Using it as one - `w = a, b = [5, 6]`,
+    `var w = a, b = ...`, `return a, b = ...`, `a, b = c, d = ...` - is
+    a compile error; write the multi-assignment as a statement of its
+    own.
 
   - MyLang supports both the classic `for` loop and an explicit `foreach` loop.
 
@@ -282,6 +436,184 @@ var a = 42;
 
 # But here we cannot see `b`.
 ```
+
+**A brace-less body is a scope too.** The body of an `if`/`else`/`while`/`for`/
+`foreach` written *without* braces is a scope exactly like the braced form, so a
+declaration inside it is not visible afterwards:
+
+```C#
+if (c) var x = 5;
+print(x);               # ERROR: undefined variable 'x'
+
+if (c) { var x = 5; }
+print(x);               # ERROR too - the two forms behave identically
+```
+
+This holds for every declaration (`var`, `const`, `func`, `struct`), and whether
+or not the condition is a compile-time constant. Declare the name *above* the
+statement if you need it afterwards.
+
+**A declaration's name exists for the whole scope; its value binds when the
+declaration runs.** Reading it in between is refused - what JavaScript calls
+the *temporal dead zone*:
+
+```C#
+func f() {
+    var r = t;          # ERROR: 't' is used before its declaration
+    var t = 5;
+    return r;
+}
+```
+
+This holds even when an outer name of the same spelling exists - the inner
+declaration wins for the whole scope, so the earlier read is a mistake rather
+than a silent read of the outer one. Put the shadowing declaration in a nested
+scope if that is what you meant:
+
+```C#
+var loc = 99;
+func f() { var r = loc; { var loc = 5; ... } return r; }   # r == 99
+```
+
+**Functions and structs are different: they bind at the top of their scope**,
+so calling one declared further down - and mutual recursion - keep working:
+
+```C#
+var dyn r = later();      # fine: `later` is bound before the block runs
+print(r);
+func later() { return 7; }
+```
+
+That applies at every scope, not just the top level. A *lambda* is an ordinary
+variable, though, so `var f = func(x) => x;` binds where it is written.
+
+**A `const` container, function or type alias binds at the top of its scope
+too**, right after the scope's functions and structs. Its value is computed
+while the program is compiled, so binding it early changes no value - it only
+means a read that runs before the declaration's line sees it:
+
+```C#
+func use(int k) { return K[k]; }
+print(use(1));            # 20: `K` is bound before the block runs
+const K = [10, 20, 30];
+```
+
+A `const` *scalar* (`const N = 5;`) has no run-time binding at all: every read
+of it is its value, written in place while the program is parsed, so it must be
+declared above its first use.
+
+**Where the failure is provable, the compiler refuses the program.** If a call
+is evaluated unconditionally and the function it names unconditionally reads a
+global declared further down, that call can only ever fail — so it is rejected
+before the program runs:
+
+```C#
+func fetch() { return g; }
+var dyn t = fetch();     # ERROR: this call always fails: g is not bound
+var g = 5;               #        until later
+```
+
+This holds **even inside a `try`** — the failure is certain, so there is
+nothing to handle:
+
+```C#
+func fetch() { return g; }
+try { var dyn t = fetch(); } catch (UnboundSymbolEx) { print("no"); }
+var g = 5;               # ERROR, same as above
+```
+
+Where the compiler *cannot* decide, the check happens at run time and is
+catchable. Anything conditional is in that group — the call may never happen,
+or the callee may never reach the read:
+
+```C#
+func fetch() { return g; }
+if (ready()) { var dyn t = fetch(); }   # may or may not fail: run-time check
+var g = 5;
+```
+
+Where it *cannot* decide but the shape is suspicious, the compile emits a
+**warning** (to stderr, with a caret, non-fatal) rather than staying silent:
+
+```
+warning: this call may fail: g is not bound until later at line 3, col 28
+
+    if (ready()) { var dyn t = fetch(); }
+                               ^^^^^^^^
+```
+
+Catching `UnboundSymbolEx` should be **very rare** in real code. It exists for
+the residue the compiler cannot decide; the provable cases never get that far.
+
+**`--strict` removes the residue entirely.** With that option every *non-local*
+must be declared above its first use, so no function can reach a global that is
+not bound yet and `UnboundSymbolEx` becomes unreachable:
+
+```C#
+func total(a) { return a + base; }
+var base = 100;
+print(total(1));       # 101 by default; --strict refuses it - move `base` up
+```
+
+It is off by default because it refuses programs that are correct — the usual
+"helpers at the top, configuration at the bottom" layout is exactly the shape
+it rejects. Function and struct *names* are exempt (they bind when their scope
+is entered, so a forward call is not a forward reference — mutual recursion
+keeps working), and so is a lazy builtin's argument: `isbound(g)` asks *about*
+`g` rather than reading it, which is how a program copes with an order it
+cannot change.
+
+**`defined()` lets you feature-test a name.** Since a name declared nowhere is
+refused, `defined(x)` is the way to ask about one — and inside the branch it
+guards, *that* name is tolerated:
+
+```C#
+if (isbound(x)) { print(x); }        # fine - `x` was checked
+if (isbound(x)) { print(x, y); }     # ERROR: `y` was not
+if (isbound(x) && isbound(y)) { print(x, y); }   # fine - both were
+```
+
+Either query guards — `isbound(x)` is the usual one, `defined(x)` works too.
+Only the checked name, and only in the branch the check proves: the `else` arm,
+a negated guard, an `||` chain, and anything after the `if` are unaffected.
+When `x` really does not exist the guarded code is also *deleted* — the guard
+folds to `false` and the dead branch is dropped — so the branch may use `x`
+any way it likes: compare it, copy it into a local, pass it on.
+
+**Nesting is bounded.** Expressions, blocks and type annotations
+(`array<array<int>>`) may nest up to 256 levels; past that the program is
+refused with a syntax error. Every link of a chain counts as a level: a
+unary operator (`!!x`, `- -x`), a `?:` in the else arm of another, a `??`
+or an `=` on the right of another, a lambda whose body is another lambda
+(two levels for `func() => ...`: the `{ return ...; }` it stands for),
+and each call, subscript, slice or member access in a postfix chain
+(`f()()`, `a[0][0]`, `a.b.c`). The limit is far above
+anything written or generated in practice, and exists so that a pathological
+input is *refused* rather than crashing the interpreter.
+
+**A name declared nowhere is a compile error.** A misspelled or missing
+variable is refused before the program runs, not when execution reaches it:
+
+```C#
+var scaled = 10;
+var total = scaled * heigth;    # ERROR at compile time: undefined variable
+print(total);                   #        'heigth'
+```
+
+That is the error reported whatever the program does with the value next:
+`var y = nosuch(1); print(y + 1);` names `nosuch`, not `y`.
+
+This costs nothing: a script resolves every name it can reach, so such a name
+was guaranteed to fail at run time anyway. A name declared *later* is a
+different matter and is still accepted (a function may read a global declared
+below it). The query builtins are exempt - `defined(x)`, `isbound(x)`,
+`isconst(x)` and `isconstdecl(x)` never evaluate their argument, so asking
+about a name that exists nowhere is legal and answers `false` (which is what
+makes `if (isbound(x)) { ... }` the feature test - see `isbound(name)`).
+Only the builtins are exempt: a function, parameter or variable of the
+program's own named `defined` (or `isbound`, ...) is called like any other
+function, so its argument is evaluated and must exist, and a check through
+it guards nothing.
 
 **Top-level variables have an implicit `var`.** At the outermost scope (a
 statement directly in the program/REPL, not inside any block or function), a
@@ -363,7 +695,15 @@ compile errors. (A plain `var x;` is implicitly nullable — equivalent to
     `f = 5;`), and `int x = true;` stores `1`.
   * **`array`/`dict`** are *generic*: they only require the value to be an array
     / dict, while its element/key/value types are inferred as usual — so
-    `array nums = [1,2,3]` is still a fast flat `array<int>`.
+    `array nums = [1,2,3]` is still a fast flat `array<int>`. A bare `array` /
+    `dict` is a **hole** the compiler fills, never a type of its own: on a
+    variable, from what the variable receives; on a **parameter**, per call —
+    the function is a *template* over it (see *Static type inference*), so
+    `func f(array a)` called with an `array<int>` and with an `array<str>` gets
+    one instance for each, where the annotation only checks the argument is an
+    array. A **struct field** has no single receiver to fill it from, so it must
+    name its whole type (`array<dyn> t;`, `dict<str, int>? m;`): a bare `array`
+    / `dict` field is a compile error.
   * **Parameterized containers** `array<T>` and `dict<K, V>` pin the element
     (and key) types, and **compose recursively**:
     ```C#
@@ -379,17 +719,66 @@ compile errors. (A plain `var x;` is implicitly nullable — equivalent to
     `array<int>` (likewise `array<float>` / `array<bool>` / `array<PodStruct>`),
     so a subsequent `append` stays unboxed. Nesting uses ordinary `<...>` (a
     closing `>>` is split automatically, as in modern C++).
+
+    **A container literal takes the declared type of the place it lands
+    in** - a variable, an element, an `append`/`push`/`insert`, a
+    parameter or a struct field - element by element, so its numbers widen
+    to the declared element type and an element may be `none` where it is
+    `opt`:
+    ```C#
+    array<float> f = [1, 2];          # holds 1.0 and 2.0
+    array<int?> slots = [none, 3];
+    slots[0] = 5; append(slots, 6);   # an int fits an int?
+    func avg(array<float> xs) => sum(xs) / len(xs);
+    avg([1, 2]);                      # the literal is an array<float>
+    const array<float> K = [1, 2];    # a const holds 1.0, 2.0 too
+    ```
+    So does a literal assigned to a variable whose type is INFERRED, at
+    the type the variable ends up with: `var d = {"a": 1}; d["b"] = 2.5;`
+    makes `d` a `dict<str, float>`, and its literal holds `1.0`.
+    Its **storage** follows the declared type too, at every level: `[1.5]`
+    passed for an `array<float?>` parameter is a general array, so a
+    later `xs[0] = none` fits (built from its own values it would be a
+    flat float array, which holds floats only).
+    That is only for a **literal** (a fresh value, written in place): an
+    array VARIABLE, a named const or a call's result of another element
+    type is a compile error (`var a = [1]; array<float> f = a;`) - arrays
+    are references, and widening one would change it for every other name
+    that holds it. Convert it explicitly
+    (`array<float> f = map(func(x) => float(x), a);`). The same holds for
+    such a value written as an ELEMENT of a literal: in
+    `array<array<float>> m = [[1], f()];` the `[1]` widens, while `f()`
+    must already be an `array<float>`; `[dict(1)]` is not an
+    `array<dict<str, float>>` (`dict(1)` is a call, a `dict<?, int>`
+    whose key the stores fill).
+    A single value stored into an element - `a[i] = 5`, `append(a, 5)`,
+    `push(a, 5)`, `insert(a, 0, 5)`, a dict key or value - widens to the
+    declared type the same way: `5` stored into an `array<float?>` is
+    `5.0`, `true` into an `array<int>` is `1`. A `dyn` value assigned
+    (`=`) to an element or a dict value of type `int` or `float` converts
+    as it would into a typed variable, a `TypeError` when it does not fit
+    (`ga[0] = runtime("s")` into an `array<float?>`).
   * **A `struct` type** pins the variable to that exact type (like a scalar):
     `Point p = Point(3, 4)` is fine, while `Point p = Other(...)` (or a later
     `p = Other(...)`) is a compile error. The struct name is read as a type only
     in declaration position (`Point(...)` construction and `Point.CONST` keep
     working). It works as a **parameter** type too — `func mag2(Point p) => ...`
-    — where a wrong-struct argument is a compile error.
+    — where a wrong-struct argument is a compile error. Where a parameter, a
+    `foreach` or `catch` variable or a capture is named like the struct, the
+    name means that binding in its scope, so it is not a type there: inside
+    `func f(Point) { ... }`, `Point q;` is a compile error (as in C++).
+    A struct variable in a container literal is fine: `array<Point> a = [p];`.
   * **No initializer** gives the type's zero value: `int x;` → `0`, `float x;` →
     `0.0`, `bool x;` → `false`, `str x;` → `""`, `array x;` → `[]`,
     `dict x;` → `{}`, and a **struct zero-initializes recursively** by the same
     rules (`Point origin;` → `Point(x: 0, y: 0)`; each field gets its own zero,
     nested structs included). (An `opt`-qualified one defaults to `none`.)
+    A nested struct whose type is declared further down than the struct
+    holding it is zero-initialized too, provided it is declared above the
+    variable. One declared below the variable, or a non-`opt` `dyn` field
+    (which has no zero value), gives no zero value: such a variable needs
+    an initializer, and without one it is a compile error. `array(n)` fills
+    its elements with the same zero values (see `array()`).
   * It works in a `for` initializer too: `for (int i = 0; i < n; i += 1) ...`.
 
 The type keywords are still ordinary identifiers everywhere else — `int(x)`,
@@ -540,6 +929,16 @@ small values like integers, floats, and strings become literals during the
 read-only symbols at runtime, but still allowing some operations on them (like
 `[index]` and `len(arr)`) to be const-evaluated.
 
+A constant bound to a *builtin* is that builtin: like a scalar it does not
+exist at runtime, and every use of its name is the builtin itself, so a call
+through it is checked, typed and folded exactly as the direct call:
+
+```C#
+const L = len;
+func g(a) { return L(a) + 1; }   # the same as len(a) + 1
+print(g([1, 2, 3]));             # 4
+```
+
 A `const` array or dictionary is **deeply read-only**: there is no shallow
 const, so a const container and every element nested inside it are immutable.
 The read-only-ness is a property of the *value*, not just the name — so it holds
@@ -576,6 +975,108 @@ s[0] = 9;         # error: NotLValueEx
 s = [9, 9];       # OK: rebinding the name s is allowed
 ```
 
+**Rebinding a const or a builtin name is a compile error.** An assignment, a
+compound assignment or a `++`/`--` whose target is a `const` holding an
+array, a dict, a struct or a function - or a struct's name, or a `pure
+func`'s - raises `CannotRebindConstEx`, and one whose target is a builtin's
+name `CannotRebindBuiltinEx`, when the program compiles, even in code that
+never runs:
+
+```C#
+const K = [1];
+func never() { K = [2]; }          # compile error: CannotRebindConstEx
+if (runtime(false)) { len = 5; }   # compile error: CannotRebindBuiltinEx
+```
+
+A `const` holding a **scalar** - a number, a bool, a string or `none` - has
+no run-time variable at all: its name stands for its value everywhere (see
+above), so `N = 6`, `N += 1` or `N++` with `const N = 5;` is the compile error
+for a target that is not an assignable location (a `SyntaxError`, as `5 = 6`
+is - see *What can appear on the left of `=`*).
+
+A parameter, a capture, a `foreach` or a `catch` variable is its own binding
+and is never const, whatever outer name it shadows: in
+`const K = [1]; func f(K) { K = [2]; return K; }` the assignment rebinds the
+parameter. Reading it reads that binding, never the outer constant - a read
+of such a name is not folded to the constant's value - so
+`const K = 5; func f(K) => K + 1;` gives `f(10) == 11`, and with
+`pure func a(x) => x + 1;`, a parameter named `a` is called as the function
+passed in, not as the pure function. (In the REPL, where a top-level name
+stays redefinable, an assignment to a top-level const or builtin - or to a
+`pure func`'s or a struct's name - is refused when it runs; redefining the
+function or the struct with a new declaration is still allowed.)
+
+**What can appear on the left of `=`.** Exactly five forms denote a location:
+a variable, an id list (`a, b = ...`), an element `a[i]`, a field `a.f`, and
+the value a box holds, `*b` (see *Boxes*).
+Anything else — a literal, a call result, an arithmetic/comparison/logical
+expression, a ternary, a **slice** `a[i:j]`, or an **optional member**
+`a?.f` (it is `none` when `a` is `none`) — is a value, not a place, so
+assigning to it is a **compile error**, and so is a compound assignment or
+`++`/`--` on it - with type inference or without (`-nti`):
+
+```C#
+0 = 99;             # compile error: not an assignable location
+(a + b) = 3;        # compile error
+f() = 3;            # compile error
+s[0:2] = "xy";      # compile error: a slice is a value (there is no
+                    # slice-assignment; build a new string instead)
+p?.x = 3;           # compile error, as are `p?.x += 1` and `p?.x++`
+f()++;              # compile error, as are `(a + 1)++` and `--s[0:1]`
+```
+
+The rule is: when the target cannot possibly be a location *because of its
+shape*, the compiler rejects it - and so is an element or a field of a
+**constant** written directly, whatever the key: `K[0] = v`, `K["k"] = v`
+(present or not), `K.k = v`, `P.CONST = v` and `++K[5]` are all compile
+errors, since no store can ever write a constant. (A *read* of a missing key
+or index of a constant stays the compile-time `KeyNotFoundEx` /
+`OutOfBoundsEx` it is.) When assignability depends on the **value** at run
+time — writing through a `const` container reached through another name, or
+through a `dyn` that happens to hold a read-only one — it stays a catchable
+`NotLValueEx`, as in the example above.
+
+**Storing through a value.** An element or a field of *any* expression is a
+location — `f()[0]`, `(c ? a : b).x`, `[x, y][k]`, `g()[i].y` — and a store
+there goes into the value that expression evaluated to, exactly as if it were
+first bound to a fresh variable: `f()[0] = v` means `{ var t = f(); t[0] =
+v; }`. Arrays and dicts are references, so the write lands in the object `f`
+returned; a struct is a value, so `f().x = v` writes `t`'s copy, which is then
+gone (a write *into* an array or dict field, `f().a[0] = v`, still lands in
+that array):
+
+```C#
+var scores = [1, 2, 3];
+func pick() => scores;
+pick()[0] = 10;             # scores is [10, 2, 3]
+pick()[1] += 5;             # [10, 7, 3]
+var old = pick()[2]++;      # old is 3, scores is [10, 7, 4]
+clone(scores)[0] = 9;       # allowed: writes into the copy, then gone
+scores[0:2][0] = 0;         # a slice is a new array: scores is unchanged
+```
+
+The usual rules still hold through the value: a `const` refuses the write
+(`NotLValueEx`), a slice detaches (copy on write) as it would in a variable,
+and a string's characters cannot be assigned. The right-hand side is
+evaluated first, then the expression under the access, then each key.
+
+The first argument of an in-place builtin (`append`, `push`, `pop`,
+`insert`, `erase`, `sort`, `rev_sort`, `reverse`, `intptr`) follows the same
+rule: given a value rather than a variable, the builtin works on that value,
+evaluated before the other arguments - `append(f(), x)` means
+`{ var t = f(); append(t, x); }`, so it appends to the array `f` returned,
+and `append([1, 2], 3)` to a fresh array nobody keeps - called directly
+or through a `dyn` holding the builtin (`var dyn ap = append; ap([1],
+2)`). A `const` value refuses it (`CannotChangeConstEx`), as through a
+variable.
+
+```C#
+var queue = [1, 2];
+func q() => queue;
+append(q(), 3);             # queue is [1, 2, 3]
+print(pop(q()));            # 3
+```
+
 To get a mutable copy you must ask for one explicitly: `clone(x)` makes a
 **shallow** mutable copy (only the top level is copied; nested objects are
 shared, so nested objects of a const stay read-only), while `deepclone(x)` makes
@@ -583,6 +1084,21 @@ a **fully mutable deep copy** that you can change at any depth. A *fresh*
 literal is not derived from a const, so `var a = [1, 2, 3]` is mutable as usual
 (though an element that is itself a const stays read-only — `var a = [y]` with
 `y` const keeps `a[0]` read-only).
+
+#### Folding, and the `-nc` switch
+
+Replacing a constant expression by its value — `len(arr)` by `3`, `2 * K` by
+`6`, `arr[1]` by the element — is an *optimization*, and `mylang -nc FILE`
+turns it off (handy with `-s`, to see the tree as written). It turns off
+nothing else, because nothing else is an optimization: under `-nc` a `const`
+is still evaluated at compile time and its name still denotes its value, a
+struct still defines a type (usable in a declaration, with the same memory
+layout), a `pure func` can still be called from a `const` initializer, a
+statically dead branch is still discarded, and a constant expression that
+always fails is still a compile error. A program compiles, runs, prints and
+fails identically with and without `-nc` — only its syntax tree differs (and
+not even inside a `pure func` body, which is folded either way: that is what
+lets it be called at compile time).
 
 #### De-duplication of const expressions
 
@@ -648,19 +1164,24 @@ like a `const`:
 
 ```
 $ ./build/mylang -e 'var a = 6; var b = 0; print(a / b);'
-DivisionByZeroEx: Division by zero at line 1, col 30:32
+DivisionByZeroEx: Division by zero at line 1, col 33:34
 
     var a = 6; var b = 0; print(a / b);
-                                ^^^^^
+                                    ^
+note: a constant expression is evaluated while compiling, so its error is a
+compile error, which no try/catch handles; to raise it when the program runs
+instead, pass one of its values through runtime(), as in 10 / runtime(0)
 ```
 
 This is intentional: a value we can fully compute at compile time that can never
 succeed is a program that can never run correctly, so it is a build error, not a
 runtime exception. `try`/`catch` is for *runtime* exceptions and does **not**
-catch these. If you want such an expression to stay a (catchable) runtime error
-— for tests, or to opt out of folding — wrap the runtime-varying part in
-[`runtime()`](#runtimeexpr): `a / runtime(b)` throws `DivisionByZeroEx` at
-runtime instead.
+catch these, and neither does a branch that never runs: `if (runtime(false))
+{ print(a / b); }` is the same compile error. If you want such an expression to
+stay a (catchable) runtime error — for tests, or to opt out of folding — wrap
+the runtime-varying part in [`runtime()`](#runtimeexpr): `a / runtime(b)`
+throws `DivisionByZeroEx` at runtime instead. The compiler's message says so,
+with the note shown above.
 
 ### Type system
 
@@ -682,15 +1203,55 @@ runtime instead.
     `none`, and empty containers/strings are false, everything else true.
 
   * **Integer**
-    A *signed* pointer-size integer (e.g. `3`).
+    A *signed* pointer-size integer (e.g. `3`). Arithmetic wraps around at
+    64 bits (two's complement). The two division edge cases **throw** instead
+    of crashing or wrapping: dividing by zero throws `DivisionByZeroEx`, and
+    the one overflowing division — the most negative integer divided by `-1`
+    (`(1 << 63) / -1`, whose true result does not fit) — throws
+    `InvalidValueEx` ("integer overflow in division"); `%` follows the same
+    rule. Both are ordinary catchable runtime errors (and, like any
+    always-failing constant expression, a build error when fully constant).
+    Otherwise `/` truncates toward zero and `%` takes the sign of the
+    dividend, as in C: `-7 / 2 == -3`, `-7 % 2 == -1`, `7 % -2 == 1`.
+    An integer literal is decimal digits, from `0` to `9223372036854775807`
+    (2^63 - 1); the lowest int is written `-9223372036854775808` - a minus
+    directly before the digits 9223372036854775808, which fit no int on
+    their own (as an operand of anything else, `1 - 9223372036854775808` or
+    `-(9223372036854775808)`, they are out of range). A literal outside the
+    range is a compile error.
 
   * **Float**
     A floating-point number (e.g. `1.23`). Internally, it's a C `double`
-    (64-bit IEEE 754), exactly like Python's `float`.
+    (64-bit IEEE 754), exactly like Python's `float`. A float literal is
+    decimal digits with a `.` and/or an exponent - `1.5`, `.5`, `5.`,
+    `1e5`, `2.5E-1` - and reads as the nearest double; a subnormal is kept
+    (the smallest positive double, `4.9e-324`, is a valid literal), while
+    a literal beyond the range (`1e999`), or so small that it would read
+    as 0 (`1e-400`), is a compile error. Dividing a float by
+    zero (`0.0` or `-0.0`) throws `DivisionByZeroEx`, as does `%`; an
+    infinity or a NaN comes from an overflow (`1e308 * 10.0`), from the
+    `inf` and `nan` constants or from a math builtin, and then follows
+    IEEE: `inf - inf` is a NaN, a NaN compares unequal to everything
+    (itself included), and `-x` of `0.0` is `-0.0`, which equals `0.0`.
+    A float prints with six decimals (`-0.000000` for negative zero),
+    an infinity as `inf` / `-inf`, and a NaN always as `nan` - its sign
+    is never shown.
+    An int meets a float only at an operator with a float operand, where
+    the int converts to a float: an operator between two ints is an int
+    operator even inside an expression that also holds a float, and the
+    operators of one precedence level apply left to right. So with
+    `var i = 7;`, `i / 2 * 1.0` is `3.0` (the int division first), while
+    `1.0 * i / 2` is `3.5`; and `i * 4611686018427387904 * 0.5` wraps
+    before it halves.
 
   * **String**
     A string like "hello". Strings are immutable and support slices (e.g.
     `s[3:5]` or `s[3:]` or `s[-2:]`, having the same meaning as in `Python`).
+    `s[i]` is the one-character string at `i`, indexed like an array (below).
+    Immutability holds through aliases, exactly as in Python: after
+    `var b = a; a += "!"`, `b` is unchanged. `s += x` is still amortized
+    O(n) for the usual accumulator loop - it appends in place when no other
+    string can see the change.
     A `"..."` literal **may span multiple lines**, and the line breaks are kept
     as `\n` in the value (Ruby-style); the usual escapes (`\n`, `\t`, `\"`,
     `\\`, …) work too. An unterminated string (no closing `"` before
@@ -698,8 +1259,34 @@ runtime instead.
 
   * **Array**
     A mutable type for arrays and tuples (e.g. `[1,2,3]`). It can contain items
-    of different type and it supports writable slices. Array slices behave like
-    copies while, under the hood, they use copy-on-write techniques.
+    of different type and it supports writable slices. A **slice** `a[s:e]`
+    is a new array, separate from `a`: writing to either never changes the
+    other. Once taken, a slice is an array like any other, so assigning it,
+    passing it to a function or storing it in a container SHARES it - it is
+    not copied again (Python's rule):
+
+    ```C#
+    var a = [1, 2, 3, 4];
+    var s = a[1:3];          # [2, 3], a new array
+    var t = s;               # t is another name for the same slice
+    t[0] = 9;                # s is [9, 3]; a is still [1, 2, 3, 4]
+    func setz(x) { x[0] = 0; }
+    setz(s);                 # s is [0, 3]: the callee wrote the caller's slice
+    ```
+
+    Under the hood a slice is a copy-on-write view of `a`'s storage, so
+    taking one is cheap: nothing is copied until something writes to the
+    slice (through any name holding it) or to `a`. Two slice expressions
+    are two arrays, even with the same bounds, and so are two empty slices.
+    `a[i]` reads or writes the element at `i`, counting from 0; a negative
+    index counts from the end, so `a[-1]` is the last element and
+    `a[-len(a)]` the first. Any other index - below `-len(a)`, or `len(a)`
+    and beyond, which is every index of an empty array - throws
+    `OutOfBoundsEx`. `a[s:e]` is the slice from `s` up to (not including)
+    `e`, with Python's rules: either bound may be omitted, a negative bound
+    counts from the end, a start below `-len(a)` means `0` and an end past
+    `len(a)` means `len(a)`, and an empty or reversed range gives `[]` - a
+    slice never throws for its bounds. Strings slice the same way.
 
   * **Dictionary**
     Dictionaries are hash-maps (O(1) lookup) defined using `Python`'s syntax:
@@ -707,13 +1294,49 @@ runtime instead.
     looked-up with `get()`/`get!()`/`find()`, and deleted with `erase()`. **Any
     hashable value can be a key** — strings, ints, floats, `bool`, `none`, and
     (by value) arrays, dicts and structs (e.g. `d[[1,2]]`, `d[Point(1,2)]`),
-    since `hash()` is total. A container key is **frozen** (snapshotted deeply
+    since `hash()` is total. A `none` key needs a dict whose keys may be
+    none (`dict<int?, ...>`, `dict<dyn?, ...>`, or an inferred one a
+    `none` key went into): into a `dict<int, ...>` a key that may be
+    `none` is a compile error. A container key is **frozen** (snapshotted deeply
     read-only) when inserted, so mutating the original afterwards cannot corrupt
-    the dict. **Perks**: identifier-like string-keys can be accessed with the
-    "member of" syntax: `d.key`. A read of a *missing* key (`d[k]`/`d.key`)
-    raises `KeyNotFoundEx` — non-`opt` access (a value or an exception, never
-    `none`); use `get()` for a nullable lookup, or `dict(default)` for a default
-    value. A write (`d[k] = v`) inserts the key.
+    the dict; a key that contains itself is frozen with its cycle (see
+    *Values that contain themselves* below). **Perks**: identifier-like
+    string-keys can be accessed with the "member of" syntax: `d.key`. A read
+    of a *missing* key (`d[k]`/`d.key`) raises `KeyNotFoundEx` — non-`opt`
+    access (a value or an exception, never `none`); use `get()` for a
+    nullable lookup, or `dict(default)` for a default value. A write
+    (`d[k] = v`) inserts the key.
+
+    **A dictionary keeps INSERTION ORDER**, as Python's does: printing it,
+    `foreach`, `keys()`/`values()`/`kvpairs()`, `map`/`filter` and every
+    copy visit the keys in the order they were added. Storing over a key
+    that is already there keeps its place; a key that was erased and is
+    inserted again goes last. A dict literal, `dict(pairs)` and
+    `make_dict()` insert in the order they are written or given. Two dicts
+    holding the same pairs in different orders are still `==` and hash
+    equal - the order is never part of a dict's value.
+
+    **A dict literal is built like successive stores**, so a key written
+    twice takes the LAST value, at the place of its first occurrence - as
+    in Python, and as `dict(pairs)` and `make_dict()` do. Every key and
+    value is still evaluated, left to right, and this holds whether the
+    key is a constant or known only when the program runs:
+
+    ```C#
+    print({"a": 1, "b": 2, "a": 3});     # {"a": 3, "b": 2}
+    var k = str(runtime("b"));
+    print({"b": 0, "c": 1, k: 5});       # {"b": 5, "c": 1}
+    ```
+
+    ```C#
+    var d = {"z": 1, "a": 2};
+    d["m"] = 3;
+    d["z"] = 0;              # an existing key keeps its place
+    print(keys(d));          # ["z", "a", "m"]
+    erase(d, "z");
+    d["z"] = 5;              # inserted again: last
+    print(d);                # {"a": 2, "m": 3, "z": 5}
+    ```
 
   * **Function**
     Both standalone functions and lambdas have the same object type and can be passed
@@ -727,6 +1350,75 @@ runtime instead.
     instance and catch it by its type (see *Custom exceptions*). A built-in
     exception bound with `catch (X as e)` surfaces as this type (printable,
     re-throwable), but carries no fields.
+
+#### Values that contain themselves
+
+Arrays and dicts are references (and so is a struct's array, dict or `dyn`
+field), so a value can contain itself: directly (`append(a, a)`), through a
+dict (`d["self"] = d`), through a struct field, or around a longer ring.
+Every operation that walks a value is defined on such a value - none of them
+follows the ring forever:
+
+```C#
+var dyn a = [1];
+append(a, a);
+print(a);                   # [1, [...]]
+var dyn d = {};
+d["self"] = d;
+print(d);                   # {"self": {...}}
+print([a, a]);              # [[1, [...]], [1, [...]]]
+```
+
+  * **Printing** (`print`, `str`, the REPL's `=>` echo): a container that is
+    already being printed further up is written `[...]`, `{...}` or, for a
+    class instance, `Name(...)` (`box(Name(...))` for a `box<P>`). A struct
+    value is always printed in full: a cycle through one passes through the
+    array, dict, class instance or box holding it, and that is where the
+    `...` appears. A container that appears at two places side by side,
+    neither inside the other, is printed in full at each, as `[a, a]`
+    shows.
+
+  * **`==` and `!=` compare by shape.** Two values are equal when walking
+    them side by side meets equal scalars in the same places, and every step
+    back to a container already being compared further up leads, on both
+    sides, the same number of levels up. So `a == a`; two rings built
+    separately the same way are equal; each node of a ring of two equals the
+    other; but rings of one, two and three nodes all differ, and so do a ring
+    and its one-step unrolling: `clone(a)` is a fresh array whose second
+    element is the ring `a`, so `clone(a) != a` (and it prints as
+    `[1, [1, [...]]]`).
+
+  * **`hash`** agrees with `==` on these values - equal values hash equal -
+    so a value that contains itself can be a dict key. The key is frozen as
+    usual, cycle included: the frozen copy contains itself, not the
+    original.
+
+  * **`deepclone`** copies the cycle: the copy of `a` contains the copy, not
+    `a`. It keeps any other sharing too: a container that appears at two
+    places is copied once, and both places hold that one copy (see
+    [`deepclone`](#deepcloneobj)). The read-only snapshot a constant or a
+    dict key takes works the same way.
+
+  * **Ordering** (`<`, `sort`, `min`, `max`) is not defined on arrays, dicts
+    or structs at all (`TypeErrorEx`), so it never walks one.
+
+  * **Constants.** A pure function can build such a value at compile time -
+    with an element store, `r[1] = r`, since `append` is not available there
+    - and a `const` holds it frozen, cycle included. A `var` initialized by
+    the same call gets a mutable value of the same shape, whether the call
+    was evaluated at compile time or at run time. A compiled image
+    ([.myv](#compiled-scripts-myv)) cannot store a constant that contains
+    itself: `mylang -c` refuses it with a `MyvError` saying where the
+    constant is, and writes no file.
+
+  * **A function is never walked into**: a closure that captured the array
+    it is stored in prints as `<function>` and compares by identity.
+
+**Memory.** MyLang frees a value when the last reference to it goes away, so
+a value that contains itself is not freed while the ring exists, even when
+the program can no longer reach it. Break the ring when you are done with it
+(`pop(a)`, `erase(d, "self")`). A ring the program cannot break - inside a
+constant or a dict key, which are read-only - is freed when the program ends.
 
 ### Static type inference
 
@@ -766,8 +1458,37 @@ Key rules:
   * A variable's type is the **join** of everything assigned to it. Assigning an
     incompatible type on any path is an error. `int` automatically widens to
     `float` (so `var x = 1; x = 2.5;` is fine, and `x` becomes a `float`).
+    A type and its nullable form join to the nullable one, a struct or
+    class type included: `var p = P(1); p = maybe_p;` with a `P?` makes
+    `p` a `P?`, as `c ? P(1) : maybe_p` is.
+  * **A function value's type is its whole signature, not just its arity.** A
+    variable holding a function may only be assigned functions with the *same*
+    parameter and return types, so the signature a call site sees is one the
+    runtime actually keeps:
+
+    ```C#
+    func a(int k) { return k; }
+    func b(int k) { return 2.5; }   # same arity, different return type
+    func c(int k) { return k * 2; } # same signature
+
+    var g = a;
+    g = c;                 # ok
+    g = b;                 # error: g has type 'func(int)->int'
+                           #        but is assigned 'func(int)->float'
+
+    var dyn h = a;
+    h = b;                 # ok: `dyn` opts out of the check
+    ```
+
+    This only ever compares types the compiler has actually settled on — an
+    un-inferred or `dyn` parameter/return matches anything — so ordinary
+    higher-order code (`apply(sq, 5)`, an array of same-shaped functions, an
+    inline `map` callback) is unaffected. Use `dyn` when you genuinely want a
+    variable to hold differently-typed functions.
   * **A function with un-annotated parameters is a *template*** (like a C++
-    template), not a fixed-type function. It is **not type-checked on its own**;
+    template), not a fixed-type function - and so is one with a parameter
+    annotated with a bare `array` / `dict`, which then only checks the argument
+    is an array / a dict. It is **not type-checked on its own**;
     instead it is **instantiated per call-site signature**, and each instance is
     type-checked + compiled separately. So `sq` above works for `int`, and would
     *independently* work for `float` — calling a template with two different
@@ -779,9 +1500,14 @@ Key rules:
     annotate it (`func f(int n)`) — then the function is concrete and a
     wrong-typed call is an error — or mark it `dyn` for one dynamic instance
     that accepts anything. Return types are inferred from what each instance
-    returns. (Recursion and forward references work; an anonymous lambda or a
-    function with an `opt` parameter is not a template — it uses the join model
-    below.)
+    returns. (Recursion and forward references work; an anonymous lambda is not
+    a template — it uses the join model below.) An un-annotated **`opt`**
+    parameter is a template parameter too: each instance is keyed by the
+    argument's type without its `?` (`int` and `int?` share one), and a
+    `none` or omitted argument has an instance of its own, where the parameter
+    is a `dyn?` - so `func f(opt x)` called as `f(2)`, `f(2.5)` and `f()` gets
+    three instances, and `f(2)` stays an `int`. (A `none` given to an `opt`
+    parameter adds nothing to its type: its declaration already allows `none`.)
   * A **concrete** function's (typed or `dyn` params) parameter and return
     types are the **join** of how it is called and what it returns, across the
     whole program. A typed parameter called with an incompatible type is an
@@ -789,6 +1515,55 @@ Key rules:
   * Arrays and dicts are typed by their contents (`[1,2,3]` is an array of int).
     A genuinely mixed container is allowed — its element type just becomes `dyn`
     (see below), so you don't get the speed/safety benefits but it still works.
+    An empty `[]` or `{}` (and `array(n)`) takes the type of what the program
+    puts into it: `var a = []; append(a, 1);` is an `array<int>`. One nothing
+    typed is ever put into is the most generic container, `array<dyn>` /
+    `dict<dyn,dyn>`, so iterating or reading it always compiles:
+
+    ```C#
+    func show(d) {
+        foreach (k, v in d)
+            print(k + ": " + str(v));
+    }
+    show({"a": 1});     # this instance: d is a dict<str,int>
+    show({});           # this one: a dict<dyn,dyn> - prints nothing
+    ```
+  * **A container's type is exact.** There is no implicit conversion between
+    two container types, in either direction and at any depth: an
+    `array<int>` is neither an `array<dyn>` nor an `array<float>` nor an
+    `array<int?>`, and the same goes for dicts. A container is a
+    reference - two names can hold one - so two names for it must agree on
+    its type. A container another name may hold (one read from a
+    variable, returned by a call, read as an element, picked by a
+    ternary...) therefore keeps its type wherever it goes, and a place of
+    another type is a compile error:
+
+    ```C#
+    var a = [1, 2];
+    var b = a;        # TypeMismatchEx: 'b' has type 'array<dyn>' but the
+    b[0] = "s";       # container it is given is an 'array<int>'
+    ```
+
+    A NEW container takes the type the program gives it - a literal, a
+    builtin's new container (`map`, `filter`, `make_array`, `keys`,
+    `values`, `clone`, ... but not `sort`, `rev_sort` or `reverse`,
+    which return the array they were given), a slice, an array sum, a
+    `cast`: the join of what is put into it, an int widened beside a
+    float and mixed kinds `dyn`. So `var a = [1]; a[0] = "s";` is an
+    `array<dyn>`. An explicit `none` stored into one makes its element
+    nullable: `var a = [1, 2]; a[0] = none;` is an `array<int?>` (an
+    EMPTY container is the exception: `[]` with nothing filled in has
+    no element type yet). A container that holds only `none`s has no
+    other type to take: `[none]` is an `array<dyn?>` and `{none: 1}` a
+    `dict<dyn?,int>`, and what is stored into one later keeps it so
+    (`var a = [none, none]; a[0] = 5;` is an `array<dyn?>`, never an
+    `array<int>` with a `none` in it); written for a typed place,
+    `array<int?> a = [none];`, it is that place's type. `a + b` of two
+    arrays is a new array of the two element types' join: `[1] + [1.5]`
+    is an `array<float>` (the ints widened), `[1] + ["x"]` an
+    `array<dyn>`. To change a
+    container's type, convert it: `cast<array<dyn>>(a)` is a new
+    `array<dyn>` holding `a`'s elements (see *cast*).
   * **Null safety.** A plain value is *non-nullable*: passing `none` where a
     non-`none` value is required — an arithmetic operand, a subscript base — is
     a compile error. A local that might be `none` (e.g. `var x;`, or assigned
@@ -813,6 +1588,18 @@ Key rules:
     also return a `bool`. The logical operators `&& || !` return a `bool` too.
     A comparison/logical result therefore infers as `bool` (e.g. `var ok = a <
     b;` makes `ok` a `bool`), and an array of such results is `array<bool>`.
+  * **`&&` and `||` short-circuit.** The operand that *determines* the result
+    stops the chain — `false` for `&&`, `true` for `||` — so the rest is never
+    evaluated: its side effects do not happen and its errors are not raised.
+    That is what makes the guard idiom work:
+
+    ```C#
+    if (i < len(a) && a[i] > 0) { ... }   # no out-of-bounds when i is too big
+    if (p != none && p.x > 0) { ... }     # p.x is not read when p is none
+    ```
+
+    The *value* is unaffected — `a && b` is still `bool(a) && bool(b)`, so
+    `false || 5` is `true`, not `5` (unlike Python, which yields the operand).
   * **Bitwise / shift operators** `~ & ^ | << >> >>>` work like in C/C++, but on
     **`int` only** (a `bool` operand promotes to `int`; a `float`/`str`/... is a
     compile-time type error). The result is always `int`. `~` is bitwise NOT;
@@ -828,19 +1615,30 @@ Key rules:
     c` parses as `a & (b == c)`, the classic C trap; parenthesize as `(a & b) ==
     c`). The `~` token doubles as the `dyn` modifier in a *parameter* position
     (`func f(~x)`), but that is a declaration, not an expression, so the two
-    never collide.
+    never collide. Every one of these (except unary `~`) also has the compound
+    assignment form — `x <<= 1`, `x >>= 2`, `x >>>= 3`, `x &= m`, `x |= m`,
+    `x ^= m` — identical to `x = x OP rhs`, with the same int-only rule and
+    the same shift-count semantics (a negative count throws `InvalidValueEx`,
+    a count `>= 64` saturates).
   * **Ternary conditional** `cond ? a : b` — evaluates `cond` (any truthy value,
     like `if`), then **only** the taken branch (short-circuit). Its type is the
-    join of the two branches (`c ? 1 : 2.0` is `float`). Right-associative, so
+    join of the two branches (`c ? 1 : 2.0` is `float`); branches of
+    **incompatible** types (`c ? [1] : 7`) make the result `dyn` — a runtime
+    variant — so a plain `var` bound to it needs an explicit `dyn`
+    (`var dyn q = c ? [1] : 7;`), exactly like any other dyn-typed value. Right-associative, so
     `a ? b : c ? d : e` is `a ? b : (c ? d : e)`. A const condition folds to the
     taken branch at compile time. It is looser than every operator above and
     tighter than `=`; a ternary used as a slice bound needs parens
-    (`a[(c?x:y):h]`, like Python).
+    (`a[(c?x:y):h]`, like Python). Either arm may be a lambda
+    (`c ? func(x) => x + 1 : func(x) => x * 2`); a lambda's `=> body`
+    extends as far as an expression can, so one in the last arm ends the
+    ternary.
   * **Null-coalescing** `a ?? b` — `a` unless it is `none`, otherwise `b` (which
     is evaluated only then). It turns an `opt T` into a non-`opt` when `b`
     is non-`opt` (`var n = maybe ?? 0;` makes `n` a plain `int`).
     Right-associative (`a ?? b ?? c`), binds tighter than `?:` and looser than
-    `||` (matching C#: `|| > ?? > ?: > =`).
+    `||` (matching C#: `|| > ?? > ?: > =`). `b` may be a lambda
+    (`maybe_f ?? func(x) => x`).
   * **Optional member access** `a?.b` — `none` if `a` is `none`, otherwise `a.b`
     (the member is not looked up when `a` is `none`). Unlike a plain `a.b`
     (which
@@ -851,6 +1649,9 @@ Key rules:
     `none`. (A plain `.c` after a `?.` is *not* guarded — write `?.c` for every
     link you want null-safe; this differs from JavaScript, where one `?.` guards
     the rest of the chain.) Pairs naturally with `??`: `a?.b ?? default`.
+    `a?.b` is a value, never a place: assigning to it, a compound assignment
+    and `++`/`--` on it are compile errors (see *What can appear on the left
+    of `=`*).
 
 #### The `opt` and `dyn` modifiers
 
@@ -914,6 +1715,20 @@ slot = "now a string";           # ok, because it's dyn
     total(d);               # -> 2 (d holds int); non-int d -> runtime error
     ```
 
+    A parameter no call site types (a function reached only through a `dyn`
+    value) is such a `dyn` too: `var y = x; if (c) { y = 1; }` keeps `y` an
+    `int` and checks `x` when it is stored.
+
+    A `dyn?` value may be `none`, which no coercion turns into a number, so
+    it makes the variable nullable: `var s = 0; s = d;` with `d` a `dyn?`
+    makes `s` an `int?` (and `s + 1` the compile error any possibly-none
+    operand is). A plain `var` given only `dyn?` values is a `dyn?`.
+
+    So is a call to a function whose returns mix a `dyn` with another type -
+    `func big(dyn v) { if (v < 9) return v * 2; return "s"; }` returns
+    `dyn` - so `var k = 5; k = big(x);` keeps `k` an `int`, and
+    `array<int> a = map(big, xs);` checks each element when it is stored.
+
     But a **fresh** `var` whose only source is `int + dyn` *is* `dyn`, so it
     must say so: `var r = 3 + d;` is an error (declare `var dyn r`), whereas
     `var dyn r = 3 + d;` holds the actual result (int/float/…). Arithmetic can't
@@ -926,7 +1741,166 @@ slot = "now a string";           # ok, because it's dyn
     nullable), `dyn x` (dynamic, non-null), `opt dyn x` (dynamic, nullable). So
     `dyn` opts out of *type* checking but **not** null-safety — passing `none`
     to a non-`opt` `dyn` parameter is still a compile error asking for
-    `opt dyn`.
+    `opt dyn`. The same holds for a `dyn` **variable, element and field**:
+    `dyn a = none;`, a later `a = none`, and giving one anything that may be
+    `none` (a `T?`, a `dyn?`, a function that may return nothing,
+    `runtime(none)`) are compile errors (`NullabilityEx`), as `int a = none`
+    is - a `dyn` never widens to `dyn?` because `none` reached it. So does a
+    `none` stored into an `array<dyn>`, a `dict<K, dyn>` or a struct's `dyn`
+    field. `dyn x;` with no value is refused: a `dyn` has no zero value
+    (`dyn? x;` starts as `none`). `runtime(x)` keeps its argument's
+    nullability: `runtime(1)` is a `dyn`, `runtime(none)` a `dyn?`.
+
+    **A `none` the compiler cannot see is refused at the call.** A `dyn`
+    value is non-opt by type, yet at run time it may hold `none` — read from
+    a `dyn` container (`var dyn n = runtime([none])[0];`), or passed through
+    a `dyn` callee the compiler cannot check against. Whatever the path, a
+    parameter that is not `opt` never holds `none`: binding one raises a
+    `TypeErrorEx` naming the parameter (`parameter 'x' is not 'opt' and
+    cannot be none`), at the call, before the function's body runs. Every
+    argument has been evaluated by then, left to right, and the caret marks
+    the offending argument. This holds for every kind of parameter — typed,
+    untyped, `dyn`, a struct or an array — and for a function a builtin
+    calls back (`map`, `filter`, `sort`, `find`, `sum`, `make_dict`), where
+    the caret marks the builtin call's arguments. An `opt` parameter takes
+    `none` as always.
+
+    ```
+    func g(int x) { return x * 2 + 1; }
+    var dyn h = runtime(g);
+    h(none);          # TypeErrorEx: parameter 'x' is not 'opt' and cannot
+                      # be none - g's body never runs
+    ```
+
+    **A `dyn` value entering a typed place is checked.** The same holds
+    for every type, not only for `none`: when a `dyn` value - or a
+    container whose element type is `dyn` - goes where a type was
+    declared, the value is checked against that type when it gets
+    there, and a value that does not fit raises a `TypeErrorEx` before
+    anything is stored or bound. The places are:
+
+      * an argument bound to a typed parameter (`array<int> a`, `P p`,
+        `str s`, `box<int> b`, a class);
+      * a field given to a struct or class constructor;
+      * a store into an element (`a[i] = d`), a dict value (`m[k] = d`)
+        or a dict key (`m[d] = v`), and a store into a container field
+        (`s.v = d` for an `array<int> v` field);
+      * a value given to `append`, `push` or `insert`, which store it
+        into the array or dict;
+      * a value assigned to a variable declared with a type, when the
+        value's type has a `dyn` inside (an `array<dyn>` into an
+        `array<int> v`) - a value whose type is `dyn` itself is refused
+        at compile time there. A multi-assignment checks what each
+        declared target receives, just before that target is stored:
+        `a, b = rows` with `rows[1]` not fitting `b` stores `a` and
+        leaves `b` as it was, as a failing conversion does.
+
+    The check goes as deep as the declared type does: an `array<int>`
+    checks each element of the array, a `dict<str, array<int>>` each
+    key, each value and each value's elements. A struct or class is
+    checked by its type alone (its fields were checked when they were
+    stored), and a `dyn` element type stops the check. The message
+    names the place and the first part that does not fit, and the caret
+    marks the value:
+
+    ```
+    func takes(array<int> a) => len(a);
+    var dyn d = runtime(["x"]);
+    takes(d);         # TypeErrorEx: parameter 'a' is declared
+                      # 'array<int>' but the argument's [0] is a 'str'
+    array<str> names = ["ann"];
+    names[0] = runtime(5);    # TypeErrorEx: the element is declared
+                              # 'str' but the value is an 'int'
+    ```
+
+    `none` fits only an `opt` place (`array<str?>`). A value that fits
+    is stored as it is, and an `int` or `float` place converts a `dyn`
+    number as described above.
+
+    A compound assignment into an element, a field or a variable
+    declared with a type (`a[i] += d`, `v += r`, `a, b += rows`) is
+    refused at compile time when its result may not fit the place:
+    the operation's result cannot be checked before the store, so the
+    compiler asks for the plain form, `a[i] = a[i] + d`, which is
+    checked.
+
+    **A container keeps its type.** An array or a dict carries the type
+    it was made with - the type of the place its literal or the call
+    that built it was written for - and a store reached through a `dyn`
+    name, or into an element whose type is `dyn`, is checked against the
+    type of the container it reaches, not against the name's:
+
+    ```
+    var rows = [[1], [2]];        # an array<array<int>>
+    var dyn d = rows;
+    d[0] = ["x"];                 # TypeErrorEx: the array's elements are
+                                  # 'array<int>' but the value's [0] is
+                                  # a 'str'
+    ```
+
+    The container is left as it was; a value that fits is stored,
+    converted as a typed store converts it (an `int` into a `float`
+    element is a `float`). The same holds for every way a value enters
+    a container: an element or dict value store (plain or compound - a
+    compound's result is checked), a member store into a dict
+    (`d.k = v`), a store several levels deep (`d[0][1] = v`), and
+    `append`, `push` and `insert`. A NEW dict key is checked against
+    the dict's key type wherever it is inserted, a default dict's read
+    included (a read of a missing key inserts it), and `a += b` checks
+    and converts each element it appends against `a`'s type, however
+    `a` was reached. A container made where `dyn` is declared
+    (`var dyn d = [1, 2]`, an element of an `array<dyn>`) is dynamic:
+    its type refuses nothing - it is an `array<dyn?>` (a
+    `dict<dyn?, dyn?>`), since a `dyn` element is never `none` - and
+    neither does one whose type nothing gave it (`[]` that nothing
+    filled, or one written where only a `dyn` was known). Its STORAGE
+    still holds only what it can (*Flat arrays*): a
+    literal nested in a `dyn` element and an array sum are built from
+    their own values, so `var dyn s = [1, 2] + [3];` is flat int
+    storage, which widens a `bool` and refuses a string.
+
+    **A container enters a typed place by its type.** An array or a dict
+    reaching a parameter, a field or an element declared with a type
+    through a `dyn` (the check above) is checked by the type it carries,
+    not by what it holds at that moment - whatever it holds now, any
+    other name may store into it later:
+
+    ```
+    func takes(array<int> a) => len(a);
+    var dyn d = [1, 2];           # an array<dyn?>
+    takes(d);                     # TypeErrorEx: parameter 'a' is declared
+                                  # 'array<int>' but the argument is an
+                                  # 'array<dyn?>'
+    ```
+
+    The container's type must be the place's exactly (*A container's
+    type is exact*): an `array<int>` enters neither an `array<dyn>`
+    parameter nor an `array<int?>` one, an `array<array<int>>` does not
+    enter an `array<array<dyn>>`, and an `array<dyn?>` - a dynamic
+    container - does not enter an `array<dyn>` (convert it with
+    `cast<array<dyn>>(d)`, which refuses a `none`). A container that
+    carries no type - one only a `dyn` reaches, such as an element of an
+    `array<dyn>` - is checked by what it holds and then TAKES the
+    place's type, so the place's type stays true however the container
+    is reached afterwards. A constant's container cannot change: it is
+    checked by what it holds, and takes no type. A container the runtime
+    builds carries its type too: `argv` is an `array<str>` and
+    `layout(S).fields` an `array<StructField>`, so a store of an `int`
+    through a `dyn` name for either is refused.
+
+    With type inference disabled (`-nti`) the parameter and constructor
+    checks still run - the declaration alone decides them, as it does
+    the `none` check - but no store is checked, since inference is what
+    finds the place's declared type and gives a container its type. A
+    value that does not fit its place is then caught where it is read as
+    the declared type: an element read as a number (`a[i] * 2` of an
+    `array<int>`), a dict value read that way (`d.k + 1` of a
+    `dict<str, int>`) and a typed `foreach` variable raise `TypeErrorEx`
+    at that read - the caret marks the element read, or the container of
+    the `foreach` - when the value is not of the declared type (a `bool`
+    reads as `0`/`1` and an `int` as a float, as everywhere). A literal is not converted to its
+    place either, so `half([1, 2.5])` into an `array<float>` parameter
+    is refused there: its first element is an `int`.
 
 #### Null-checks are understood (narrowing)
 
@@ -943,6 +1917,50 @@ func g(opt x) {
     return -1;
 }
 ```
+
+A guard clause is any `if` whose branch cannot finish - it ends in a
+`return`, a `throw`, a `rethrow`, or, in a loop, a `break` or a `continue`
+(see *Where a function can end* below for what "cannot finish" covers):
+
+```C#
+foreach (x in values) {          # values: array<int?>
+    if (x == none) continue;
+    total += x;                  # x is known non-none here
+}
+```
+
+#### Where a function can end
+
+A function whose body can finish without a `return` returns `none` there,
+so its return type is nullable: `func f(int n) { if (n > 0) return n; }`
+returns `int?`. The compiler knows a statement cannot finish when it is a
+`return`, a `throw` or a `rethrow` (or a `break` / `continue`, which leave
+it for its loop); a block holding such a statement; an `if` / `else`
+neither of whose branches can finish; a loop whose condition is always
+true (`while (true)`, `for (;;)`) and that has no `break` of its own; and
+a `try` whose body and every `catch` cannot finish, or whose `finally`
+cannot. So these return a plain `int`:
+
+```C#
+func first_over(array<int> a, int k) {
+    var i = 0;
+    while (true) {               # left only by the return (or an error)
+        if (a[i] > k) return a[i];
+        i++;
+    }
+}
+func parse_or(str s, int dflt) {
+    try {
+        return int(s);
+    } catch (InvalidValueEx) {
+        return dflt;
+    }
+}
+```
+
+A condition counts as always true only when it is a constant (`true`, `1`,
+a `const` that is true); a loop over `runtime(true)` may end, as far as the
+compiler knows, and its function stays nullable.
 
 #### Speed
 
@@ -1047,12 +2065,26 @@ a few difference from `C` worth pointing out:
     compile error, as in C), not as `-(-1)`; write `- -1` or `-(-1)` for double
     negation.
 
+  - The **initializer** and the **increment** of a `for` may be any
+    expression, as in `C`: `for (tick(); i < n; tick())` calls `tick()`
+    once before the loop and again after every pass, and a value nobody
+    reads (`for (0; i < n; i++)`) is computed and dropped - an error it
+    raises is still raised.
+
   - To declare multiple variables, use the syntax: `var a, b = [3,4];` or
     just `var a,b,c,d = 0;` if you want all the variables to have the same
     initial value. When the right-hand side is an **array**, it is destructured
     **strictly** — it must have exactly as many elements as there are targets
     (`var a, b, c = [1, 2];` is an error, as is `var a, b = [1, 2, 3];`). A
     **non-array** value is spread to every target (the `var a,b = 0` case).
+    An array **literal** on the right is unpacked element by element, each
+    **as written**: `x, y = [12, 2.5]` means `x = 12; y = 2.5` (at once), so
+    `x` gets the int `12` - although the literal as a value, say stored in a
+    variable, would be an `array<float>` holding `12.0`. The same holds for
+    a `const` multi-declaration: `const x, y = [12, 2.5];` makes `x` the int
+    `12`, and its targets may be containers too -
+    `const a, b = [[1], {"k": 2}];` binds two deeply read-only constants,
+    exactly as `const a = [1]; const b = {"k": 2};` would.
 
   - Use `_` as a **placeholder** for a destructured entry you don't want:
     `var a, _, b = [1, 2, 3];` binds `a == 1`, `b == 3` and drops the middle.
@@ -1064,7 +2096,9 @@ a few difference from `C` worth pointing out:
     compile error.
 
   - To increase the value of multiple variables use the syntax:
-    `a, b += [1, 2]`. In the extremely rare and complex cases when in the
+    `a, b += [1, 2]` - each target gets `target + element`, and an operator
+    that cannot apply to a target and its element is a compile error, as
+    for a single `a += 1`. In the extremely rare and complex cases when in the
     *increment* statement of the for-loop we need to assign to each variable
     a new variable using different expressions, take advantage of the
     expansion syntax in assignment: `i, j = [i+2, my_next(i, j*3)]`.
@@ -1094,6 +2128,13 @@ foreach (var k, v in d) {
 ```
 
 To iterate only through each key, just use `var k in d` instead.
+A dict entry is exactly a key and a value: a third loop variable is an
+error, never a `none` (a compile error when the container is known to be
+a dict, a `TypeErrorEx` at the container when it is `dyn`):
+
+```C#
+foreach (var k, v, w in d) { }   # error: a dict entry is a key and a value
+```
 
 #### Optional `var`
 
@@ -1114,6 +2155,58 @@ foreach (var e in arr) { ... }    # OK: `var` shadows intentionally
 
 (Note: this differs from a previous behavior where a bare name reused an
 existing variable. A `foreach` loop variable is now always a fresh declaration.)
+
+#### Modifying the container during the loop
+
+The loop body may change the very array or dictionary it is walking; the
+result is defined, and identical in every engine:
+
+  * **An array** loop runs over the length the array had when the loop
+    **started** - elements the body appends (with `append`, `push`, `+=`,
+    or an `insert` at the end) are not visited. Each element is read when
+    its turn comes, so a store the body makes to a *later* element is seen,
+    and `sort`/`reverse` (which reorder the elements in place) are seen the
+    same way; the loop variable itself is a copy (storing over the current
+    element does not change it). But if the body **moves** elements - a
+    `pop`, an `erase`, or an `insert` anywhere but the end, through any
+    variable that refers to the array, or in a function it calls - the loop
+    raises `OutOfBoundsEx` (at the container) when its next step comes,
+    even if the length is back where it was. Moving elements under the loop
+    would otherwise make it silently skip one element or visit another
+    twice. A loop over a **slice** walks that slice: changing the array the
+    slice was taken from never affects it, while a change made through
+    another name holding the same slice is seen like any change to the
+    array being walked (a removed or moved element raises as above).
+  * **A dictionary** loop visits each key the dictionary held when the loop
+    started, once, in the dictionary's order, **if the key is still there
+    when its turn comes**, with
+    its value at that moment. Keys the body inserts are not visited, keys it
+    erases before their turn are skipped.
+  * Reassigning the loop's container **variable** does not affect the loop:
+    it keeps walking the value it started with.
+
+```C#
+var a = [1, 2, 3];
+foreach (x in a)
+    append(a, x);                 # visits 1, 2, 3; a is now 6 long
+
+var d = {"a": 1, "b": 2, "c": 3};
+foreach (k in d)
+    erase(d, k);                  # fine: every key is visited, d ends empty
+
+var b = [1, 2, 3, 4];
+foreach (x in b)
+    pop(b);                       # OutOfBoundsEx on the second iteration
+
+var c = [10, 20, 30, 40];
+foreach (x in c) {
+    print(x);                     # prints 10, 20 - then OutOfBoundsEx:
+    if (x == 20) {                # the erase moved 30 into the place
+        erase(c, 0);              # already visited, so the loop would
+        append(c, 5);             # have skipped it
+    }
+}
+```
 
 #### Extra features: the "indexed" keyword
 
@@ -1212,6 +2305,24 @@ var add = func (x, y) => x + y;
 Note: when creating function objects in expressions, we're not allowed to assign
 them a name.
 
+Being a regular symbol, a function's name can be **reassigned** - to another
+function or a lambda with a compatible signature - and every later call through
+the name reaches the new value, including calls from inside other functions
+and a recursive function's calls to itself:
+
+```C#
+func sq(x) { return x * x; }
+func ng(x) { return 0 - x; }
+func use(y) => sq(y) + 1;
+print(sq(3), use(2));      # 9 5
+sq = ng;
+print(sq(3), use(2));      # -3 -1
+```
+
+The exception is a `pure func` (see [Pure functions](#pure-functions)): its name
+is a compile-time binding, like a `const`, so reassigning it is a compile-time
+`CannotRebindConstEx` (and so is reassigning a struct's name).
+
 **Function scope is lexical, like a variable's.** A named function (or struct)
 declared inside a block — an `if`/`for`/`{ }` body, or another function's body —
 is **scoped to that block**: it is visible from its declaration to the end of
@@ -1230,6 +2341,77 @@ function declared at the **outermost (program) scope** is visible everywhere
 
 A `var`-bound lambda (`var f = func(x) => x;`) follows ordinary variable scope.
 
+##### How a lambda's un-annotated parameters get their types
+
+A lambda with un-annotated parameters is typed from the places it is
+**called**, and there are two regimes:
+
+* a **non-capturing** lambda bound to a write-once variable that is only
+  ever called is a *template*, so it is monomorphized per call signature -
+  `f(1)` and `f("hi")` simply produce two typed instances. Each call still
+  reads `f` first, so a call made before `var f = ...` has run raises
+  `UnboundSymbolEx`, as it does for any other variable;
+* a **capturing** lambda is not, so all of its call sites *join* into one
+  parameter type. Two numeric argument types widen (`int` and `float` give
+  `float`, and the `int` argument is then coerced); two irreconcilable ones
+  are a compile error.
+
+**A joined parameter binds exactly like a declared one.** Once the call sites
+make `x` a `float`, `x` behaves as if written `float x`: an `int` (or `bool`)
+argument is converted when it is bound, so `f(1)` receives `1.000000`, not `1`;
+likewise a parameter joined to `int` converts a `bool` argument to `0`/`1`; and
+a `dyn` argument whose value does not fit throws `TypeErrorEx` at the call. The
+same holds for an un-annotated `opt` parameter of a named function, whose call
+sites join the same way (`func o(opt z)` called with `3` and `1.5`).
+
+```C#
+var b = 2;
+var f = func [b] (x) { return x; };
+print(f(1), f(2.5));      # 1.000000 2.500000
+```
+
+**How the closure reaches the call makes no difference.** Bound directly to a
+variable, returned from a factory, or read out of a container - as long as the
+compiler can tell *which* closure is being called, every call site joins:
+
+```C#
+func make_adder(n) {
+  var base = n * 10;
+  return func [base] (x) { return base + x; };   # `x` is int below
+}
+
+var add = make_adder(3);
+print(add(4));            # 34 - `x` is typed `int` from this call site
+```
+
+```C#
+func make_f(n) => func [n] (x) { return typestr(x); };
+var f = make_f(1);
+print(f(1) + " " + f(2.5));      # float float - int widened to float
+
+var base = 20;                                    # the same, written
+var g = func [base] (x) { return typestr(x); };   # directly
+print(g(1) + " " + g(2.5));      # float float - identical
+```
+
+What *does* stop the typing is not knowing **which** closure a call reaches.
+When a value may hold more than one, nothing is attributed to either and their
+parameters stay `dyn` - which is why the two closures below keep working with
+arguments of different types:
+
+```C#
+func mk_a(n) => func [n] (x) { return "a" + str(x); };
+func mk_b(n) => func [n] (x) { return "b" + str(x); };
+
+func pick(int k) {
+  var ops = [mk_a(1), mk_b(2)];
+  var p = ops[k];               # may be either closure
+  var q = ops[k + 1];           # ...so neither gets typed
+  return p(7) + q("s");         # both fine: their `x` stays dyn
+}
+```
+
+
 #### Const parameters
 
 A parameter can be declared `const`, which forbids reassigning it in the body:
@@ -1241,11 +2423,15 @@ func f(const x, y) {
 }
 ```
 
-Reassigning a `const` parameter is a compile-time error. A non-const parameter
-stays mutable, and - since parameters are passed by value - a function (even a
-`pure` one) may freely reassign its own non-const parameters without affecting
-the caller. A plain parameter that is never reassigned anywhere in the body is
-treated as *effectively const* automatically.
+Reassigning a `const` parameter is a compile-time error, and so is writing a
+field of the struct it holds (a struct is a value - see *Structs*). It protects
+the parameter, not an array or dict it holds, which is the caller's: through
+`const a`, `a[0] = 9` and `append(a, 9)` change the caller's array (a
+constant passed in stays read-only, as everywhere). A non-const
+parameter stays mutable, and - since parameters are passed by value - a
+function (even a `pure` one) may freely reassign its own non-const parameters
+without affecting the caller. A plain parameter that is never reassigned
+anywhere in the body is treated as *effectively const* automatically.
 
 #### Typed parameters
 
@@ -1383,6 +2569,16 @@ c1: 10
 c1: 11
 ```
 
+A capture of a **constant** works the same way: the closure gets its own
+copy of the constant's value, which it may change like any captured
+variable, while the constant itself stays what it is:
+
+```C#
+const K = 5;
+var next = func [K] { K += 1; return K; };
+print(next(), next(), K);   # Will print 6 7 5
+```
+
 ### Calling functions during const-evaluation
 
 Regular user-defined function objects (including lambdas) are not considered
@@ -1416,13 +2612,21 @@ To overcome the just-described limitation, `MyLang` has a special syntax for
 *both* during const evaluation and during runtime *but* the function cannot
 see global variables, nor capture anything: it can only use constants and the
 value of its parameters: that's exactly what we need during const evaluation.
+"Constants" means every constant in scope where the function is **declared** -
+scalars, but also const arrays, dicts and struct values, and other pure
+functions - and it holds when the call is itself const-evaluated:
+`const A = [1, 2]; pure func f(i) => A[i]; const Z = f(1);` gives `Z == 2`.
 For example, to generate `sorted_people` during const evaluation it's enough to
 write:
 
-A pure function must have **no observable side effects**. Because arrays, dicts
-and structs are passed **by reference**, *modifying one that was passed in*
-(`a[i] = v`, `a.field = v`, `append(a, x)`, ...) is a side effect visible to the
-caller — so a function that does it is **not** pure. A pure function may still:
+A pure function must have **no observable side effects**. Because arrays and
+dicts are passed **by reference**, *modifying one that was passed in*
+(`a[i] = v`, `d.key = v`, `append(a, x)`, ...) is a side effect visible to the
+caller — so a function that does it is **not** pure. (A struct is a value: a
+function changing a field of a struct parameter changes its own copy, which the
+caller never sees. The purity check does not yet tell a struct's field from a
+dict's key, so `p.field = v` on a parameter still makes a function impure.) A
+pure function may still:
 modify a **scalar** parameter (`int`/`float`/`bool` are passed by copy), and
 freely build and modify **fresh local** containers (a `var r = [...]` declared
 inside the function and returned). So `func mk(n) { var r = [0,0]; r[0] = n;
@@ -1449,42 +2653,21 @@ print(add2(non_const));
 print(add2(5));
 ```
 
-The abstract syntax tree that language's engine will use at runtime will be:
+The second call is run at compile time. `-s` prints the tree twice: first
+as parsed, then as the engine runs it. A constant call to a user function is
+folded once the whole program is typed (see below), so it is still a call in
+the first tree, and the second tree, the one the engine runs, ends with:
 
 ```
 $ ./build/mylang -s t
-Syntax tree
---------------------------
-Block(
-  FuncDeclStmt(
-    Id("add2")
-    <NoCaptures>
-    IdList(
-      Id("x")
-    )
-    Expr04(
-      Id("x")
-      Op '+'
-      Int(2)
-    )
-  )
-  VarDecl(
-    Id("non_const")
-    Op '='
-    Int(25)
-  )
-  CallExpr(
+...
+  DirectBuiltinCallExpr(
     Id("print")
     ExprList(
-      CallExpr(
-        Id("add2")
-        ExprList(
-          Id("non_const")
-        )
-      )
+      Int(27)
     )
   )
-  CallExpr(
+  DirectBuiltinCallExpr(
     Id("print")
     ExprList(
       Int(7)
@@ -1496,9 +2679,80 @@ Block(
 7
 ```
 
-As you can see, in the first case an actual function call happens because
-`non_const` is not a constant, while in the second case it's AS IF we passed
-a literal integer to `print()`.
+As you can see, in the second case it's AS IF we passed a literal integer to
+`print()`. (So is the first case here: the optimizer saw that `non_const` is
+never changed, and folded it too - an actual call happens only for a value
+known when the program runs.)
+
+#### A call at compile time computes what it computes at run time
+
+A function run at compile time gives the same answer as the same call made
+when the program runs. Type inference changes what a function computes, so
+before the compiler runs a function it infers the function's types for the
+call's argument types, just as it does for the program:
+
+```C#
+pure func f(int n) {
+    var x = n;          # x is a float: it is assigned 2.5 below
+    var r = str(x);
+    x = 2.5;
+    return r;
+}
+const R = f(3);
+print(R, f(int(runtime(3))));       # 3.000000 3.000000
+```
+
+This holds for every call the compiler makes: a `const` initializer, a
+constant call it folds inside an expression, a struct's `const` member, and a
+callback that a const builtin calls (`map`, `sort`, ...). The call is typed
+exactly as written, with the functions and constants it reaches. A function
+template gets one instance per argument signature, as in the program (see
+[Static type inference](#static-type-inference)). A const builtin given a
+function is typed as written too, so a callback's parameter takes the
+container's element type, as it does at run time:
+
+```C#
+const C = [1, none];
+const T = map(pure func(opt v) { var w = v; w = 0.5; return typestr(w); }, C);
+print(T);                           # ["float?", "float?"]
+```
+
+A function can also be reached through a **value**, and then it is typed the
+way the program types it. Suppose the value is a name bound to the function:
+`const G = show;`, a function another function returned, or a function passed
+as an argument. Then a call through it uses the template's instance. Suppose
+instead the function is read out of a constant container: `const OPS =
+[show];` and `OPS[0](4)`. Then the call runs the untyped template, because the
+program cannot redirect a value stored inside a constant to an instance.
+
+A type error in that typed code is a compile error, with the program's caret:
+`pure func bad(x) { var y = x; y = "s"; return 1; }` makes `const Z =
+bad(3);` an error, just as `bad(int(runtime(3)))` is.
+
+Some types are decided by joining every place in the program: an
+un-annotated `opt` parameter takes all its call sites, a lambda's parameter
+does the same (unless the lambda is written as a builtin's argument, whose
+call is its only one), and a template called through a value gets an instance
+only if every call through that value agrees on the argument types. A constant
+call inside an expression takes part in those joins as any call does: the
+compiler computes it while parsing, but replaces it by its value only once the
+whole program is typed, and only when that value already has the type the
+program gives the call and each argument already has its parameter's type.
+Otherwise the call runs when the program runs:
+
+```C#
+pure func id(opt v) => v;          # v joins int and float: a float
+var x = id(2);
+print(x, id(2.5));                 # 2.000000 2.500000
+```
+
+There is one limit. Where the value is needed while compiling - a `const`
+initializer, a condition the compiler decides, a struct's `const` member - and
+for a join the call reaches only inside the function it calls, the compiler
+uses only the compile-time call itself, because it has not yet seen the rest
+of the program. With type inference off (`-nti`), compile-time calls and
+run-time calls both run untyped, so the first example of this section prints
+`3 3`.
 
 #### Automatic pure promotion
 
@@ -1553,6 +2807,22 @@ Note: if an exception is generated by constant expressions (e.g. `int("blah")`),
 during the const-evaluation, the error will be reported directly, bypassing any
 exception handling logic. The reason for that is to enforce *early failure*.
 
+**Some errors cannot be caught.** A few exceptions report a condition the
+script must not handle - `InternalErrorEx` (a bug in the interpreter itself),
+`UndefinedVariable`, and `CannotRebindConstEx` / `CannotRebindBuiltinEx`
+(an assignment to a const or to a builtin's name - a compile error in a
+script, raised when it runs in the REPL). Naming one in a `catch`
+clause is a compile error, and a bare `catch { }` will not swallow one
+either:
+
+```C#
+try { ... } catch (InternalErrorEx) { ... }   # ERROR at compile time
+try { ... } catch { ... }                     # never handles those
+```
+
+They are still *reported* like any other runtime error - same message, caret
+and backtrace - and a `finally` on the way out still runs.
+
 Multiple `catch` statements are allowed as well:
 
 ```C#
@@ -1597,6 +2867,20 @@ exceptions that can be caught with `try-catch` blocks is:
   * KeyNotFoundEx
   * CannotOpenFileEx
   * StackOverflowEx
+  * OutOfMemoryEx
+  * InvalidArgumentEx (a builtin got a bad argument *value*, e.g. `max` of an
+    empty array)
+  * InvalidNumberOfArgsEx (a builtin call with the wrong number of arguments —
+    builtins validate arity at *runtime* — and a function reached through a
+    `dyn` value, or called back by a builtin, that takes another number of
+    parameters than it is given: `filter(func() => true, [1])` passes its
+    callback one argument)
+  * CannotChangeConstEx (a `const`/read-only container mutated through a
+    mutating builtin — `append`/`push`/`insert`/`erase`/`sort`; the const-ness
+    is a *runtime* property, e.g. an aliased const passed as a parameter)
+  * InvalidValueEx (a value a builtin cannot use, e.g. `int("3.7")`)
+  * UnboundSymbolEx (a name read before its declaration has run - see
+    `isbound`)
 
 Other exceptions like `SyntaxErrorEx` cannot be caught, instead.
 
@@ -1609,6 +2893,25 @@ far deeper than the old process-stack bound) and can be changed with the
 `MYLANG_VM_STACK` environment variable (a slot count). The tree-walking
 engine still relies on the process stack, so an uncatchable crash remains
 possible there for extreme depths.
+How DEEP a program can recurse - like how fast it runs and how much memory
+it can use - is a property of the engine and the environment, not of the
+language: the native-code tier may carve some frames from the machine stack
+and go deeper than the interpreter, so the depth at which `StackOverflowEx`
+is raised can differ between engines and configurations. What does not
+differ is that it IS raised, catchably, rather than the process crashing.
+
+`OutOfMemoryEx` ("Out of memory") is raised, catchably, when the program
+asks for memory the system refuses - in every engine, with the usual caret
+and backtrace. A builtin that builds a result of a size the program gives
+(`range`, `array(n)`, `make_array`, `lpad` / `rpad`) reserves the whole
+result before filling it, so a size that cannot be served raises at the
+size argument and nothing is half-built (`make_array` runs no callback):
+`array(1 << 59)` is an `OutOfMemoryEx`, not a crash. A container or string
+growing until memory runs out (`s += s` in a loop) raises it at the
+operation that asked for more. Like recursion depth, HOW MUCH memory a
+program may use belongs to the environment; one thing no language can
+define is an operating system that over-commits memory and then kills the
+process outright instead of refusing the request.
 It's also possible in `MyLang` to catch ANY exception use a catch-anything
 block:
 
@@ -1623,10 +2926,26 @@ try {
 }
 ```
 
+To see what was caught, write the catch-anything as `catch (dyn as e)`: it
+catches everything `catch { }` does and binds the exception to `e`, a `dyn`
+variable - the struct instance for a thrown struct (whatever its type, a
+function's private struct included), a printable exception object for a
+built-in one. It is the last clause of its `try`, after any typed ones:
+
+```C#
+try {
+    run_job();
+} catch (TypeErrorEx) {
+    print("bad input");
+} catch (dyn as e) {
+    print("job failed:", e);
+}
+```
+
 ### Structs
 
 `struct` declares a C-like value type with explicitly-typed fields and
-type-level `const`s (no methods in v1):
+type-level `const`s (no methods yet):
 
 ```C#
 struct Point {
@@ -1651,30 +2970,117 @@ call and reuses the same argument rules — positional, named (`x: v`), and mixe
 wrong-typed, missing, extra, reordered, or unknown-named field is a compile
 error.
 
+The type's name can also be used as a **value** - a constructor passed
+around. Like a builtin used as a value it is a `dyn`, so a variable holding
+it is declared `dyn`, and a call through it is checked when it runs:
+
+```C#
+func build(dyn mk, int n) => mk(n, n * 10);
+var dyn ctor = Point;
+print(build(Point, 1).y, ctor(2, 3).x);   # 10 2
+```
+
 **Fields take the same explicit types as variables** — `bool`, `int`, `float`,
-`str`, `array`, `dict`, another struct type, or `dyn`. v1 restrictions (to be
-lifted later): a field must have an explicit type (no `var`), and `opt` is
-allowed only on a `dyn`/`array`/`dict` field (a non-opt field is guaranteed
-never `none`). An uninitialised field-less use isn't possible — every field is
+`str`, `array<T>`, `dict<K, V>`, another struct type, or `dyn` (a bare `array`
+/ `dict` is refused: a field names its whole type). Two rules keep a
+struct a lean data container: a field must have an explicit type (no `var`),
+and `opt` is allowed only on a `dyn`/`array`/`dict` field or a field of a
+class type (see *Classes*; a non-opt field is guaranteed never `none`). An
+uninitialised field-less use isn't possible — every field is
 supplied at construction (or defaulted to `none` when an omitted optional).
+A field's struct or class type may be declared further down the program
+(`struct Line { Point a; Point b; }` above `struct Point`), but it must be
+declared somewhere: a field typed by a name that names no struct or class
+(`struct S { Nope x; }`) is a compile error, `'Nope' is not a type`, as
+for a variable. In the REPL a later input may still declare it.
+
+**A struct may have no fields.** `struct Unit {}` is legal, and so is one
+that declares only `const` members (`struct Marker { const TAG = 7; }` —
+consts are type-level, so such a struct is still field-less). A field-less
+struct constructs with `Unit()`, prints as `Unit()`, compares equal to every
+other instance of its own type (there is no state to differ by), hashes
+equal, and works as a dict key. Its most useful form is a **payload-less
+exception type**, since `throw` takes a struct instance:
+
+```C#
+struct Timeout {}
+
+try {
+    throw Timeout();
+} catch (Timeout) {
+    print("timed out");
+}
+```
 
 **Access.** `obj.field` reads/writes a field; `obj.CONST` / `Type.CONST` reads a
-const member. `.` means *field access* on a struct and *key access* on a dict —
+const member. A const member's initializer is a constant expression exactly as
+a `const` declaration's is, so it may hold any constant value - a struct or
+class instance included (`const ORIGIN = Point(0, 0);`). `.` means *field
+access* on a struct and *key access* on a dict —
 resolved by the base's type. Reading a field that doesn't exist is a compile
-error (for a statically-typed base).
+error (for a statically-typed base). A field WRITE is checked like a
+construction's field value - `p.x = "s"`, `p.x += 1.5` into an `int` field,
+or `none` into a non-`opt` one is a compile error - and so is a write into an
+element reached through a field or another element (`s.a[0] = v`,
+`append(s.a, v)`, `m[0][0] = v`), against the element type its declaration
+gives it - or, for a container whose type was inferred, the element type it
+was inferred with (`var m = [["x"]]; m[0][0] = 5;` is a compile error: a
+store into an element of an element does not widen `m` the way a store
+into `m`'s own element does). At run time a field store converts and checks
+its value exactly as the constructor does, whatever the struct's layout:
+`p.f = 2` into a `float` field stores `2.0`, a `bool` into an `int` field `0`
+or `1`, and a `dyn` value that does not fit the field raises `TypeErrorEx`.
 
-**Value semantics.** A struct is a value, with the same COW semantics as
-arrays/dicts: plain assignment **aliases** (`var q = p; p.x = 9` makes `q.x` 9
-too, like Python objects), while `clone()` makes an independent (shallow) copy
-and `deepclone()` a deep one. `==` is structural and field-wise between
-**same-type** instances (different struct types are never equal); structs are
-**hashable** (`hash()` combines the field hashes, so a struct can be a dict key).
-`print(p)` shows `Point(x: 1, y: 2)`.
+**Value semantics.** A struct is a **value**, like a C struct or a C#
+`struct`: every copy is independent. A copy is made wherever a struct moves to
+a new home — an assignment or declaration (`var q = p`), an argument, a return
+value, a `foreach` variable, a capture, an element or a field read
+(`var e = a[0]`) — so after `var q = p; q.x = 9`, `p.x` is unchanged, and a
+function changing a field of its parameter changes its own copy. The copy is
+**shallow**: the plain fields and the nested structs are copied, while an
+`array` or `dict` field is a reference (as everywhere in MyLang), so both copies
+see a change made *inside* it (`q.a[0] = 5`, `append(q.a, 5)`) and only the one
+copy sees it *replaced* (`q.a = [5]`). A store through a **location** writes the
+struct stored there: `a[i].x = v`, `d["k"].x += 1`, `p.inner.x = v` and
+`a[i].x++` change the element, the entry and the field in place. A store
+through a *value* writes that value's copy, which is then gone:
+`f().x = 1` changes nothing `f` can see (see *Storing through a value*).
+
+```C#
+struct Point { int x; int y; }
+var p = Point(1, 2);
+var q = p;            # a copy
+q.x = 9;              # p.x is still 1
+var pts = [p, q];     # each element a copy
+pts[0].x = 5;         # writes the element: pts[0].x is 5, p.x is still 1
+var e = pts[1];       # a copy of the element
+e.y = 0;              # pts[1].y is still 2
+```
+
+A copy costs nothing until something writes it: the implementation shares a
+struct between its copies and duplicates it on the first write through a copy
+that is not its only holder (copy on write), so passing a struct to a function
+that only reads it never copies it. `clone(p)` is the same shallow copy;
+`deepclone(p)` also copies the arrays and dicts inside. `==` is structural and
+field-wise between **same-type** instances (different struct types are never
+equal); structs are **hashable** (`hash()` combines the field hashes, so a
+struct can be a dict key). `print(p)` shows `Point(x: 1, y: 2)`.
 
 **`const` works fully.** A struct holds state only in instances, not in the
 type, so `const P = Point(1, 2)` is computed at compile time and is **deep
-read-only** — mutating a const instance's field is an error. `Type.CONST` folds
-at parse time. An `array` of a struct type infers as `array<Struct>`
+read-only** — writing a field of `P` is a compile error. A **copy** of a
+constant is an ordinary value: `var q = P; q.x = 5` changes `q` only (an array
+or dict field is still the constant's, read-only, so `q.a[0] = 1` raises
+`NotLValueEx`), and so is a constant passed to a parameter. A **`const`
+parameter**'s struct cannot be changed (C#'s `in`): writing a field of it —
+through struct fields only, `c.x = v`, `c.inner.x += 1`, `c.x++` — is a
+compile error when its type is known to be a struct; a write *into* an array,
+a dict, a box or a class instance it holds (`c.a[0] = v`, `append(c.a, v)`,
+`c.d.k = v`, `*c.b = v`, `c.node.val = v`) is a write into that reference and
+is allowed - replacing such a field (`c.b = box(1)`) is not. (A `dyn` const
+parameter is not checked: like
+any parameter it holds the call's own copy.) `Type.CONST` folds at parse time.
+An `array` of a struct type infers as `array<Struct>`
 (`var a = [Point(1,2), Point(3,4)]`).
 
 **Layout.** A struct whose fields are all `bool`/`int`/`float` (or other such
@@ -1682,15 +3088,21 @@ POD structs, embedded inline) gets a compact native-C byte layout, and an
 `array` of it is stored **flat/unboxed** — contiguous bytes, no per-element
 object — just like `array<int>` (`array_storage(a)` reports `"struct"`). A
 struct with any `array`/`dict`/`str`/`dyn`/`opt` field is stored as a boxed
-slot array instead. This is transparent: it changes only memory layout and
-speed, never behavior.
+slot array instead, as is a **field-less** struct (it has `size 0`, so there
+are no bytes to lay out and an `array` of it is a general array, never
+zero-stride). This is transparent: it changes only memory layout and speed,
+never behavior. Writing a field of an element - `a[i].x = v`, `a[i].x += 1`,
+`a[i].x++`, `a[i].inner.y = v` - stores into the array in place either way,
+and so does writing a field of a struct embedded inline (`p.inner.y = v`).
 
 **Recursive structs must use a nullable field.** A *non-opt* struct field whose
 type contains its own struct (directly, `struct N { N next; }`, or through a
 cycle of non-opt struct fields) is a **compile error** — such a value could
-never be constructed (it would nest forever). Make the back-edge **nullable** so
-it can terminate with `none`: write `dyn? next` (or `opt dyn next`). That is how
-you build a linked list or tree:
+never be constructed (it would nest forever). A non-opt **box** of such a
+struct counts too (`struct N { box<N> me; }`): a box always holds a value.
+Make the back-edge **nullable** so
+it can terminate with `none`: write `dyn? next` (or `opt dyn next`, or
+`opt box<N> me`). That is how you build a linked list or tree:
 
 ```
 struct Node {
@@ -1700,10 +3112,281 @@ struct Node {
 var list = Node(1, Node(2, Node(3, none)));
 ```
 
+A chain may be any length: dropping the head of a million-node list frees
+it without running out of stack, in every engine.
+
 Structs may be declared anywhere a statement is allowed, **including inside a
-function** (lexically scoped like a nested function). A struct's fields and
+function** (lexically scoped like a nested function). Such a struct is one
+type however the function is called: the values two calls return are
+instances of the same struct (they compare with `==`), also when the
+function is a template called with different argument types, and when a
+call is evaluated while compiling. A struct's fields and
 consts live in the struct's own namespace, so a struct `const PI` never clashes
 with a global `const PI`.
+
+#### Type aliases
+
+A `const` bound to a struct (or a class) is a **type alias**: another name
+for the same type, usable wherever the struct's own name is.
+
+```
+struct Point { int x; int y; const ORIGIN_X = 0; }
+const P = Point;
+
+P p;                        # a declaration: Point(x: 0, y: 0)
+func norm(P q) => q.x * q.x + q.y * q.y;
+array<P> pts = [P(1, 2), P(x: 3, y: 4)];
+print(P.ORIGIN_X, P == Point, typestr(P(5, 6)));    # 0 true Point
+try { throw Point(1, 1); } catch (P as e) { print(e.x); }
+```
+
+The alias is the struct itself, not a new type: a value constructed through
+it is a `Point` (`typestr` names `Point`, `==` compares it with any other
+`Point`), and the construction is checked against `Point`'s fields. The
+initializer may be any constant expression that yields a struct (another
+alias, a `pure` call returning one), and an alias may be declared inside a
+function like any `const`. A parameter, a loop or catch variable or a
+capture named like the alias hides it. A hidden alias in a type position or
+in a catch clause is an error (`'P' is not a type here: ...`). A binding
+named like the *struct* does not hide the alias: inside `func f(Point)`,
+`P p;` still declares a `Point` and `catch (P)` still catches one.
+
+An alias is a `const`, so it exists once its declaration has run, where a
+struct's own name can be used above its declaration. A construction through
+the alias that runs earlier - in a function called above `const P = Point;`
+- raises `UnboundSymbolEx`, as a read of any other global does (and is a
+compile error when the call can only fail).
+
+### Classes
+
+`class` declares a struct with **reference semantics**. Its declaration is a
+struct's - typed fields, `const` members, positional / named construction,
+zero-initialization (`Node n;`) - and so are field reads and writes. What
+differs is what a copy means:
+
+```C#
+class Node {
+    int val;
+    opt Node next;      # a field of the class's own type must be opt
+}
+
+var a = Node(1, none);
+var b = a;              # b and a are ONE object
+b.val = 2;              # a.val is 2 as well
+var list = Node(1, Node(2, Node(3, none)));
+
+func bump(Node n) { n.val += 100; }
+bump(a);                # a.val is 102: the function wrote the caller's object
+```
+
+- **A copy shares the object.** Assigning a class instance, passing it,
+  returning it, storing it in an array, a dict or a field, or binding it as a
+  `foreach` variable never copies it: a write through any holder (`b.val = 2`,
+  `arr[0].val = 2`, `n.val += 100`) is seen through every other one.
+  `clone(c)` makes a new instance with the same fields (shallow), and
+  `deepclone(c)` copies everything reachable from it.
+- **`==` and `!=` compare identity.** Two instances are equal only when they
+  are the same instance; equal fields do not make them equal. `hash(c)` goes
+  by identity too, so a class instance is a dict key by **identity**: it is
+  not frozen when it is inserted (its hash does not depend on its fields), and
+  changing its fields afterwards leaves it findable. The hash of an instance is
+  the same in every run and every engine.
+- **A struct holding a class field copies the reference.** `var s2 = s1;` gives
+  `s2` its own copy of every plain field, and the same object in a class field:
+  `s2.n.val = 7` is seen through `s1`, `s2.n = Node(0, none)` rebinds `s2`'s
+  field only. A struct field inside a class lives in the class object.
+- **`const` freezes the whole object.** `const c = Node(1, none)` is built at
+  compile time and is deep read-only: writing one of its fields through any
+  alias (`var d = c; d.val = 5`, or a function parameter bound to it) raises
+  `CannotChangeConstEx`, and so does a mutating builtin on an array it holds.
+  Each `const` declaration makes its own instances: `const a = Node(1, none);
+  const b = Node(1, none);` are two objects (`a == b` is false).
+- **A field of the class's own type must be `opt`** - a non-`opt` one could
+  never be constructed (the first instance would need an existing one), and is
+  a compile error. `opt` is allowed on a class-typed field (`opt Node next`, or
+  `Node? next`), which holds `none` or an instance; it is not allowed on a
+  struct-typed field.
+- **A pure function cannot construct a class instance**: each construction is
+  a new object, so the call cannot be folded or shared. `pure func mk() =>
+  Node(1, none);` is a compile error, and a plain function that constructs one
+  is never inferred pure.
+- **An array of class instances holds references.** An `array<Node>` (or
+  `array<Node?>`, whose elements may be `none`) stores one reference per
+  element, not a copy, so `arr[i].val = 2` writes the instance every other
+  holder sees, and `var x = arr[i]` is that instance too. A class may hold an
+  array of itself: `class Tree { int v; array<Tree> kids; opt Tree parent; }`
+  (the class's own name is a type inside its declaration). Such an array is
+  stored compactly (`array_storage` reports `"class"`); storing anything else
+  in it through a `dyn` alias turns it into an ordinary array first - no
+  behavior changes.
+- `kindstr(c)` is `"class"`; `typestr(c)` is the class's name.
+
+A class instance can refer to itself, directly or through others
+(`a.next = a`). Printing, comparing and copying such a value terminate (see
+*Values that contain themselves*), but the memory of a ring that nothing else
+refers to is not reclaimed yet - the open design question is recorded in
+`plans/reference-cycles.md`.
+
+### Casts
+
+`cast<T>(x)` converts `x` to **exactly** the type `T`, when the program
+runs. `cast` is a keyword; `T` is any complete type, written as a
+declaration writes it - a scalar, `T?`, a struct or class name, a type
+alias, `box<...>`, `array<...>`, `dict<...>`, nested as deep as you like.
+A bare `array` or `dict` (`cast<array>(x)`) leaves the element type open,
+so it is refused at compile time: the cast's type is what it makes. The
+result's static type is `T`, and the value has exactly that type (a
+container carries `T` as its own type).
+
+```
+array<int> xs = [1, 2, 3];
+var fs = cast<array<float>>(xs);    # a NEW array<float>: [1.0, 2.0, 3.0]
+var n = cast<int>("42");            # 42
+var on = cast<bool>("Yes");         # true
+var dyn v = runtime("2.5");
+float f = cast<float>(v);           # 2.5
+```
+
+**Scalars** convert both ways:
+
+| to \ from | `bool`     | `int`        | `float`        | `str`         |
+|-----------|------------|--------------|----------------|---------------|
+| `bool`    | same       | 0 / 1 only   | 0.0 / 1.0 only | the words     |
+| `int`     | 0 / 1      | same         | = `int(f)`     | = `int(s)`    |
+| `float`   | 0.0 / 1.0  | = `float(i)` | same           | = `float(s)`  |
+| `str`     | = `str(b)` | = `str(i)`   | = `str(f)`     | same          |
+
+  * A float becomes an int as [`int()`](#intvalue) makes one: it is
+    truncated, and a NaN, an infinity or a value outside the int range
+    is refused. A string becomes a number as `int()` / `float()` read
+    one: the whole string is the number.
+  * A number becomes a bool only from 0 or 1 (0.0 or 1.0).
+  * A string becomes a bool from one of these words, in any case and
+    with nothing around it: `true`, `yes`, `on`, `enabled` give `true`;
+    `false`, `no`, `off`, `disabled` give `false`.
+  * Only a scalar becomes a `str`: `str(x)` still prints a container,
+    but `cast<str>` of one is refused.
+
+**`none`, `T?` and `dyn`.** `cast<T?>` lets `none` through and casts any
+other value to `T`; a `T` without `?` refuses `none`. `cast<dyn?>(x)`
+always succeeds and keeps the value as it is - only its static type
+changes; `cast<dyn>(x)` is the same once it has checked that `x` is not
+`none`.
+
+**Containers.** `cast<array<E>>(a)` and `cast<dict<K, V>>(d)` build a
+NEW container of the type `T`, stored as `T` stores it (an
+`array<int>` flat, an `array<dyn>` general), converting each element -
+each key and value - by these rules, at every level. A nested container
+that already has its target type is not copied: the new container
+shares it, as a shallow copy would. Under a `dyn` element type the
+elements are kept as they are. A dict keeps its order and its default
+(converted too). Two keys that become the same key (`"1"` and `"01"`
+both become `1`) are refused, naming both: one of the entries would be
+lost. An array never becomes a dict, nor a dict an array.
+
+```
+dict<str, int> d = {"a": 1, "b": 2};
+var f = cast<dict<str, float>>(d);       # {"a": 1.0, "b": 2.0}
+var dyn rows = runtime([[1, 2], [3]]);
+var m = cast<array<array<int>>>(rows);   # typed array<array<int>>
+var dyn mixed = cast<array<dyn>>(xs);    # a general copy of xs
+append(mixed, "x");                      # now it can hold anything
+```
+
+**Structs, classes, boxes.** The value must already be that struct, that
+class or that box type (a `dyn` holding one is checked when the cast
+runs); the cast returns a copy - a class instance comes back as a NEW
+instance with the same field values, a box as a new box.
+
+**Failures.** A value the conversion cannot take raises
+`InvalidValueEx` (`"abc"` to an `int`, `2` to a `bool`, NaN to an `int`,
+two colliding keys); a value of the wrong kind raises `TypeErrorEx` (an
+array to an `int`, a struct `Q` to `P`, `none` to a type without `?`).
+The message names where inside the value the problem is, and the caret
+marks the cast's argument:
+
+```
+var dyn x = runtime(["1", "x"]);
+cast<array<int>>(x);   # InvalidValueEx: cast<array<int>>: [1] "x" is not
+                       # an int
+```
+
+Nothing is changed when a cast fails: the source is never written, and
+no partial result is left anywhere.
+
+**At compile time.** A cast that no value of its argument's type could
+survive is a compile error (`TypeMismatchEx`): `cast<int>(xs)` with `xs`
+an `array<int>`, `cast<array<int>>(5)`, `cast<P>(q)` with `q` a `Q`,
+`cast<dyn>(none)`. A cast of a constant is evaluated while compiling, so
+one that fails (`cast<int>("abc")`) is a compile error too, as
+`int("abc")` is. A `const` bound to a cast holds the cast's value, and
+like every constant its type is that value's exact type: `const K =
+cast<array<int?>>([1, 2]);` is an `array<int>`, since no `none` can ever
+be stored into a constant.
+
+### Boxes
+
+A **box** is a reference to one value: `box(v)` makes one, and the prefix
+operator `*` reads and writes the value it holds. Every copy of a box - a
+variable, a parameter, an array element, a field, a capture - is the SAME
+box, so a write through one is seen through all of them:
+
+```C#
+var b = box(5);         # a box<int>
+var c = b;              # the same box
+*c = 7;                 # *b is 7 as well
+*b += 1;  (*b)++;       # 9
+
+func bump(box<int> n) { *n += 1; }
+bump(b);                # *b is 10: the function wrote the caller's box
+
+struct P { int x; int y; }
+var bp = box(P(1, 2));  # a box<P>: the struct, shared
+bp.x = 5;               # fields are read and written directly
+var q = *bp;            # a COPY of the struct, a value
+*bp = P(3, 4);          # the box takes new fields - it stays the same box
+```
+
+- **What `box(v)` makes depends on `v`.** An `int`, a `float`, a `bool` or a
+  `str` gives a `box<int>` ... `box<str>`; a struct value gives a `box<P>`
+  holding a copy of it. A value that is a reference already - an array, a
+  dict, a function, a class instance, a box - is returned **as it is**, so
+  `box(arr) == arr`. A possibly-`none` argument is a compile error (box the
+  value it holds); a `dyn` holding `none` raises `TypeErrorEx`. `box()` is an
+  ordinary run-time builtin - it is never folded, so `const k = box(1)` is a
+  compile error, and a function that calls it is never inferred pure.
+- **`box<T>` is a type** - in a declaration (`box<int> n;`, whose zero value
+  is a fresh `box(0)`), a parameter, a struct field, an array element
+  (`array<box<int>>`). `T` is a `bool`, `int`, `float`, `str` or struct
+  type; `box<array<int>>` is a compile error (an array is a reference
+  already). A `box<int>` is not a `box<float>`, in either direction, and a box
+  is never `none` unless it is `opt` (`opt box<int> b;`, narrowed as usual
+  before `*b`).
+- **`*b` is a value and a location.** `*b` reads the value (a copy, for a
+  `box<P>`); `*b = v`, `*b OP= v`, `(*b)++` and `--*b` write it. A value that
+  does not fit the box is a compile error when its type is known (`*b = "s"`
+  into a `box<int>`), and a `TypeErrorEx` at the `*b` when it is not (a
+  `dyn`); an `int` stored into a `box<float>` becomes a float, and the value
+  of `*b = v` is the stored value. `*` of something that is not a box is a
+  compile error, or a `TypeErrorEx` for a `dyn`; reading a box of another
+  element than its static type says (one a `dyn` passed in) raises at the
+  `*` too, so a typed reader never meets a misfit. `*` is a prefix operator
+  like `-`: `*b++` is `*(b++)`, which `++` on a box refuses - write `(*b)++`.
+- **A box used as its value is a compile error naming the fix**: `b + 1`, or
+  `b` passed for an `int` parameter, says *`'b' is a box: read its value with
+  *b`*.
+- **A `box<P>` behaves as a class instance does** (see *Classes*): its fields
+  are read and written directly (`bp.x += 1`, `bp.inner.y++`,
+  `append(bp.xs, 3)`) in the one shared struct, `==` and `hash()` go by
+  identity, and an `array<box<P>>` holds references (`array_storage` reports
+  `"class"`).
+- **`==` and `hash()` go by identity** for every box, so a box is a dict key by
+  identity, and `box(1) == box(1)` is false. `clone(b)` and `deepclone(b)`
+  make a NEW box holding a copy of the value.
+- A `const` parameter's box is read-only in the function: `*b = v` and
+  `b.x = v` on it are compile errors.
+- `print(b)` shows `box(5)` / `box(P(x: 1, y: 2))`; `kindstr(b)` is `"box"`;
+  `typestr(b)` is `box<int>` / `box<P>`.
 
 ### Custom exceptions
 
@@ -1729,9 +3412,31 @@ try {
 
 `throw MyError(...)` constructs the struct (positional, named, or mixed
 arguments — exactly like any struct construction) and throws it. The matching
-`catch (MyError)` selects the clause **by the struct type's name**, and
-`catch (MyError as e)` additionally binds `e` to the thrown instance, so
-`e.msg` / `e.code` read its fields.
+`catch (MyError)` selects the clause **by the struct type itself**: the name
+is resolved where the clause is written, exactly like the type in
+`MyError e;` (a type alias names its struct), and the clause catches that
+struct only. `catch (MyError as e)` additionally binds `e` to the thrown
+instance, with the type `MyError`, so `e.msg` / `e.code` read its fields and
+a field it does not have is a compile error.
+
+Two structs with the same name are two types. A struct declared inside a
+function is that function's own: a clause outside it cannot name it - the
+name there means another struct, or nothing - so such an exception is caught
+outside only by a catch-all. A name that is neither a struct visible where
+the clause is written nor a built-in exception is a compile error:
+
+```C#
+func load() { struct Err { int code; } throw Err(7); }
+struct Err { bool ok; }
+
+try { load(); } catch (Err) { ... }         # not caught: load's Err is
+                                            # another type
+try { load(); } catch (dyn as e) { print(e); }   # Err(code: 7)
+try { load(); } catch (Nope) { }            # ERROR: 'Nope' is not a type
+```
+
+(In the REPL a later input may declare the struct, so there a name no
+struct takes yet matches the thrown struct by its name.)
 
 As with built-in exceptions, a single `catch` may list several types, and a
 catch variable bound with `as` is available in the handler:
@@ -1747,10 +3452,10 @@ try {
 }
 ```
 
-When the same handler catches more than one struct type, only the fields the
-types have in common are safe to read (the bound `e` is dynamically typed, so
-field access is resolved at run time). A struct exception that no `catch`
-clause matches propagates outward like any other exception.
+When the same handler catches more than one type, only the fields the
+types have in common are safe to read (the bound `e` is then dynamically
+typed, so field access is resolved at run time). A struct exception that no
+`catch` clause matches propagates outward like any other exception.
 
 A payload-less exception is simply a struct with no relevant fields (or one
 whose fields you ignore):
@@ -1761,7 +3466,11 @@ throw Stop(0);
 ```
 
 Only a struct instance can be thrown; `throw 5` or `throw "oops"` is a compile
-error.
+error, and so is throwing a value that can only be `none` (`throw none`, a
+variable nothing but `none` is ever stored in, the result of a function that
+returns nothing). A value that *may* be `none` - an `opt` struct, or a `dyn`
+variable that starts as `none` and later holds a caught exception - is checked
+when it is thrown: if it is `none` then, the `throw` raises `TypeErrorEx`.
 
 ### Re-throwing an exception
 
@@ -1777,6 +3486,24 @@ try {
 
     print("Something went wrong!!");
     rethrow;
+}
+```
+
+`rethrow` raises the exception again where it stands, as Python's `raise`
+and C#'s `throw;` do: the nearest handler around the `rethrow` gets it,
+and that is a `try` inside the catch body when there is one.
+
+```C#
+struct E { int v; }
+
+try {
+    throw E(1);
+} catch (E as e) {
+    try {
+        rethrow;
+    } catch (E as again) {
+        print("caught again");      # runs: the inner catch takes it
+    }
 }
 ```
 
@@ -1804,14 +3531,124 @@ try {
 }
 ```
 
+The `finally` block runs however the `try` or a `catch` block is left:
+at its end, by a `return`, `break` or `continue`, or by an exception -
+one no clause caught, or one a `catch` block raises itself (a `rethrow`
+too). In the last case the exception goes on after the `finally` has run.
+
 It's worth noting that `try-finally` constructs (without any `catch` clause) are
 allowed as well.
+
+### An exception raised while handling another
+
+An exception raised while another one is being *handled* remembers that
+one, as in Python (its implicit `__context__`). An exception is being
+handled while a `catch` block that caught it runs - including any function
+called from there - and while a `finally` block runs because the exception
+is passing through it. When the new exception is never caught, the report
+prints the earlier one first, then the new one:
+
+```C#
+struct ParseError { str text; }
+struct LogError { str why; }
+
+func log_failure(str what) {
+    throw LogError("the log is read-only");
+}
+
+try {
+    throw ParseError("x = ");
+} catch (ParseError as e) {
+    log_failure(e.text);
+}
+```
+
+```
+Exception 'ParseError', data: ParseError(text: "x = ") at prog.my, line 9, col 5:28
+
+        throw ParseError("x = ");
+        ^^^^^^^^^^^^^^^^^^^^^^^
+
+During handling of the above exception, another exception occurred:
+
+Uncaught exception 'LogError', data: LogError(why: "the log is read-only") at prog.my, line 5, col 5:42
+
+        throw LogError("the log is read-only");
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Backtrace (most recent call first):
+  [0] log_failure(what) at line 5
+  [1] main()            at line 11
+```
+
+The rules:
+
+  * An earlier exception prints its header and caret, not a backtrace: only
+    the uncaught one has a backtrace.
+  * The chain can be longer: an exception raised while handling one that
+    was itself raised while handling another prints all three, oldest
+    first. At most the 16 most recent earlier exceptions are kept, and the
+    report says `(older exceptions are not shown)` when there were more.
+  * `rethrow`, and `throw e` of the value a `catch (T as e)` bound, raise
+    the exception being handled itself, so it does not remember itself.
+    It keeps whatever it remembered already.
+  * A `finally` block reached without an exception passing through handles
+    nothing, and neither does the code after a `catch` block, however the
+    block was left (at its end, or by `break`, `continue` or `return`).
+  * A `rethrow` raises the exception the `catch` caught even after an
+    earlier `rethrow` in the same block was caught by a `try` inside it.
+  * The chain belongs to the exception while it is raised, not to the
+    value a `catch (T as e)` binds: a value kept in a variable and thrown
+    again later, outside its `catch` block, starts with no chain - and,
+    like any `throw`, with the caret and backtrace of where it is thrown
+    then.
+
+The chain is part of the report only: a script cannot read it.
 
 ## Builtins
 
 ### Const builtins
 The following built-in functions will be evaluated during *parse-time* when
 const arguments are passed to them.
+
+Such a call is still **typed as the call**, by the builtin's own rule, never
+as the value it computes: `get(D, "a")` is an `int?` and `dict([[1, "b"]])` a
+`dict<dyn, dyn>` (its pairs mix two kinds) even when every argument is a
+constant. The value replaces
+the call once the whole program is typed, as for a constant call to a user
+function (see *Calling functions during const-evaluation*), so turning
+folding off (`-nc`) changes nothing a program can see:
+
+```
+const D = {"a": 1};
+var g = get(D, "a");
+print(g + 1);             # compile error: g is an int?, which may be none
+if (g != none)
+    print(g + 1);         # 2
+```
+
+`??` gives a non-`opt` result here as everywhere (`var n = get(D, "a") ?? 0;`
+is an `int`). A `const` declaration binds the value itself, so `const c =
+get(D, "a");` is the int 1, and a `pure` function's body is evaluated the
+same way in both modes.
+
+**A declaration wins over the builtin it shadows.** A `var`/`const` may not
+take a const builtin's name at all (`var len = 7;` is a compile-time
+`CannotRebindBuiltinEx`), but a **function**, a **parameter** and a **foreach
+loop variable** may — and where such a declaration is visible, the name means
+*it*, never the builtin, in every position including a const-folded one:
+
+```
+func abs(x) { return 42; }
+print(abs(-1));                 # 42 - the function, not the builtin's 1
+func g(abs) => abs + 1;
+print(g(2));                    # 3  - the parameter
+```
+
+The name is taken from the builtin for the whole program, so a `func abs`
+declared anywhere means a call to `abs` elsewhere is no longer const-folded
+(it still computes the builtin's answer at run time — only the fold is lost).
+A `pure func` is unaffected: it *is* a compile-time binding and keeps folding.
 
 ### General builtins
 
@@ -1829,7 +3666,12 @@ Return the number of elements in the given container.
 
 #### `str(value, [decimal_digits])`
 Convert the given value to a string. If `value` is a float, the 2nd parameter
-indicates the desired number of decimal digits in the output string. A string
+indicates the desired number of decimal digits in the output string: an int
+from 0 to 64 (any other int throws `InvalidValueEx`, a non-int `TypeErrorEx`;
+only a float takes it). The value is rounded to the nearest, and one exactly
+halfway goes to the even digit, as C's `printf` and Python's `format` do:
+`str(2.5, 0)` is `"2"`, `str(3.5, 0)` is `"4"`, `str(0.125, 2)` is
+`"0.12"`. A string
 converts to **itself** (unquoted), but a string nested **inside a container**
 (array, dict, or struct) is rendered **quoted and escaped** so the output is
 unambiguous and re-parseable — e.g. `str(["a", 1])` is `[\"a\", 1]` and
@@ -1840,15 +3682,29 @@ echo uses this quoted form for the top-level value too, so a bare string echoes
 as `=> "hello"` (IRB-style).
 
 #### `int(value)`
-Convert the given string to an integer. If the value is a float, it will be
-trucated. If the value is a string, it will be parsed and converted to an integer,
-if possible. If the value is already an integer, it will be returned as-it-is.
+Convert the given value to an integer. If the value is a float, it is
+truncated toward zero (`int(-2.7) == -2`); a NaN, an infinity, or a float
+outside the integer range (`-2^63 <= x < 2^63`) has no integer value and
+throws `InvalidValueEx`. A string must be an integer as a whole: optional
+surrounding whitespace, an optional `+` or `-`, then decimal digits, as an
+integer literal spells them (`int(" -42 ") == -42`, `int("007") == 7`).
+Anything else - `"12abc"`, `"3.7"`, `"1e3"`, `"0x1A"`, `"1_000"`, an empty
+string - is not an integer, and neither is one outside the integer range;
+both throw `InvalidValueEx`. A bool is `0` or `1`, and an integer is
+returned as-it-is.
 
 #### `float(value)`
 Convert the given value to float. If the value is an integer, it will be
-converted to a floating-point number. If the value is a string, it will parsed
-and converted to float, if possible. If the value is already a float, it will be
-returned as-it-is.
+converted to a floating-point number. A string must be a number as a whole:
+optional surrounding whitespace, an optional `+` or `-`, then either a number
+spelled as a literal spells it (`"2.5"`, `".5"`, `"1e5"`, `"2.5E-1"`, `"7"`)
+or one of the words `inf`, `infinity`, `nan` in any case; anything else
+(`"1.5x"`, `"0x1p3"`, `"nan(1)"`, an empty string) throws `InvalidValueEx`.
+A number beyond the float range, or so small it reads as 0, is refused when
+it is known at COMPILE time, exactly like such a literal (`const F =
+float("1e999");` does not compile); at run time it rounds as IEEE does, to
+`inf` / `-inf` or to `0.0` / `-0.0` (`float(s)` with `s` read from a file).
+If the value is already a float, it will be returned as-it-is.
 
 #### `clone(obj)`
 Clone the given object, **shallowly**: a non-trivial object (array, dictionary,
@@ -1863,6 +3719,21 @@ and dictionary is copied too, so the result is completely independent of the
 original and writable at any depth. This is the way to obtain a mutable version
 of a `const` (or of any object you want to change deeply without affecting the
 source). Scalars and strings are returned unchanged.
+
+The copy has the **same shape** as the original, as Python's
+`copy.deepcopy` does: each array, dict, class instance and box reachable
+from `obj` is copied exactly once, and every place that held it holds that
+one copy. So what is shared in the original is shared in the copy, and a
+value that contains itself is copied with its cycle: the copy contains the
+copy (see [Values that contain themselves](#values-that-contain-themselves)).
+A struct value is a value, so its copies stay independent.
+
+```C#
+var inner = [1, 2];
+var copy = deepclone([inner, inner]);   # one array, stored twice
+copy[0][0] = 9;
+print(copy[1][0]);                      # 9: still one array in the copy
+```
 
 #### `type(value)`
 Return a **`Type` reflection object** for the value's type — a native composite
@@ -1884,28 +3755,51 @@ if (e != none) print(e.kind);   # "int"
 For just the strings use [`typestr`/`kindstr`](#typestrx--kindstrx); for the
 declared/static type of a **variable** use [`decltype`](#decltypevariable).
 
+With static type inference turned off (`-nti`) there is no static type to
+answer from, so the query is answered when it runs, from the value: `kind`,
+`name` and `nullable` describe the value, and `elem` / `key` / `val` are
+`none`. (`decltype` behaves the same way there.)
+
 #### `hash(value)`
 Return the integer hash used by dictionaries internally when `value` is a key.
 It works on **any** value — `bool`/`int`/`float`/`str`/`none` and, **deeply
 and by value**, `array`/`dict`/`struct`. Equal values hash equal: `true`/`1`,
 `1`/`1.0`, two arrays with the same elements, two dicts with the same pairs (in
-any insertion order, since a dict is unordered), two structs of the same type
+any insertion order: `==` ignores a dict's order), two structs of the same type
 with the same fields. The array/struct hash is **order-dependent** (`[1,2]` ≠
 `[2,1]`), the dict hash is **order-independent**. A string's hash is computed
 once and cached (strings are immutable). Because `hash()` is total, **any value
-can be a dictionary key** (see *Dictionaries*).
+can be a dictionary key** (see *Dictionaries*) - one that contains itself too,
+hashed consistently with how `==` compares it (see
+[Values that contain themselves](#values-that-contain-themselves)). A hash
+depends only on the value - a struct's on its type's name and its fields, a
+class instance's on its identity - never on where anything lives in memory, so
+it is the same in every run and in every engine.
 
 ### Array builtins
 
 #### `array(N, [value])`
 Return an array with `N` elements. With a second argument, every element is
-`value` (a fixed value, not a callback). With **one** argument the fill is
-chosen by *type inference*: if the array's inferred element type is `int`,
-`float`, or `bool` (e.g. you later fill it with ints), unfilled elements are
-`0` / `0.0` / `false`; otherwise they are `none`. So `var a = array(3); a[0] =
-5;` yields `[5, 0, 0]`, while an array that stays untyped/dynamic yields all
-`none`. The element type also picks the internal storage: an `int`/`float`/`bool`
-array is a compact *flat* array (see `array_storage()`), anything else is
+`value` (a fixed value, not a callback). With **one** argument every element
+is the **zero value of the array's element type** - what a declaration with
+no initializer gives (`T x;`, see *Explicit type annotations*): `0`, `0.0`,
+`false`, `""`, a fresh `[]` / `{}` of the element's own type, a struct
+zero-initialized field by field, a fresh class instance, a box of its
+value's zero - each element a value of its own (`append(m[0], 5)` grows
+one element of an `array<array<int>>`). The element type is the one type
+inference finds for the array - the variable it is assigned to, declared
+or inferred from what the program later stores: `var a = array(3); a[0] =
+5;` yields `[5, 0, 0]`, `var s = array(2); s[0] = "x";` yields `["x", ""]`.
+A nullable element type (`array<int?>`, `array<dyn?>`) is filled with
+`none`, and so is an array whose element type nothing decides (one nothing
+is stored into, one made where `dyn` is declared - `var dyn d =
+array(2)` - or any array with type inference disabled, `-nti`). An element
+type with no zero value - a non-`opt` `dyn`, a struct with a non-`opt`
+`dyn` field, a struct field whose struct is declared further down - is a
+compile error: give a fill value, `array(n, v)`, or make the element type
+nullable. The element type also picks the internal storage: an
+`int`/`float`/`bool` array is a compact *flat* array (see
+`array_storage()`), and so is an array of a POD struct; anything else is
 general. To build each element from its index, use `make_array()`.
 
 (`array()` is a *non-const* builtin: a call like `array(1000000)` is never
@@ -1918,16 +3812,23 @@ flat (`int`/`float`/`bool`) when every element the callback returns is that one
 scalar kind, otherwise general.
 
 #### `top(array)`
-Return the last element of the array. This is an alias for `array[-1]`.
+Return the last element of the array. This is an alias for `array[-1]`, so
+an empty array throws `OutOfBoundsEx`.
 It is useful when a given array is used as a stack, in combination with
 other builtins like `push()` and `pop()`.
 
 #### `range(n, [end, [step]])`
 When only one parameter is provided, it returns an array with numbers
-from 0 to `n`. When `end` is passed to the function, the array goes from
-`n` to `end-1`. When `step` is passed too, the array goes from `n` to
-`end-step` with each element being `step` bigger than the previous. `step`
-can be negative as well. This is equivalent to `Python 2.x`'s range() function.
+from 0 to `n-1`. When `end` is passed to the function, the array goes from
+`n` to `end-1`. When `step` is passed too, the elements are `n`,
+`n + step`, `n + 2*step`, ... for as long as they lie strictly before `end`
+(below it for a positive step, above it for a negative one):
+`range(0, 10, 3)` is `[0, 3, 6, 9]`, `range(5, 0, -2)` is `[5, 3, 1]`. An
+`end` on the wrong side gives `[]`, and a `step` of 0 throws
+`InvalidValueEx`. The elements are exact even at the ends of int: the value
+after the last one need not be an int (`range(9223372036854775806,
+9223372036854775807, 5)` is `[9223372036854775806]`). This is equivalent to
+`Python 2.x`'s range() function.
 In `Python 3.x`, this is equivalent to: `list(range(...))`. Warning: while
 it might look pretty in foreach loops, that's typically not a good idea
 because it returns a whole array, not a generator object like in `Python 3.x`.
@@ -1942,7 +3843,9 @@ The comparator should be a *strict weak ordering* (return `a < b`, not a
 qsort-style numeric difference like `a - b`). A comparator that isn't one
 yields an **unspecified but well-defined, memory-safe** ordering — never a
 crash: with a custom comparator `sort()` uses a heapsort that stays within the
-array's bounds regardless of what the comparator returns.
+array's bounds regardless of what the comparator returns. A comparator that
+changes the array's length raises `InvalidArgumentEx` (see *Callbacks that
+change the container they run over*).
 
 Note: while `sort()` works in-place, it still can be used to sort arrays
 without altering them and to sort const arrays as well: in the first case,
@@ -1965,23 +3868,48 @@ return the result. In case the optional argument `key_func` is passed to `sum()`
 the operator `+` is applied to the result of `key_func(elem)`, for each element
 instead.
 
+The result has the type of the terms being added - the element type, or the
+return type of `key_func` - except that `bool` terms are counted, so a sum of
+bools is always an `int` (even of a single term: `sum([true]) == 1`).
+
+The sum of an **empty** array is the additive identity when the sum is
+numeric: `0` for an `int` (or `bool`) sum, `0.0` for a `float` one. Any other
+kind of sum (strings, arrays, `dyn`, ...) has no such value, so an empty one
+raises `InvalidArgumentEx`. Which case applies is decided by the sum's static
+type; where no type is known (under `-nti`, or `sum` called through a
+function value), only an array stored as flat ints/bools/floats yields
+`0`/`0.0`, and any other empty sum raises.
+
+```C#
+array<int> none_yet = [];
+print(sum(none_yet) + 1);                    # 1
+print(sum(none_yet, func(int x) => x * 0.5)); # 0.000000
+```
+
 ### Dictionary builtins
 
 #### `keys(dictionary)`
-Return an array containing all the keys of the given dictionary.
+Return an array containing all the keys of the given dictionary, in its
+(insertion) order.
 
 #### `values(dictionary)`
-Return an array containing all the values of the given dictionary.
+Return an array containing all the values of the given dictionary, in its
+(insertion) order.
 
 #### `kvpairs(dictionary)`
 Return the contents of the given dictionary, in the form of an array of
-[key, value] arrays.
+[key, value] arrays, in its (insertion) order.
 
 #### `dict(array)` / `dict(default_value)`
 With an **array** argument, build a dictionary from an array of [key, value]
-arrays (the counterpart of `kvpairs()`). With any other (non-array, non-`none`)
+arrays (the counterpart of `kvpairs()`), in the array's order; on a
+duplicate key the later value wins, at the place of the first. With any other (non-array, non-`none`)
 argument, build an empty **default dict**: reading a missing key returns (and
-inserts) that default value instead of throwing, so accumulation works directly:
+inserts) that default value instead of throwing, so accumulation works directly.
+The default's type is the value type; the key type is whatever the program
+stores (`dict(0)` used with string keys is a `dict<str, int>`). `dict(pairs)` is
+typed by its pairs: an array of `[k, v]` arrays of one element type `T` makes a
+`dict<T, T>`, mixed pairs a `dict<dyn, dyn>`:
 
 ```C#
 var counts = dict(0);
@@ -1994,7 +3922,8 @@ Return `{ keys[0]: gen_func(keys[0]), ..., keys[N-1]: gen_func(keys[N-1]) }` —
 the dictionary analogue of `make_array()` (a value-callback comprehension).
 `keys` is an array; `gen_func` is called once per key and returns that key's
 value. The result type is `dict<K, V>` with `K` the keys' element type and `V`
-the callback's return type. On a duplicate key the later one wins (as with
+the callback's return type. The keys go in the order of `keys`; on a
+duplicate key the later value wins, at the place of the first (as with
 `dict()`), and each key is frozen on insert. Example:
 
 ```C#
@@ -2017,7 +3946,8 @@ without a none-check). Same behavior as the `d[key]` / `d.key` sugar.
 Split the given string by the given delimiter. Returns an array.
 
 #### `join(array_of_strings, delim)`
-Join the given array of strings with the given delimiter. Returns a string.
+Join the given array of strings with the given delimiter. Returns a string:
+`""` for an empty array, the one element itself for a single one.
 
 #### `ord(string)`
 Return the numeric value of the given 1-char string.
@@ -2044,14 +3974,16 @@ the padding character is space.
 The counter-part of `lpad()`: pad the string on the right.
 
 #### `lstrip(string)`
-Return a slice of the given string skipping any leading whitespace.
+Return a slice of the given string skipping any leading whitespace: a
+space, a tab, `\n`, `\r`, a vertical tab or a form feed (bytes 9-13 and
+32). No other byte is whitespace.
 
 #### `rstrip(string)`
 Return a slice of the given string skipping any trailing whitespace.
 
 #### `strip(string)`
 Return a slice of the given string skipping any leading or trailing
-whitespace.
+whitespace. A string that is all whitespace strips to `""`.
 
 #### `startswith(string, sub_string)`
 Return `true` if the given string starts with the given sub_string, `false`
@@ -2071,8 +4003,9 @@ of the `what` substring in `container` or `none`.
 
 When `container` is an array, it returns the index of the first element equal
 to `what`. Also, when `container` is an array, a 3rd parameter (`key_func`) is
-supported: it's a function object accepting a value (element of the array) and
-returning the value that must be compared to `what`. It's useful when we're
+supported: it's a function object accepting a value (element of the array,
+typed as the array's element type) and returning the value that must be
+compared to `what`. It's useful when we're
 searching something in an array of composite elements (e.g. tuples).
 
 When `container` is a dictionary, it returns the value associated with the
@@ -2113,22 +4046,56 @@ In case the container is a dictionary, `func` is required to accept two paramete
 a key and a value, but the behavior will be semantically the same (a dictionary will
 be returned).
 
+Like `make_array()`, `map` and `filter` build their result array in the compact
+*flat* representation (see `array_storage()`) when it is stored where the
+element type is known to be `int`, `float` or `bool` (e.g. `var b = map(func(x)
+=> x * 2, range(10))`); a `dyn` destination gets the general representation.
+The result's contents are the same either way.
+
+#### Callbacks that change the container they run over
+
+A callback passed to a builtin is arbitrary code, and it may modify the very
+container the builtin is walking. The outcome is always defined:
+
+  * `find`, `map`, `filter`, `make_dict` and `sum` over an **array** visit
+    index 0, 1, 2, ... for as long as the index is below the array's
+    *current* length - elements a callback removes are not visited, elements
+    it appends are.
+  * `map` and `filter` over a **dictionary** visit the pairs the dictionary
+    held when the call began, with the values they had then; entries a
+    callback adds or removes do not change what is visited.
+  * `sort`/`rev_sort` raise `InvalidArgumentEx` when the comparator changes
+    the length of the array being sorted (or turns a string array into a
+    general one by storing a non-string in it).
+
+A callback must be a function: passing a builtin (`find(a, 3, len)`) is a
+`TypeErrorEx`, for every higher-order builtin alike.
+
 ### Numeric builtins
 
 #### `abs(num)`
-Return the absolute value of the given number.
+Return the absolute value of the given number, an `int` or a `float`. Any
+other argument whose type the compiler knows is a compile error - a `bool`
+too: `abs(true)` is refused, as is `abs(b)` for a `bool` variable `b`. A
+`dyn` value that holds no number raises `TypeErrorEx` when the call runs.
 
 #### `min(a, b, [c, [...]])`
-Return the smallest value among the ones passed to it.
+Return the smallest value among the ones passed to it. Numbers of different
+kinds give a result of their common kind (the promotion chain
+`bool <= int <= float`): `min(1, 2.5)` is `1.0`, `max(true, 0)` is `1`.
 
 #### `min(array)`
-Return the smallest value among the ones in the given array.
+Return the smallest value among the ones in the given array. The result has
+the array's element type; an **empty** array has no smallest value, so it
+raises `InvalidArgumentEx` (a compile-time error when the array is a `const`).
 
 #### `max(a, b, [c, [...]])`
-Return the largest value among the ones passed to it.
+Return the largest value among the ones passed to it, of the arguments'
+common kind like `min()`: `max(3, 2.5)` is `3.0`.
 
 #### `max(array)`
-Return the largest value among the ones in the given array.
+Return the largest value among the ones in the given array. Like `min()`, an
+**empty** array raises `InvalidArgumentEx`.
 
 #### `exp(x)`
 Return e^x.
@@ -2195,7 +4162,10 @@ Return true if `x` is "Not a Number".
 
 #### `round(x, [precision])`
 Round `x` to the nearest integer or to a floating-point number with
-`precision` digits.
+`precision` digits. `x` is an `int` or a `float` and `precision` a
+non-negative `int`: an argument of any other type the compiler knows is a
+compile error - a `bool` too, as with `abs` - and a `dyn` value that holds
+the wrong kind raises `TypeErrorEx` when the call runs.
 
 ### Numeric constants
 
@@ -2231,6 +4201,12 @@ Check `expr` and throw AssertionFailureEx if it's false.
 #### `exit(code)`
 Exit the program with the given numeric code
 
+#### `box(value)`
+A **box**: a reference to `value` that every copy shares, read and written
+with the prefix `*` (see [Boxes](#boxes)). A value that is a reference
+already - an array, a dict, a function, a class instance, a box - is
+returned as it is.
+
 #### `runtime(expr)`
 An *optimization barrier*. Returns the value of its single argument unchanged at
 runtime, but because it is a non-const builtin, the call is opaque to
@@ -2242,6 +4218,50 @@ folded normally, so `runtime(1/0)` fails at compile time (the error is *inside*
 the expression, before it is "runtime-ized"), whereas `1 / runtime(0)` throws a
 catchable `DivisionByZeroEx` at runtime. Useful for tests and to deliberately
 opt a specific expression out of folding.
+
+#### `isbound(name)`
+Has `name`'s **declaration run yet?** The companion to `defined()`, and the
+pair differ exactly in the *temporal dead zone* (see
+[Declaring variables](#declaring-variables)): a
+declaration's *name* exists from the moment its scope is entered, its *value*
+is bound when the declaration statement executes - except a function, a
+struct and a run-time `const`, which are bound at scope entry (so `isbound`
+is `true` for them throughout their scope).
+
+| `name` is... | `defined(name)` | `isbound(name)` |
+|---|---|---|
+| declared nowhere | `false` | `false` |
+| declared, declaration not yet run | `true` | `false` |
+| declared, declaration has run | `true` | `true` |
+
+So **`isbound(x)` alone is the feature test** — it answers "can I use this right
+now", which is what a guard wants. `defined(x)` is the narrower, rarer question
+"does this name exist at all", true even where the value is not there yet.
+
+```C#
+func f() {
+    var before = isbound(a);        # false - `a` is declared below
+    var a = 5;
+    var after = isbound(a);         # true
+    return [before, after, defined(a)];     # [false, true, true]
+}
+```
+
+The argument is **unevaluated** (which is the point — reading an unbound
+global is the very `UnboundSymbolEx` this lets a script avoid) and must be an
+**identifier**: `isbound(len)` and `isbound(none)` are fine (both `true`: a
+builtin is always bound, and `none` always exists and is always bound, so
+`defined(none)` is `true` too), `isbound(3)` and `isbound("x")` are compile
+errors, as is any wrong arity. It also acts as a
+guard, so `if (isbound(x)) { print(x); }` compiles even when `x` exists
+nowhere. Like `defined`, it
+can only be *called* — the bare name is not usable as a value.
+
+For a parameter, a capture, a builtin or a local the answer is decided at
+compile time (a local is bound exactly after its declaration, on every loop
+iteration alike). Only a **global read from inside a function** is a genuine
+runtime query, since whether the program has reached the declaration yet is
+not a lexical property.
 
 #### `isconst(expr)` / `isconstdecl(expr)`
 Compile-time introspection (mainly handy in tests). `isconst()` is true when
@@ -2269,12 +4289,21 @@ Get the internal shared object pointer referred by `symbol`.
 It's currently used in tests to check if two array slices refer internally
 to the same object.
 
+#### `refcount(symbol)` — dev-only
+The number of handles sharing the reference `symbol` holds (its internal
+use count; `1` for a scalar). Like `show()` it is a **dev-only** builtin,
+available at the REPL and in the test harness and a compile-time error in a
+script: it is a test instrument for the call protocol, since a leaked
+reference is otherwise unobservable from a program (a plain alias never
+copies, so a forgotten release changes no value).
+
 #### `array_storage(array)`
 Return the array's internal storage, named by the element type: `"int"`,
-`"float"`, `"bool"`, `"struct"`, or `"str"` for a compact *flat* (unboxed)
-array (8 bytes per element for int/float, **one byte** per element for bool,
-packed C structs for `struct`, 24-byte shared string handles for `"str"`), or
-`"general"` for the boxed representation otherwise. This is purely an
+`"float"`, `"bool"`, `"struct"`, `"str"` or `"class"` for a compact *flat*
+(unboxed) array (8 bytes per element for int/float, **one byte** per element
+for bool, packed C structs for `struct`, 24-byte shared string handles for
+`"str"`, one 8-byte reference per class instance for `"class"` - `none` is a
+null reference), or `"general"` for the boxed representation otherwise. This is purely an
 introspection aid (mainly for tests) — flat and general arrays behave
 identically; the only observable difference is speed and memory.
 
@@ -2283,6 +4312,12 @@ string dict's `keys()`/`values()` produce them. Unlike the type-driven flat
 scalars, a flat string array never rejects a mutation — writing a non-string
 element (or any operation without a flat fast path) silently converts it to
 the `"general"` representation first (the same model as `"struct"` arrays).
+A **class** array (`"class"`) follows the same model: an `array<C>` of a
+class `C` is born flat from its type (or from a literal of class instances),
+and a value that is neither a class instance nor `none`, or an operation
+without a flat fast path (`sort`, `insert`, `erase`, ...), converts it to
+`"general"` first. A conversion happens in place, so every alias of the array
+sees the same array afterwards.
 
 An array's storage is **decided once, at creation, from its proven static
 type** — it is never converted afterward (no runtime "promotion", so no
@@ -2294,21 +4329,68 @@ from the very first element — even if its initializer looked like all ints (so
 operation (`append`/`pop`/`insert`/`erase`/`sort`/`map`/`filter`/slicing/…)
 preserves the representation.
 
+A **`bool` value widens into numeric storage** like everywhere else in the
+language (the promotion chain `bool <= int <= float`, the same rule as
+`int x = true;` or a struct's int field): storing, appending, or inserting a
+bool into an `array<int>` writes `0`/`1`, into an `array<float>` `0.0`/`1.0`.
+The reverse (an int into an `array<bool>`) stays a `TypeError` — that would be
+a narrowing, which the language never does implicitly. The elements of an
+array **built** for a destination of a known element type widen the same
+way when a `dyn` source supplies them - a `dyn` callback's results in
+`array<int> r = map(f, xs)`, `make_array`, `filter`, the fill value of
+`array(n, v)`, the keys or values of a `dyn` dict - and a value that is not
+of that type at all (a string for an `array<int>`) raises `TypeErrorEx`
+there, rather than leaving a misfit in the array.
+
+The same widening applies to the values a **literal** or a **selection**
+produces, wherever it is written: a container literal holds its values at its
+static element (value) type, and a ternary or `??` result at the type its two
+arms join to. So `[1, 2.5]` is an `array<float>` holding `1.0` and `2.5`,
+`[true, 3]` an `array<int>` holding `1` and `3`, `{"a": 1, "b": 2.5}` a
+`dict<str,float>`, `flag ? 1 : 2.5` a `float`, and `x ?? 2.5` a float for an
+`opt int` `x`. Nested literals follow the outer type: in `[[1, 2.5], [3, 4]]`,
+an `array<array<float>>`, the second row holds `3.0` and `4.0`. A constant
+array that is merely *named* inside another keeps its own type
+(`const A = [3, 4]; const N = [[1, 2.5], A];` leaves `A` an `array<int>`).
+Where the outer type is a declared one, its element type decides
+instead: `array<dyn> k = [1, 2.5, true]` holds `1`, `2.5` and `true` -
+a `dyn` element converts nothing - and a literal nested in a `dyn`
+element is its own type, as one in a `dyn` variable is: in
+`array<dyn> n = [[1, 2.5], [true]]` the first row holds `1.0` and
+`2.5`, the second `true`.
+
+The rule holds for every other place a value lands where the static type is
+wider: a function whose return type is `float` returns its `int` paths as
+floats (`func g(b) { if (b) return 1; return 2.5; }` returns `1.0`); a
+`dict<float, _>` stores an int key as a float key and a `dict<_, float>`
+element or member (`d[k] = 1`, `d.k = 1`) holds `1.0`; a plain `var` whose
+type joins to `float` (`var x = 1; ... x = 2.5;`) holds `1.0` from the start;
+and a `float` global keeps a float when a function assigns it an int.
+
 Because the representation is fixed, the *only* way to ask a flat
 (statically-typed) array to hold a value of a different type is to launder it
 through a `dyn` alias and mutate that (e.g. `var dyn d = int_array;
-append(d, "x")`). The array's shared storage stays int-typed, so this raises a
-`TypeError` rather than promoting.
+append(d, "x")`, or `d += ["x"]`). The array's shared storage stays
+int-typed, so this raises a `TypeError` rather than promoting, and leaves the
+array unchanged. (`a += b` grows `a` in place, like a run of `append`s, so
+every alias of `a` sees the new elements.)
 
 To get a polymorphic (general) array on purpose:
 
   * **Declare it `dyn`.** `var dyn a = [1, 2, 3];` builds a general array from
-    the start, so `a[0] = "x";` just works. (`runtime()` does **not** do this —
-    it only changes the array's *static type* as the compiler sees it, not how
-    it is stored, so the value stays flat and a mixed write still throws.)
-  * **Promote an existing array with `dynarray()`** (below) — `clone()` /
-    `deepclone()` deliberately preserve the layout, so a clone of a flat array
-    is still flat.
+    the start, so `a[0] = "x";` just works. So do the builtins that build
+    their array for the place it is bound to - `range()`, `array()`,
+    `make_array()`, `map()`, `filter()`, `keys()` and `values()`. Any other
+    value keeps the storage it already has: `var dyn d = clone(a);` (or
+    `sort(a)`, or `a + b`) of a flat `a` is flat, whether or not the
+    compiler evaluates the call ahead of time. (`runtime()` does **not**
+    make an array general either — it only changes the array's *static
+    type* as the compiler sees it, not how it is stored, so the value stays
+    flat and a mixed write still throws.)
+  * **Promote an existing array with a cast**: `cast<array<dyn>>(a)` (see
+    [Casts](#casts)) builds a general copy — `clone()` / `deepclone()`
+    deliberately preserve the layout, so a clone of a flat array is still
+    flat.
 
 ### Non-const reflection builtins
 Runtime introspection of the live program state. They are ordinary (non-const)
@@ -2332,8 +4414,9 @@ REPL every global is map-resident, so all of them appear.
 #### `typestr(x)` / `kindstr(x)`
 Two **compile-time type queries**: `typestr` gives `x`'s full **structural**
 type as a string (`"array<int>"`, `"dict<str,int>"`, `"array<dict<str,int>>"`,
-`"int?"`, a struct name `"Point"`), and `kindstr` gives just the **kind**
-(`"array"`, `"int"`, `"struct"`, …). They are richer / coarser views of the same
+`"int?"`, a struct or class name `"Point"`), and `kindstr` gives just the
+**kind** (`"array"`, `"int"`, `"struct"`, `"class"`, …). They are richer /
+coarser views of the same
 thing — use `kindstr` for a quick category check, `typestr` for the exact type.
 
 Both have an **unevaluated operand** (like C++ `decltype`/`sizeof`): the arg
@@ -2366,7 +4449,10 @@ compiler's error messages.
 #### `signature(f)`
 Return a function's declared signature as a string, e.g.
 `"pure func hypot(float a, float b)"` — reflecting `pure`, `const`/`opt`/`dyn`
-modifiers and type annotations on each parameter. Given a **struct type** (or a
+modifiers and type annotations on each parameter, written as declared
+(`"func f(Point p, array<int> a, dict<str,Point>? d, box<int> b)"`; an
+annotated container or box takes the `?` suffix, any other type the `opt`
+prefix, as in a struct's signature). Given a **struct type** (or a
 struct **instance**) it returns the constructor form, e.g. `"Point(int x, int
 y)"`.
 
@@ -2375,8 +4461,9 @@ Return a struct's **in-memory layout** as a structured **`StructLayout`** value
 (a *native composite type* — an actual struct you can read programmatically),
 with `.name`, `.size` (POD bytes, 0 for boxed), `.align`, `.pod` (bool), and
 `.fields` — an `array<StructField>`, each `{ str name; str type; int offset;
-int size; int align; }`. For a boxed field, `offset`/`size`/`align` are `-1`
-(it has no byte layout).
+int size; int align; }`. A boxed struct's fields have no byte layout: their
+`offset`/`size`/`align` are `-1`, whatever their type (an `int` field of a
+struct that also holds a `str` included).
 ```C#
 struct Point { int x; int y; }
 var lay = layout(Point);
@@ -2399,8 +4486,12 @@ code — the closest thing to "showing the disassembly". You see what actually
 runs: dead code removed, folded constants as literals (`func g() {
 print(f(1,2)); }` shows as `func g() { print(3); }` once `f` is inlined and
 folded), inlined call bodies spliced in and annotated, and a flat array's
-element type shown as `array<int>`. Best-effort and not round-trippable (an
-unhandled node renders as a comment placeholder). Passing **any other
+element type shown as `array<int>`. Best-effort and not round-trippable, but
+every statement and expression renders as code: a lambda as
+`func [captures] (params) => ...`, a multi-assignment as `a, b = ...`, a
+named argument with its label, a float with every digit it needs to read
+back as the same number (`0.6666666666666666`, not `0.666667`). Passing
+**any other
 argument** treats it as an **expression** and renders its optimized tree —
 `show(2 + 3 * 4)` is `"14"`. In the REPL, `:show <name>` prints this for a
 function **and** its `name$N` template-instance / specialization clones, with
@@ -2413,9 +4504,9 @@ version. `:show <expression>` works too.
 Return an `array<str>` of the synthetic global names (`name$N` template
 instances, `name$sN` specializations) of every clone derived from
 function `f` (empty when none). These clones are real globals — the compiler
-inserts each at the root and binds its synthetic name — so this is a plain scope
-walk. *What* each clone specializes on is shown by the REPL `:trace` /
-`:globals` views.
+inserts each at the root and binds its synthetic name — so they are listed in a
+script and in the REPL alike. *What* each clone specializes on is shown by the
+REPL `:trace` / `:globals` views.
 
 ### Non-const tracing builtins
 Toggle the **diagnostic tracer** — a per-category narration of the compiler's
@@ -2443,24 +4534,16 @@ Return the active trace categories as a sorted `array<str>`.
 ### Non-const array builtins
 
 #### `append(array, value)`
-Append `value` to the given array.
+Append `value` to the given array, and return the array - an `array<T>`
+like its first argument (`var r = append(a, 4);` then `r[0]` reads `a`'s
+first element: the two name one array).
 
 #### `push(array, value)`
 An alias for `append()`. Useful for symmetry when used with `pop()`.
 
 #### `pop(array)`
-Pop (and return) the last element from the given array.
-
-#### `dynarray(array)`
-Return a fresh, **general (polymorphic) copy** of `array` — its static type is
-`array<dyn>`, so the copy can hold elements of any type. This is the explicit,
-manual way to "promote" a flat (`int`/`float`) array into one you can store
-mixed types into; there is no automatic runtime promotion (see
-[`array_storage()`](#array_storagearray)). The original is left untouched and
-keeps its compact layout, and the copy is independent of it (unlike a plain
-`var d = a`, which aliases). The copy is shallow (top-level): nested arrays keep
-their own representation. Compare `var dyn a = [...]`, which builds a general
-array from the start.
+Pop (and return) the last element from the given array. Popping an empty
+array throws `OutOfBoundsEx`.
 
 ### Non-const generic-container builtins
 
@@ -2480,10 +4563,13 @@ In the case `container` was an array, always return true or throws
 ### Non-const numeric builtins
 
 #### `rand(a, b)`
-Generate a random integer in the range [a, b].
+Generate a random integer in the range [a, b]. An empty range (`a > b`)
+raises `InvalidArgumentEx`.
 
 #### `randf(a, b)`
-Generate a random floating-point number in the range [a, b].
+Generate a random floating-point number in the range [a, b]. An empty range
+(`a > b`), a `nan` bound, or a range whose width is not finite (e.g.
+`randf(-inf, inf)`) raises `InvalidArgumentEx`.
 
 ### Non-const I/O builtins
 
@@ -2492,7 +4578,16 @@ Write to the standard output the string-versions of the given
 arguments, separated by a single space and terminated by a line ending.
 
 #### `readln()`
-Read a single line from the standard input.
+Read a single line from the standard input, without its line ending. At
+the **end of input** (stdin closed, or a file piped in has been consumed)
+it returns `none`, so its type is `opt str` and a program can tell the
+end from an empty line (which reads as `""`). A last line with no line
+ending is still returned; the call after it returns `none`. The usual
+idiom supplies a default:
+
+```C#
+var cmd = readln() ?? "quit";     # end of input behaves like "quit"
+```
 
 #### `writeln(string)`
 Write the given string to the standard output, plus a line ending

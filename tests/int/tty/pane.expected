@@ -1,0 +1,219 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+[?2004h[J>> [3C[J>> [3C[J>> [3C[J>> [3C[J>> [3C[J>> [3C[J>> [3C
+[?2004l[?2004h[J>> [3C
+
+
+[2A╭─ search:  ───────── 0 matches ─╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[11C╭─ search:  ───────── 0 matches ─╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[11C╭─ search:  ───────── 0 matches ─╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[11C╭─ search:  ───────── 0 matches ─╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[11C╭─ search:  ───────── 0 matches ─╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[11C╭─ search:  ───────── 0 matches ─╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[11C╭─ search:  ───────── 0 matches ─╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[11C╭─ search:  ───────── 0 matches ─╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[11C╭─ search:  ───────── 0 matches ─╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[11C[J[1A[J>> [3C[J>> v[90mar[0m[4C[J>> va[90mr[0m[5C[J>> [38;5;39mvar[0m[6C[J>> [38;5;39mvar[0m [7C[J>> [38;5;39mvar[0m a[90ms[0m[8C[J>> [38;5;39mvar[0m al[9C[J>> [38;5;39mvar[0m alp[10C[J>> [38;5;39mvar[0m alph[11C[J>> [38;5;39mvar[0m alpha[12C[J>> [38;5;39mvar[0m alpha_[13C[J>> [38;5;39mvar[0m alpha_o[14C[J>> [38;5;39mvar[0m alpha_on[15C[J>> [38;5;39mvar[0m alpha_one[16C[J>> [38;5;39mvar[0m alpha_one [17C[J>> [38;5;39mvar[0m alpha_one =[18C[J>> [38;5;39mvar[0m alpha_one = [19C[J>> [38;5;39mvar[0m alpha_one = [38;5;215m1[0m[20C
+[?2004l=> [38;5;215m1[0m
+[?2004h[J>> [3C[J>> v[90mar[0m[4C[J>> va[90mr[0m[5C[J>> [38;5;39mvar[0m[6C[J>> [38;5;39mvar[0m [7C[J>> [38;5;39mvar[0m a[90ms[0m[8C[J>> [38;5;39mvar[0m al[90mpha_one[0m[9C[J>> [38;5;39mvar[0m alp[90mha_one[0m[10C[J>> [38;5;39mvar[0m alph[90ma_one[0m[11C[J>> [38;5;39mvar[0m alpha[90m_one[0m[12C[J>> [38;5;39mvar[0m alpha_[90mone[0m[13C[J>> [38;5;39mvar[0m alpha_t[14C[J>> [38;5;39mvar[0m alpha_tw[15C[J>> [38;5;39mvar[0m alpha_two[16C[J>> [38;5;39mvar[0m alpha_two [17C[J>> [38;5;39mvar[0m alpha_two =[18C[J>> [38;5;39mvar[0m alpha_two = [19C[J>> [38;5;39mvar[0m alpha_two = [38;5;215m2[0m[20C
+[?2004l=> [38;5;215m2[0m
+[?2004h[J>> [3C[J>> v[90mar[0m[4C[J>> va[90mr[0m[5C[J>> [38;5;39mvar[0m[6C[J>> [38;5;39mvar[0m [7C[J>> [38;5;39mvar[0m a[90ms[0m[8C[J>> [38;5;39mvar[0m al[90mpha_one[0m[9C[J>> [38;5;39mvar[0m alp[90mha_one[0m[10C[J>> [38;5;39mvar[0m alph[90ma_one[0m[11C[J>> [38;5;39mvar[0m alpha[90m_one[0m[12C[J>> [38;5;39mvar[0m alpha_[90mone[0m[13C[J>> [38;5;39mvar[0m alpha_t[90mwo[0m[14C[J>> [38;5;39mvar[0m alpha_th[15C[J>> [38;5;39mvar[0m alpha_thr[16C[J>> [38;5;39mvar[0m alpha_thre[17C[J>> [38;5;39mvar[0m alpha_three[18C[J>> [38;5;39mvar[0m alpha_three_[19C[J>> [38;5;39mvar[0m alpha_three_i[20C[J>> [38;5;39mvar[0m alpha_three_is[21C[J>> [38;5;39mvar[0m alpha_three_is_[22C[J>> [38;5;39mvar[0m alpha_three_is_a[23C[J>> [38;5;39mvar[0m alpha_three_is_a_[24C[J>> [38;5;39mvar[0m alpha_three_is_a_v[25C[J>> [38;5;39mvar[0m alpha_three_is_a_ve[26C[J>> [38;5;39mvar[0m alpha_three_is_a_ver[27C[J>> [38;5;39mvar[0m alpha_three_is_a_very[28C[J>> [38;5;39mvar[0m alpha_three_is_a_very_[29C[J>> [38;5;39mvar[0m alpha_three_is_a_very_l[30C[J>> [38;5;39mvar[0m alpha_three_is_a_very_lo[31C[J>> [38;5;39mvar[0m alpha_three_is_a_very_lon[32C[J>> [38;5;39mvar[0m alpha_three_is_a_very_long[33C[J>> [38;5;39mvar[0m alpha_three_is_a_very_long_[34C[J>> [38;5;39mvar[0m alpha_three_is_a_very_long_n[35C[J>> [38;5;39mvar[0m alpha_three_is_a_very_long_na[36C[J>> [38;5;39mvar[0m alpha_three_is_a_very_long_nam[37C[J>> [38;5;39mvar[0m alpha_three_is_a_very_long_name[38C[J>> [38;5;39mvar[0m alpha_three_is_a_very_long_name [39C[J>> [38;5;39mvar[0m alpha_three_is_a_very_long_name =[40C[J>> [38;5;39mvar[0m alpha_three_is_a_very_long_name = [41C[J>> [38;5;39mvar[0m alpha_three_is_a_very_long_name = [38;5;215m3[0m[42C
+[?2004l=> [38;5;215m3[0m
+[?2004h[J>> [3C[J>> f[90mor[0m[4C[J>> fu[90mnc[0m[5C[J>> fun[90mc[0m[6C[J>> [38;5;39mfunc[0m[7C[J>> [38;5;39mfunc[0m [8C[J>> [38;5;39mfunc[0m a[90ms[0m[9C[J>> [38;5;39mfunc[0m af[10C[J>> [38;5;39mfunc[0m af([11C[J>> [38;5;39mfunc[0m af(a[90ms[0m[12C[J>> [38;5;39mfunc[0m af(a)[13C[J>> [38;5;39mfunc[0m af(a) [14C[J>> [38;5;39mfunc[0m af(a) {[15C[J>> [38;5;39mfunc[0m af(a) {
+..   [5C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   r[6C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   re[7C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   ret[8C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   retu[9C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   retur[10C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m[11C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m [12C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a[13C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a [14C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a +[15C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a + [16C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a + a[17C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a + al[18C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a + alp[19C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a + alph[20C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a + alpha[21C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a + alpha_[22C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a + alpha_o[23C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a + alpha_on[24C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a + alpha_one[25C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a + alpha_one;[26C[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a + alpha_one;
+..   [5C[2A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a + alpha_one;
+..   }[6C
+[?2004l[?2004h[J>> [3C
+
+
+[2A╭─ search:  ───────── 4 matches ─╮
+│ [7m❯ func af(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[11C╭─ search: a ──────── 4 matches ─╮
+│ [7m❯ func [1ma[22mf(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[12C╭─ search: al ─────── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22mpha_two = 2           [0m │
+╰────────────────────────────────╯[2A[13C╭─ search: alp ────── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22mha_two = 2           [0m │
+╰────────────────────────────────╯[2A[14C╭─ search: alph ───── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22m[1mh[22ma_two = 2           [0m │
+╰────────────────────────────────╯[2A[15C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22m[1mh[22m[1ma[22m_two = 2           [0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22m[1mh[22m[1ma[22m_two = 2           [0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22m[1mh[22m[1ma[22m_two = 2           [0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22m[1mh[22m[1ma[22m_one = 1           [0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22m[1mh[22m[1ma[22m_one = 1           [0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22m[1mh[22m[1ma[22m_one = 1           [0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22m[1mh[22m[1ma[22m_three_is_a_very_lo[0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22m[1mh[22m[1ma[22m_three_is_a_very_lo[0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22m[1mh[22m[1ma[22m_three_is_a_very_lo[0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ func af(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ func af(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ func af(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ func af(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ func af(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ func af(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22m[1mh[22m[1ma[22m_three_is_a_very_lo[0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ func af(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22m[1mh[22m[1ma[22m_three_is_a_very_lo[0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22m[1mh[22m[1ma[22m_one = 1           [0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22m[1mh[22m[1ma[22m_two = 2           [0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22m[1mh[22m[1ma[22m_two = 2           [0m │
+╰────────────────────────────────╯[2A[16C╭─ search: alpha ──── 4 matches ─╮
+│ [7m❯ v[1ma[22mr a[1ml[22m[1mp[22m[1mh[22m[1ma[22m_one = 1           [0m │
+╰────────────────────────────────╯[2A[16C[J[1A[J>> [38;5;39mvar[0m alpha_one = [38;5;215m1[0m[20C
+[?2004l=> [38;5;215m1[0m
+[?2004h[J>> [3C
+
+
+[2A╭─ search:  ───────── 4 matches ─╮
+│ [7m❯ var alpha_one = 1           [0m │
+╰────────────────────────────────╯[2A[11C╭─ search: a ──────── 4 matches ─╮
+│ [7m❯ func [1ma[22mf(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[12C╭─ search: aa ─────── 4 matches ─╮
+│ [7m❯ func [1ma[22mf([1ma[22m) {   return a + al[0m │
+╰────────────────────────────────╯[2A[13C╭─ search: aaa ────── 4 matches ─╮
+│ [7m❯ func [1ma[22mf([1ma[22m) {   return [1ma[22m + al[0m │
+╰────────────────────────────────╯[2A[14C╭─ search: aaaa ───── 2 matches ─╮
+│ [7m❯ func [1ma[22mf([1ma[22m) {   return [1ma[22m + [1ma[22ml[0m │
+╰────────────────────────────────╯[2A[15C╭─ search: aaaaa ──── 2 matches ─╮
+│ [7m❯ func af(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[16C╭─ search: aaaaaa ─── 0 matches ─╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[17C╭─ search: aaaaaaa ── 0 matches ─╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[18C╭─ search: aaaaaaaa ─ 0 matches ─╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[19C╭─ search: aaaaaaaaa ────────────╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[20C╭─ search: aaaaaaaaaa ───────────╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[21C╭─ search: aaaaaaaaaaa ──────────╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[22C╭─ search: aaaaaaaaaaaa ─────────╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[23C╭─ search: aaaaaaaaaaaaa ────────╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[24C╭─ search: aaaaaaaaaaaaaa ───────╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[25C╭─ search: aaaaaaaaaaaaaaa ──────╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[26C╭─ search: aaaaaaaaaaaaaaaa ─────╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[27C╭─ search: aaaaaaaaaaaaaaaaa ────╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[28C╭─ search: aaaaaaaaaaaaaaaaaa ───╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[29C╭─ search: aaaaaaaaaaaaaaaaaaa ──╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[30C╭─ search: aaaaaaaaaaaaaaaaaaa ──╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[30C╭─ search: aaaaaaaaaaaaaaaaaaa ──╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[30C╭─ search: aaaaaaaaaaaaaaaaaaa ──╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[30C╭─ search: aaaaaaaaaaaaaaaaaaa ──╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[30C╭─ search: aaaaaaaaaaaaaaaaaaa ──╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[30C╭─ search: aaaaaaaaaaaaaaaaaaa ──╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[30C╭─ search: aaaaaaaaaaaaaaaaaaa ──╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[30C╭─ search: aaaaaaaaaaaaaaaaaaa ──╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[30C╭─ search: aaaaaaaaaaaaaaaaaaa ──╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[30C╭─ search: aaaaaaaaaaaaaaaaaaa ──╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[30C╭─ search: aaaaaaaaaaaaaaaaaaa ──╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[30C╭─ search: aaaaaaaaaaaaaaaaaaa ──╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[30C╭─ search: aaaaaaaaaaaaaaaaaaa ──╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[30C[J[1A[J>> [3C
+
+
+[2A╭─ search:  ───────── 4 matches ─╮
+│ [7m❯ var alpha_one = 1           [0m │
+╰────────────────────────────────╯[2A[11C╭─ search: f ────────── 1 match ─╮
+│ [7m❯ [1mf[22munc af(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[12C╭─ search: fu ───────── 1 match ─╮
+│ [7m❯ [1mf[22m[1mu[22mnc af(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[13C╭─ search: fun ──────── 1 match ─╮
+│ [7m❯ [1mf[22m[1mu[22m[1mn[22mc af(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[14C╭─ search: func ─────── 1 match ─╮
+│ [7m❯ [1mf[22m[1mu[22m[1mn[22m[1mc[22m af(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[15C╭─ search: func  ────── 1 match ─╮
+│ [7m❯ [1mf[22m[1mu[22m[1mn[22m[1mc[22m[1m [22maf(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[16C╭─ search: func a ───── 1 match ─╮
+│ [7m❯ [1mf[22m[1mu[22m[1mn[22m[1mc[22m[1m [22m[1ma[22mf(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[17C╭─ search: func af ──── 1 match ─╮
+│ [7m❯ [1mf[22m[1mu[22m[1mn[22m[1mc[22m[1m [22m[1ma[22m[1mf[22m(a) {   return a + al[0m │
+╰────────────────────────────────╯[2A[18C[J[1A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a + alpha_one;
+..   }[6C
+
+
+[2A╭─ search:  ───────── 4 matches ─╮
+│ [7m❯ var alpha_one = 1           [0m │
+╰────────────────────────────────╯[2A[11C╭─ search: z ──────── 0 matches ─╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[12C╭─ search: zz ─────── 0 matches ─╮
+│ [90m(no matches)[0m                   │
+╰────────────────────────────────╯[2A[13C[J[3A[J>> [38;5;39mfunc[0m af(a) {
+..   [38;5;39mreturn[0m a + alpha_one;
+..   }[6C
+[?2004l[?2004h[J>> [3C
+[?2004l

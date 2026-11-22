@@ -1,0 +1,17 @@
+# #88: an op that raises AFTER an inlined call, in the same fragment.
+# With the JIT a whole body is one fragment whose originals are deleted,
+# so every op collapses onto one pc; a raising op that did not bake "not
+# inlined code" let the flush look the pc up and borrow the INLINED
+# neighbour's chain - a phantom `dbl(x)` frame, where -nj and -tw render
+# none. The builtin call (`assert`), a dyn member read and a compound
+# global store all raised without the stamp.
+func dbl(x) => x * 2 + 1;
+func run(int n) {
+    var a = dbl(n);
+    print(a);
+    var d = {"x": 1};
+    var dyn dd = runtime(d);
+    try { print(dd.y); } catch (KeyNotFoundEx) { print("member caught"); }
+    assert(a == 0);
+}
+run(int(runtime(4)));

@@ -19,8 +19,6 @@ using std::cerr;
 using std::ostream;
 using std::endl;
 
-using std::move;
-using std::forward;
 using std::unique_ptr;
 using std::shared_ptr;
 using std::make_pair;
@@ -37,6 +35,13 @@ using std::make_unique;
  */
 typedef double float_type;
 typedef intptr_t int_type;
+
+/* INT_TESTS (#107) is the intrusive superset of the -rt suite: both build
+ * systems define TESTS with it. A hand-rolled -DINT_TESTS alone would
+ * compile hooks with nothing to drive them. */
+#if defined(INT_TESTS) && !defined(TESTS)
+#error "INT_TESTS requires TESTS (make INT_TESTS=1 / cmake -DINT_TESTS=ON)"
+#endif
 
 #ifndef _MSC_VER
 
@@ -75,7 +80,20 @@ typedef intptr_t int_type;
  * those leaf helpers ML_ALWAYS_INLINE pins them into the loop regardless of its
  * size. Use ONLY for tiny, hot, non-recursive, non-address-taken leaves.
  */
-#if defined(_MSC_VER)
+/* ML_COVERAGE: a COVERAGE build (GCOV=1) - see the assertion block below */
+#ifndef ML_COVERAGE
+#  define ML_COVERAGE 0
+#endif
+#if ML_COVERAGE
+   /* A COVERAGE build emits each of these helpers ONCE, out of line.
+    * Forced inline, every caller got its own copy of the helper's branches,
+    * so a decision reached through one opcode's handler was uncovered in
+    * the eighty others: read_int_slot's bool arm alone was 87 elements,
+    * and 2,552 uncovered elements of vm.cpp were such copies (2026-11-07).
+    * The source states each decision once, and so does the universe now.
+    * A coverage build's speed is nobody's concern. */
+#  define ML_ALWAYS_INLINE inline __attribute__((noinline))
+#elif defined(_MSC_VER)
 #  define ML_ALWAYS_INLINE __forceinline
 #else
 #  define ML_ALWAYS_INLINE inline __attribute__((always_inline))
@@ -126,10 +144,27 @@ typedef intptr_t int_type;
  * failure, a real type error) do NOT use these - throw a proper Exception so
  * the error is handled in every build. ML_CHECK is for "impossible" states.
  */
-#ifndef NDEBUG
+/*
+ * A COVERAGE build (GCOV=1, which defines ML_COVERAGE=1) compiles them away
+ * too, and only them: NDEBUG stays off, so every other debug-only net (the
+ * register tracker, the AST teardown proof, the chunk verifier on our own
+ * output) still runs and is still measured. An assertion's failure arm is a
+ * branch gcov counts and no correct run may take, so in that build it was
+ * not product coverage but a fixed pile of uncoverable elements - and an
+ * always-inline helper's check (Frame::at's bounds, read_int_slot's tag)
+ * charged one to EVERY call site. The other builds keep the full net.
+ * `mylang -v` reports it (`coverage 1`, and `asserts 0`: ML_CHECK is off).
+ */
+#if !defined(NDEBUG) && !ML_COVERAGE
 #  include <cassert>
 #  define ML_CHECK(cond)          assert(cond)
 #  define ML_CHECK_MSG(cond, msg) assert((cond) && (msg))
+#elif !defined(NDEBUG)
+   /* the coverage form NAMES the condition in an unevaluated operand: no
+    * code, no branch, and a debug-only value that only a check reads is
+    * still used (the NDEBUG form drops both the check and the value) */
+#  define ML_CHECK(cond)          ((void)sizeof(!(cond)))
+#  define ML_CHECK_MSG(cond, msg) ((void)sizeof(!(cond)), (void)sizeof(msg))
 #else
 #  define ML_CHECK(cond)          ((void)0)
 #  define ML_CHECK_MSG(cond, msg) ((void)0)
@@ -158,3 +193,68 @@ typedef intptr_t int_type;
 #  define ML_VM_CHECK(cond)          ((void)0)
 #  define ML_VM_CHECK_MSG(cond, msg) ((void)0)
 #endif
+
+/*
+ * ML_UNTRUSTED_CHECK - the PROVENANCE tier (#137, maintainer-set 2026-08-09).
+ *
+ * The axis that matters for a corrupt `.myv` is not the BUILD TYPE, it is
+ * WHERE THE BYTECODE CAME FROM. Bytecode `vm_compile` just produced in this
+ * process is correct by construction and covered by the whole test suite;
+ * bytecode read off a disk is arbitrary bytes. Gating the defence on ASSERTS
+ * conflates those, and gets it exactly backwards: the build that most needs
+ * the check (an optimized, assert-free release running a shipped image) is
+ * the one that loses it.
+ *
+ * So this tier is NOT compiled out by ASSERTS. It is a test of one global,
+ * `g_untrusted_bytecode`, which is FALSE for a fresh compile and set only by
+ * myv_read. A trusted run pays a predictable, never-taken branch on a
+ * hot-cached global; an untrusted run pays the check.
+ *
+ * ⛔ USE IT ONLY where the condition is genuinely VALUE-DEPENDENT - where
+ * verify_chunk cannot decide it at load from the image alone. Anything
+ * statically decidable belongs THERE instead, at zero runtime cost (that is
+ * tier 1; see verify_chunk in codegen.cpp). This tier is the residue.
+ *
+ * It THROWS rather than asserting: a corrupt image is input, and an input
+ * error must be reported in every build, not aborted on in some.
+ * `UNTRUSTED_CHECKS=0` compiles the whole tier away - the A/B lever for
+ * measuring what the never-taken branch costs, NOT a shipping config.
+ */
+#ifndef ML_UNTRUSTED_CHECKS
+#  define ML_UNTRUSTED_CHECKS 1
+#endif
+#if ML_UNTRUSTED_CHECKS
+extern bool g_untrusted_bytecode;
+[[noreturn]] void ml_untrusted_fail(const char *what);
+#  define ML_UNTRUSTED_CHECK(cond, what)                                    \
+      do {                                                                  \
+          if (g_untrusted_bytecode && !(cond))                              \
+              ml_untrusted_fail(what);                                      \
+      } while (0)
+#else
+#  define ML_UNTRUSTED_CHECK(cond, what) ((void)0)
+#endif
+
+/*
+ * The same provenance question as a PREDICATE, for the one place the
+ * macro cannot serve: a helper the emitter takes NO status from, which
+ * must therefore take a DEFINED FALLBACK rather than throw (#142). Such
+ * a site still wants its ML_VM_CHECK tripwire for bytecode WE compiled -
+ * where the condition really is an interpreter bug - while staying
+ * silent for an image, where a corrupt value is input, not a bug. Spell
+ * that `ML_VM_CHECK(ml_untrusted_bytecode() || <invariant>)`.
+ * Constant-folds to `false` when the tier is compiled out.
+ */
+/* #97 (#72): the most candidates a value call site may be spliced as a
+ * guard chain of - the HARD limit the per-instruction storage is sized by;
+ * the inferencer's tuned cap (g_value_cands_max) sits at or below it */
+#define ML_VALUE_CANDS_HARD 8
+
+inline bool ml_untrusted_bytecode()
+{
+#if ML_UNTRUSTED_CHECKS
+    return g_untrusted_bytecode;
+#else
+    return false;
+#endif
+}

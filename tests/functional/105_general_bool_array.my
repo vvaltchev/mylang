@@ -1,0 +1,79 @@
+# An array<bool> is not always stored flat: an array of bools only `dyn`
+# reaches may be general and untyped (an inline keys() of a dict<bool,
+# ...> was a general array<bool> too, until rule 4 made every typed
+# array's storage follow its type - it is flat now) - a parameter declared
+# array<bool> accepts both (the untyped one takes that type as it enters;
+# a cast<array<dyn>>'s array<dyn> enters no array<bool>, Q2 decision A).
+# Reading an element where an int is expected - a condition,
+# arithmetic, a counted loop - must read it as
+# 0/1, as a flat bool array's element reads. It raised TypeErrorEx in
+# every engine, each with another caret (the tree-walker marked the
+# whole `if`, the JIT the element, -nj nothing at all). And in a FLOAT
+# expression (`x * b[i]`) it is widened to 0.0/1.0 - the tree-walker
+# alone raised TypeErrorEx there, until 2026-11-07.
+
+func cond_count(array<bool> b) {
+    var s = 0;
+    for (var i = 0; i < len(b); i++)
+        if (b[i])
+            s += 1;
+    return s;
+}
+
+func arith(array<bool> b) {
+    var s = 0;
+    for (var i = 0; i < len(b); i++)
+        s += b[i];
+    return s + b[0] * 10 + b[len(b) - 1];
+}
+
+func walk_down(array<bool> b) {
+    var s = 0;
+    for (var i = len(b) - 1; i >= 0; i--) {
+        var e = b[i];
+        s = s * 2 + e;
+    }
+    return s;
+}
+
+func scaled(float x, array<bool> b) {
+    var s = 0.0;
+    for (var i = 0; i < len(b); i++)
+        s += x * b[i];
+    return s + b[0] * 0.5 + b[len(b) - 1] * 0.25;
+}
+
+func gen_bools() {
+    var d = {};
+    d[true] = 1;
+    d[false] = 2;
+    return d;
+}
+
+var flat = [true, false, true, true];
+array<dyn> holder = [[true, "x", true, true]];
+var dyn gen = holder[0];
+gen[1] = false;
+assert(array_storage(flat) == "bool" && array_storage(gen) == "general");
+var dyn dg = cast<array<dyn>>(flat);
+# the cast's result carries array<dyn> in every mode (-nti too), so it
+# enters no array<bool>
+var refused = 0;
+try { cond_count(dg); } catch (TypeErrorEx) { refused = 1; }
+assert(refused == 1);
+# rule 4 (an untyped run, -nti, has no types for the storage to follow)
+if (typestr(runtime(0)) == "dyn")
+    assert(array_storage(keys(gen_bools())) == "bool");
+
+foreach (a in [flat, gen])
+    print(cond_count(a), arith(a), walk_down(a));
+assert(cond_count(gen) == 3 && arith(gen) == 14 && walk_down(gen) == 13);
+assert(cond_count(gen) == cond_count(flat) && arith(gen) == arith(flat));
+print(scaled(float(runtime(1.5)), flat), scaled(float(runtime(1.5)), gen));
+assert(scaled(float(runtime(1.5)), gen) == 5.25);
+assert(scaled(float(runtime(1.5)), gen) == scaled(float(runtime(1.5)), flat));
+
+# keys() follows insertion order: [true, false]
+print(cond_count(keys(gen_bools())), arith(keys(gen_bools())));
+assert(cond_count(keys(gen_bools())) == 1);
+assert(arith(keys(gen_bools())) == 11);

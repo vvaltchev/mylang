@@ -1,0 +1,40 @@
+# A boxed compare (a `dyn` operand) stores a bool, and off the low-address
+# arena (MYLANG_NO_LOWMEM=1: corpus_diff --nolowmem) its type tag is no
+# imm32 - store_type_tag_via builds it in a scratch register. With every
+# caller-saved register holding a pin, store_dst_bool's RefScratch BORROWS
+# a pinned rcx (push), and the seam pushed it AGAIN: a NESTED borrow,
+# which the checked build's register tracker aborts on. The values are
+# the oracle here; a checked build also reports the nesting.
+
+func loop_cond(int n) {
+    var p = 11; var q = 12; var r = 13; var s = 14; var t = 15;
+    var u = 16; var v = 17;
+    var dyn d = runtime(0);
+    while (d < n) {
+        p &= 1023; q &= 1023; r &= 1023; s &= 1023; t &= 1023;
+        u &= 1023; v &= 1023;
+        d = d + 1;
+    }
+    return p + q + r + s + t + u + v;
+}
+
+func bool_value(int n) {
+    var p = 1; var q = 2; var r = 3; var s = 4; var t = 5;
+    var u = 6; var v = 7; var hits = 0;
+    var dyn d = runtime(0);
+    for (var i = 0; i < n; i++) {
+        p += i; q += p; r += q; s += r; t += s; u += t; v += u;
+        var dyn lt = d < i % 3;
+        if (lt) hits += 1;
+        d = d + 1;
+        d = d % 4;
+    }
+    return [p + q + r + s + t + u + v, hits];
+}
+
+var n = int(runtime(5));
+var a = loop_cond(n);
+var b = bool_value(n);
+print(a, b);
+assert(a == 98);
+assert(b == [2206, 1]);

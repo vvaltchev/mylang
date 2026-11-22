@@ -1,0 +1,17 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> >> >> >> >> >> .. .. .. .. .. .. .. .. .. .. .. >> >> /* pure */ array<bool> func g(int b) => f$s0(false, b);
+>> /* pure */ func f$s0(dyn a, int b) {
+    bool r = b > 2;
+    bool s = !(b > 3);
+    bool t = b > 1 && b < 9;
+    int w = 0;
+    int i = 0;
+    while (i < b) {
+        w += i * 2 + 1;
+        i++;
+    }
+    return [r, s, t, w > 3];
+}
+>> => [false, true, false, false]
+>> => [true, false, true, true]
+>> 

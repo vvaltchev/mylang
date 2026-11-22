@@ -1,0 +1,98 @@
+# #97 closure inlining: a value call whose callee the analysis names is
+# spliced behind a GUARD (the callee slot holds that closure) into the
+# caller - main included - with each capture op reaching the closure
+# THROUGH the callee slot, since the inlined body runs in the caller's
+# frame, whose own captures are not the closure's. Every shape must
+# print what the call printed:
+#  - a mutable capture persisting across calls, and two closures of one
+#    factory keeping SEPARATE captures (the guard hits for both - the
+#    identity is the descriptor, the state is the object);
+#  - a typed parameter: an exact `int` bind and a widening `float` one;
+#  - a REFERENCE capture read and written (the helper arm, refcounted);
+#  - a discarded result;
+#  - a closure calling a closure (a splice in a FUNCTION body);
+#  - a throw inside the inlined body, caught, on a warmed iteration.
+# The `try` sits in its OWN function: the splice declines a caller with
+# try regions, and a `try` in main would have declined every site here.
+# MYLANG_JIT_COLD=guard runs every guard's MISS arm - the original call.
+func mk(int s) {
+    var c = s;
+    return func [c] () { c++; return c; };
+}
+
+func ma(int base) {
+    return func [base] (int k) { return base + k; };
+}
+
+func ms(float f) {
+    return func [f] (float x) { return f * x; };
+}
+
+func mka(int n) {
+    var a = [n, n + 1];
+    return func [a] () { return a; };
+}
+
+func mks(str s0) {
+    var s = s0;
+    return func [s] (str x) { s = x; return s; };
+}
+
+func mkd(int d) {
+    return func [d] (int x) { return d / (x - 3) + 1000; };
+}
+
+func risky(int k) {
+    var r = dv(k);
+    return r;
+}
+
+func safe(int k) {
+    try {
+        return risky(k);
+    } catch (DivisionByZeroEx) {
+        return -1;
+    }
+    return -2;
+}
+
+func twice(int n) {
+    var inc = mk(n);
+    var r = 0;
+    for (var j = 0; j < 3; j++)
+        r = r + inc();
+    return r;
+}
+
+var a = mk(runtime(10));
+var b = mk(runtime(100));
+var add = ma(runtime(7));
+var sc = ms(runtime(0.5));
+var g = mka(runtime(3));
+var h = mks(runtime("x"));
+var dv = mkd(runtime(100));
+
+var t = 0;
+var s = 0;
+var u = 0.0;
+var tot = 0;
+var last = "";
+var tw = 0;
+var caught = 0;
+var sv = 0;
+for (var i = 0; i < 40; i++) {
+    t = t + a() + a() + b();
+    s = s + add(i);
+    u = u + sc(i);
+    var q = g();
+    tot = tot + q[0] + q[1];
+    last = h(str(i));
+    b();
+    tw = tw + twice(i);
+    var r = safe(i % 5);
+    if (r < 0)
+        caught++;
+    else
+        sv = sv + r;
+}
+print(t, s, u, tot, last, h("end"), tw, caught, sv, a(), b());

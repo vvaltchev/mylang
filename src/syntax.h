@@ -8,6 +8,7 @@
 #include "uniqueid.h"
 #include "structtype.h"
 #include "funcdesc.h"
+#include "reflect.h"        /* reflect_decl_annot (sync_params) */
 
 enum pFlags : unsigned {
 
@@ -24,15 +25,63 @@ enum pFlags : unsigned {
 
 enum class ConstructType {
 
+    /* TRANSITIONAL sentinel: every concrete node class stamps a real
+     * tag (the Construct ctor ML_CHECKs it), so `other` is
+     * constructible by NO shipped class - a new class that forgets
+     * its tag fails -rt on its first construction, by name. That is
+     * the net that keeps the tag-switch walkers (#102) exhaustive:
+     * a switch over this enum with no default is forced by
+     * -Werror=switch to classify every kind. */
     other,
-    nop,
-    ret,
-    idlist,
-    block,
-    id,
-    lit_int,
-    subscript,
+
+    /* childless */
+    nop, brk, cont, rethrow,
+
+    /* literals */
+    lit_int, lit_bool, lit_float, lit_none, lit_str, lit_arr,
+    lit_obj, lit_dict_kv, lit_dict,
+
+    id, idlist, expr_list, block,
+
+    /* the SingleChildConstruct family - CONTIGUOUS (is_single_ct) */
+    expr01, inlined_call, throw_stmt,
+
+    /* the MultiOpConstruct family - CONTIGUOUS (is_multiop_ct) */
+    expr02, expr03, expr04, expr05, expr06, expr07, expr08, expr09,
+    expr10, expr11, expr12,
+
+    /* the CallExpr family: ONE tag - the subclasses (Direct/Cached/
+     * DirectBuiltin) add no walked children, so the walkers treat
+     * them by the base layout; non-walker code still dynamic_casts
+     * for the subclass identity */
+    call,
+
+    typed_scalar, expr14, if_stmt, ret, while_stmt, func_decl,
+    struct_decl, subscript, slice, try_catch, foreach_stmt, member,
+    incdec, ternary, coalesce, for_stmt, for_range,
+    deref,      /* `*b`: the value a box holds (DerefExpr) */
+    cast,       /* `cast<T>(x)` (CastExpr, plans/cast.md) */
 };
+
+/* Null-safe tag read: null -> `other`, which no real node carries
+ * (the ctor ML_CHECKs it) - so `ctag(e) == ConstructType::x` is
+ * exactly `dynamic_cast<X *>(e) != nullptr` for a leaf class,
+ * including the null-operand case. The #102 ladder conversions
+ * rely on this (a dynamic_cast of null is null; a raw ct read of
+ * null would crash). */
+class Construct;
+class FuncDeclStmt;   /* CallExpr::callee_fn - defined below */
+static inline ConstructType ctag(const Construct *c);
+
+/* the contiguous-family queries (the bytecode.h range pattern) */
+static inline bool is_multiop_ct(ConstructType c)
+{
+    return c >= ConstructType::expr02 && c <= ConstructType::expr12;
+}
+static inline bool is_single_ct(ConstructType c)
+{
+    return c >= ConstructType::expr01 && c <= ConstructType::throw_stmt;
+}
 
 /*
  * Static-type hint stamped on an expression node by the type inferencer
@@ -49,15 +98,27 @@ enum class TypeHint : unsigned char { none, i, f };
  * the inferencer from the DESTINATION's inferred type so the array is built in
  * its final representation at creation - no runtime promotion. `dflt` =
  * value-driven (build flat iff the elements are homogeneous int/float). See
- * plans/type-driven-specialization.md.
+ * plans/archived/type-driven-specialization.md.
  */
 enum class ArrHint : unsigned char {
-    dflt, general, flat_i, flat_f, flat_b, flat_s
+    dflt, general, flat_i, flat_f, flat_b, flat_s,
+    flat_c      /* array<C> of a class C: references (Storage::objs) */
 };
+
+/* #97 CB3: the flat result kind map/filter may build, from the call's
+ * ArrHint - 1 int, 2 float, 3 bool, 0 none (general). Only an EXPLICIT
+ * flat hint counts: the destination was proven that array type, so no
+ * later store can be refused an element a general result accepted. The
+ * VM carries it in MapFilterV's target2 bits 1-2. */
+inline int map_filter_flat_hint(ArrHint h)
+{
+    return h == ArrHint::flat_i ? 1 : h == ArrHint::flat_f ? 2
+         : h == ArrHint::flat_b ? 3 : 0;
+}
 
 /* DeclType / SymKind / ResolvedSym / FuncDescriptor moved to funcdesc.h (the
  * serializable runtime function descriptor lives outside the AST headers'
- * node classes - see plans/vm-ast-free-runtime.md). */
+ * node classes - see plans/archived/vm-ast-free-runtime.md). */
 
 struct InlineCtx;
 
@@ -94,7 +155,7 @@ public:
      * node - the backing for the -vm AST-teardown proof (vm_ast_teardown:
      * after codegen the whole AST is destroyed, the count must hit ZERO, and
      * any residual pointer reads zeroed, freed memory). Defined in syntax.cpp.
-     * See plans/vm-ast-free-runtime.md. (RECYCLE has its own new/delete above,
+     * See plans/archived/vm-ast-free-runtime.md. (RECYCLE has its own new/delete above,
      * which maintain the same counter + ASan-poison the freed node.)
      */
     static void *operator new(std::size_t n);
@@ -118,6 +179,89 @@ public:
     TypeHint th = TypeHint::none;
 
     /*
+     * ⛔ `th == i` DOES NOT MEAN "int" - IT ALSO MEANS BOOL. A bool is
+     * evaluated through the int path on purpose (it promotes to 0/1, so
+     * typed arithmetic over bools is unboxed exactly like int), and this
+     * flag is how a consumer that needs the VALUE tells the two apart.
+     *
+     * It exists because the VM lost the distinction: compile_boxed_expr
+     * lowered a th==i node through the typed int path on the stated
+     * argument that the result "is a valid int EvalValue, so a boxed
+     * consumer reads it fine" - true for an int, FALSE for a bool, which
+     * then printed as 1/0 where the tree-walker printed true/false (a
+     * RULE 2 divergence on `a[i]`, `p.b`, `d[k]` and a slice element).
+     * Set by the inferencer wherever it stamps th==i for a Bool type;
+     * copied by copy_base_fields() so clones keep it.
+     */
+    bool th_bool = false;
+
+    /*
+     * Set by the inferencer when this expression's static type is a VALUE
+     * all the way down: a scalar, a string, `none`, or a struct whose
+     * fields are values in turn. No other name can change what such a
+     * value denotes - an array, a dict, a function and a `dyn` can each be
+     * reached through a second name, and a write there is a write here.
+     * The loop transforms (try_for_range, the slice hoist, LICM) read it
+     * to decide whether a write through an UNRELATED name may change an
+     * expression they want to evaluate once. Default false, the
+     * conservative answer for a node nothing stamped. Copied by
+     * copy_base_fields().
+     */
+    bool th_val = false;
+
+    /*
+     * #54, `-nc` only: the parser would have REPLACED this constant node by
+     * a literal here, had folding been on (set by nc_eval_const). Read by
+     * pExpr14's assignable-shape rule, so `const A = [1]; A[0] = 2;` is the
+     * same compile error with and without folding. Parse-time only.
+     */
+    bool nc_folds = false;
+
+    /*
+     * #96: a constant expression holding a call to a USER function, which a
+     * folding parse evaluates but does not replace while parsing - type
+     * inference must see the call, as it does under `-nc`, or a parameter
+     * the program joins over its call sites misses this one (and every
+     * diagnostic about the call moves). `late_fold` is the literal the
+     * parse computed; Inferencer::apply_late_folds swaps it in once the
+     * program is typed, when its type is the one inference gave the node.
+     * Null: no literal can stand for it, and the node runs. Parse and
+     * inference time only; a clone carries both (a template instance
+     * cloned from a body during inference folds the same way).
+     * `late_fold_witness`: the literal only WITNESSES the value's type -
+     * the parse would not have baked it (an array outside a declaration)
+     * - so it decides whether an enclosing deferred node may fold
+     * (late_fold_fits) and is never swapped in itself.
+     */
+    bool defer_fold = false;
+    bool late_fold_witness = false;
+    std::unique_ptr<Construct> late_fold;
+
+    /*
+     * The parser PROVED this constant expression is not none: it is the
+     * left side of a `??` the parser decided, which stands for the whole
+     * `a ?? b` (README: the result is non-opt). Its own static type may
+     * say `opt` - a `get()` / `find()` call kept as a node until
+     * inference has typed it (#96) or under `-nc` - so type_of strips
+     * that: `var n = get(D, "a") ?? 0` is an int, as it is when `D` is
+     * not a constant. Set only for an expression of constants and
+     * builtins (pValueIsTypingFree): a pure function's value may differ
+     * at run time from the one the parser computed, and a none in a slot
+     * typed int would be undefined behaviour. Copied by copy_base_fields
+     * (a template instance is cloned before it is typed).
+     */
+    bool never_none = false;
+
+    /*
+     * #68: set on the ROOT of an inlined call's spliced body - the node
+     * that stands where the call stood: that call's inlined-at element,
+     * whose call_site / call_end span an error the enclosing operation
+     * raises about this value carets (inline_operand_span). Set by the
+     * AST inliner's expression engine; copied by copy_base_fields.
+     */
+    const InlineCtx *inline_call = nullptr;
+
+    /*
      * Representation hint for an array-producing node, set by the inferencer
      * from the destination type so the array is built in its final
      * representation (type-driven creation, no promotion). On a CallExpr's args
@@ -129,6 +273,28 @@ public:
     /* The element struct type for ArrHint::flat_s (an empty array<Struct> needs
      * it, having no element to infer from). Copied by copy_base_fields. */
     const StructTypeDef *arr_hint_struct = nullptr;
+
+    /*
+     * Q2 (plans/typed-containers.md): the type a container made HERE is
+     * made with - an interned array<T> / dict<K, V> (structtype.h), or
+     * null (untyped). Set by the inferencer on a LiteralArray /
+     * LiteralDict, and on a container-building builtin call's args
+     * ExprList (read through ArgLocs::ctype). Copied by copy_base_fields.
+     */
+    const TypeAnnot *ctype = nullptr;
+
+    /*
+     * Q2 increment 2: a STORE the compiler could not check against its
+     * container's own type - the place's static type is `dyn` or not yet
+     * known (a store through a `dyn` name, into an array<dyn> element, a
+     * template base's parameter): the store checks the value against the
+     * type the container carries, at the write (ct_fit, eval.h). Set by
+     * the inferencer on the lvalue node of such a store (a Subscript or a
+     * MemberExpr) and on the args ExprList of such an append / push /
+     * insert (read through ArgLocs::ct_store); codegen carries it as
+     * Instr::ct_checked. Copied by copy_base_fields.
+     */
+    bool ct_store = false;
 
     /*
      * Set on nodes spliced in by function inlining: the "inlined-at" chain used
@@ -147,7 +313,13 @@ public:
         , is_const(is_const)
         , start(Loc())
         , end(Loc())
-    { }
+    {
+        /* #102: every concrete class must stamp a real tag - the
+         * tag-switch walkers dispatch on it, and an `other` node
+         * would silently walk as CHILDLESS (the hidden-occurrence
+         * trap). A new class fails here on first construction. */
+        ML_CHECK(ct != ConstructType::other);
+    }
 
     bool is_nop() const { return ct == ConstructType::nop; }
     bool is_ret() const { return ct == ConstructType::ret; }
@@ -196,10 +368,24 @@ public:
         d.end = end;
         d.inline_ctx = inline_ctx;
         d.th = th;
+        d.th_bool = th_bool;
+        d.th_val = th_val;
         d.arr_hint = arr_hint;
         d.arr_hint_struct = arr_hint_struct;
+        d.ctype = ctype;
+        d.ct_store = ct_store;
+        d.defer_fold = defer_fold;
+        d.late_fold_witness = late_fold_witness;
+        d.never_none = never_none;
+        d.inline_call = inline_call;
+        d.late_fold = late_fold ? late_fold->clone() : nullptr;
     }
 };
+
+static inline ConstructType ctag(const Construct *c)
+{
+    return c ? c->ct : ConstructType::other;
+}
 
 /*
  * Clone a child pointer, preserving its static type: c->clone() returns a
@@ -217,8 +403,9 @@ class ChildlessConstruct : public Construct {
 
 public:
 
-    ChildlessConstruct(const char *name, Loc start = Loc(), Loc end = Loc())
-        : Construct(name)
+    ChildlessConstruct(const char *name, ConstructType ct,
+                       Loc start = Loc(), Loc end = Loc())
+        : Construct(name, false, ct)
     {
         this->start = start;
         this->end = end;
@@ -232,7 +419,8 @@ class SingleChildConstruct : public Construct {
 public:
     unique_ptr<Construct> elem;
 
-    SingleChildConstruct(const char *name) : Construct(name) { }
+    SingleChildConstruct(const char *name, ConstructType ct)
+        : Construct(name, false, ct) { }
 
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
         return elem->do_eval(ctx);
@@ -246,7 +434,8 @@ class MultiOpConstruct : public Construct {
 public:
     std::vector<std::pair<Op, unique_ptr<Construct>>> elems;
 
-    MultiOpConstruct(const char *name) : Construct(name) { }
+    MultiOpConstruct(const char *name, ConstructType ct)
+        : Construct(name, false, ct) { }
     void serialize(ostream &s, int level = 0) const override;
 
     /* Special methods */
@@ -266,7 +455,7 @@ public:
     typedef ElemT ElemType;
     std::vector<unique_ptr<ElemType>> elems;
 
-    MultiElemConstruct(const char *name, ConstructType ct = ConstructType::other)
+    MultiElemConstruct(const char *name, ConstructType ct)
         : Construct(name, false, ct)
     { }
 
@@ -305,8 +494,6 @@ inline ostream &operator<<(ostream &s, const Construct &c)
 class Literal : public Construct {
 
 public:
-
-    Literal() : Construct("Literal", true) { }
 
 protected:
     /* Lets a concrete literal carry a ConstructType tag (LiteralInt uses it to
@@ -349,7 +536,8 @@ class LiteralBool final: public Literal {
 
 public:
 
-    LiteralBool(bool v) : value(v) { }
+    LiteralBool(bool v)
+        : Literal(ConstructType::lit_bool), value(v) { }
 
     bool bval() const { return value; }
 
@@ -379,7 +567,8 @@ class LiteralFloat final: public Literal {
 
 public:
 
-    LiteralFloat(float_type v) : value(v) { }
+    LiteralFloat(float_type v)
+        : Literal(ConstructType::lit_float), value(v) { }
 
     float_type fval() const { return value; }
 
@@ -402,7 +591,7 @@ class LiteralNone final: public Literal {
 
 public:
 
-    LiteralNone() : Literal() { }
+    LiteralNone() : Literal(ConstructType::lit_none) { }
     void serialize(ostream &s, int level = 0) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -437,8 +626,10 @@ class LiteralStr final: public Literal {
 public:
 
     LiteralStr(const std::string_view &v);
-    LiteralStr(const EvalValue &v) : value(v) { }
-    LiteralStr(EvalValue &&v) : value(move(v)) { }
+    LiteralStr(const EvalValue &v)
+        : Literal(ConstructType::lit_str), value(v) { }
+    LiteralStr(EvalValue &&v)
+        : Literal(ConstructType::lit_str), value(std::move(v)) { }
 
     const EvalValue &strval() const { return value; }
 
@@ -459,13 +650,48 @@ class LiteralArray final: public MultiElemConstruct<> {
 
 public:
 
-    LiteralArray() : MultiElemConstruct<>("LiteralArray") { }
+    /*
+     * The literal's static ELEMENT type, when it is a numeric kind the
+     * elements must be WIDENED to (i: a bool becomes an int; f: an int or
+     * bool becomes a float) - stamped by the inferencer (annotate_hints).
+     * `[fi, 2.5]` is an array<float> whatever position it is written in,
+     * so its int element is stored as a float: every typed reader (the
+     * VM's element tiers) trusts the element type, and the tree-walker
+     * binding the raw int was the divergence (task #75).
+     */
+    DeclType elem_coerce = DeclType::none;
+
+    /*
+     * The right side of a multi-assignment (`x, y = [12, 2.5]`), unpacked
+     * element by element AS WRITTEN (README): the const evaluator does not
+     * widen it to its joined type either - `const x, y = [12, 2.5]` gave
+     * `x` the float 12.0 where `var x, y = ..` gave the int 12. Stamped by
+     * the parser (pExpr14).
+     */
+    bool unpacked = false;
+
+    /*
+     * A declaration's annotation gives this literal its element type
+     * (`array<dyn> a = [1, 2.5, true]`): the const evaluator builds it
+     * as that type says (elem_coerce), never by the join of its own
+     * values - joined, the parse-time bake held 1.0 and 1.0 where the
+     * same literal built at run time (-nc) held 1 and true (RULE 2).
+     * Stamped by the parser (stamp_literal_annot), before the bake.
+     */
+    bool annotated = false;
+
+    LiteralArray()
+        : MultiElemConstruct<>("LiteralArray",
+                               ConstructType::lit_arr) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<LiteralArray>();
         copy_base_fields(*c);
         clone_elems_into(*c);
+        c->elem_coerce = elem_coerce;
+        c->unpacked = unpacked;
+        c->annotated = annotated;
         return c;
     }
 };
@@ -505,13 +731,36 @@ class LiteralObj final: public Construct {
 
 public:
 
+    /* It replaced a container literal written in the source (`[1, 2]`),
+     * not a folded call or name: a FRESH value, which a declared container
+     * type may give its element type (the inferencer's literal_into) as
+     * the unfolded LiteralArray / LiteralDict gets it under -nc. */
+    bool from_literal = false;
+
+    /* It replaced a node that builds its array to its destination's type
+     * at run time - a container literal, or a call to a builtin that reads
+     * its ArrHint (builtin_takes_arr_hint) - so it takes that storage when
+     * folded too. Any other folded value (`clone(a)`, `sort(a)`, `a + b`)
+     * keeps the storage it was built with, as the unfolded node does
+     * (#97: `var dyn d = clone(K)` was general folded and flat under -nc). */
+    bool takes_hint = false;
+
+    /* Q2: it replaced a node that makes its container with the TYPE of
+     * the place it is bound to - a container literal, a call to a builtin
+     * that builds one (builtin_builds_container), an array sum - so the
+     * inferencer types the baked value by that place too. Any other
+     * folded value - a user function's result - keeps the type it was
+     * made with, as the unfolded call's does (a run-time `var a = [..]`
+     * in the function is typed there). */
+    bool typed_by_place = false;
+
     LiteralObj(const EvalValue &v, bool immutable = false)
-        : Construct("LiteralObj", true)
+        : Construct("LiteralObj", true, ConstructType::lit_obj)
         , value(v)
         , immutable(immutable) { }
     LiteralObj(EvalValue &&v, bool immutable = false)
-        : Construct("LiteralObj", true)
-        , value(move(v))
+        : Construct("LiteralObj", true, ConstructType::lit_obj)
+        , value(std::move(v))
         , immutable(immutable) { }
 
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -520,6 +769,9 @@ public:
     /* The baked const value (read-only). Used by the type inferencer to derive
      * the static type of a folded const array/dict literal. */
     const EvalValue &literal_value() const { return value; }
+    /* The inferencer's one rewrite of it: a literal stored into a declared
+     * container type it fits widens to that type (widen_baked_value) */
+    void set_literal_value(EvalValue v) { value = std::move(v); }
 
     /* Whether do_eval shares the value (const target) vs a mutable clone (var).
      * Read by the VM codegen to bake a LoadLiteralObjV pool entry. */
@@ -528,6 +780,9 @@ public:
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<LiteralObj>(value, immutable);
         copy_base_fields(*c);
+        c->from_literal = from_literal;
+        c->takes_hint = takes_hint;
+        c->typed_by_place = typed_by_place;
         return c;
     }
 };
@@ -538,7 +793,9 @@ public:
     unique_ptr<Construct> key;
     unique_ptr<Construct> value;
 
-    LiteralDictKVPair() : Construct("LiteralDictKVPair") { }
+    LiteralDictKVPair()
+        : Construct("LiteralDictKVPair", false,
+                    ConstructType::lit_dict_kv) { }
     void serialize(ostream &s, int level = 0) const override;
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override {
         throw InternalErrorEx(); /* Construct not meant to be evaluated directly */
@@ -557,13 +814,24 @@ class LiteralDict final: public MultiElemConstruct<LiteralDictKVPair> {
 
 public:
 
-    LiteralDict() : MultiElemConstruct<LiteralDictKVPair>("LiteralDict") { }
+    /* the dict's static VALUE type's widening, as LiteralArray's
+     * elem_coerce (keys are left as written) */
+    DeclType val_coerce = DeclType::none;
+    DeclType key_coerce = DeclType::none;   /* the same, for the keys */
+    bool annotated = false;     /* as LiteralArray's, keys and values */
+
+    LiteralDict()
+        : MultiElemConstruct<LiteralDictKVPair>(
+              "LiteralDict", ConstructType::lit_dict) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<LiteralDict>();
         copy_base_fields(*c);
         clone_elems_into(*c);
+        c->val_coerce = val_coerce;
+        c->key_coerce = key_coerce;
+        c->annotated = annotated;
         return c;
     }
 };
@@ -583,6 +851,12 @@ public:
      * other position. */
     bool is_underscore() const { return uid->val == "_"; }
 
+    /* A compiler-made reference to the BUILTIN of this name, which no user
+     * name shadows: the `box(...)` a `box<T> n;` declaration's zero value
+     * calls (a program may well have its own `box`). The inferencer and the
+     * resolver bind it to the builtin table only. */
+    bool builtin_only = false;
+
     /*
      * Only meaningful when this Identifier is a function parameter (an element
      * of FuncDeclStmt::params). `const_param` is set by the parser for a param
@@ -594,7 +868,17 @@ public:
     bool auto_const_param = false;
 
     /*
-     * Type-inference modifiers (see plans/type-inference.md). Set by the parser
+     * TDZ (#131): this use names a symbol that IS declared in an enclosing
+     * scope but whose declaration has not been walked yet. Only ever set on
+     * a LAZY builtin's argument (`defined`/`isconst`/`isconstdecl`), because
+     * every other use in that position is a compile error
+     * (UseBeforeBindingEx). It is what makes `defined(a)` before `var a`
+     * fold to TRUE - the name exists; it is merely unbound.
+     */
+    bool in_tdz = false;
+
+    /*
+     * Type-inference modifiers (see plans/archived/type-inference.md). Set by the parser
      * for a param or a var/const declared `opt` (nullable: may hold `none`) or
      * `dyn` (dynamically typed: behaves as today, inference does not constrain
      * it). Only meaningful on a declaration / parameter identifier.
@@ -619,6 +903,41 @@ public:
      * form, whose element type stays inferred. */
     std::shared_ptr<TypeAnnot> decl_annot;
 
+    /*
+     * The parser resolved this name to a CLASS descriptor. A use of one -
+     * in practice a construction - makes a function impure: each
+     * construction is a new object with its own identity, so folding or
+     * de-duplicating the call would merge objects the program can tell
+     * apart (func_body_is_pure).
+     */
+    bool names_class = false;
+
+    /*
+     * The VARIABLE a redirected call still reads. A call through a
+     * var-bound lambda TEMPLATE (`var f = func(x) => x; f(1)`) is
+     * redirected by the inferencer to an instance, `lambda$N`, a
+     * function bound at the top of the program - but the call names
+     * `f`, and `f` binds where it is written (README). So the callee
+     * Identifier of such a call keeps the original `f` Identifier here:
+     * the resolver resolves it as an ordinary read (the TDZ, the step 7
+     * prover and the warnings see it), and when it names a GLOBAL
+     * (`live_guard`) every engine reads it before the call, so a call
+     * made before `var f = ...` ran raises UnboundSymbolEx as `-nti`
+     * does. A local `f` needs no check: a use the TDZ allows runs after
+     * the declaration. Compile-time only - no Construct survives.
+     */
+    unique_ptr<Identifier> bind_guard;
+
+    /* The guard an engine must read before the call: a GLOBAL one (or a
+     * REPL name the map holds), else null. */
+    const Identifier *live_guard() const {
+        if (!bind_guard)
+            return nullptr;
+        const SymKind k = bind_guard->sym.kind;
+        return k == SymKind::global || k == SymKind::unresolved
+            ? bind_guard.get() : nullptr;
+    }
+
     Identifier(const std::string_view &str)
         : Construct("Id", false, ConstructType::id)
         , uid(UniqueId::get(str))
@@ -635,12 +954,18 @@ public:
         copy_base_fields(*c);
         c->sym = sym;
         c->const_param = const_param;
+        c->in_tdz = in_tdz;
         c->auto_const_param = auto_const_param;
         c->opt_mod = opt_mod;
         c->dyn_mod = dyn_mod;
         c->decl_type = decl_type;
         c->decl_struct = decl_struct;
         c->decl_annot = decl_annot;   /* shared: TypeAnnot is immutable */
+        c->names_class = names_class;
+        c->builtin_only = builtin_only;
+        if (bind_guard)
+            c->bind_guard.reset(static_cast<Identifier *>(
+                bind_guard->clone().release()));
         return c;
     }
 };
@@ -662,7 +987,32 @@ public:
      */
     std::vector<const UniqueId *> arg_names;
 
-    ExprList() : MultiElemConstruct<>("ExprList") { }
+    /*
+     * Per-argument numeric WIDENING (empty == none): an in-place builtin
+     * storing an argument into a typed container - `append(a, 5)` into an
+     * `array<float?>`, insert's dict key and value - stores it converted,
+     * as the element store `a[i] = 5` does (Expr14::rv_coerce). Stamped by
+     * the inferencer; the tree-walker's adapters apply it, the VM a
+     * CoerceNumV on the argument's run slot.
+     */
+    std::vector<DeclType> arg_widen;
+    DeclType widen_of(size_t i) const
+    {
+        return i < arg_widen.size() ? arg_widen[i] : DeclType::none;
+    }
+    /* #49: per argument (empty == none), the same builtins' STORED value
+     * that may misfit the container's declared element / key / value type
+     * - checked after arg_widen, before the builtin runs (the tree-walker's
+     * adapters, the VM's CheckFitV on the argument's run slot). */
+    std::vector<std::shared_ptr<const FitSpec>> arg_fit;
+    const FitSpec *fit_of(size_t i) const
+    {
+        return i < arg_fit.size() ? arg_fit[i].get() : nullptr;
+    }
+
+    ExprList()
+        : MultiElemConstruct<>("ExprList",
+                               ConstructType::expr_list) { }
     void serialize(ostream &s, int level = 0) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -670,6 +1020,8 @@ public:
         copy_base_fields(*c);
         clone_elems_into(*c);
         c->arg_names = arg_names;
+        c->arg_widen = arg_widen;
+        c->arg_fit = arg_fit;
         return c;
     }
 };
@@ -677,6 +1029,20 @@ public:
 class IdList final: public MultiElemConstruct<Identifier> {
 
 public:
+
+    /* #49: per target of a multi-assignment (empty == none), what it
+     * receives may misfit its DECLARED type - an array<dyn> element into
+     * an array<int> variable. Checked (value_fits) just before that
+     * target's store, so a refusal leaves it and the targets after it
+     * unwritten, as a failing coercion does: the tree-walker's
+     * handle_single_expr14, the VM's CheckFitV on the unpack temp.
+     * Stamped by annotate_hints (Inferencer::store_fit). */
+    std::vector<std::shared_ptr<const FitSpec>> fits;
+    const std::shared_ptr<const FitSpec> &fit_of(size_t i) const
+    {
+        static const std::shared_ptr<const FitSpec> none;
+        return i < fits.size() ? fits[i] : none;
+    }
 
     IdList()
         : MultiElemConstruct<Identifier>("IdList", ConstructType::idlist)
@@ -686,12 +1052,34 @@ public:
         auto c = make_unique<IdList>();
         copy_base_fields(*c);
         clone_elems_into(*c);
+        c->fits = fits;
         return c;
     }
 };
 
 /* NOT `final`: DirectCallExpr (below) derives from it for the devirtualized
  * direct-call fast path, reusing what/args/serialize/clone helpers. */
+/*
+ * A stamp naming a FuncDescriptor (CallExpr::callee_desc): the pointer AND
+ * the descriptor's serial. A descriptor is freed with its declaration when
+ * an optimizer drops one - a lambda folded away after inference stamped a
+ * call that could reach it - and the next descriptor allocated may take
+ * its address; the pointer then names a live descriptor that is not the
+ * one stamped. A consumer trusts a stamp only once the pointer is known
+ * live AND the serials agree (Codegen::add_value_callee). Before, the
+ * check was the pointer alone, and a non-ASan build put a stray
+ * `<lambda>` in tests/functional/76_const_bindings's fa$0 pool that an
+ * ASan build (whose quarantine delays reuse) did not.
+ */
+struct DescStamp {
+    const FuncDescriptor *desc = nullptr;
+    uint64_t serial = 0;
+    DescStamp() = default;
+    explicit DescStamp(const FuncDescriptor *d)
+        : desc(d), serial(d ? d->serial : 0) { }
+    explicit operator bool() const { return desc != nullptr; }
+};
+
 class CallExpr: public Construct {
 
 public:
@@ -721,6 +1109,11 @@ public:
      * into an EmplaceStruct that coerces the ctor's arg values into the
      * flat struct array's bytes - no temporary StructObject. */
     const StructTypeDef *vm_struct_ctor_def = nullptr;
+    /* Lever 4b: `len(x)` with x statically a non-opt ARRAY (1) or STRING
+     * (2) - codegen (which separately proves the callee is the unshadowed
+     * len builtin via DirectBuiltinCallExpr) then emits the existing
+     * ArrLen/StrLen op instead of the CallBuiltinV marshal. 0 = no proof. */
+    unsigned char vm_len_kind = 0;
 
     /* Analogue for a BOXED (non-POD) struct construction: the inferencer stamps
      * the constructed `StructTypeDef *` here (null for POD - that uses
@@ -728,6 +1121,86 @@ public:
      * the boxed StructObject from a value run + per-arg locs), rather than
      * falling back to the tree-walker's construct_struct. */
     const StructTypeDef *vm_struct_boxed_def = nullptr;
+
+    /* A struct construction whose callee is a TYPE ALIAS (`const T = S;`
+     * then `T(1)`): the construction is typed and lowered as S's, but the
+     * call names T, a const that binds where its declaration runs. When T
+     * is a GLOBAL the VM reads it before the arguments (codegen's
+     * emit_ctor_guard), so a construction that runs before `const T = S;`
+     * did raises UnboundSymbolEx as the tree-walker's read of the callee
+     * does - a struct's own name binds at scope entry and needs none. */
+    bool ctor_alias = false;
+
+    /*
+     * #116 increment 4: THE SINGLE FUNCTION THIS CALL CAN REACH, or null
+     * when the callee-set analysis cannot name one (⊤, more than one
+     * candidate, an escaped function, a template base). Stamped by the
+     * inferencer at the end of infer_one, from a SETTLED analysis over the
+     * post-instantiation tree.
+     *
+     * Its consumer is the #93 ESCAPE ANALYSIS, which otherwise poisons a
+     * whole function whenever a call's callee is not a named global slot
+     * (`f(x)` where f is a parameter, or a closure held in a variable) - a
+     * callee it cannot name could reassign the global some caller passed
+     * us. Naming it turns that poison into an ordinary call EDGE.
+     *
+     * ⛔ DELIBERATELY NOT COPIED BY copy_call_fields, and that is
+     * FAIL-CLOSED, not an omission. A clone is a new context - the inliner
+     * splices a body and substitutes its parameters, so the callee of the
+     * cloned call may be something else entirely. A null stamp means "this
+     * pass does not know", which every consumer already treats as the
+     * conservative case. DO NOT "complete" copy_call_fields with this
+     * field.
+     *
+     * ⛔ AND IT IS DELIBERATELY NOT READ BY THE STEP-7 PROVER. That tier
+     * decides whether a program COMPILES, and this stamp exists only when
+     * inference ran - wiring it there would make `-nti` change whether a
+     * program is REFUSED. An optimization may consult inference; a
+     * compile-error tier may not.
+     */
+    FuncDeclStmt *callee_fn = nullptr;
+
+    /*
+     * #97 E1: the SAME answer as `callee_fn`, held as the callee's
+     * program-lifetime DESCRIPTOR instead of its AST node.
+     *
+     * ⛔ IT EXISTS BECAUSE `callee_fn` CANNOT BE READ LATE, AND THAT IS
+     * NOT A STYLE POINT - IT IS A USE-AFTER-FREE. The stamp is written
+     * at the end of inference; its first consumer (#93's escape
+     * analysis) runs inside `resolve_names`, moments later, while every
+     * decl is still alive. The VM CODEGEN runs after the whole optimizer
+     * stack, which drops and replaces FuncDeclStmts - so dereferencing
+     * `callee_fn->desc` there read freed memory (ASan: heap-use-after-
+     * free in add_value_callee, caught on this field's first run).
+     *
+     * A FuncDescriptor is created at parse time and lives for the whole
+     * program - `vm_compile` MOVES it into the VmProgram precisely so it
+     * outlives the AST teardown - so holding one is safe at any later
+     * stage, which is also why the runtime call model reads descriptors
+     * and never decls.
+     *
+     * ⛔ NOT COPIED BY copy_call_fields either, for `callee_fn`'s exact
+     * reason: a clone is a new context and a null stamp is the
+     * conservative answer.
+     */
+    DescStamp callee_desc;
+    /*
+     * #97 E3 (2026-09-20): the SECOND candidate of a TWO-WAY value call
+     * site - `ops[i % 2]` reaching add_op or sub_op. Set together with
+     * `callee_desc` when the callee set has exactly two members, neither
+     * escaped; null otherwise. `callee_fn` stays null for such a site (the
+     * resolver's consumers need ONE function). The JIT's frameless site
+     * dispatches on the live descriptor between the two; every other
+     * consumer of `callee_desc` treats a site with this set as UNNAMED
+     * (jit_baked_callee returns null for a two-entry pool pc). Same
+     * lifetime and copy rules as `callee_desc`.
+     */
+    DescStamp callee_desc2;
+    /* #97 (#72): the THIRD and later candidates of a value site the
+     * callee-set analysis names at most g_value_cands_max functions for
+     * (callee_desc, callee_desc2, then these) - for the splice's guard
+     * chain alone; the JIT's frameless dispatch serves exactly two */
+    std::vector<DescStamp> callee_desc_more;
 
     /* Set by the inferencer when the callee's static type is `dyn` (callable at
      * runtime, resolved dynamically). The VM lowers it to CallValueGenericV — a
@@ -746,22 +1219,165 @@ public:
      * needed. */
     bool tq_folded = false;
 
-    CallExpr() : Construct("CallExpr") { }
-    explicit CallExpr(const char *name) : Construct(name) { }
+    /*
+     * Bit i is set when argument i's STATIC TYPE could be a callable value (a
+     * `Func`, or a `dyn` that might hold one) - i.e. this call might INVOKE it.
+     * Stamped by the inferencer (annotate_hints, where types are live); args
+     * beyond bit 31 fold into bit 31.
+     *
+     * DEFAULT ~0u ON PURPOSE: an unstamped call (no inference ran, a node a
+     * later pass built, a field a field-by-field copy forgot) must read as
+     * "every argument may be callable", which every consumer treats as the
+     * conservative case. Purity of the named callback is decided LATER, in
+     * specialize_types - `effective_pure` is the RESOLVER's answer and does not
+     * exist yet when this is stamped.
+     */
+    uint32_t callable_arg_mask = ~0u;
+
+    /*
+     * Bit i is set when argument i may hold `none` at run time AND may reach
+     * a parameter not declared `opt` - so the bind must refuse it (RULE 1:
+     * README, "a parameter that is not opt never holds none"). The static
+     * check refuses an `opt` argument to a non-opt parameter, but a `dyn`
+     * one is non-opt by type and may still hold none (`runtime(none)`, a
+     * dyn container's element), so a dyn / unresolved / opt-ish argument
+     * sets its bit unless the callee is statically known and the parameter
+     * is `opt`. Stamped by annotate_hints; args past bit 31 fold into it.
+     * Consumers: codegen, which emits CheckNoneArgsV before such a call
+     * (the call op itself is unchanged), and the AST inliner, which keeps
+     * such a call a real call.
+     *
+     * DEFAULT ~0u ON PURPOSE, like callable_arg_mask: an unstamped call
+     * (-nti, a node a later pass built) reads as "every argument may be
+     * none", the case that keeps the check - narrowed only by the SHAPE
+     * test below, which needs no inference.
+     */
+    uint32_t none_arg_mask = ~0u;
+
+    /*
+     * #49: some argument may MISFIT its parameter's declared type at run
+     * time - a `dyn` value (or a container with a `dyn` element) reaching
+     * a parameter whose ParamDesc::fit the bind must check (value_fits).
+     * Stamped by annotate_hints (Inferencer::call_fit_args). The same
+     * consumers as none_arg_mask: the tree-walker's bind checks fits only
+     * at such a call, codegen emits CheckNoneArgsV before it (which checks
+     * fits too), and the AST inliner keeps it a call. DEFAULT TRUE for the
+     * same reason that mask defaults to every bit: an unstamped call keeps
+     * the check.
+     */
+    bool fit_args = true;
+
+    /*
+     * Parsed inside a `const` declaration's initializer: the one place a
+     * CLASS instance may be made at compile time (plans/class-and-box.md -
+     * anywhere else, folding or de-duplicating the construction would merge
+     * objects the program can tell apart). Read where a construction is
+     * evaluated in a const context (CallExpr::do_eval's dispatch).
+     */
+    bool in_const_decl = false;
+
+    /*
+     * The callee NAMES a lazy builtin (defined / isbound / isconst /
+     * isconstdecl, which ask about their argument's NAME and never
+     * evaluate it) but is the PROGRAM's own symbol of that name - a
+     * function, a parameter, a variable. Such a call is an ordinary call:
+     * its argument is evaluated, so a name in it must be declared, and no
+     * pass may answer it as the builtin would (#133: a declaration beats
+     * the builtin it shadows). Until 2026-11-13 the resolver and AutoConst
+     * recognized a lazy call by the callee's NAME, so `defined(zork)`
+     * called the builtin and answered false in a program declaring its
+     * own `func defined`, and the REPL folded `defined(p)` to true over
+     * an earlier input's function.
+     *
+     * Stamped by the inferencer's structural pass (stamp_lazy_calls), the
+     * one place that knows: its scopes hold the REPL's earlier inputs too,
+     * and it runs under -nti. Default false: an unstamped call is read as
+     * the builtin, as before.
+     */
+    bool user_callee = false;
+
+    /* An argument whose SHAPE cannot evaluate to none: a non-none literal,
+     * an operator chain (arithmetic, comparison, logical, bitwise and
+     * unary operators yield a value or throw - never none), a typed
+     * scalar, an inc-dec, a function literal. */
+    static bool arg_never_none(const Construct *e)
+    {
+        const ConstructType c = ctag(e);
+        switch (c) {
+        case ConstructType::lit_int: case ConstructType::lit_bool:
+        case ConstructType::lit_float: case ConstructType::lit_str:
+        case ConstructType::lit_arr: case ConstructType::lit_obj:
+        case ConstructType::lit_dict:
+        case ConstructType::typed_scalar: case ConstructType::incdec:
+        case ConstructType::func_decl:
+            return true;
+        default:
+            return is_multiop_ct(c);
+        }
+    }
+
+    /* argument i may hold none: its mask bit is set (past bit 31 there is
+     * none - assume it may) and its shape does not rule none out */
+    bool arg_may_be_none(size_t i) const {
+        return (i >= 32 || ((none_arg_mask >> i) & 1u))
+               && !arg_never_none(args->elems[i].get());
+    }
+
+    /* some argument may bind none to a non-opt parameter (the callee is
+     * not known here: codegen asks it for every call it lowers, and
+     * every such call has an argument list) */
+    bool may_bind_none() const {
+        for (size_t i = 0; i < args->elems.size(); i++)
+            if (arg_may_be_none(i))
+                return true;
+        return false;
+    }
+
+    /* the bind must check its arguments: a none for a non-opt parameter
+     * or a misfit for a typed one (#49) */
+    bool check_args() const { return fit_args || may_bind_none(); }
+
+    CallExpr() : Construct("CallExpr", false, ConstructType::call) { }
+    explicit CallExpr(const char *name)
+        : Construct(name, false, ConstructType::call) { }
     void serialize(ostream &s, int level = 0) const override;
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+
+    /*
+     * Copy every CallExpr-level analysis field (NOT `what`/`args`, which the
+     * caller moves or clones). THE SINGLE PLACE that enumerates them - both
+     * `clone()` and the resolver's devirtualization swap (which builds a
+     * DirectCallExpr / CachedCallExpr / DirectBuiltinCallExpr and moves the
+     * children over) go through here.
+     *
+     * A field-by-field copy at each swap site is how `vm_len_kind` was once
+     * silently dropped, and how `callable_arg_mask` was dropped the day it was
+     * added - each time producing a node that merely LOOKS un-analyzed, so the
+     * consumer quietly declines an optimization instead of failing. Add a new
+     * field HERE and every path gets it.
+     */
+    void copy_call_fields(CallExpr &d) const {
+        d.direct_func_slot = direct_func_slot;
+        d.vm_direct_func = vm_direct_func;
+        d.vm_struct_ctor_def = vm_struct_ctor_def;
+        d.vm_len_kind = vm_len_kind;
+        d.vm_struct_boxed_def = vm_struct_boxed_def;
+        d.ctor_alias = ctor_alias;
+        d.vm_dyn_callee = vm_dyn_callee;
+        d.tq_folded = tq_folded;
+        d.callable_arg_mask = callable_arg_mask;
+        d.none_arg_mask = none_arg_mask;
+        d.fit_args = fit_args;
+        d.in_const_decl = in_const_decl;
+        d.user_callee = user_callee;
+    }
 
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<CallExpr>();
         copy_base_fields(*c);
+        copy_call_fields(*c);
         c->what = clone_as(what);
         c->args = clone_as(args);
-        c->direct_func_slot = direct_func_slot;
-        c->vm_direct_func = vm_direct_func;
-        c->vm_struct_ctor_def = vm_struct_ctor_def;
-        c->vm_struct_boxed_def = vm_struct_boxed_def;
-        c->vm_dyn_callee = vm_dyn_callee;
-        c->tq_folded = tq_folded;
         return c;
     }
 };
@@ -786,13 +1402,9 @@ public:
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<DirectCallExpr>();
         copy_base_fields(*c);
+        copy_call_fields(*c);
         c->what = clone_as(what);
         c->args = clone_as(args);
-        c->direct_func_slot = direct_func_slot;
-        c->vm_direct_func = vm_direct_func;
-        c->vm_struct_ctor_def = vm_struct_ctor_def;
-        c->vm_struct_boxed_def = vm_struct_boxed_def;
-        c->vm_dyn_callee = vm_dyn_callee;
         return c;
     }
 };
@@ -813,13 +1425,9 @@ public:
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<CachedCallExpr>();
         copy_base_fields(*c);
+        copy_call_fields(*c);
         c->what = clone_as(what);
         c->args = clone_as(args);
-        c->direct_func_slot = direct_func_slot;
-        c->vm_direct_func = vm_direct_func;
-        c->vm_struct_ctor_def = vm_struct_ctor_def;
-        c->vm_struct_boxed_def = vm_struct_boxed_def;
-        c->vm_dyn_callee = vm_dyn_callee;
         return c;
     }
 };
@@ -873,6 +1481,7 @@ public:
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<DirectBuiltinCallExpr>();
         copy_base_fields(*c);
+        copy_call_fields(*c);
         c->what = clone_as(what);
         c->args = clone_as(args);
         c->builtin = builtin;
@@ -880,7 +1489,6 @@ public:
         c->lvalue_rest_native = lvalue_rest_native;
         c->lvalue_rest_capable = lvalue_rest_capable;
         c->map_filter_kind = map_filter_kind;
-        c->tq_folded = tq_folded;
         return c;
     }
 };
@@ -902,7 +1510,9 @@ class InlinedCallExpr final: public SingleChildConstruct {
 
 public:
 
-    InlinedCallExpr() : SingleChildConstruct("InlinedCall") { }
+    InlinedCallExpr()
+        : SingleChildConstruct("InlinedCall",
+                               ConstructType::inlined_call) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -937,10 +1547,28 @@ struct ParamSpec {
  */
 void desugar_named_call(CallExpr *call, const std::vector<ParamSpec> &params);
 
+/*
+ * The builtins that build their result array to the storage of the place
+ * it is bound to (the ArrHint the inferencer stamps on the call's
+ * arguments): range, array, make_array, keys, values, map, filter. Every
+ * other builtin's result keeps the storage it builds. The one list - the
+ * inferencer stamps the hint by it, and the parser marks a folded call by
+ * it (LiteralObj::takes_hint).
+ */
+bool builtin_takes_arr_hint(std::string_view name);
+
+/*
+ * Q2: the builtins whose result is a container they BUILD, which the call
+ * gives its type (ArgLocs::ctype): the inferencer stamps it, and the
+ * parser marks a folded call by it (LiteralObj::typed_by_place).
+ */
+bool builtin_builds_container(std::string_view name);
+
 class Expr01 final: public SingleChildConstruct {
 
 public:
-    Expr01() : SingleChildConstruct("Expr01") { }
+    Expr01()
+        : SingleChildConstruct("Expr01", ConstructType::expr01) { }
 
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<Expr01>();
@@ -954,7 +1582,8 @@ class Expr02 final: public MultiOpConstruct {
 
 public:
 
-    Expr02() : MultiOpConstruct("Expr02") { }
+    Expr02()
+        : MultiOpConstruct("Expr02", ConstructType::expr02) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -970,7 +1599,8 @@ class Expr03 final: public MultiOpConstruct {
 
 public:
 
-    Expr03() : MultiOpConstruct("Expr03") { }
+    Expr03()
+        : MultiOpConstruct("Expr03", ConstructType::expr03) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -985,7 +1615,8 @@ class Expr04 final: public MultiOpConstruct {
 
 public:
 
-    Expr04() : MultiOpConstruct("Expr04") { }
+    Expr04()
+        : MultiOpConstruct("Expr04", ConstructType::expr04) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1001,7 +1632,8 @@ class Expr05 final: public MultiOpConstruct {
 
 public:
 
-    Expr05() : MultiOpConstruct("Expr05") { }
+    Expr05()
+        : MultiOpConstruct("Expr05", ConstructType::expr05) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1016,7 +1648,8 @@ class Expr06 final: public MultiOpConstruct {
 
 public:
 
-    Expr06() : MultiOpConstruct("Expr06") { }
+    Expr06()
+        : MultiOpConstruct("Expr06", ConstructType::expr06) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1031,7 +1664,8 @@ class Expr07 final: public MultiOpConstruct {
 
 public:
 
-    Expr07() : MultiOpConstruct("Expr07") { }
+    Expr07()
+        : MultiOpConstruct("Expr07", ConstructType::expr07) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1047,7 +1681,8 @@ class Expr08 final: public MultiOpConstruct {
 
 public:
 
-    Expr08() : MultiOpConstruct("Expr08") { }
+    Expr08()
+        : MultiOpConstruct("Expr08", ConstructType::expr08) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1063,7 +1698,8 @@ class Expr09 final: public MultiOpConstruct {
 
 public:
 
-    Expr09() : MultiOpConstruct("Expr09") { }
+    Expr09()
+        : MultiOpConstruct("Expr09", ConstructType::expr09) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1079,7 +1715,8 @@ class Expr10 final: public MultiOpConstruct {
 
 public:
 
-    Expr10() : MultiOpConstruct("Expr10") { }
+    Expr10()
+        : MultiOpConstruct("Expr10", ConstructType::expr10) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1094,7 +1731,8 @@ class Expr11 final: public MultiOpConstruct {
 
 public:
 
-    Expr11() : MultiOpConstruct("Expr11") { }
+    Expr11()
+        : MultiOpConstruct("Expr11", ConstructType::expr11) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1109,7 +1747,8 @@ class Expr12 final: public MultiOpConstruct {
 
 public:
 
-    Expr12() : MultiOpConstruct("Expr12") { }
+    Expr12()
+        : MultiOpConstruct("Expr12", ConstructType::expr12) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1139,11 +1778,20 @@ public:
     std::vector<std::pair<Op, unique_ptr<Construct>>> elems;
 
     TypedScalarExpr(Cat cat, TypeHint kind)
-        : Construct("TypedScalarExpr"), cat(cat), kind(kind) { }
+        : Construct("TypedScalarExpr", false,
+                    ConstructType::typed_scalar)
+        , cat(cat), kind(kind) { }
 
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     int_type eval_int(EvalContext *ctx) const override;
     float_type eval_float(EvalContext *ctx) const override;
+    /* the un-wrapped bodies; eval_int/eval_float add the inlined-at frame
+     * flush for a node inside an inlined body (task #75 - the typed path
+     * bypasses Construct::eval, so without this an error thrown through a
+     * typed chain lost its virtual backtrace frames; chain-less nodes call
+     * the body directly, zero cost) */
+    int_type eval_int_body(EvalContext *ctx) const;
+    float_type eval_float_body(EvalContext *ctx) const;
     void serialize(ostream &s, int level = 0) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1162,8 +1810,35 @@ public:
     unique_ptr<Construct> rvalue;
     unsigned fl;
     Op op;
+    /*
+     * A destructure `a, b = <rvalue>` whose rvalue the inferencer PROVED a
+     * non-opt array (annotate_hints), and its element kind (i/f, or none
+     * for any other element - read boxed). The codegen lowers such an
+     * unpack into a length test plus per-target element reads.
+     */
+    bool unpack_rv_array = false;
+    TypeHint unpack_rv_th = TypeHint::none;
+    /* A plain store into a DICT element or dict member whose static value
+     * type is numeric and wider than the rvalue's (#75 follow-up): the
+     * rvalue widens to it (i/f) before the store, in every engine. */
+    DeclType rv_coerce = DeclType::none;
+    /* An assignment's VALUE (`var z = (a[i] = 3)`) is the stored value: the
+     * right-hand side converted to the target's static type - i/f when an
+     * element or field target is numeric and wider than the rvalue (a dict
+     * target widens its rvalue through rv_coerce instead). Read only where
+     * the value is used: the tree-walker's result, the VM's value form. */
+    DeclType val_widen = DeclType::none;
+    /* #49: the store's VALUE may misfit its place's declared type - a
+     * `dyn` (or a container with a `dyn` element) stored into an element,
+     * a dict value or a container / box field whose type is fixed. Checked
+     * (value_fits) after rv_coerce and before the store, with the value's
+     * caret: the tree-walker's handle_single_expr14, the VM's CheckFitV.
+     * Stamped by annotate_hints (Inferencer::store_fit); null: no check. */
+    std::shared_ptr<const FitSpec> rv_fit;
 
-    Expr14() : Construct("Expr14"), fl(pNone), op(Op::invalid) { }
+    Expr14()
+        : Construct("Expr14", false, ConstructType::expr14)
+        , fl(pNone), op(Op::invalid) { }
     void serialize(ostream &s, int level = 0) const override;
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
@@ -1174,6 +1849,11 @@ public:
         c->rvalue = clone_as(rvalue);
         c->fl = fl;
         c->op = op;
+        c->unpack_rv_array = unpack_rv_array;
+        c->unpack_rv_th = unpack_rv_th;
+        c->rv_coerce = rv_coerce;
+        c->val_widen = val_widen;
+        c->rv_fit = rv_fit;
         return c;
     }
 };
@@ -1185,7 +1865,7 @@ public:
     unique_ptr<Construct> thenBlock;
     unique_ptr<Construct> elseBlock;
 
-    IfStmt() : Construct("IfStmt") { }
+    IfStmt() : Construct("IfStmt", false, ConstructType::if_stmt) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1223,6 +1903,18 @@ public:
     std::vector<const UniqueId *> global_func_names;
 
     /*
+     * Parallel to global_func_names (by GLOBAL-table slot): 1 iff that slot is
+     * ever an assignment target AFTER its declaration (a function/global
+     * REASSIGNED - `f = g`), i.e. NOT write-once. The resolver fills it. The
+     * native-call JIT (#55) reads it: a direct call may lower to a native
+     * `call` only when its callee slot is write-once (the callee identity is
+     * then compile-time-fixed); a reassigned (dynamically-typed) callee stays
+     * interpreted in v1 (native in v3 via a runtime type check). Empty == none
+     * reassigned (or not the root block).
+     */
+    std::vector<char> global_slot_reassigned;
+
+    /*
      * Set by the resolver when every declaration in this block is a frame slot
      * (no map-bound decl: no capture, no nested-func name, no slot-budget
      * overflow). Such a block never touches the EvalContext map, so do_eval can
@@ -1242,6 +1934,7 @@ public:
         c->slot_start = slot_start;
         c->slot_count = slot_count;
         c->global_func_names = global_func_names;
+        c->global_slot_reassigned = global_slot_reassigned;
         c->scope_free = scope_free;
         return c;
     }
@@ -1250,7 +1943,8 @@ public:
 class BreakStmt final: public ChildlessConstruct {
 
 public:
-    BreakStmt(): ChildlessConstruct("BreakStmt") { }
+    BreakStmt()
+        : ChildlessConstruct("BreakStmt", ConstructType::brk) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1263,7 +1957,8 @@ public:
 class ContinueStmt final: public ChildlessConstruct {
 
 public:
-    ContinueStmt(): ChildlessConstruct("ContinueStmt") { }
+    ContinueStmt()
+        : ChildlessConstruct("ContinueStmt", ConstructType::cont) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1277,6 +1972,10 @@ class ReturnStmt final: public Construct {
 
 public:
     unique_ptr<Construct> elem;
+    /* The enclosing function's static return type is numeric and wider
+     * than this value's (`if (b) return 1; return 2.5;`): the value widens
+     * to it (i/f) before it is returned, in every engine (#75 follow-up). */
+    DeclType ret_coerce = DeclType::none;
 
     ReturnStmt(): Construct("ReturnStmt", false, ConstructType::ret) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1286,6 +1985,7 @@ public:
         auto c = make_unique<ReturnStmt>();
         copy_base_fields(*c);
         c->elem = clone_as(elem);
+        c->ret_coerce = ret_coerce;
         return c;
     }
 };
@@ -1295,8 +1995,13 @@ class WhileStmt final: public Construct {
 public:
     unique_ptr<Construct> condExpr;
     unique_ptr<Construct> body;
+    /* The condition is a constant the parser found true (in both fold
+     * modes, so `-nc` agrees): the loop ends only by a `break`, a
+     * `return` or an exception - the inferencer's always_exits. */
+    bool cond_true = false;
 
-    WhileStmt() : Construct("WhileStmt") { }
+    WhileStmt()
+        : Construct("WhileStmt", false, ConstructType::while_stmt) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1305,9 +2010,49 @@ public:
         copy_base_fields(*c);
         c->condExpr = clone_as(condExpr);
         c->body = clone_as(body);
+        c->cond_true = cond_true;
         return c;
     }
 };
+
+/*
+ * #49: a parameter's ParamDesc::fit - its declared type as a run-time
+ * annotation, for a declaration a `dyn` argument can misfit: `bool`,
+ * `str`, a struct, a container (generic or parameterized) or a box. Null
+ * for an untyped or `dyn` parameter and for `int` / `float`, whose bind
+ * converts (and refuses what it cannot).
+ */
+inline std::shared_ptr<const TypeAnnot> param_fit_annot(const Identifier *p)
+{
+    if (p->dyn_mod)
+        return nullptr;
+    std::shared_ptr<TypeAnnot> t;
+    switch (p->decl_type) {
+    case DeclType::b: case DeclType::s:
+        t = std::make_shared<TypeAnnot>();
+        t->kind = p->decl_type;
+        break;
+    case DeclType::strct:
+        if (!p->decl_struct)
+            return nullptr;
+        t = std::make_shared<TypeAnnot>();
+        t->kind = DeclType::strct;
+        t->strct = p->decl_struct;
+        break;
+    case DeclType::arr: case DeclType::dict: case DeclType::box:
+        if (p->decl_annot)
+            t = std::make_shared<TypeAnnot>(*p->decl_annot);
+        else {
+            t = std::make_shared<TypeAnnot>();
+            t->kind = p->decl_type;
+        }
+        break;
+    default:
+        return nullptr;
+    }
+    t->opt = p->opt_mod;
+    return t;
+}
 
 class FuncDeclStmt final: public Construct {
 
@@ -1354,8 +2099,30 @@ public:
      */
     bool is_template = false;
 
+    /*
+     * Set by the inferencer when every parameter's static type can be a
+     * per-frame pure-call cache KEY (PureCacheKey compares argument values
+     * with ==): a scalar, a string, a struct of such, or an array / dict of
+     * such - a value compared by IDENTITY (a class instance, a box, a
+     * function) or a `dyn` can change while it stays equal to itself, so a
+     * cached result would outlive it. The inliner marks `cache_results`
+     * only on such a function. COMPILE-only; false without inference.
+     */
+    bool args_cache_safe = false;
+
+    /*
+     * A const-argument SPECIALIZATION (`name$sN`, the inliner's
+     * build_specialization): what each parameter was bound to, as a value
+     * repr (`1`, `[1, 2]`), or "" for one left a parameter - so the REPL's
+     * `:globals` and the `specialize` trace can say what the clone is FOR.
+     * Empty for every other function. COMPILE-only, display only.
+     */
+    std::vector<std::string> spec_args;
+    /* spec_args rendered, " with mode = 1, k = [1, 2]" ("" if none) */
+    std::string spec_args_str() const;
+
     FuncDeclStmt()
-        : Construct("FuncDeclStmt")
+        : Construct("FuncDeclStmt", false, ConstructType::func_decl)
         , desc_owner(make_unique<FuncDescriptor>())
         , desc(desc_owner.get())
     {
@@ -1380,6 +2147,14 @@ public:
                 const Identifier *p = params->elems[i].get();
                 desc->params.push_back({p->uid, p->opt_mod, p->const_param,
                                         p->dyn_mod, p->decl_type});
+                /* signature()'s text for an annotation the DeclType
+                 * keyword cannot say (a struct, array<T>, box<T>, ...) */
+                if (p->decl_type == DeclType::strct || p->decl_annot)
+                    desc->params.back().sig_type = UniqueId::get(
+                        reflect_decl_annot(p->decl_type, p->decl_struct,
+                                           p->decl_annot.get(),
+                                           p->opt_mod));
+                desc->params.back().fit = param_fit_annot(p);
                 if (!p->opt_mod)
                     desc->min_args = static_cast<int>(i) + 1;
             }
@@ -1397,6 +2172,7 @@ public:
         c->params = clone_as(params);
         c->body = clone_as(body);
         c->slot_writes = slot_writes;
+        c->args_cache_safe = args_cache_safe;
         /* A fresh descriptor for the clone (its own runtime identity): copy
          * the compile results, re-snapshot the params from the cloned
          * Identifiers, leave the chunk unset (the clone has its own body).
@@ -1434,7 +2210,7 @@ static inline Construct *func_expr_body(const FuncDeclStmt *fd)
 }
 
 /*
- * A `struct Name { ... }` declaration (plans/structs.md). Owns the
+ * A `struct Name { ... }` declaration (plans/archived/structs.md). Owns the
  * StructTypeDef; do_eval binds the type name to a const descriptor value
  * (t_structtype) in scope, like a func name. Const-evaluable, so a `const`
  * built from the type (construction, `Type.CONST`) folds at parse time.
@@ -1455,11 +2231,12 @@ public:
     StructTypeDef *def = nullptr;
 
     void set_def(unique_ptr<StructTypeDef> d) {
-        def_owner = move(d);
+        def_owner = std::move(d);
         def = def_owner.get();
     }
 
-    StructDeclStmt() : Construct("StructDeclStmt", true) { }
+    StructDeclStmt()
+        : Construct("StructDeclStmt", true, ConstructType::struct_decl) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
     unique_ptr<Construct> clone() const override;
@@ -1484,6 +2261,23 @@ public:
      * only when this holds - the runtime type + COW + vivify are handled by
      * the shared Type::subscript path. */
     bool base_dict = false;
+    /* Lever 4b: `what` is statically a non-opt STRING - gates the fused
+     * ord(s[i]) lowering (OrdCharV: the byte read, no 1-char SharedStr). */
+    bool base_str = false;
+    /* C1c: the base is statically array<bool> (non-opt elem). Feeds the
+     * ELEM-BOOL hint (Instr::opflags bit 6) on StoreElemInt/LoadElemInt,
+     * so the JIT's hoist pick guards the bools kind - ADVISORY (a wrong
+     * hint fails a runtime guard and the loop runs its cold twin). */
+    bool elem_bool = false;
+    /* A DICT subscript whose static key type is numeric and wider than the
+     * index's: the key widens to it (i/f) - so an int stored under a
+     * dict<float, _> is a float key, as its type says (#75 follow-up). */
+    DeclType key_coerce = DeclType::none;
+    /* #49: the store TARGET's dict key may misfit the dict's declared key
+     * type (a `dyn` key into a dict<str, _>) - checked after key_coerce,
+     * before the store (subscript_store, the VM's CheckFitV after the
+     * key). Stamped only on a store target; null: no check. */
+    std::shared_ptr<const FitSpec> key_fit;
 
     Subscript() : Construct("Subscript", false, ConstructType::subscript) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1497,7 +2291,11 @@ public:
         c->what = clone_as(what);
         c->index = clone_as(index);
         c->base_array = base_array;
+        c->base_str = base_str;
         c->base_dict = base_dict;
+        c->elem_bool = elem_bool;
+        c->key_coerce = key_coerce;
+        c->key_fit = key_fit;
         return c;
     }
 };
@@ -1509,8 +2307,13 @@ public:
     unique_ptr<Construct> what;
     unique_ptr<Construct> start_idx;
     unique_ptr<Construct> end_idx;
+    /* Set by the inferencer when `what` is statically a non-opt ARRAY or
+     * STRING: with int(-proven)/absent bounds such a slice CANNOT throw
+     * (pure clamping semantics) - the loop-invariant hoist's
+     * zero-iteration safety gate (lever 3). */
+    bool base_sliceable = false;
 
-    Slice() : Construct("Slice") { }
+    Slice() : Construct("Slice", false, ConstructType::slice) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1520,6 +2323,7 @@ public:
         c->what = clone_as(what);
         c->start_idx = clone_as(start_idx);
         c->end_idx = clone_as(end_idx);
+        c->base_sliceable = base_sliceable;
         return c;
     }
 };
@@ -1528,6 +2332,13 @@ struct AllowedExList {
 
     unique_ptr<IdList> exList;
     unique_ptr<Identifier> asId;
+    /* question 25: per exList element, the struct the name resolves to
+     * where the clause is written (the clause catches THAT struct only),
+     * or null for a built-in exception's name - and for a name the
+     * inferencer could not resolve in an OPEN world (the REPL, a
+     * parse-time copy), which then matches by name. Set by the
+     * inferencer's structural pass; empty when it has not run. */
+    std::vector<const StructTypeDef *> defs;
 };
 
 class TryCatchStmt final: public Construct {
@@ -1538,7 +2349,8 @@ public:
     unique_ptr<Construct> finallyBody;
     std::vector<std::pair<AllowedExList, unique_ptr<Construct>>> catchStmts;
 
-    TryCatchStmt() : Construct("TryCatchStmt") { }
+    TryCatchStmt()
+        : Construct("TryCatchStmt", false, ConstructType::try_catch) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1551,7 +2363,8 @@ public:
             AllowedExList ael;
             ael.exList = clone_as(cs.first.exList);
             ael.asId = clone_as(cs.first.asId);
-            c->catchStmts.emplace_back(move(ael), clone_as(cs.second));
+            ael.defs = cs.first.defs;
+            c->catchStmts.emplace_back(std::move(ael), clone_as(cs.second));
         }
         return c;
     }
@@ -1562,7 +2375,8 @@ class RethrowStmt final: public ChildlessConstruct {
 public:
 
     RethrowStmt(Loc start = Loc(), Loc end = Loc())
-        : ChildlessConstruct("RethrowStmt", start, end) { }
+        : ChildlessConstruct("RethrowStmt", ConstructType::rethrow,
+                             start, end) { }
 
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
@@ -1576,7 +2390,9 @@ public:
 class ThrowStmt final: public SingleChildConstruct {
 
 public:
-    ThrowStmt(): SingleChildConstruct("ThrowStmt") { }
+    ThrowStmt()
+        : SingleChildConstruct("ThrowStmt",
+                               ConstructType::throw_stmt) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
 
     unique_ptr<Construct> clone() const override {
@@ -1627,7 +2443,7 @@ public:
      * exactly like the general-array path. */
     bool container_is_str = false;
     /* Set by the inferencer for a non-indexed 1- or 2-var loop over a proven
-     * DICT: the VM iterates it natively with a LIVE unordered_map iterator
+     * DICT: the VM iterates it natively with a LIVE map iterator
      * (DictIterInit/DictIterNext), binding the key (1-var) or key+value (2-var)
      * box-free. A dict has no O(1) index, so this is a separate loop shape from
      * the counted array foreach. */
@@ -1662,7 +2478,9 @@ public:
      * bind. A whole-`p` use or `p.field` write makes the codegen bail. */
     const StructTypeDef *container_struct_def = nullptr;
 
-    ForeachStmt() : Construct("ForeachStmt"), idsVarDecl(false), indexed(false) { }
+    ForeachStmt()
+        : Construct("ForeachStmt", false, ConstructType::foreach_stmt)
+        , idsVarDecl(false), indexed(false) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1702,9 +2520,32 @@ public:
     /* Set by the inferencer when `what` is statically a STRUCT instance (so
      * `s.f = v` is a field store). Gates the VM's native StoreMemberV. */
     bool base_struct = false;
+    /* The proven base's StructTypeDef (with base_struct) - lets codegen
+     * resolve the field's slot/offset at COMPILE time (the 64_struct_create
+     * fix: no runtime name scan). Null when base_struct is false. */
+    const StructTypeDef *base_struct_def = nullptr;
+    /* The field's slot in base_struct_def, resolved at COMPILE time by the
+     * inferencer (-1 = not a field / unproven). Runtime uses it behind a
+     * def-identity check, so no name scan runs on a proven member access. */
+    int field_slot = -1;
+    /* class step 4: the proven base is a non-opt `box<P>` - the same
+     * StructObject as a P (base_struct / base_struct_def describe P), but
+     * a REFERENCE: two names share it, so a pass that treats a member of
+     * a struct VALUE as the variable's own (fr_member_of_value) or reads
+     * it out of a flat struct array must not apply. */
+    bool base_boxed = false;
 
-    MemberExpr() : Construct("MemberExpr") { }
+    MemberExpr()
+        : Construct("MemberExpr", false, ConstructType::member) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    /* do_eval's access step over an ALREADY-EVALUATED base value: an
+     * assignable field / dict value, or a value read. A store evaluates
+     * the base once and calls this (eval.cpp, member_store). `rooted`: the
+     * base outlives this evaluation - a variable, or a store's HELD value
+     * (hold_store_base) - so a boxed field may be handed out as an lvalue;
+     * a field of a temporary is a value, its object freed after the read. */
+    EvalValue access(const EvalValue &dval, bool for_write,
+                     bool rooted) const;
     int_type eval_int(EvalContext *ctx) const override;
     float_type eval_float(EvalContext *ctx) const override;
     void serialize(ostream &s, int level = 0) const override;
@@ -1718,6 +2559,9 @@ public:
         c->optional = optional;
         c->base_dict = base_dict;
         c->base_struct = base_struct;
+        c->base_struct_def = base_struct_def;
+        c->field_slot = field_slot;
+        c->base_boxed = base_boxed;
         return c;
     }
 };
@@ -1736,7 +2580,9 @@ public:
     bool is_prefix;                 /* ++x / --x  (else postfix x++ / x--) */
     bool is_inc;                    /* ++ (else --) */
 
-    IncDecExpr() : Construct("IncDecExpr"), is_prefix(false), is_inc(true) { }
+    IncDecExpr()
+        : Construct("IncDecExpr", false, ConstructType::incdec)
+        , is_prefix(false), is_inc(true) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1746,6 +2592,64 @@ public:
         c->lvalue = clone_as(lvalue);
         c->is_prefix = is_prefix;
         c->is_inc = is_inc;
+        return c;
+    }
+};
+
+/*
+ * `*b` - the value the box `b` holds (plans/class-and-box.md, step 3): an
+ * rvalue that reads it, and a LOCATION - `*b = v`, `*b += v`, `(*b)++`
+ * write the box, never the variable `b`. For a `box<P>` the read is a copy
+ * (P is a value); a store overwrites the box's fields in place.
+ */
+class DerefExpr final: public Construct {
+
+public:
+
+    unique_ptr<Construct> elem;     /* the box expression */
+    /* The box the inferencer proved `elem` holds (box_load_want's code):
+     * 0 = unknown (a dyn), 1 int, 2 float, 3 bool, 4 str, 5 the struct
+     * `want_def`. A read checks it, so a typed consumer never finds a
+     * misfit a `dyn` laundered into a box<T> place. */
+    int want = 0;
+    const StructTypeDef *want_def = nullptr;
+
+    DerefExpr() : Construct("DerefExpr", false, ConstructType::deref) { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<DerefExpr>();
+        copy_base_fields(*c);
+        c->elem = clone_as(elem);
+        c->want = want;
+        c->want_def = want_def;
+        return c;
+    }
+};
+
+/*
+ * `cast<T>(x)` (plans/cast.md): `x` converted to exactly the type T, at run
+ * time - cast_value (types/cast.cpp.h), which every engine calls. T is
+ * complete (the parser refuses a bare `array` / `dict` anywhere in it) and
+ * interned, so it outlives the AST like a container's own type (Q2).
+ */
+class CastExpr final: public Construct {
+
+public:
+
+    unique_ptr<Construct> elem;         /* x */
+    const TypeAnnot *to = nullptr;      /* T, interned (annot_intern) */
+
+    CastExpr() : Construct("CastExpr", false, ConstructType::cast) { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<CastExpr>();
+        copy_base_fields(*c);
+        c->elem = clone_as(elem);
+        c->to = to;
         return c;
     }
 };
@@ -1760,7 +2664,8 @@ public:
     unique_ptr<Construct> thenExpr;
     unique_ptr<Construct> elseExpr;
 
-    TernaryExpr() : Construct("TernaryExpr") { }
+    TernaryExpr()
+        : Construct("TernaryExpr", false, ConstructType::ternary) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1783,7 +2688,8 @@ public:
     unique_ptr<Construct> lhs;
     unique_ptr<Construct> rhs;
 
-    CoalesceExpr() : Construct("CoalesceExpr") { }
+    CoalesceExpr()
+        : Construct("CoalesceExpr", false, ConstructType::coalesce) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1804,8 +2710,10 @@ public:
     unique_ptr<Construct> cond;
     unique_ptr<Construct> inc;
     unique_ptr<Construct> body;
+    /* No condition, or a constant the parser found true: WhileStmt's */
+    bool cond_true = false;
 
-    ForStmt() : Construct("ForStmt") { }
+    ForStmt() : Construct("ForStmt", false, ConstructType::for_stmt) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1816,6 +2724,7 @@ public:
         c->cond = clone_as(cond);
         c->inc = clone_as(inc);
         c->body = clone_as(body);
+        c->cond_true = cond_true;
         return c;
     }
 };
@@ -1844,7 +2753,8 @@ public:
     int i_slot = 0;               /* the loop var's frame slot */
     Op cmp_op = Op::lt;           /* lt/le -> ascending; ge/gt -> descending */
 
-    ForRangeStmt() : Construct("ForRangeStmt") { }
+    ForRangeStmt()
+        : Construct("ForRangeStmt", false, ConstructType::for_range) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     void serialize(ostream &s, int level = 0) const override;
 
@@ -1860,3 +2770,112 @@ public:
         return c;
     }
 };
+
+/*
+ * node_cast<T>(c) is dynamic_cast<T *>(c) for a node class whose tag NO
+ * class outside its own subtree carries: a `final` class (its tag is its
+ * alone), CallExpr (every class tagged `call` is a CallExpr), or one of
+ * the two family bases, SingleChildConstruct and MultiOpConstruct (each
+ * a contiguous tag range, NodeIs below). T may be const-qualified,
+ * exactly as the dynamic_cast's target was; a class with no NodeTag entry
+ * does not compile. It reads the tag instead of the
+ * RTTI - the #102 conversion, for the forms that BIND the result.
+ *
+ * It also takes a fixed pile out of the coverage universe: dynamic_cast
+ * tests its operand for null first, a branch gcov charged to every call
+ * site, and almost every operand here cannot be null - about a thousand
+ * elements no input could take (2026-11-11). The null test is ctag's now,
+ * one per translation unit.
+ *
+ * The ML_CHECK proves every answer equals the dynamic_cast's in each
+ * build that has assertions, so a wrong NodeTag row aborts by name.
+ */
+template <class T> struct NodeTag;   /* no row: not tag-castable */
+#define ML_NODE_TAG(T, t)                                         \
+    template <> struct NodeTag<T> {                               \
+        static constexpr ConstructType tag = ConstructType::t;    \
+    };
+ML_NODE_TAG(LiteralInt, lit_int)
+ML_NODE_TAG(LiteralBool, lit_bool)
+ML_NODE_TAG(LiteralFloat, lit_float)
+ML_NODE_TAG(LiteralNone, lit_none)
+ML_NODE_TAG(NopConstruct, nop)
+ML_NODE_TAG(LiteralStr, lit_str)
+ML_NODE_TAG(LiteralArray, lit_arr)
+ML_NODE_TAG(LiteralObj, lit_obj)
+ML_NODE_TAG(LiteralDictKVPair, lit_dict_kv)
+ML_NODE_TAG(LiteralDict, lit_dict)
+ML_NODE_TAG(Identifier, id)
+ML_NODE_TAG(ExprList, expr_list)
+ML_NODE_TAG(IdList, idlist)
+ML_NODE_TAG(CallExpr, call)
+ML_NODE_TAG(InlinedCallExpr, inlined_call)
+ML_NODE_TAG(Expr01, expr01)
+ML_NODE_TAG(Expr02, expr02)
+ML_NODE_TAG(Expr03, expr03)
+ML_NODE_TAG(Expr04, expr04)
+ML_NODE_TAG(Expr05, expr05)
+ML_NODE_TAG(Expr06, expr06)
+ML_NODE_TAG(Expr07, expr07)
+ML_NODE_TAG(Expr08, expr08)
+ML_NODE_TAG(Expr09, expr09)
+ML_NODE_TAG(Expr10, expr10)
+ML_NODE_TAG(Expr11, expr11)
+ML_NODE_TAG(Expr12, expr12)
+ML_NODE_TAG(TypedScalarExpr, typed_scalar)
+ML_NODE_TAG(Expr14, expr14)
+ML_NODE_TAG(IfStmt, if_stmt)
+ML_NODE_TAG(Block, block)
+ML_NODE_TAG(BreakStmt, brk)
+ML_NODE_TAG(ContinueStmt, cont)
+ML_NODE_TAG(ReturnStmt, ret)
+ML_NODE_TAG(WhileStmt, while_stmt)
+ML_NODE_TAG(FuncDeclStmt, func_decl)
+ML_NODE_TAG(StructDeclStmt, struct_decl)
+ML_NODE_TAG(Subscript, subscript)
+ML_NODE_TAG(Slice, slice)
+ML_NODE_TAG(TryCatchStmt, try_catch)
+ML_NODE_TAG(RethrowStmt, rethrow)
+ML_NODE_TAG(ThrowStmt, throw_stmt)
+ML_NODE_TAG(ForeachStmt, foreach_stmt)
+ML_NODE_TAG(MemberExpr, member)
+ML_NODE_TAG(IncDecExpr, incdec)
+ML_NODE_TAG(DerefExpr, deref)
+ML_NODE_TAG(CastExpr, cast)
+ML_NODE_TAG(TernaryExpr, ternary)
+ML_NODE_TAG(CoalesceExpr, coalesce)
+ML_NODE_TAG(ForStmt, for_stmt)
+ML_NODE_TAG(ForRangeStmt, for_range)
+#undef ML_NODE_TAG
+
+/*
+ * Is a node of tag `c` a U? Its own tag for a NodeTag class; for the two
+ * family BASES, the CONTIGUOUS tag range their subtree is (ConstructType
+ * lists each family together for exactly this) - so node_cast serves
+ * `node_cast<const MultiOpConstruct>(e)` as well, with no dynamic_cast.
+ */
+template <class U> struct NodeIs {
+    static bool in(ConstructType c) { return c == NodeTag<U>::tag; }
+};
+template <> struct NodeIs<SingleChildConstruct> {
+    static bool in(ConstructType c) { return is_single_ct(c); }
+};
+template <> struct NodeIs<MultiOpConstruct> {
+    static bool in(ConstructType c) { return is_multiop_ct(c); }
+};
+
+template <class T, class C>
+static inline T *node_cast(C *c)
+{
+    typedef typename std::remove_const<T>::type U;
+    typedef typename std::conditional<std::is_const<C>::value,
+                                      const Construct, Construct>::type B;
+    static_assert(std::is_final<U>::value || std::is_same<U, CallExpr>::value
+                  || std::is_same<U, SingleChildConstruct>::value
+                  || std::is_same<U, MultiOpConstruct>::value,
+                  "node_cast: the tag must name T's whole subtree");
+    B *b = c;
+    T *r = NodeIs<U>::in(ctag(b)) ? static_cast<T *>(b) : nullptr;
+    ML_CHECK(r == dynamic_cast<T *>(b));
+    return r;
+}

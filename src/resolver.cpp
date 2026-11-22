@@ -2,6 +2,7 @@
 
 #include "syntax.h"
 #include "resolver.h"
+#include "inttest.h"
 #include "inferencer.h"   /* specialize_types (run_optimizers) */
 #include "analyzer.h"
 #include "errors.h"
@@ -11,6 +12,7 @@
 #include <functional>
 #include <unordered_set>
 #include <unordered_map>
+#include <set>
 #include <vector>
 #include <deque>
 #include <string>
@@ -65,6 +67,15 @@
 bool MakeConstructFromConstVal(const EvalValue &v, unique_ptr<Construct> &out,
                                bool process_arrays, bool immutable = false);
 
+#ifdef TESTS
+/* #93 reach diagnostics - defined further down, beside the other counters;
+ * declared here because the analysis lives in the anonymous namespace below
+ * and an `extern` there would get internal linkage instead. */
+extern unsigned long g_esc_p_callee, g_esc_p_gwrite,
+                     g_esc_p_hobuiltin, g_esc_p_shape;
+extern unsigned long g_esc_named_by_cs;
+#endif
+
 namespace {
 
 /* Max slots per frame. The Frame no longer has a fixed-width liveness word
@@ -95,6 +106,32 @@ struct Scope {
         DeclType type;
     };
     std::vector<Decl> decls;
+
+    /*
+     * Every name this scope's block DECLARES, including declarations
+     * lexically BELOW the current walk position. Filled by
+     * collect_scope_names BEFORE the block's statements are walked.
+     *
+     * Used ONLY by the FIX-1 check ("is this name declared anywhere in an
+     * enclosing scope?") - never by resolution, which still walks forward
+     * and so still reads an OUTER binding for a name shadowed later. That
+     * separation is deliberate: FIX-1 must distinguish "declared nowhere"
+     * (a typo - a compile error) from "declared below" (legal today, and
+     * what step 3's TDZ will turn into UseBeforeBindingEx), and
+     * `unresolved AT THIS POINT` cannot tell them apart.
+     */
+    std::vector<const UniqueId *> all_names;
+
+    /*
+     * The subset of `all_names` that has a TEMPORAL DEAD ZONE: `var`/`const`
+     * declarations only. A func or struct declaration HOISTS WITH ITS
+     * BINDING (it is a compile-time entity with no runtime initialisation
+     * order), which is what keeps mutual recursion and the "helpers below
+     * main" layout legal - so it is never "declared but unbound" and must
+     * NOT raise UseBeforeBindingEx. This is JavaScript's `function`-vs-`let`
+     * split, which MyLang already had for funcs; TDZ adds the `let` half.
+     */
+    std::vector<const UniqueId *> var_names;
 };
 
 /*
@@ -109,6 +146,7 @@ struct FuncState {
     int next_slot = 0;
     std::vector<Scope> scopes;
     std::vector<int> writes;        /* per slot -> fd->slot_writes */
+    std::unordered_set<int> const_slots; /* the slots a `const` declared */
 };
 
 /*
@@ -128,6 +166,23 @@ struct FuncState {
  */
 
 /*
+ * The callee of a call to a LAZY builtin - one that asks about its
+ * argument's NAME and never evaluates it (defined / isbound / isconst /
+ * isconstdecl) - or null. The callee must NAME one and must not be the
+ * program's own symbol of that name (CallExpr::user_callee, stamped by the
+ * inferencer): a program's `func defined` is called like any function, so
+ * its argument is evaluated and must be declared (#133). Every pass that
+ * treats a lazy call specially asks this, never the name alone.
+ */
+static const Identifier *lazy_builtin_callee(const CallExpr *call)
+{
+    const Identifier *cid = node_cast<const Identifier>(call->what.get());
+    if (!cid || call->user_callee || !is_lazy_builtin(cid->uid))
+        return nullptr;
+    return cid;
+}
+
+/*
  * Builtins that take their FIRST argument as an lvalue or identifier (and throw
  * NotLValueEx / require an identifier otherwise). A value substituted/folded
  * there would change behavior, so neither auto-const nor the inliner folds it.
@@ -137,6 +192,7 @@ static bool is_lvalue_arg_builtin(std::string_view name)
 {
     return name == "append" || name == "push" || name == "pop"
         || name == "insert" || name == "erase" || name == "intptr"
+        || name == "refcount"
         || name == "sort" || name == "rev_sort" || name == "reverse";
 }
 
@@ -204,15 +260,15 @@ static bool is_readonly_value(const EvalValue &v)
  * already bool, since mylang's &&/|| yield bool (so bool(x) == x there). */
 static bool produces_bool(const Construct *c)
 {
-    if (dynamic_cast<const LiteralBool *>(c)
-            || dynamic_cast<const Expr06 *>(c)    /* < > <= >= */
-            || dynamic_cast<const Expr07 *>(c)    /* == != */
-            || dynamic_cast<const Expr11 *>(c)    /* && */
-            || dynamic_cast<const Expr12 *>(c))   /* || */
+    if (ctag(c) == ConstructType::lit_bool
+            || ctag(c) == ConstructType::expr06    /* < > <= >= */
+            || ctag(c) == ConstructType::expr07    /* == != */
+            || ctag(c) == ConstructType::expr11    /* && */
+            || ctag(c) == ConstructType::expr12)   /* || */
         return true;
-    if (auto *u = dynamic_cast<const Expr02 *>(c))  /* unary `!` */
+    if (auto *u = node_cast<const Expr02>(c))  /* unary `!` */
         return u->elems.size() == 1 && u->elems[0].first == Op::lnot;
-    if (auto *ts = dynamic_cast<const TypedScalarExpr *>(c))
+    if (auto *ts = node_cast<const TypedScalarExpr>(c))
         return ts->cat == TypedScalarExpr::Cat::cmp
             || ts->cat == TypedScalarExpr::Cat::logical
             || ts->cat == TypedScalarExpr::Cat::lnot;
@@ -226,25 +282,27 @@ static bool refs_uid(const Construct *c, const UniqueId *uid)
 {
     if (!c)
         return false;
-    if (auto *id = dynamic_cast<const Identifier *>(c))
+    if (auto *id = node_cast<const Identifier>(c))
         return id->uid == uid;
-    if (auto *b = dynamic_cast<const Block *>(c)) {
+    if (ctag(c) == ConstructType::block) {
+        auto *b = static_cast<const Block *>(c);
         for (auto &e : b->elems)
             if (refs_uid(e.get(), uid)) return true;
         return false;
     }
-    if (auto *f = dynamic_cast<const ForStmt *>(c))
+    if (auto *f = node_cast<const ForStmt>(c))
         return refs_uid(f->init.get(), uid) || refs_uid(f->cond.get(), uid)
             || refs_uid(f->inc.get(), uid) || refs_uid(f->body.get(), uid);
-    if (auto *fe = dynamic_cast<const ForeachStmt *>(c))
+    if (auto *fe = node_cast<const ForeachStmt>(c))
         return refs_uid(fe->container.get(), uid) || refs_uid(fe->body.get(), uid);
-    if (auto *tc = dynamic_cast<const TryCatchStmt *>(c)) {
+    if (ctag(c) == ConstructType::try_catch) {
+        auto *tc = static_cast<const TryCatchStmt *>(c);
         if (refs_uid(tc->tryBody.get(), uid)) return true;
         for (auto &p : tc->catchStmts)
             if (refs_uid(p.second.get(), uid)) return true;
         return refs_uid(tc->finallyBody.get(), uid);
     }
-    if (auto *e = dynamic_cast<const Expr14 *>(c))
+    if (auto *e = node_cast<const Expr14>(c))
         return refs_uid(e->lvalue.get(), uid) || refs_uid(e->rvalue.get(), uid);
     bool found = false;
     for_each_child(const_cast<Construct *>(c),
@@ -269,25 +327,27 @@ static int count_uid(const Construct *c, const UniqueId *uid)
 {
     if (!c)
         return 0;
-    if (auto *id = dynamic_cast<const Identifier *>(c))
+    if (auto *id = node_cast<const Identifier>(c))
         return id->uid == uid ? 1 : 0;
     int n = 0;
-    if (auto *b = dynamic_cast<const Block *>(c)) {
+    if (ctag(c) == ConstructType::block) {
+        auto *b = static_cast<const Block *>(c);
         for (auto &e : b->elems) n += count_uid(e.get(), uid);
         return n;
     }
-    if (auto *f = dynamic_cast<const ForStmt *>(c))
+    if (auto *f = node_cast<const ForStmt>(c))
         return count_uid(f->init.get(), uid) + count_uid(f->cond.get(), uid)
              + count_uid(f->inc.get(), uid) + count_uid(f->body.get(), uid);
-    if (auto *fe = dynamic_cast<const ForeachStmt *>(c))
+    if (auto *fe = node_cast<const ForeachStmt>(c))
         return count_uid(fe->container.get(), uid)
              + count_uid(fe->body.get(), uid);
-    if (auto *tc = dynamic_cast<const TryCatchStmt *>(c)) {
+    if (ctag(c) == ConstructType::try_catch) {
+        auto *tc = static_cast<const TryCatchStmt *>(c);
         n += count_uid(tc->tryBody.get(), uid);
         for (auto &p : tc->catchStmts) n += count_uid(p.second.get(), uid);
         return n + count_uid(tc->finallyBody.get(), uid);
     }
-    if (auto *e = dynamic_cast<const Expr14 *>(c))
+    if (auto *e = node_cast<const Expr14>(c))
         return count_uid(e->lvalue.get(), uid) + count_uid(e->rvalue.get(), uid);
     for_each_child(const_cast<Construct *>(c),
         [&](Construct *ch) { n += count_uid(ch, uid); });
@@ -304,6 +364,51 @@ static bool func_is_cacheable_recursive(const FuncDeclStmt *fd)
         && count_uid(fd->body.get(), fd->id->uid) >= 2;
 }
 
+static void fmi_children(Construct *c,
+                         const std::function<void(Construct *)> &fn);
+
+/* The names a program ASSIGNS anywhere (`sq = ng;`, at any depth, a
+ * declaration excluded) - by NAME. The resolver's rebound_names; the REPL's
+ * cross-input seeding asks it too: a prior input's function bound to a name
+ * THIS input assigns is not what a call through the name reaches. */
+static void collect_rebound_names(
+    Construct *c, std::unordered_set<const UniqueId *> &out)
+{
+    if (!c)
+        return;
+    if (ctag(c) == ConstructType::expr14) {
+        auto *e = static_cast<Expr14 *>(c);
+        if (!(e->fl & pFlags::pInDecl)) {
+            Construct *lv = e->lvalue.get();
+            if (ctag(lv) == ConstructType::id)
+                out.insert(static_cast<Identifier *>(lv)->uid);
+            else if (ctag(lv) == ConstructType::idlist)
+                for (auto &x : static_cast<IdList *>(lv)->elems)
+                    out.insert(x->uid);
+        }
+    }
+    if (ctag(c) == ConstructType::func_decl)
+        collect_rebound_names(
+            static_cast<FuncDeclStmt *>(c)->body.get(), out);
+    fmi_children(c, [&](Construct *ch) {
+        collect_rebound_names(ch, out);
+    });
+}
+
+/* Is `id` a global-table name the program ASSIGNS somewhere (`sq = ng;`)?
+ * The resolver publishes the reassigned slots on the root block
+ * (global_slot_reassigned); a function bound to such a name is a VALUE the
+ * program can replace, so no pass may fold, inline or specialize a call
+ * through the name as a call to the declared function. */
+static bool global_name_rebound(const Block *rb, const Identifier *id)
+{
+    if (!rb || !id || id->sym.kind != SymKind::global || id->sym.slot < 0)
+        return false;
+    const size_t slot = static_cast<size_t>(id->sym.slot);
+    return slot < rb->global_slot_reassigned.size()
+        && rb->global_slot_reassigned[slot];
+}
+
 class AutoConst {
 
     EvalContext cctx;   /* const context for evaluating folded constants */
@@ -313,7 +418,9 @@ class AutoConst {
 public:
 
     explicit AutoConst(AnalysisInfo *a = nullptr,
-                       EvalContext *prior_pure = nullptr, bool repl = false)
+                       EvalContext *prior_pure = nullptr, bool repl = false,
+                       const std::unordered_set<const UniqueId *> *rebound =
+                           nullptr)
         : cctx(nullptr, true), analysis(a), repl_mode(repl)
     {
         /* REPL: seed the fold context with the prior inputs' effectively-pure
@@ -323,11 +430,16 @@ public:
          * its body still resolves its callees against the runtime scope. Only
          * pure FUNCTIONS are seeded (never a runtime var), so folding stays
          * sound; a current-input redefinition redirects to its own (new)
-         * instance, so a stale prior instance here is never used. */
+         * instance, so a stale prior instance here is never used. A name
+         * this input ASSIGNS (`rebound`) is not seeded: the value it holds
+         * when a call through it runs is not the one it holds now -
+         * `gf = func(y) => y * 2; gf(3)` folded to the OLD lambda's 4. */
         if (prior_pure) {
             std::vector<std::pair<const UniqueId *, const LValue *>> syms;
             prior_pure->collect_symbols(syms);
             for (const auto &kv : syms) {
+                if (rebound && rebound->count(kv.first))
+                    continue;
                 const EvalValue &v = kv.second->get();
                 if (v.is<intrusive_ptr<FuncObject>>() &&
                     v.get<intrusive_ptr<FuncObject>>()->func->effective_pure &&
@@ -346,6 +458,7 @@ public:
 
     void run(Block *root, const std::vector<int> &main_writes)
     {
+        root_rb = root;
         register_pure_funcs(root);
         fold_function(root, main_writes, nullptr);
     }
@@ -425,7 +538,7 @@ private:
     {
         unique_ptr<Construct> &arg = ce->args->elems[0];
         bool result;
-        auto *id = dynamic_cast<Identifier *>(arg.get());
+        auto *id = node_cast<Identifier>(arg.get());
 
         if (id && id->sym.kind == SymKind::local && fc.params
                 && id->sym.slot >= 0
@@ -461,11 +574,11 @@ private:
      * non-identifier arg (`defined(a[0])`, a rare misuse) is still left as a
      * runtime `defined()` call. Returns true iff it folded. Closes the
      * AST-builtin fold gap that made `s + defined(p)` emit a VM node
-     * fallback (see plans/vm-fallback-elimination.md).
+     * fallback (see plans/archived/vm-fallback-elimination.md).
      */
     bool try_fold_defined(unique_ptr<Construct> &slot, CallExpr *ce)
     {
-        auto *id = dynamic_cast<Identifier *>(ce->args->elems[0].get());
+        auto *id = node_cast<Identifier>(ce->args->elems[0].get());
         if (!id)
             return false;
         const SymKind k = id->sym.kind;
@@ -473,7 +586,13 @@ private:
          * -> fold to `true`. A GLOBAL is a genuine runtime property (its decl
          * may not have run) -> left for DefinedGlobalV. */
         if (k == SymKind::local || k == SymKind::capture
-                || k == SymKind::builtin) {
+                || k == SymKind::builtin || k == SymKind::global
+                || id->in_tdz) {
+            /* TDZ (#131): `in_tdz` means the name is DECLARED in this scope
+             * but its declaration has not been walked yet - `defined()` asks
+             * whether the name EXISTS, so the answer is true. Whether its
+             * value is bound yet is `isbound()`'s question (step 6), which
+             * takes over the runtime DefinedGlobalV check. */
             MakeConstructFromConstVal(EvalValue(true), slot, false);
             return true;
         }
@@ -491,6 +610,64 @@ private:
     }
 
     /*
+     * `isbound(name)` - has the DECLARATION run yet? The TDZ twin of
+     * try_fold_defined, and the answers are deliberately different:
+     *
+     *   func f() { var b = isbound(a); var a = 5; return b; }   -> FALSE
+     *   func f() { var b = defined(a); var a = 5; return b; }   -> true
+     *
+     * For a LEXICAL kind the answer is a compile-time constant: a param /
+     * capture / builtin is always bound, and a local is bound exactly after
+     * its declaration - `in_tdz` is the resolver's own record of "declared in
+     * this scope, declaration not yet walked", so the fold is exact. Each loop
+     * iteration re-runs the declaration, so "before the decl" is false on
+     * every iteration too and no runtime bound-flag is needed.
+     *
+     * A GLOBAL read from a function body is the one genuine RUNTIME query (the
+     * decl may not have executed): left un-folded for DefinedGlobalV in the VM
+     * and builtin_isbound in the tree-walker.
+     */
+    bool try_fold_isbound(unique_ptr<Construct> &slot, CallExpr *ce)
+    {
+        Construct *arg = ce->args->elems[0].get();
+        /* `none` is always available - the inferencer lets it through the
+         * identifier check for that reason (see reject_dev_builtins). */
+        if (ctag(arg) == ConstructType::lit_none) {
+            MakeConstructFromConstVal(EvalValue(true), slot, false);
+            return true;
+        }
+        auto *id = node_cast<Identifier>(arg);
+        if (!id)
+            return false;                  /* the arg-shape error, not ours */
+        if (id->in_tdz) {
+            MakeConstructFromConstVal(EvalValue(false), slot, false);
+            return true;
+        }
+        const SymKind k = id->sym.kind;
+        if (k == SymKind::local || k == SymKind::capture
+                || k == SymKind::builtin) {
+            MakeConstructFromConstVal(EvalValue(true), slot, false);
+            return true;
+        }
+        /*
+         * A name that exists NOWHERE is not bound -> `false`, the same shape
+         * try_fold_defined uses. This is an OPTIMIZATION, not a correctness
+         * fix, and the distinction is worth stating because the obvious
+         * assumption is the other way: the runtime path answers correctly
+         * without it (builtin_isbound's unresolved arm evaluates the
+         * Identifier, which yields the UndefinedId sentinel), so removing the
+         * fold leaves the whole suite green in all five modes - measured.
+         * What it buys is eliminating the call. NOT in the REPL, where an
+         * unresolved name may be an open-world map global.
+         */
+        if (k == SymKind::unresolved && !repl_mode) {
+            MakeConstructFromConstVal(EvalValue(false), slot, false);
+            return true;
+        }
+        return false;   /* global -> runtime; unresolved -> the REPL's map */
+    }
+
+    /*
      * Register every effectively-pure NAMED function into `cctx`, so that
      * fold_reads can evaluate their constant-argument calls at compile time.
      * Does not descend into function bodies (a pure func contains no funcs, and
@@ -500,19 +677,24 @@ private:
      * auto-pure funcs - and pure calls whose args only become const via
      * auto-const - can fold too.
      */
+    /* The root block, for the rebound-name test (set by run). */
+    const Block *root_rb = nullptr;
+
     void register_pure_funcs(Construct *c)
     {
         if (!c)
             return;
 
-        if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+        if (ctag(c) == ConstructType::func_decl) {
+            auto *fd = static_cast<FuncDeclStmt *>(c);
             /* Register a pure func into the fold context so its const-arg calls
              * fold - EXCEPT a recursive one: evaluating it at compile time
              * (fib(40)) could hang. A recursive pure func keeps its purity flag
              * (for inlining/CSE) but its const-arg recursion folds only via the
              * depth/budget-bounded unroll. */
             if (fd->desc->effective_pure && fd->id
-                    && !func_is_self_recursive(fd)) {
+                    && !func_is_self_recursive(fd)
+                    && !global_name_rebound(root_rb, fd->id.get())) {
                 try {
                     fd->eval(&cctx);
                 } catch (const Exception &) {
@@ -524,20 +706,25 @@ private:
 
         auto rec = [&](Construct *ch) { register_pure_funcs(ch); };
 
-        if (auto *b = dynamic_cast<Block *>(c)) {
+        if (ctag(c) == ConstructType::block) {
+            auto *b = static_cast<Block *>(c);
             for (auto &e : b->elems)
                 rec(e.get());
-        } else if (auto *f = dynamic_cast<ForStmt *>(c)) {
+        } else if (ctag(c) == ConstructType::for_stmt) {
+            auto *f = static_cast<ForStmt *>(c);
             rec(f->init.get()); rec(f->cond.get());
             rec(f->inc.get());  rec(f->body.get());
-        } else if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+        } else if (ctag(c) == ConstructType::foreach_stmt) {
+            auto *fe = static_cast<ForeachStmt *>(c);
             rec(fe->container.get()); rec(fe->body.get());
-        } else if (auto *tc = dynamic_cast<TryCatchStmt *>(c)) {
+        } else if (ctag(c) == ConstructType::try_catch) {
+            auto *tc = static_cast<TryCatchStmt *>(c);
             rec(tc->tryBody.get());
             for (auto &p : tc->catchStmts)
                 rec(p.second.get());
             rec(tc->finallyBody.get());
-        } else if (auto *e14 = dynamic_cast<Expr14 *>(c)) {
+        } else if (ctag(c) == ConstructType::expr14) {
+            auto *e14 = static_cast<Expr14 *>(c);
             rec(e14->lvalue.get()); rec(e14->rvalue.get());
         } else {
             for_each_child(c, rec);
@@ -551,7 +738,7 @@ private:
     void fold_function(Construct *body, const std::vector<int> &writes,
                        const IdList *params)
     {
-        Block *b = dynamic_cast<Block *>(body);
+        Block *b = node_cast<Block>(body);
 
         if (!b)
             return;
@@ -570,7 +757,7 @@ private:
     {
         if (!fd->body)
             return;
-        if (dynamic_cast<Block *>(fd->body.get())) {
+        if (node_cast<Block>(fd->body.get())) {
             fold_function(fd->body.get(), fd->slot_writes, fd->params.get());
         } else {
             FCtx fc{ fd->slot_writes, {}, {}, fd->params.get() };
@@ -608,36 +795,43 @@ private:
             return;
 
         auto block = [&](Construct *x) {
-            if (auto *id = dynamic_cast<Identifier *>(x))
+            if (auto *id = node_cast<Identifier>(x))
                 if (id->sym.kind == SymKind::local)
                     blocked.insert(id->sym.slot);
         };
 
-        if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+        if (ctag(c) == ConstructType::func_decl) {
+            auto *fd = static_cast<FuncDeclStmt *>(c);
             if (fd->captures)
                 for (auto &cap : fd->captures->elems)
                     block(cap.get());
             return;                    /* separate slot frame: don't descend */
         }
 
-        if (auto *ce = dynamic_cast<CallExpr *>(c)) {
+        if (ctag(c) == ConstructType::call) {
+            auto *ce = static_cast<CallExpr *>(c);
             /* Block the callee: it isn't folded, so promoting a var used there
              * would drop its decl and leave a dangling reference (a misleading
              * "undefined variable" instead of not-callable). */
             block(ce->what.get());
             /* Block only the first arg of a builtin that takes it as an lvalue
              * or identifier; all other call arguments are safe to fold. */
-            auto *callee = dynamic_cast<Identifier *>(ce->what.get());
+            auto *callee = node_cast<Identifier>(ce->what.get());
             if (callee && ce->args && !ce->args->elems.empty()
                     && is_lvalue_arg_builtin(callee->get_str()))
                 block(ce->args->elems[0].get());
-        } else if (auto *sub = dynamic_cast<Subscript *>(c)) {
+        } else if (ctag(c) == ConstructType::subscript) {
+            auto *sub = static_cast<Subscript *>(c);
             if (block_subscript_bases)
                 block(sub->what.get());
-        } else if (auto *me = dynamic_cast<MemberExpr *>(c)) {
+        } else if (ctag(c) == ConstructType::member) {
+            auto *me = static_cast<MemberExpr *>(c);
             if (block_subscript_bases)
                 block(me->what.get());
-        } else if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+        } else if (ctag(c) == ConstructType::deref) {
+            block(static_cast<DerefExpr *>(c)->elem.get());
+        } else if (ctag(c) == ConstructType::foreach_stmt) {
+            auto *fe = static_cast<ForeachStmt *>(c);
             if (fe->ids)
                 for (auto &id : fe->ids->elems)
                     block(id.get());
@@ -650,23 +844,28 @@ private:
             prescan_blocked(ch, blocked, block_subscript_bases);
         };
 
-        if (auto *b = dynamic_cast<Block *>(c)) {
+        if (ctag(c) == ConstructType::block) {
+            auto *b = static_cast<Block *>(c);
             for (auto &e : b->elems)
                 rec(e.get());
-        } else if (auto *f = dynamic_cast<ForStmt *>(c)) {
+        } else if (ctag(c) == ConstructType::for_stmt) {
+            auto *f = static_cast<ForStmt *>(c);
             rec(f->init.get());
             rec(f->cond.get());
             rec(f->inc.get());
             rec(f->body.get());
-        } else if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+        } else if (ctag(c) == ConstructType::foreach_stmt) {
+            auto *fe = static_cast<ForeachStmt *>(c);
             rec(fe->container.get());
             rec(fe->body.get());
-        } else if (auto *tc = dynamic_cast<TryCatchStmt *>(c)) {
+        } else if (ctag(c) == ConstructType::try_catch) {
+            auto *tc = static_cast<TryCatchStmt *>(c);
             rec(tc->tryBody.get());
             for (auto &p : tc->catchStmts)
                 rec(p.second.get());
             rec(tc->finallyBody.get());
-        } else if (auto *e14 = dynamic_cast<Expr14 *>(c)) {
+        } else if (ctag(c) == ConstructType::expr14) {
+            auto *e14 = static_cast<Expr14 *>(c);
             rec(e14->lvalue.get());        /* reaches `a[i]=`/`a.k=` bases */
             rec(e14->rvalue.get());        /* reaches a func-expr's captures */
         } else {
@@ -674,19 +873,43 @@ private:
         }
     }
 
-    /* A block's statements: promote const decls, fold, drop dead code. */
+    /* A block's statements: promote const decls, fold, drop dead code.
+     * A dropped statement is reset IN PLACE and the nulls are removed at
+     * the end - also when a fold RAISES (a constant call that throws is a
+     * compile error): the block then keeps every statement it still has,
+     * since the exception's payload may be a struct whose definition one
+     * of them owns. Moving the statements into a second vector, as this
+     * did, freed them while the exception unwound, and the driver's report
+     * read the freed definition (heap-use-after-free, every engine). */
     void fold_block(Block *b, FCtx &fc)
     {
-        std::vector<unique_ptr<Construct>> kept;
+        auto compact = [b] {
+            b->elems.erase(std::remove_if(b->elems.begin(), b->elems.end(),
+                               [](const unique_ptr<Construct> &p) {
+                                   return !p;
+                               }),
+                           b->elems.end());
+        };
+        try {
+            fold_block_stmts(b, fc);
+        } catch (...) {
+            compact();
+            throw;
+        }
+        compact();
+    }
 
+    void fold_block_stmts(Block *b, FCtx &fc)
+    {
         for (auto &e : b->elems) {
 
-            if (auto *e14 = dynamic_cast<Expr14 *>(e.get())) {
+            if (ctag(e.get()) == ConstructType::expr14) {
+                auto *e14 = static_cast<Expr14 *>(e.get());
 
                 if (e14->fl & pFlags::pInDecl) {
 
                     fold_reads(e14->rvalue, fc);
-                    auto *id = dynamic_cast<Identifier *>(e14->lvalue.get());
+                    auto *id = node_cast<Identifier>(e14->lvalue.get());
 
                     if (id && id->sym.kind == SymKind::local
                            && is_scalar_literal(e14->rvalue.get())
@@ -703,24 +926,19 @@ private:
                               "  write-once scalar -> " +
                               fc.consts[id->sym.slot].to_string() +
                               "  (folded at uses)");
-                        continue;
+                        e.reset();
                     }
-
-                    kept.push_back(move(e));
                     continue;
                 }
 
                 fold_reads(e14->rvalue, fc);   /* assignment: rhs ... */
                 fold_lvalue_reads(e14->lvalue, fc);   /* ... and lvalue reads */
-                kept.push_back(move(e));
                 continue;
             }
 
-            if (fold_child(e, fc))
-                kept.push_back(move(e));
+            if (!fold_child(e, fc))
+                e.reset();
         }
-
-        b->elems = move(kept);
     }
 
     /*
@@ -734,17 +952,20 @@ private:
         if (!c)
             return false;
 
-        if (auto *b = dynamic_cast<Block *>(c)) {
+        if (ctag(c) == ConstructType::block) {
+            auto *b = static_cast<Block *>(c);
             fold_block(b, fc);
             return true;
         }
 
-        if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+        if (ctag(c) == ConstructType::func_decl) {
+            auto *fd = static_cast<FuncDeclStmt *>(c);
             fold_func_body(fd);            /* block / expr-bodied func */
             return true;
         }
 
-        if (auto *iff = dynamic_cast<IfStmt *>(c)) {
+        if (ctag(c) == ConstructType::if_stmt) {
+            auto *iff = static_cast<IfStmt *>(c);
 
             fold_reads(iff->condExpr, fc);
 
@@ -764,11 +985,20 @@ private:
                     if (dead)
                         analysis->mark_dead(dead->start, dead->end);
                 }
-                unique_ptr<Construct> taken =
-                    t ? move(iff->thenBlock) : move(iff->elseBlock);
-                if (!taken || !fold_child(taken, fc))
+                /* Fold the live branch WHERE IT IS, and take it out of the
+                 * `if` only afterwards: its fold may RAISE (a constant call
+                 * that throws is a compile error), and a branch held by a
+                 * local would be freed while that exception unwinds - with
+                 * the function that owns the thrown struct's definition in
+                 * it, which the driver's report then reads (fold_block's
+                 * rule; `var on = true; if (on) { func a() { struct E {..}
+                 * throw E(1); } a(); }` was that use-after-free). */
+                unique_ptr<Construct> &live =
+                    t ? iff->thenBlock : iff->elseBlock;
+                if (!live || !fold_child(live, fc))
                     return false;          /* no live branch (or folds away) */
-                slot = move(taken);        /* replace if with its live branch */
+                unique_ptr<Construct> taken = std::move(live);
+                slot = std::move(taken);   /* the `if` becomes that branch */
                 return true;
             }
 
@@ -780,7 +1010,8 @@ private:
             return true;
         }
 
-        if (auto *w = dynamic_cast<WhileStmt *>(c)) {
+        if (ctag(c) == ConstructType::while_stmt) {
+            auto *w = static_cast<WhileStmt *>(c);
             fold_reads(w->condExpr, fc);
             if (is_scalar_literal(w->condExpr.get())) {
                 const EvalValue v = w->condExpr->eval(&cctx);
@@ -799,31 +1030,39 @@ private:
             return true;
         }
 
-        if (auto *f = dynamic_cast<ForStmt *>(c)) {
-            if (f->init && !fold_child(f->init, fc)) f->init.reset();
+        if (ctag(c) == ConstructType::for_stmt) {
+            auto *f = static_cast<ForStmt *>(c);
+            /* the init and the increment are expressions, which fold_child
+             * never drops (only a dead `if` / `while` folds away) */
+            if (f->init)
+                fold_child(f->init, fc);
             fold_reads(f->cond, fc);
-            if (f->inc && !fold_child(f->inc, fc)) f->inc.reset();
+            if (f->inc)
+                fold_child(f->inc, fc);
             if (f->body && !fold_child(f->body, fc)) f->body.reset();
             return true;
         }
 
-        if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+        if (ctag(c) == ConstructType::foreach_stmt) {
+            auto *fe = static_cast<ForeachStmt *>(c);
             fold_reads(fe->container, fc);
             if (fe->body && !fold_child(fe->body, fc)) fe->body.reset();
             return true;
         }
 
-        if (auto *tc = dynamic_cast<TryCatchStmt *>(c)) {
-            if (tc->tryBody && !fold_child(tc->tryBody, fc))
-                tc->tryBody.reset();
+        if (ctag(c) == ConstructType::try_catch) {
+            auto *tc = static_cast<TryCatchStmt *>(c);
+            /* every body is a braced block, which fold_child never drops */
+            fold_child(tc->tryBody, fc);
             for (auto &p : tc->catchStmts)
-                if (p.second && !fold_child(p.second, fc)) p.second.reset();
-            if (tc->finallyBody && !fold_child(tc->finallyBody, fc))
-                tc->finallyBody.reset();
+                fold_child(p.second, fc);
+            if (tc->finallyBody)
+                fold_child(tc->finallyBody, fc);
             return true;
         }
 
-        if (auto *r = dynamic_cast<ReturnStmt *>(c)) {
+        if (ctag(c) == ConstructType::ret) {
+            auto *r = static_cast<ReturnStmt *>(c);
             /* fold the returned expression. ReturnStmt is a plain Construct
              * (not a SingleChildConstruct), so fold_reads doesn't recurse into
              * it - without this a promoted const used only in a `return` would
@@ -833,7 +1072,8 @@ private:
             return true;
         }
 
-        if (auto *e14 = dynamic_cast<Expr14 *>(c)) {
+        if (ctag(c) == ConstructType::expr14) {
+            auto *e14 = static_cast<Expr14 *>(c);
             fold_reads(e14->rvalue, fc);   /* assignment as a statement: rhs */
             fold_lvalue_reads(e14->lvalue, fc);   /* ... and lvalue reads */
             return true;
@@ -854,8 +1094,44 @@ private:
      */
     void fold_lvalue_reads(unique_ptr<Construct> &lvalue, FCtx &fc)
     {
-        if (lvalue && !lvalue->is_id() && !lvalue->is_idlist())
-            fold_reads(lvalue, fc);
+        if (!lvalue || lvalue->is_id() || lvalue->is_idlist())
+            return;
+        /*
+         * Fold the INTERIOR reads of a write chain - the indexes - but
+         * never the chain's BASE SPINE (`arr` in `arr[j] = v`, `a` in
+         * `a[i][j] = v`, `s` in `s.f = v`).
+         *
+         * Before specialization relaxed the base block this distinction was
+         * moot: a subscript/member base was blocked from promotion
+         * entirely, so an id on the spine never had a const to fold and
+         * folding "the whole lvalue" only ever touched the indexes. The
+         * relaxed seed set (block_subscript_bases=false) lets a seeded
+         * const ARRAY fold into subscript bases - sound for READS, but
+         * folding it into a WRITE target's base turns `arr[j] = n` into
+         * `Obj([...])[j] = n`. The tree-walker happened to survive that
+         * (evaluating the read-only literal's subscript for write throws
+         * the same NotLValueEx the un-specialized call throws), but the
+         * NO-FAIL CODEGEN cannot lower a store whose base is a literal -
+         * so a legal program (pass a const array to a function that writes
+         * its param; must THROW at runtime) was refused at COMPILE time
+         * with NotLoweredEx.
+         */
+        Construct *c = lvalue.get();
+        while (c) {
+            if (ctag(c) == ConstructType::subscript) {
+                auto *sub = static_cast<Subscript *>(c);
+                fold_reads(sub->index, fc);      /* the index is a READ */
+                c = sub->what.get();             /* descend the spine */
+            } else if (ctag(c) == ConstructType::member) {
+                auto *mem = static_cast<MemberExpr *>(c);
+                c = mem->what.get();             /* nothing to fold here */
+            } else {
+                /* the spine's root: an Identifier stays (the whole point),
+                 * and any other rvalue root (`f()[0] = v`) is left alone
+                 * too, exactly as refold leaves assignment targets */
+                break;
+            }
+        }
     }
 
     /*
@@ -870,7 +1146,8 @@ private:
         if (!c)
             return;
 
-        if (auto *id = dynamic_cast<Identifier *>(c)) {
+        if (ctag(c) == ConstructType::id) {
+            auto *id = static_cast<Identifier *>(c);
             if (id->sym.kind == SymKind::local) {
                 auto it = fc.consts.find(id->sym.slot);
                 if (it != fc.consts.end()) {
@@ -894,12 +1171,13 @@ private:
             return;
         }
 
-        if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+        if (ctag(c) == ConstructType::func_decl) {
+            auto *fd = static_cast<FuncDeclStmt *>(c);
             fold_func_body(fd);        /* block / expr-bodied func */
             return;                    /* leave capture list / name alone */
         }
 
-        if (auto *mo = dynamic_cast<MultiOpConstruct *>(c)) {
+        if (auto *mo = node_cast<MultiOpConstruct>(c)) {
             bool all_lit = true;
             for (auto &p : mo->elems) {
                 fold_reads(p.second, fc);
@@ -921,8 +1199,8 @@ private:
              *     operand type); if exactly ONE remains the result is bool(op),
              *     so we drop the const only when that operand is ALREADY a bool
              *     (a comparison / logical / `!` - else bool(x) != x). */
-            const bool is_and = dynamic_cast<Expr11 *>(mo) != nullptr;
-            const bool is_or  = dynamic_cast<Expr12 *>(mo) != nullptr;
+            const bool is_and = node_cast<Expr11>(mo) != nullptr;
+            const bool is_or  = node_cast<Expr12>(mo) != nullptr;
             if (!all_lit && (is_and || is_or) && mo->elems.size() >= 2
                     && is_scalar_literal(mo->elems[0].second.get())) {
                 size_t drop = 0;
@@ -955,7 +1233,7 @@ private:
                     }
                     if (remaining == 1
                             && produces_bool(mo->elems[drop].second.get())) {
-                        slot = move(mo->elems[drop].second);
+                        slot = std::move(mo->elems[drop].second);
                         TRACE(fold, 0, "drop non-contributing const operand");
                         return;
                     }
@@ -978,12 +1256,14 @@ private:
             return;
         }
 
-        if (auto *e14 = dynamic_cast<Expr14 *>(c)) {
+        if (ctag(c) == ConstructType::expr14) {
+            auto *e14 = static_cast<Expr14 *>(c);
             fold_reads(e14->rvalue, fc);   /* embedded assignment: rhs only */
             return;
         }
 
-        if (auto *inc = dynamic_cast<IncDecExpr *>(c)) {
+        if (ctag(c) == ConstructType::incdec) {
+            auto *inc = static_cast<IncDecExpr *>(c);
             /* Fold READS in the inc-dec lvalue (a subscript INDEX, or a
              * subscript/member BASE) but never the mutated target itself -
              * exactly like an assignment lvalue. Without this, `a[i]++` keeps
@@ -996,23 +1276,30 @@ private:
             return;
         }
 
-        if (auto *sc = dynamic_cast<SingleChildConstruct *>(c)) {
+        if (auto *sc = node_cast<SingleChildConstruct>(c)) {
             fold_reads(sc->elem, fc);
             return;
         }
-        if (auto *ce = dynamic_cast<CallExpr *>(c)) {
-            auto *callee = dynamic_cast<Identifier *>(ce->what.get());
-            if (callee && ce->args && ce->args->elems.size() == 1
-                    && (callee->get_str() == "isconst"
-                        || callee->get_str() == "isconstdecl")) {
+        if (ctag(c) == ConstructType::call) {
+            auto *ce = static_cast<CallExpr *>(c);
+            auto *callee = node_cast<Identifier>(ce->what.get());
+            const Identifier *lazy = lazy_builtin_callee(ce);
+            if (lazy && ce->args && ce->args->elems.size() == 1
+                    && (lazy->get_str() == "isconst"
+                        || lazy->get_str() == "isconstdecl")) {
                 fold_isconst(slot, ce, fc,
-                             callee->get_str() == "isconstdecl");
+                             lazy->get_str() == "isconstdecl");
                 return;
             }
-            if (callee && ce->args && ce->args->elems.size() == 1
-                    && callee->get_str() == "defined"
+            if (lazy && ce->args && ce->args->elems.size() == 1
+                    && lazy->get_str() == "defined"
                     && try_fold_defined(slot, ce)) {
                 return;   /* folded; else fall through to normal arg handling */
+            }
+            if (lazy && ce->args && ce->args->elems.size() == 1
+                    && lazy->get_str() == "isbound"
+                    && try_fold_isbound(slot, ce)) {
+                return;
             }
 
             bool all_const = ce->args != nullptr;
@@ -1032,6 +1319,23 @@ private:
              * runtime. Any OTHER exception is a real error in fully-constant
              * code and propagates (a build error), per the auto-const rule.
              */
+            /* cctx holds the const builtins BY NAME, so a call to the
+             * program's own function named like one (`func top()`, `func
+             * abs()`) would run the builtin - registering the function there
+             * fails on the taken name. Such a call is not folded: it raised
+             * the builtin's InvalidNumberOfArgsEx for `top()` in every engine,
+             * and called the builtin under -nti, where no instance renames
+             * the call. */
+            if (all_const && callee && callee->sym.kind != SymKind::builtin
+                    && EvalContext::const_builtins.count(callee->uid))
+                all_const = false;
+            /* ...and a callee that is a parameter, a local or a capture is
+             * not the pure function cctx holds under that name (`pure func
+             * a ..; func f(a) { return a(2); }` called the outer `a`) */
+            if (all_const && callee
+                    && (callee->sym.kind == SymKind::local
+                        || callee->sym.kind == SymKind::capture))
+                all_const = false;
             if (all_const && callee) {
                 /* Capture callee loc + name before the node may be freed. */
                 const Loc cloc = callee->start;
@@ -1051,22 +1355,34 @@ private:
             }
             return;
         }
-        if (auto *sub = dynamic_cast<Subscript *>(c)) {
+        if (ctag(c) == ConstructType::subscript) {
+            auto *sub = static_cast<Subscript *>(c);
             fold_reads(sub->what, fc);
             fold_reads(sub->index, fc);
             return;
         }
-        if (auto *sl = dynamic_cast<Slice *>(c)) {
+        if (ctag(c) == ConstructType::slice) {
+            auto *sl = static_cast<Slice *>(c);
             fold_reads(sl->what, fc);
             fold_reads(sl->start_idx, fc);
             fold_reads(sl->end_idx, fc);
             return;
         }
-        if (auto *me = dynamic_cast<MemberExpr *>(c)) {
+        if (ctag(c) == ConstructType::member) {
+            auto *me = static_cast<MemberExpr *>(c);
             fold_reads(me->what, fc);
             return;
         }
-        if (auto *te = dynamic_cast<TernaryExpr *>(c)) {
+        /* `cast<T>(n)` reads its operand like any expression - a promoted
+         * `n` dropped its declaration, so a read left unfolded here would
+         * read a slot nothing wrote. The cast itself is not folded: its
+         * literal's type need not be T (`cast<dyn>(5)`). */
+        if (ctag(c) == ConstructType::cast) {
+            fold_reads(static_cast<CastExpr *>(c)->elem, fc);
+            return;
+        }
+        if (ctag(c) == ConstructType::ternary) {
+            auto *te = static_cast<TernaryExpr *>(c);
             fold_reads(te->condExpr, fc);
             fold_reads(te->thenExpr, fc);
             fold_reads(te->elseExpr, fc);
@@ -1080,7 +1396,8 @@ private:
             }
             return;
         }
-        if (auto *co = dynamic_cast<CoalesceExpr *>(c)) {
+        if (ctag(c) == ConstructType::coalesce) {
+            auto *co = static_cast<CoalesceExpr *>(c);
             fold_reads(co->lhs, fc);
             fold_reads(co->rhs, fc);
             /* a const lhs collapses: none -> rhs, otherwise -> lhs */
@@ -1091,12 +1408,14 @@ private:
             }
             return;
         }
-        if (auto *la = dynamic_cast<LiteralArray *>(c)) {
+        if (ctag(c) == ConstructType::lit_arr) {
+            auto *la = static_cast<LiteralArray *>(c);
             for (auto &el : la->elems)
                 fold_reads(el, fc);
             return;
         }
-        if (auto *ld = dynamic_cast<LiteralDict *>(c)) {
+        if (ctag(c) == ConstructType::lit_dict) {
+            auto *ld = static_cast<LiteralDict *>(c);
             for (auto &kv : ld->elems) {
                 fold_reads(kv->key, fc);
                 fold_reads(kv->value, fc);
@@ -1126,14 +1445,19 @@ public:
              bool repl = false, EvalContext *prior_pure = nullptr)
     {
         repl_mode = repl;
+        collect_rebound_names(root, rebound_names);
 
         /* REPL: a function from an earlier input that is effectively pure lets
          * a NEW function calling it is recognized pure too (cross-input
-         * auto-pure propagation - see func_body_is_pure / pure_func_names). */
+         * auto-pure propagation - see func_body_is_pure / pure_func_names).
+         * Not a name this input assigns: what a call through it reaches is
+         * no longer the function it holds now. */
         if (prior_pure) {
             std::vector<std::pair<const UniqueId *, const LValue *>> syms;
             prior_pure->collect_symbols(syms);
             for (const auto &kv : syms) {
+                if (rebound_names.count(kv.first))
+                    continue;
                 const EvalValue &v = kv.second->get();
                 if (v.is<intrusive_ptr<FuncObject>>() &&
                     v.get<intrusive_ptr<FuncObject>>()->func->effective_pure)
@@ -1147,7 +1471,8 @@ public:
          * 64-slot limit. Not in the REPL, where top-level names stay
          * redefinable in the map. The slot->name list is stored on the root
          * block (it sizes the table and lets globals()/reflection list it). */
-        if (auto *rb = dynamic_cast<Block *>(root)) {
+        if (ctag(root) == ConstructType::block) {
+            auto *rb = static_cast<Block *>(root);
             if (!repl)
                 hoist_global_funcs(rb);
         }
@@ -1165,38 +1490,1013 @@ public:
          * global slot, stamp the function-side use sites recorded in pass 1: a
          * user global wins, else a builtin gets its table slot, else the name
          * stays unresolved (the runtime map -> UndefinedVariableEx). */
-        for (Identifier *id : escaped_refs) {
+        for (const EscapedRef &er : escaped_refs) {
+            Identifier *id = er.id;
             auto it = global_func_slots.find(id->uid);
-            if (it != global_func_slots.end())
+            if (it != global_func_slots.end()) {
                 id->sym = ResolvedSym{ SymKind::global, it->second };
-            else
-                stamp_builtin(id);
+                /* ...and its declared type, as resolve_ref carries it to a
+                 * use in the declaring function: a function's `gl = v`
+                 * into a `float gl` must coerce the int like main's does */
+                auto dt = global_decl_types.find(id->uid);
+                if (dt != global_decl_types.end())
+                    id->decl_type = dt->second;
+                continue;
+            }
+            stamp_builtin(id);
+
+            /* FIX-1: not a global, not a builtin, and neither this function
+             * nor the top level declares the name anywhere - it can never
+             * bind. `root_decl_names` is the top-level scope's own pre-scan,
+             * kept because that scope is popped by the time we get here. */
+            if (!repl_mode && !er.lazy_arg && !id->is_underscore()
+                    && !er.guarded                      /* #135 */
+                    && id->sym.kind == SymKind::unresolved
+                    && !er.declared_later
+                    && !root_decl_names.count(id->uid))
+                fix1_undefined(id);
         }
 
+        check_rebinds();
+
+        /* Now that escaped globals have their slots, RE-SNAPSHOT every
+         * capture list: the in-walk snapshot above ran before this stamp. */
+        for (FuncDeclStmt *fd : capture_funcs)
+            sync_capture_desc(fd);
+
         /* Publish the global table's slot->name list to the root block, which
-         * sizes the runtime GlobalFuncTable and lets globals() enumerate it. */
-        if (auto *rb = dynamic_cast<Block *>(root))
+         * sizes the runtime GlobalFuncTable and lets globals() enumerate it;
+         * plus the write-once map (reassigned slots) for the native-call gate
+         * (#55): 1 == slot reassigned (NOT write-once). */
+        if (ctag(root) == ConstructType::block) {
+            auto *rb = static_cast<Block *>(root);
             rb->global_func_names = global_names;
+            rb->global_slot_reassigned.assign(global_names.size(), 0);
+            for (int s : reassigned_globals)
+                if (s >= 0 && s < static_cast<int>(global_names.size()))
+                    rb->global_slot_reassigned[static_cast<size_t>(s)] = 1;
+        }
+
+        /*
+         * Step 7 tier 2: refuse a call that PROVABLY cannot work. Runs on the
+         * CLEAN tree, BEFORE AutoConst/the inliner, on purpose - see
+         * prove_unbound_calls for why that is what makes it optimization-
+         * invariant (RULE 2).
+         */
+        if (!repl_mode)
+            if (ctag(root) == ConstructType::block) {
+                auto *rb = static_cast<Block *>(root);
+                if (g_strict_mode)      /* --strict: FIX-2's original shape */
+                    strict_forward_globals(rb);
+                prove_unbound_calls(rb, main_st.writes);
+                /* tier 3: the residue it declined */
+                warn_unbound_calls(rb, main_st.writes);
+            }
 
         /* Promote write-once scalar vars to constants and fold (uses the write
          * counts just collected; the top-level frame's in main_st.writes).
          * prior_pure seeds the fold context so cross-input pure calls fold. */
-        if (auto *rb = dynamic_cast<Block *>(root))
-            AutoConst(analysis, prior_pure, repl_mode).run(rb, main_st.writes);
+        if (auto *rb = node_cast<Block>(root))
+            AutoConst(analysis, prior_pure, repl_mode, &rebound_names)
+                .run(rb, main_st.writes);
     }
 
 private:
+
+    /*
+     * #135: `defined()`-GUARDED NARROWING. A name that exists NOWHERE is a
+     * compile error (FIX-1, #130), which leaves no way to feature-test one.
+     * Dart's promotion-after-a-test is the model: the SPECIFIC name that was
+     * CHECKED is tolerated, and nothing else.
+     *
+     *     if (defined(x)) { print(x); }           # x tolerated
+     *     if (defined(x)) { print(x, y); }        # y is STILL an error
+     *     if (defined(x) && defined(y)) { ... }   # both tolerated
+     *
+     * This is deliberately NOT "code the DCE will delete may say anything" -
+     * that would lose FIX-1's typo protection wholesale (maintainer, #135).
+     * The code still VANISHES: when `x` exists nowhere, `defined(x)` folds to
+     * false, the branch is dead, and the existing DCE drops it. Narrowing's
+     * only job is to let the guarded code COMPILE.
+     *
+     * POLARITY, and it is the whole correctness question: the guard holds for
+     * the THEN branch and for the REST of its own `&&` chain (so
+     * `if (defined(x) && x > 0)` works). It does NOT hold for the ELSE
+     * branch, and `!defined(x)` establishes nothing.
+     */
+    void collect_defined_guards(const Construct *cond,
+                                std::vector<const UniqueId *> &out)
+    {
+        if (!cond)
+            return;
+
+        /* an `&&` chain: every conjunct contributes. `||` does NOT - the
+         * branch can be taken with the other side true, so nothing is proven.
+         * A TypedScalarExpr is the M8 form of the same chain. */
+        if (ctag(cond) == ConstructType::expr11) {
+            auto *e11 = static_cast<const Expr11 *>(cond);
+            for (const auto &p : e11->elems)
+                collect_defined_guards(p.second.get(), out);
+            return;
+        }
+        if (ctag(cond) == ConstructType::typed_scalar) {
+            auto *ts = static_cast<const TypedScalarExpr *>(cond);
+            if (ts->cat != TypedScalarExpr::Cat::logical)
+                return;
+            for (const auto &p : ts->elems)
+                if (p.first == Op::invalid || p.first == Op::land)
+                    collect_defined_guards(p.second.get(), out);
+            return;
+        }
+
+        const auto *call = node_cast<const CallExpr>(cond);
+        if (!call || !call->args || call->args->elems.size() != 1)
+            return;
+        /* Only `defined`. Broadening this to any 1-arg call is in fact
+         * unobservable - every other call EVALUATES its argument, so an
+         * undefined name there is refused by FIX-1 before any guard could
+         * help - which is why no test can catch that mistake. Named rather
+         * than left to chance. */
+        const Identifier *cid = lazy_builtin_callee(call);
+        if (!cid)
+            return;
+        /* `isbound` guards too: since it answers `false` for a name that
+         * exists nowhere, `if (isbound(x)) { print(x); }` is THE short
+         * feature test - and without narrowing here the `print(x)` inside it
+         * would still be refused, so the short form would not work at all. */
+        const std::string_view gname = cid->get_str();
+        if (gname != "defined" && gname != "isbound")
+            return;
+        if (const auto *arg =
+                node_cast<const Identifier>(call->args->elems[0].get()))
+            out.push_back(arg->uid);
+    }
+
+    bool is_guarded(const UniqueId *uid) const
+    {
+        if (guarded.empty())
+            return false;
+        for (const UniqueId *g : guarded)
+            if (g == uid)
+                return true;
+        return false;
+    }
+
+    /*
+     * `--strict` (step 7): EVERY NON-LOCAL MUST BE DECLARED ABOVE ITS FIRST
+     * USE. This is FIX-2 in its original shape, kept behind a flag because it
+     * is too aggressive to impose on everyone - it refuses programs that are
+     * CORRECT today, not merely risky ones:
+     *
+     *     func total(a) { return a + base; }
+     *     func run() { return total(1); }
+     *     var base = 100;
+     *     print(run());                    # 101 by default, REFUSED here
+     *
+     * That is the ordinary "helpers at the top, configuration at the bottom"
+     * layout, so the cost is real and recurring - which is exactly why it is
+     * opt-in. What it buys is that `UnboundSymbolEx` becomes UNREACHABLE: with
+     * every global declared before any function that mentions it, no call can
+     * find one unbound.
+     *
+     * FUNCTION, STRUCT and run-time CONST names are NOT subject to it. They
+     * bind at SCOPE ENTRY (#134, question 21), so a forward use is not a
+     * forward reference at all - requiring definition order there would
+     * forbid mutual recursion and buy nothing.
+     *
+     * It reuses `escaped_refs`, which already holds every function-body
+     * reference to an outer name, so this is a comparison of two source
+     * positions and not a second analysis.
+     */
+    void strict_forward_globals(Block *rb)
+    {
+        std::unordered_map<const UniqueId *, Loc> decl_at;
+
+        for (auto &e : rb->elems) {
+            auto *ex = node_cast<Expr14>(e.get());
+            /* a `const` binds at scope entry too (question 21) */
+            if (!ex || !(ex->fl & pFlags::pInDecl)
+                    || (ex->fl & pFlags::pInConstDecl))
+                continue;
+            auto *lv = node_cast<Identifier>(ex->lvalue.get());
+            if (lv && lv->sym.kind == SymKind::global)
+                decl_at.emplace(lv->uid, lv->start);
+        }
+
+        if (decl_at.empty())
+            return;
+
+        for (const EscapedRef &er : escaped_refs) {
+
+            Identifier *id = er.id;
+
+            /* a lazy builtin's argument is a question ABOUT the name, not a
+             * use of its value - `isbound(g)` is how a program copes with a
+             * name it cannot order above itself */
+            if (id->sym.kind != SymKind::global || er.lazy_arg)
+                continue;
+
+            auto it = decl_at.find(id->uid);
+            if (it == decl_at.end())
+                continue;               /* a func/struct name: exempt */
+
+            const Loc &d = it->second;
+            if (d.line > id->start.line
+                    || (d.line == id->start.line && d.col > id->start.col))
+                throw UseBeforeBindingEx(
+                    intern_msg("--strict: '" + std::string(id->get_str())
+                               + "' is used before its declaration"),
+                    id->start, id->end);
+        }
+    }
+
+    /* ------------------------------------------------------------------
+     * STEP 7 tier 2 - THE PROVER: a call that is GUARANTEED to raise
+     * UnboundSymbolEx is a COMPILE error, not a runtime one.
+     *
+     *     func fetch() { return g; }
+     *     var dyn t = fetch();          <- refused: `g` cannot be bound yet
+     *     var g = 5;
+     *
+     * and, deliberately, EVEN INSIDE A TRY (maintainer, 2026-08-08) - the two
+     * exception kinds exist so this is expressible, `UseBeforeBindingEx` being
+     * the uncatchable compile one:
+     *
+     *     try { var dyn t = fetch(); } catch (UnboundSymbolEx) { ... }
+     *     var g = 5;                    <- still refused
+     *
+     * WHAT MAKES IT SOUND, and it is one idea: only UNCONDITIONALLY evaluated
+     * code is considered, on BOTH sides. If the call might not run, or the
+     * callee might not reach the read, the failure is not guaranteed and the
+     * prover must stay silent - a false "provable" refuses a program that
+     * would have worked, which is the one outcome worse than a late error.
+     *
+     * WHY IT RUNS ON THE CLEAN TREE (before AutoConst / the inliner). Whether
+     * a program COMPILES must not depend on which optimizations ran (RULE 2),
+     * and both directions of that trap are real here: run it after DCE and
+     * `if (false) { fetch(); }` compiles while `-nc` refuses it; run it after
+     * the inliner and the callee body may have been spliced into main, so the
+     * shape being analysed differs between `-ni` and the default. Restricting
+     * to unconditional code removes the question entirely - a const-false
+     * branch is CONDITIONAL, so it is skipped either way - and running before
+     * every transform means the tree is the one the user wrote.
+     *
+     * WHAT IT SEES. Transitivity through the call graph
+     * (build_reachable_reads), and a callee named indirectly through a
+     * WRITE-ONCE binding - a named function, a LAMBDA literal, or a CHAIN
+     * of either (index_func_aliases). A callee it cannot name at all -
+     * `ops[0]()`, a parameter, an alias declared inside a body - is NOT
+     * proven here; it is reported by the weak arm of the warning tier
+     * instead, which is allowed to be wrong and says "might".
+     * ------------------------------------------------------------------ */
+
+    /*
+     * Visit the sub-constructs of `c` that are UNCONDITIONALLY evaluated when
+     * `c` is. The exclusions ARE the soundness argument, so they are listed
+     * rather than left to a default:
+     *   - if/while/for/foreach bodies (and everything under them): may not run
+     *   - a catch or finally body: only on the exceptional path
+     *   - a ternary arm, a `??` right side, an `&&`/`||` tail: short-circuited
+     *   - a function BODY: runs when CALLED, not where it is declared
+     * A try BODY is included: it always runs.
+     */
+    template <typename F>
+    static void for_each_unconditional(Construct *c, const F &f)
+    {
+        if (!c)
+            return;
+
+        /* Block and Expr14 are NOT in for_each_child - walk() handles them
+         * itself, so a generic descent silently stops at `var t = f();` and
+         * at every braced block. Both are unconditional; take them here. */
+        if (ctag(c) == ConstructType::block) {
+            auto *bl = static_cast<Block *>(c);
+            for (auto &e : bl->elems)
+                f(e.get());
+            return;
+        }
+        if (ctag(c) == ConstructType::expr14) {
+            auto *ex = static_cast<Expr14 *>(c);
+            f(ex->lvalue.get());
+            f(ex->rvalue.get());
+            return;
+        }
+        if (ctag(c) == ConstructType::try_catch) {
+            auto *tc = static_cast<TryCatchStmt *>(c);
+            f(tc->tryBody.get());
+            return;
+        }
+        /* A LAZY builtin does not EVALUATE its argument - `isbound(g)` and
+         * `defined(g)` ask a question ABOUT the name and are exactly what a
+         * careful program uses to avoid the error being proven here. Visiting
+         * the argument would make every such guard "a read" and refuse the
+         * program that got it right. (Caught by the isbound/defined tests.) */
+        if (ctag(c) == ConstructType::call) {
+            auto *call = static_cast<CallExpr *>(c);
+            if (lazy_builtin_callee(call)) {
+                f(call->what.get());
+                return;
+            }
+        }
+        if (ctag(c) == ConstructType::if_stmt || ctag(c) == ConstructType::while_stmt
+                || ctag(c) == ConstructType::for_stmt || ctag(c) == ConstructType::foreach_stmt
+                || ctag(c) == ConstructType::func_decl
+                || ctag(c) == ConstructType::ternary
+                || ctag(c) == ConstructType::coalesce
+                || ctag(c) == ConstructType::expr11 || ctag(c) == ConstructType::expr12)
+            return;
+
+        for_each_child(c, [&](Construct *ch) { f(ch); });
+    }
+
+    /* Walk `c` unconditionally, calling `f` on every node reached. */
+    template <typename F>
+    static void walk_unconditional(Construct *c, const F &f)
+    {
+        if (!c)
+            return;
+        f(c);
+        for_each_unconditional(c, [&](Construct *ch) {
+            walk_unconditional(ch, f);
+        });
+    }
+
+    /* The GLOBAL VARIABLES `fd` reads on every path through its body. Only
+     * names in `global_decl_stmt` count - a func/struct name binds at scope
+     * entry (#134), so it is never unbound. */
+    void unconditional_global_reads(
+        FuncDeclStmt *fd,
+        const std::unordered_map<const UniqueId *, size_t> &global_decl_stmt,
+        std::vector<Identifier *> &out)
+    {
+        walk_unconditional(fd->body.get(), [&](Construct *n) {
+            auto *id = node_cast<Identifier>(n);
+            if (id && id->bind_guard)
+                id = id->bind_guard.get();     /* the variable it reads */
+            if (id && id->sym.kind == SymKind::global
+                    && global_decl_stmt.count(id->uid))
+                out.push_back(id);
+        });
+    }
+
+    /*
+     * STEP 7 tier 3 - THE WARNING. Where the prover above found the same
+     * situation but could NOT prove the failure, say so instead of staying
+     * silent. GCC's spirit ("this variable might be uninitialized"): the
+     * program is not refused, but the reader is told.
+     *
+     *     func fetch() { return g; }
+     *     if (ready()) { var dyn t = fetch(); }   <- warned: may not be bound
+     *     var g = 5;
+     *
+     * The complement of the error tier by construction: prove_unbound_calls
+     * THROWS on everything it can prove, so anything reaching here is exactly
+     * the residue - a conditional call, a conditional read, or a call site
+     * below the top level. That is why this walks EVERYTHING (plain
+     * for_each_child plus the containers it skips) while the prover walks
+     * only unconditional code, and why the two cannot double-report.
+     *
+     * It is TRANSITIVE like the error tier (the same build_reachable_reads,
+     * asked for every path rather than the guaranteed ones) and it resolves
+     * the same write-once aliases, so the two tiers see one call graph and
+     * differ only in which paths count.
+     *
+     * IT HAS TWO STRENGTHS, and the wording is the contract:
+     *
+     *   "this call MAY fail: g is not bound until later"
+     *        the callee is KNOWN and provably reaches g on some path; only
+     *        WHETHER that path runs is open
+     *
+     *   "this call MIGHT fail: the callee is not known here, and g is not
+     *    bound until later"
+     *        the callee is NOT known - a container element, a parameter, a
+     *        reassigned name. This one is ALLOWED to be a false positive
+     *        (maintainer, 2026-08-09), which is what "might" announces.
+     *
+     * The weak arm is filtered so it is not merely noise: it fires only for
+     * a global that SOME function actually reads, since an opaque callee
+     * cannot fail on a global nobody touches. Measured over samples/ +
+     * bench/ + tests/functional/: ZERO warnings. The filter is what earns
+     * that - 76_funcval_dispatch has exactly this call shape and is quiet
+     * because its globals are declared above it, and moving one below makes
+     * it warn.
+     */
+    template <typename F>
+    static void walk_every(Construct *c, const F &f)
+    {
+        if (!c)
+            return;
+        f(c);
+        if (ctag(c) == ConstructType::block) {
+            auto *bl = static_cast<Block *>(c);
+            for (auto &e : bl->elems)
+                walk_every(e.get(), f);
+            return;
+        }
+        if (ctag(c) == ConstructType::expr14) {
+            auto *ex = static_cast<Expr14 *>(c);
+            walk_every(ex->lvalue.get(), f);
+            walk_every(ex->rvalue.get(), f);
+            return;
+        }
+        if (ctag(c) == ConstructType::try_catch) {
+            auto *tc = static_cast<TryCatchStmt *>(c);
+            walk_every(tc->tryBody.get(), f);
+            for (auto &p : tc->catchStmts)
+                walk_every(p.second.get(), f);
+            walk_every(tc->finallyBody.get(), f);
+            return;
+        }
+        if (ctag(c) == ConstructType::for_stmt) {
+            auto *fo = static_cast<ForStmt *>(c);
+            walk_every(fo->init.get(), f);
+            walk_every(fo->cond.get(), f);
+            walk_every(fo->inc.get(), f);
+            walk_every(fo->body.get(), f);
+            return;
+        }
+        if (ctag(c) == ConstructType::foreach_stmt) {
+            auto *fe = static_cast<ForeachStmt *>(c);
+            walk_every(fe->container.get(), f);
+            walk_every(fe->body.get(), f);
+            return;
+        }
+        for_each_child(c, [&](Construct *ch) { walk_every(ch, f); });
+    }
+
+    void warn_unbound_calls(Block *rb, const std::vector<int> &main_writes)
+    {
+        DeclIndex global_decl_stmt;
+        FuncIndex top_funcs;
+        NameSet structs;
+        index_top_level(rb, global_decl_stmt, top_funcs, structs);
+
+        if (global_decl_stmt.empty())
+            return;
+
+        AliasIndex aliases;
+        index_func_aliases(rb, top_funcs, main_writes, aliases);
+
+        /* a LAMBDA bound to a name is a function this program can call even
+         * with no NAMED function anywhere, so the cheap bail must ask about
+         * both indexes - asking only about top_funcs skipped s1 entirely */
+        if (top_funcs.empty() && aliases.empty())
+            return;
+
+        /* every global a call may reach, on ANY path and through ANY number
+         * of hops - the conditional read and the deeper one are what this
+         * tier exists to catch - plus which functions reach a callee this
+         * pass cannot name, for the weaker "might" arm below */
+        ReadSets reads;
+        FuncSet opaque;
+        build_reachable_reads(top_funcs, global_decl_stmt, aliases, structs,
+                              /*unconditional_only=*/false, reads, &opaque);
+
+        /*
+         * THE "MIGHT" ARM's candidate set. An un-nameable callee could run
+         * anything, so the honest statement is about any global that SOME
+         * function reads - if no function reads `g` at all, no call can fail
+         * on it, however opaque the callee. Ordered by declaration so the
+         * message names the FIRST offender and is not at the mercy of an
+         * unordered_map's iteration order.
+         */
+        std::vector<std::pair<size_t, const UniqueId *>> read_anywhere;
+        for (const auto &rp : reads)
+            for (const UniqueId *g : rp.second) {
+                auto dit = global_decl_stmt.find(g);
+                bool seen = false;
+                for (const auto &e : read_anywhere)
+                    if (e.second == g) { seen = true; break; }
+                if (!seen && dit != global_decl_stmt.end())
+                    read_anywhere.emplace_back(dit->second, g);
+            }
+        std::sort(read_anywhere.begin(), read_anywhere.end());
+
+        const auto warn_might = [&](CallExpr *call, size_t i) {
+            for (const auto &e : read_anywhere)
+                if (e.first > i) {
+                    compile_warn(
+                        intern_msg("this call might fail: the callee is not "
+                                   "known here, and " + e.second->val
+                                   + " is not bound until later"),
+                        call->start, call->end);
+                    return;
+                }
+        };
+
+        for (size_t i = 0; i < rb->elems.size(); i++) {
+
+            if (node_cast<FuncDeclStmt>(rb->elems[i].get()))
+                continue;
+
+            walk_every(rb->elems[i].get(), [&](Construct *n) {
+                auto *call = node_cast<CallExpr>(n);
+                if (!call)
+                    return;
+                FuncDeclStmt *fd = callee_of(call, top_funcs, aliases,
+                                             static_cast<ptrdiff_t>(i));
+                if (!fd) {
+                    /* `ops[0]()`, a parameter, a body-local alias: we cannot
+                     * name what runs, so this is the weaker statement */
+                    if (call_is_opaque(call, top_funcs, aliases, structs))
+                        warn_might(call, i);
+                    return;
+                }
+
+                for (const UniqueId *g : reads[fd]) {
+                    auto dit = global_decl_stmt.find(g);
+                    if (dit != global_decl_stmt.end() && dit->second > i) {
+                        compile_warn(
+                            intern_msg("this call may fail: " + g->val
+                                       + " is not bound until later"),
+                            call->start, call->end);
+                        return;     /* one per call site, not per read */
+                    }
+                }
+                /* the callee IS known, but something it reaches is not - so
+                 * the definite statement above could not be made */
+                if (opaque.count(fd))
+                    warn_might(call, i);
+            });
+        }
+    }
+
+    typedef std::unordered_map<const UniqueId *, size_t> DeclIndex;
+    typedef std::unordered_map<const UniqueId *, FuncDeclStmt *> FuncIndex;
+    typedef std::unordered_map<FuncDeclStmt *,
+                               std::vector<const UniqueId *>> ReadSets;
+    /* name -> (the function it always holds, the stmt that bound it) */
+    struct Alias { FuncDeclStmt *fd; size_t decl_stmt; };
+    typedef std::unordered_map<const UniqueId *, Alias> AliasIndex;
+
+    typedef std::unordered_set<const UniqueId *> NameSet;
+
+    /* The top-level statement index of each global VAR/CONST decl, plus every
+     * top-level named function - the two things both tiers index by - plus
+     * the STRUCT names, which the "might" warning needs only to stay quiet:
+     * `P(1)` is a call whose callee is not a function, and calling it
+     * "a callee we cannot analyse" would warn about every construction. */
+    static void index_top_level(Block *rb, DeclIndex &decls, FuncIndex &funcs,
+                                NameSet &structs)
+    {
+        for (size_t i = 0; i < rb->elems.size(); i++) {
+            Construct *e = rb->elems[i].get();
+            if (ctag(e) == ConstructType::func_decl) {
+                auto *fd = static_cast<FuncDeclStmt *>(e);
+                if (fd->id)
+                    funcs[fd->id->uid] = fd;
+                continue;
+            }
+            if (ctag(e) == ConstructType::struct_decl)
+                continue;
+            auto *ex = node_cast<Expr14>(e);
+            if (!ex || !(ex->fl & pFlags::pInDecl))
+                continue;
+            auto *lv = node_cast<Identifier>(ex->lvalue.get());
+            if (lv && lv->sym.kind == SymKind::global)
+                decls.emplace(lv->uid, i);
+        }
+        collect_struct_names(rb, structs);
+    }
+
+    /* Every name the program declares a struct under - a `struct` /
+     * `class` declaration, or a TYPE ALIAS (`const T = S;`: `T(1)` is a
+     * construction, as `S(1)` is) - at any depth: one declared inside a
+     * function is constructed there. By NAME, like the set's other
+     * readers; a binding that hides one costs a "might" warning, never
+     * an answer. Left to the top-level `struct` declarations, every
+     * construction through an alias, or of a struct declared in a
+     * function, was "a callee we cannot analyse", and a program with one
+     * global declared below a call got the "might fail" warning at
+     * every call reaching such a construction (until 2026-11-15). */
+    static void collect_struct_names(Construct *n, NameSet &structs)
+    {
+        if (!n)
+            return;
+        if (auto *sd = node_cast<StructDeclStmt>(n)) {
+            if (sd->id)
+                structs.insert(sd->id->uid);
+            return;
+        }
+        auto *ex = node_cast<Expr14>(n);
+        if (ex && (ex->fl & pFlags::pInConstDecl)) {
+            Construct *rv = ex->rvalue.get();
+            if (auto *lv = node_cast<Identifier>(ex->lvalue.get())) {
+                if (type_alias_struct(rv, 0, false))
+                    structs.insert(lv->uid);
+            } else {
+                /* a declaration's target is a name or a list of names */
+                ML_CHECK(ctag(ex->lvalue.get()) == ConstructType::idlist);
+                auto *il = static_cast<IdList *>(ex->lvalue.get());
+                for (size_t k = 0; k < il->elems.size(); k++)
+                    if (!il->elems[k]->is_underscore()
+                            && type_alias_struct(rv, k, true))
+                        structs.insert(il->elems[k]->uid);
+            }
+        }
+        for_each_child_of(n, [&](Construct *ch) {
+            collect_struct_names(ch, structs);
+        });
+    }
+
+    /*
+     * WRITE-ONCE NAMES THAT ALWAYS HOLD ONE NAMED FUNCTION (#140).
+     *
+     *     func fetch() { return g; }
+     *     var f = fetch;               <- f can only ever be `fetch`
+     *     var t = f();                 <- so this call always fails
+     *     var g = 5;
+     *
+     * Without this the callee is not an Identifier the FuncIndex knows, both
+     * tiers give up, and the program dies at RUN time on line 1 - even though
+     * the failure is exactly as certain as the direct `fetch()` spelling,
+     * which is refused at compile time.
+     *
+     * WHAT MAKES IT SOUND is write-once, the same argument AutoConst's
+     * promotion rests on: the declaration is the ONLY write, so at every
+     * point where the name is bound at all it holds that one function. A
+     * reassignment anywhere - in any scope, at any depth - disqualifies it,
+     * and the two write counters the resolver has ALREADY collected by now
+     * are what proves that: `writes[slot] == 1` for a main-frame local (the
+     * decl itself is write #1) and absence from `reassigned_globals` for a
+     * global (a decl never reaches count_write, so any entry is a reassign).
+     *
+     * A capture cannot defeat it: captures are BY VALUE, so a closure that
+     * reassigns its copy leaves this binding alone - and that write is a
+     * capture-slot write, counted against neither table.
+     *
+     * NOT chased through a container (`ops[0]()`) or a parameter: those
+     * need a real callee-SET analysis, and what the resolver can see here
+     * is one value. The limit costs a diagnostic, never an answer - and
+     * those shapes reach the warning tier's weak arm anyway.
+     */
+    void index_func_aliases(Block *rb, const FuncIndex &funcs,
+                            const std::vector<int> &main_writes,
+                            AliasIndex &out)
+    {
+        for (size_t i = 0; i < rb->elems.size(); i++) {
+
+            auto *ex = node_cast<Expr14>(rb->elems[i].get());
+            if (!ex || !(ex->fl & pFlags::pInDecl) || ex->op != Op::assign)
+                continue;
+
+            /* `var a, b = ...` binds a list: no single function value */
+            auto *lv = node_cast<Identifier>(ex->lvalue.get());
+            if (!lv)
+                continue;
+
+            /*
+             * THREE rvalue shapes name one function. A LAMBDA LITERAL is the
+             * function - there is no name to look up, and no way for the
+             * binding to hold anything else. A named top-level function is
+             * the base case. An earlier ALIAS chains: because this loop runs
+             * in statement ORDER, `var f2 = f;` finds f's entry already
+             * built, and finds it only when f was bound ABOVE - which is
+             * exactly the condition for f2 to hold f's function at all.
+             */
+            FuncDeclStmt *target = nullptr;
+            if (ctag(ex->rvalue.get()) == ConstructType::func_decl) {
+                auto *lam = static_cast<FuncDeclStmt *>(ex->rvalue.get());
+                target = lam;
+            } else if (auto *rv =
+                           node_cast<Identifier>(ex->rvalue.get())) {
+                if (rv->sym.kind == SymKind::global) {
+                    auto ft = funcs.find(rv->uid);
+                    if (ft != funcs.end())
+                        target = ft->second;
+                }
+                if (!target) {
+                    auto at = out.find(rv->uid);
+                    if (at != out.end())
+                        target = at->second.fd;
+                }
+            }
+            if (!target)
+                continue;
+
+            if (lv->sym.kind == SymKind::local) {
+                const int s = lv->sym.slot;
+                if (s < 0 || s >= static_cast<int>(main_writes.size())
+                        || main_writes[static_cast<size_t>(s)] != 1)
+                    continue;           /* reassigned somewhere */
+            } else if (lv->sym.kind == SymKind::global) {
+                if (reassigned_globals.count(lv->sym.slot))
+                    continue;
+            } else {
+                continue;               /* not a plain top-level binding */
+            }
+
+            out.emplace(lv->uid, Alias{ target, i });
+        }
+    }
+
+    /*
+     * The function a call site invokes, or null when that is not decidable.
+     * `stmt` is the top-level statement index the call sits in, or -1 when it
+     * sits inside a function BODY (which may run at any time).
+     */
+    static FuncDeclStmt *callee_of(CallExpr *call, const FuncIndex &funcs,
+                                   const AliasIndex &aliases,
+                                   ptrdiff_t stmt)
+    {
+        auto *cid = node_cast<Identifier>(call->what.get());
+        if (!cid)
+            return nullptr;             /* `ops[0]()`, a call result, ... */
+
+        auto ft = funcs.find(cid->uid);
+        if (ft != funcs.end())
+            return ft->second;
+
+        auto at = aliases.find(cid->uid);
+        if (at == aliases.end())
+            return nullptr;
+        /*
+         * A top-level call ABOVE the binding reaches an unbound name, so the
+         * failure is that name, not anything the function it will later hold
+         * reads - staying silent leaves the (correct) runtime error rather
+         * than reporting the wrong cause. From inside a BODY there is nothing
+         * to compare against, and nothing to check either: a body can only
+         * read a GLOBAL, which is in `global_decl_stmt`, so an alias that is
+         * not bound yet is already caught as an ordinary unbound read.
+         */
+        if (stmt >= 0 && at->second.decl_stmt > static_cast<size_t>(stmt))
+            return nullptr;
+        return at->second.fd;
+    }
+
+    /*
+     * OPAQUE: this call reaches MyLang code we cannot name. Not the same as
+     * "callee_of said no" - most of those are perfectly analysable things
+     * that simply are not user functions, and warning about them would bury
+     * the real diagnostic:
+     *
+     *     print(x);        a BUILTIN - C++, reads no MyLang global
+     *     P(1);            a STRUCT construction - binds fields, calls nothing
+     *     ops[0]();        opaque: an element, and we do not track the set
+     *     fn();            opaque: a parameter, bound by whoever called us
+     *
+     * A block-scoped nested function counts as opaque too: it has a global
+     * SLOT but no entry in `global_func_slots`, so this cannot name its body.
+     * That is a false positive in the honest sense - the callee really is
+     * one this pass cannot analyse - and it is why the diagnostic it feeds
+     * says "might".
+     */
+    static bool call_is_opaque(CallExpr *call, const FuncIndex &funcs,
+                               const AliasIndex &aliases,
+                               const NameSet &structs)
+    {
+        auto *cid = node_cast<Identifier>(call->what.get());
+        if (!cid)
+            return true;                /* a subscript / member / call result */
+        if (cid->sym.kind == SymKind::builtin)
+            return false;
+        if (structs.count(cid->uid))
+            return false;
+        return !funcs.count(cid->uid) && !aliases.count(cid->uid);
+    }
+
+    static void add_uniq(std::vector<const UniqueId *> &v, const UniqueId *u)
+    {
+        for (const UniqueId *x : v)
+            if (x == u)
+                return;
+        v.push_back(u);
+    }
+
+    /*
+     * WHICH GLOBALS A CALL CAN REACH - a fixpoint over the CALL GRAPH, not a
+     * one-level look at the callee's own body.
+     *
+     *     func fetch() { return g; }
+     *     func outer() { var r = fetch(); return r; }
+     *     var dyn t = outer();          <- `outer` does not read `g`...
+     *     var g = 5;                    <- ...but what it CALLS does
+     *
+     * Without this the two-hop program compiled and died at run time while
+     * the one-hop one was refused, though the failure is equally certain.
+     * `reads(F) = own(F) union reads(h) for every h that F calls`, iterated
+     * to a fixpoint - a fixpoint and not a walk because MUTUAL RECURSION
+     * makes the graph cyclic, and a cycle has no traversal order.
+     *
+     * `unconditional_only` picks which walker sees the body, and that ONE
+     * switch keeps the error tier sound: with it, both the reads and the
+     * CALLS are the unconditional ones, so a global enters F's set only if
+     * every step from F to the read is guaranteed. `outer` conditionally
+     * calling `fetch` puts `fetch` in no set of outer's; `fetch` reading `g`
+     * conditionally puts `g` in no set of fetch's. The warning tier passes
+     * false and takes every path.
+     */
+    typedef std::unordered_set<FuncDeclStmt *> FuncSet;
+
+    void build_reachable_reads(const FuncIndex &funcs, const DeclIndex &decls,
+                               const AliasIndex &aliases,
+                               const NameSet &structs,
+                               bool unconditional_only, ReadSets &out,
+                               FuncSet *opaque = nullptr)
+    {
+        std::unordered_map<FuncDeclStmt *, std::vector<FuncDeclStmt *>> callees;
+
+        /* every body a call can land in: the named functions, plus the
+         * LAMBDA an alias binds - which has no name, so the FuncIndex does
+         * not know it and iterating that map alone would leave its reads
+         * empty (and the alias pointing at an empty set, silently) */
+        std::vector<FuncDeclStmt *> bodies;
+        for (const auto &fp : funcs)
+            bodies.push_back(fp.second);
+        for (const auto &ap : aliases) {
+            bool seen = false;
+            for (FuncDeclStmt *b : bodies)
+                if (b == ap.second.fd) { seen = true; break; }
+            if (!seen)
+                bodies.push_back(ap.second.fd);
+        }
+
+        for (FuncDeclStmt *fd : bodies) {
+
+            std::vector<const UniqueId *> reads;
+            std::vector<FuncDeclStmt *> calls;
+
+            const auto visit = [&](Construct *n) {
+                if (auto *id = node_cast<Identifier>(n)) {
+                    if (id->bind_guard)            /* the variable it reads */
+                        id = id->bind_guard.get();
+                    if (id->sym.kind == SymKind::global && decls.count(id->uid))
+                        add_uniq(reads, id->uid);
+                }
+                auto *call = node_cast<CallExpr>(n);
+                if (!call)
+                    return;
+                FuncDeclStmt *h = callee_of(call, funcs, aliases, -1);
+                if (!h) {
+                    if (opaque && call_is_opaque(call, funcs, aliases,
+                                                 structs))
+                        opaque->insert(fd);
+                    return;
+                }
+                if (h != fd) {
+                    bool seen = false;
+                    for (FuncDeclStmt *k : calls)
+                        if (k == h) { seen = true; break; }
+                    if (!seen)
+                        calls.push_back(h);
+                }
+            };
+
+            if (unconditional_only)
+                walk_unconditional(fd->body.get(), visit);
+            else
+                walk_every(fd->body.get(), visit);
+
+            out[fd] = std::move(reads);
+            callees[fd] = std::move(calls);
+        }
+
+        /* propagate along the call edges until nothing new arrives - the
+         * reads, and (for the warning tier) the OPAQUE bit: a function that
+         * calls one which reaches an un-nameable callee reaches it too */
+        for (bool changed = true; changed; ) {
+            changed = false;
+            for (const auto &cp : callees)
+                for (FuncDeclStmt *h : cp.second) {
+                    for (const UniqueId *u : out[h]) {
+                        const size_t before = out[cp.first].size();
+                        add_uniq(out[cp.first], u);
+                        if (out[cp.first].size() != before)
+                            changed = true;
+                    }
+                    if (opaque && opaque->count(h)
+                            && !opaque->count(cp.first)) {
+                        opaque->insert(cp.first);
+                        changed = true;
+                    }
+                }
+        }
+    }
+
+    void prove_unbound_calls(Block *rb, const std::vector<int> &main_writes)
+    {
+        DeclIndex global_decl_stmt;
+        FuncIndex top_funcs;
+        NameSet structs;
+        index_top_level(rb, global_decl_stmt, top_funcs, structs);
+
+        if (global_decl_stmt.empty())
+            return;
+
+        AliasIndex aliases;
+        index_func_aliases(rb, top_funcs, main_writes, aliases);
+
+        /* a LAMBDA bound to a name is a function this program can call even
+         * with no NAMED function anywhere, so the cheap bail must ask about
+         * both indexes - asking only about top_funcs skipped s1 entirely */
+        if (top_funcs.empty() && aliases.empty())
+            return;
+
+        /* what a call can REACH, not just what its callee's own body reads */
+        ReadSets reads;
+        build_reachable_reads(top_funcs, global_decl_stmt, aliases, structs,
+                              /*unconditional_only=*/true, reads);
+
+        for (size_t i = 0; i < rb->elems.size(); i++) {
+
+            if (node_cast<FuncDeclStmt>(rb->elems[i].get()))
+                continue;               /* a declaration calls nothing */
+
+            walk_unconditional(rb->elems[i].get(), [&](Construct *n) {
+                auto *call = node_cast<CallExpr>(n);
+                if (!call)
+                    return;
+                FuncDeclStmt *fd = callee_of(call, top_funcs, aliases,
+                                             static_cast<ptrdiff_t>(i));
+                if (!fd)
+                    return;
+
+                for (const UniqueId *g : reads[fd]) {
+                    auto dit = global_decl_stmt.find(g);
+                    if (dit != global_decl_stmt.end() && dit->second > i)
+                        /* the caret marks the CALL: that is the statement the
+                         * user must move, and the read - which may be several
+                         * hops down - is correct code for every other
+                         * caller */
+                        throw UseBeforeBindingEx(
+                            intern_msg(
+                                "this call always fails: " + g->val
+                                + " is not bound until later"),
+                            call->start, call->end);
+                }
+            });
+        }
+    }
 
     /* Names a function reads from outer scope (so they are GLOBALs, not the
      * function's locals): a top-level VARIABLE among them gets a global-table
      * slot (so the function reads it as an O(1) slot, not a map walk). */
     std::unordered_set<const UniqueId *> escaped;
+    /* GLOBAL-table slots ever REASSIGNED (`f = g` after the decl) - i.e. NOT
+     * write-once. Filled by count_write; published to the root block's
+     * global_slot_reassigned for the native-call write-once gate (#55). */
+    std::set<int> reassigned_globals;
     /* The function-side USE sites of those escaped names (recorded while a
      * function body is resolved in pass 1, before the top-level pass has
      * assigned global slots). After pass 2, each is stamped SymKind::global if
      * its name turned out to be a top-level var (else left for the map: a
      * builtin / genuinely-undefined name). */
-    std::vector<Identifier *> escaped_refs;
+    /* FIX-1: every name the OUTERMOST top-level scope declares (its
+     * collect_scope_names pre-scan). Kept as a member because that scope is
+     * popped by the time the escaped_refs post-pass runs, and a function
+     * body's free name may legitimately refer to a global declared BELOW it. */
+    std::unordered_set<const UniqueId *> root_decl_names;
+
+    /* Every capturing FuncDeclStmt, so its descriptor's capture snapshot can
+     * be re-taken after pass 2 has stamped the escaped globals. */
+    std::vector<FuncDeclStmt *> capture_funcs;
+
+    /* Copy the RESOLVED capture sources into the descriptor (kind/slot), so
+     * the FuncObject ctor never reads a capture Identifier. */
+    static void sync_capture_desc(FuncDeclStmt *fd)
+    {
+        fd->desc->captures.clear();
+        fd->desc->captures.reserve(fd->captures->elems.size());
+        for (auto &cap : fd->captures->elems)
+            fd->desc->captures.push_back(
+                { cap->uid, cap->sym.kind, cap->sym.slot,
+                  cap->start, cap->end });
+    }
+
+    struct EscapedRef {
+        Identifier *id;
+        bool declared_later;    /* the function itself declares this name
+                                 * below the use - a forward LOCAL ref, so
+                                 * FIX-1 must not call it undefined */
+        bool lazy_arg;          /* the use is a LAZY builtin's argument
+                                 * (defined/isconst/isconstdecl): a question
+                                 * about the name, never a read */
+        bool guarded;           /* #135: a `defined()` guard vouched for the
+                                 * name at this use - recorded HERE because
+                                 * the FIX-1 check for a function-body
+                                 * reference runs after the walk, when the
+                                 * guard stack is long gone */
+    };
+
+    /* Set while walking a lazy builtin's arguments - see the CallExpr walk. */
+    bool no_undef_check = false;
+    /*
+     * Step 6: the TDZ suppression is a SEPARATE question from the FIX-1 one.
+     * BOTH lazy builtins must be allowed to ask about a name inside its TDZ
+     * (`isbound(x)` before `var x` is the whole point, and must answer
+     * false) - but only `defined` may ask about a name declared NOWHERE.
+     * `isbound(zz)` on such a name is a FIX-1 compile error like any other
+     * use, because there is nothing for it to be bound to, ever.
+     */
+    bool no_tdz_check = false;
+    /* #135: names a `defined()` guard has vouched for at this point - see
+     * collect_defined_guards. A scoped stack, like `shadowed` in the parser;
+     * empty in every program that does not feature-test, so the lookup is one
+     * compare. */
+    std::vector<const UniqueId *> guarded;
+    std::vector<EscapedRef> escaped_refs;
+    /* a top-level variable's declared type, by name, for the escaped uses */
+    std::unordered_map<const UniqueId *, DeclType> global_decl_types;
     /*
      * The GLOBAL table: every top-level function (hoisted up front so a forward
      * / mutually-recursive reference resolves) AND every top-level variable a
@@ -1207,6 +2507,12 @@ private:
      * stay redefinable in the map). */
     std::unordered_map<const UniqueId *, int> global_func_slots;
     std::vector<const UniqueId *> global_names;
+
+    /* The global slots that are const bindings (a top-level `const` a
+     * function reads, a struct name, an explicit `pure func` name), and
+     * every assignment target check_rebinds still has to answer */
+    std::unordered_set<int> const_global_slots;
+    std::vector<const Identifier *> rebind_targets;
 
     /* Append a name to the global table, returning its slot. */
     int add_global_slot(const UniqueId *uid)
@@ -1238,6 +2544,15 @@ private:
      * process_function decides each function. */
     std::unordered_set<const UniqueId *> pure_func_names;
 
+    /* Names ASSIGNED anywhere in the program (`sq = ng;`, at any depth) -
+     * collected up front, because a function's purity is decided while
+     * the walk has not yet reached a later reassignment. A function whose
+     * NAME is rebound never joins pure_func_names: a call through the name
+     * may reach whatever was assigned to it, so neither a caller's
+     * auto-purity nor any fold may assume the declared body. By NAME, so a
+     * same-named local costs a missed optimization, never an answer. */
+    std::unordered_set<const UniqueId *> rebound_names;
+
     /* Pass 2: function bodies are already resolved, so don't re-enter them. */
     bool top_level_only = false;
 
@@ -1266,15 +2581,60 @@ private:
              * table slot (a struct's name binds its type descriptor, like a
              * func name binds its FuncObject). */
             Identifier *id = nullptr;
-            if (auto *fd = dynamic_cast<FuncDeclStmt *>(e.get()))
+            if (auto *fd = node_cast<FuncDeclStmt>(e.get()))
                 id = fd->id.get();
-            else if (auto *sd = dynamic_cast<StructDeclStmt *>(e.get()))
+            else if (auto *sd = node_cast<StructDeclStmt>(e.get()))
                 id = sd->id.get();
             if (!id)
                 continue;
             if (global_func_slots.count(id->uid))
                 throw AlreadyDefinedEx(id->start, id->end);
             id->sym = ResolvedSym{ SymKind::global, add_global_slot(id->uid) };
+            note_const_decl(e.get(), id->sym.slot);
+        }
+    }
+
+    /* A struct name and an explicit `pure func` name are compile-time
+     * bindings: an assignment to either is CannotRebindConstEx (a plain
+     * func name is a variable, and may be rebound) */
+    void note_const_decl(Construct *decl, int gslot)
+    {
+        if (ctag(decl) == ConstructType::struct_decl
+                || (ctag(decl) == ConstructType::func_decl
+                    && static_cast<FuncDeclStmt *>(decl)->desc->explicit_pure))
+            const_global_slots.insert(gslot);
+    }
+
+    /*
+     * An assignment, compound assignment or inc-dec whose target names a
+     * builtin or a `const` binding is decidable here, so it is a COMPILE
+     * error (it was raised when the store ran). A parameter, a capture, a
+     * foreach or catch variable is its own binding, never const, whatever
+     * an outer name it shadows is. A local is answered at once; a global
+     * or a builtin after the escaped uses are stamped (check_rebinds).
+     * Not in the REPL, where a top-level name stays in the map and the
+     * store raises when it runs.
+     */
+    void check_rebind(FuncState *cur, Identifier *id)
+    {
+        if (!cur || id->is_underscore())
+            return;
+        if (id->sym.kind == SymKind::local) {
+            if (cur->const_slots.count(id->sym.slot))
+                throw CannotRebindConstEx(id->start, id->end);
+        } else if (id->sym.kind != SymKind::capture) {
+            rebind_targets.push_back(id);
+        }
+    }
+
+    void check_rebinds() const
+    {
+        for (const Identifier *id : rebind_targets) {
+            if (id->sym.kind == SymKind::builtin)
+                throw CannotRebindBuiltinEx(id->start, id->end);
+            if (id->sym.kind == SymKind::global
+                    && const_global_slots.count(id->sym.slot))
+                throw CannotRebindConstEx(id->start, id->end);
         }
     }
 
@@ -1284,7 +2644,7 @@ private:
      * exhausted the name is added as a masking entry (resolves to the map) so
      * shadowing still works. No-op when the function isn't slottable.
      */
-    void declare(FuncState *cur, Identifier *id)
+    void declare(FuncState *cur, Identifier *id, bool cnst = false)
     {
         if (!cur || !cur->slottable || !id)
             return;
@@ -1321,6 +2681,9 @@ private:
             cur->scopes.back().decls.push_back(
                 { id->uid, gslot, SymKind::global, id->decl_type });
             id->sym = ResolvedSym{ SymKind::global, gslot };
+            global_decl_types[id->uid] = id->decl_type;
+            if (cnst)
+                const_global_slots.insert(gslot);
             return;
         }
 
@@ -1337,6 +2700,8 @@ private:
             { id->uid, slot, SymKind::local, id->decl_type });
         cur->writes.push_back(1);   /* the declaration is write #1 */
         id->sym = ResolvedSym{ SymKind::local, slot };
+        if (cnst)
+            cur->const_slots.insert(slot);
     }
 
     /*
@@ -1374,13 +2739,15 @@ private:
         for (auto &e : b->elems) {
             Identifier *id = nullptr;
 
-            if (auto *fd = dynamic_cast<FuncDeclStmt *>(e.get())) {
+            if (ctag(e.get()) == ConstructType::func_decl) {
+                auto *fd = static_cast<FuncDeclStmt *>(e.get());
                 /* Non-capturing only; a captured-list func is not a shared
                  * global. Skip a name already hoisted (top-level global). */
                 if (fd->id && fd->id->sym.kind != SymKind::global &&
                     (!fd->captures || fd->captures->elems.empty()))
                     id = fd->id.get();
-            } else if (auto *sd = dynamic_cast<StructDeclStmt *>(e.get())) {
+            } else if (ctag(e.get()) == ConstructType::struct_decl) {
+                auto *sd = static_cast<StructDeclStmt *>(e.get());
                 if (sd->id && sd->id->sym.kind != SymKind::global)
                     id = sd->id.get();
             }
@@ -1393,7 +2760,105 @@ private:
             cur->scopes.back().decls.push_back(
                 { id->uid, slot, SymKind::global, id->decl_type });
             id->sym = ResolvedSym{ SymKind::global, slot };
+            note_const_decl(e.get(), slot);
         }
+    }
+
+    /* Record every name an lvalue declares into `s` (see collect_scope_names).
+     * `_` IS recorded: it is never bound, but a reference to it must report
+     * "undefined", not "declared nowhere", and the two messages differ. */
+    static void collect_lvalue_names(Construct *lvalue, Scope &s)
+    {
+        /* `_` is recorded in all_names (so a reference to it reports
+         * "undefined", not "declared nowhere") but NEVER in var_names: it is
+         * never bound, so it has no temporal dead zone - reading it must stay
+         * UndefinedVariableEx, not UseBeforeBindingEx. */
+        if (ctag(lvalue) == ConstructType::id) {
+            auto *id = static_cast<Identifier *>(lvalue);
+            s.all_names.push_back(id->uid);
+            if (!id->is_underscore())
+                s.var_names.push_back(id->uid);
+        } else if (ctag(lvalue) == ConstructType::idlist) {
+            auto *il = static_cast<IdList *>(lvalue);
+            for (auto &id : il->elems) {
+                s.all_names.push_back(id->uid);
+                if (!id->is_underscore())
+                    s.var_names.push_back(id->uid);
+            }
+        }
+    }
+
+    /*
+     * Pre-scan a block's DIRECT statements for the names they declare, into
+     * the freshly-pushed scope. Mirrors the parser's pStmtDeclaresName: only
+     * a func decl, a struct decl and a var/const decl (an `Expr14` carrying
+     * pInDecl) can introduce a name into the scope that contains them - a
+     * nested if/loop/try declares only inside its OWN body, which gets its
+     * own scope and its own pre-scan.
+     *
+     * ADD TO THIS if a new declaring statement form appears: a missing kind
+     * makes FIX-1 report "declared nowhere" for a name that IS declared,
+     * i.e. it refuses a legal program.
+     */
+    static void collect_scope_names(Block *b, Scope &s)
+    {
+        for (auto &e : b->elems) {
+            Construct *c = e.get();
+
+            if (ctag(c) == ConstructType::func_decl) {
+                auto *fd = static_cast<FuncDeclStmt *>(c);
+                if (fd->id)
+                    s.all_names.push_back(fd->id->uid);
+            } else if (ctag(c) == ConstructType::struct_decl) {
+                auto *sd = static_cast<StructDeclStmt *>(c);
+                if (sd->id)
+                    s.all_names.push_back(sd->id->uid);
+            } else if (ctag(c) == ConstructType::expr14) {
+                auto *ex = static_cast<Expr14 *>(c);
+                if (ex->fl & pFlags::pInDecl)
+                    collect_lvalue_names(ex->lvalue.get(), s);
+            }
+        }
+    }
+
+    /* Is `uid` declared ANYWHERE in a live scope of `cur` - including below
+     * the current walk position? The FIX-1 "declared nowhere" test. */
+    /* Is `uid` a VAR/CONST declared below the walk position in a live scope
+     * - i.e. currently in its temporal dead zone? (A func/struct is never:
+     * see Scope::var_names.) */
+    static bool in_tdz_of_live_scope(const FuncState *cur,
+                                     const UniqueId *uid)
+    {
+        if (!cur)
+            return false;
+
+        for (const auto &s : cur->scopes)
+            for (const UniqueId *n : s.var_names)
+                if (n == uid)
+                    return true;
+
+        return false;
+    }
+
+    static bool declared_in_live_scopes(const FuncState *cur,
+                                        const UniqueId *uid)
+    {
+        if (!cur)
+            return false;
+
+        for (const auto &s : cur->scopes) {
+            for (const UniqueId *n : s.all_names)
+                if (n == uid)
+                    return true;
+            /* A name already DECLARED (walked past) is in decls, not
+             * all_names, when the scope was pushed without a block
+             * pre-scan (a for/foreach/catch scope). */
+            for (const auto &d : s.decls)
+                if (d.name == uid)
+                    return true;
+        }
+
+        return false;
     }
 
     /* Throw AlreadyDefinedEx if `id` is already declared in this scope. */
@@ -1419,6 +2884,16 @@ private:
         if (!cur || !id)
             return;
 
+        /* a compiler-made reference to a builtin (Identifier::builtin_only):
+         * the builtin table's slot, whatever a scope declares - in the REPL
+         * too, whose map would otherwise find a program's own name */
+        if (id->builtin_only) {
+            const int bi = builtin_slot_index(id->uid);
+            if (bi >= 0)
+                id->sym = ResolvedSym{ SymKind::builtin, bi };
+            return;
+        }
+
         if (cur->slottable) {
             for (auto s = cur->scopes.rbegin(); s != cur->scopes.rend(); ++s) {
                 for (const auto &d : s->decls) {
@@ -1442,6 +2917,29 @@ private:
          * map walk. Escaped vars aren't in the table yet during pass 1 - they
          * are stamped post-pass-2 via escaped_refs.
          */
+        /*
+         * TDZ (#131): the scope loop above searches DECLARED-SO-FAR names;
+         * `all_names` additionally holds the ones declared BELOW. A hit here
+         * means the name IS in scope but its declaration has not run - and
+         * because the reader is inside the scope itself, that is decidable,
+         * so it is a COMPILE error. The lazy builtins are the exception:
+         * they ask ABOUT the name rather than reading it, and `defined()`
+         * must answer TRUE (the name is declared - it is merely unbound).
+         */
+        if (cur->slottable && in_tdz_of_live_scope(cur, id->uid)
+                && global_func_slots.find(id->uid) == global_func_slots.end()) {
+            if (!no_tdz_check) {
+                if (!repl_mode)
+                    throw UseBeforeBindingEx(
+                        intern_msg("'" + std::string(id->get_str())
+                                   + "' is used before its declaration"),
+                        id->start, id->end);
+            } else {
+                id->in_tdz = true;      /* declared, not yet bound */
+            }
+            return;
+        }
+
         auto git = global_func_slots.find(id->uid);
         if (git != global_func_slots.end()) {
             id->sym = ResolvedSym{ SymKind::global, git->second };
@@ -1457,7 +2955,9 @@ private:
              * it (global, else builtin, else leave for the map) after pass 2.
              */
             escaped.insert(id->uid);
-            escaped_refs.push_back(id);
+            escaped_refs.push_back(
+                EscapedRef{ id, declared_in_live_scopes(cur, id->uid),
+                            no_undef_check, is_guarded(id->uid) });
             return;
         }
 
@@ -1469,6 +2969,28 @@ private:
          * Not in the REPL, where builtins stay map-resident (redefinable).
          */
         stamp_builtin(id);
+
+        /* FIX-1: still unresolved, and no enclosing scope declares this name
+         * ANYWHERE (below included) - so it can never bind. Refuse now
+         * instead of failing at run time. */
+        if (!repl_mode && !no_undef_check && !id->is_underscore()
+                && !is_guarded(id->uid)          /* #135 */
+                && id->sym.kind == SymKind::unresolved
+                && !declared_in_live_scopes(cur, id->uid))
+            fix1_undefined(id);
+    }
+
+    /*
+     * FIX-1 (#130): a name declared in NO scope is a COMPILE error.
+     *
+     * Free, because a SCRIPT's runtime symbols map is empty and asserted
+     * (eval.h), so such a name is GUARANTEED to fail at run time - this only
+     * moves a certain runtime failure to compile time. Never in the REPL,
+     * which is open-world: a later input may declare it.
+     */
+    [[noreturn]] static void fix1_undefined(const Identifier *id)
+    {
+        throw UndefinedVariableEx(id->uid->val, id->start, id->end);
     }
 
     /* Stamp `id` SymKind::builtin if its name is a builtin (and not in REPL
@@ -1486,33 +3008,47 @@ private:
     /* Count an assignment to a resolved-local lvalue as a write of its slot. */
     void count_write(FuncState *cur, Construct *lvalue)
     {
-        if (!cur || !cur->slottable)
-            return;
-
-        auto bump = [&](Identifier *id) {
-            if (id && id->sym.kind == SymKind::local)
+        /* A write to a GLOBAL-table slot (a function/global REASSIGNED - the
+         * only writes to a global slot besides its decl, which never reaches
+         * here) makes it NOT write-once: recorded UNCONDITIONALLY (not gated
+         * on `cur->slottable`, so a reassign in any scope counts) for the
+         * native-call write-once gate (#55). A LOCAL write is counted into the
+         * frame's per-slot table (auto-const), which needs a slottable frame. */
+        auto note = [&](Identifier *id) {
+            if (!id)
+                return;
+            if (id->sym.kind == SymKind::global)
+                reassigned_globals.insert(id->sym.slot);
+            else if (id->sym.kind == SymKind::local
+                     && cur && cur->slottable)
                 cur->writes[id->sym.slot]++;
         };
 
-        if (auto *id = dynamic_cast<Identifier *>(lvalue)) {
-            bump(id);
-        } else if (auto *il = dynamic_cast<IdList *>(lvalue)) {
+        if (ctag(lvalue) == ConstructType::id) {
+            auto *id = static_cast<Identifier *>(lvalue);
+            note(id);
+            check_rebind(cur, id);
+        } else if (ctag(lvalue) == ConstructType::idlist) {
+            auto *il = static_cast<IdList *>(lvalue);
             for (auto &id : il->elems) {
-                bump(id.get());
+                note(id.get());
+                check_rebind(cur, id.get());
             }
         }
     }
 
     /* Declare the name(s) a declaration's lvalue introduces (Id/IdList). */
-    void declare_lvalue(FuncState *cur, Construct *lvalue)
+    void declare_lvalue(FuncState *cur, Construct *lvalue, bool cnst = false)
     {
-        if (auto *id = dynamic_cast<Identifier *>(lvalue)) {
-            declare(cur, id);
-        } else if (auto *il = dynamic_cast<IdList *>(lvalue)) {
+        if (ctag(lvalue) == ConstructType::id) {
+            auto *id = static_cast<Identifier *>(lvalue);
+            declare(cur, id, cnst);
+        } else if (ctag(lvalue) == ConstructType::idlist) {
+            auto *il = static_cast<IdList *>(lvalue);
             for (auto &id : il->elems) {
                 if (id->is_underscore())
                     continue;   /* `_` placeholder: not declared */
-                declare(cur, id.get());
+                declare(cur, id.get(), cnst);
             }
         }
     }
@@ -1527,68 +3063,160 @@ private:
 void
 for_each_child(Construct *c, const std::function<void(Construct *)> &fn)
 {
-    if (auto *n = dynamic_cast<SingleChildConstruct *>(c)) {
-        fn(n->elem.get());
-    } else if (auto *n = dynamic_cast<MultiOpConstruct *>(c)) {
-        for (auto &p : n->elems) {
+    /* #102: a TAG SWITCH (see Inferencer::for_each_child's note). NO
+     * default: -Werror=switch keeps it exhaustive. The SCOPE nodes -
+     * Block, for/foreach/for-range, try, Expr14, FuncDecl - are
+     * DELIBERATELY childless here exactly as in the old chain:
+     * Resolver::walk handles them and they never reach this walker
+     * (the documented for_each_child contract). */
+    switch (c->ct) {
+    case ConstructType::expr01:
+    case ConstructType::inlined_call:
+    case ConstructType::throw_stmt: {
+        fn(static_cast<SingleChildConstruct *>(c)->elem.get());
+        break;
+    }
+    case ConstructType::expr02:
+    case ConstructType::expr03:
+    case ConstructType::expr04:
+    case ConstructType::expr05:
+    case ConstructType::expr06:
+    case ConstructType::expr07:
+    case ConstructType::expr08:
+    case ConstructType::expr09:
+    case ConstructType::expr10:
+    case ConstructType::expr11:
+    case ConstructType::expr12: {
+        for (auto &p : static_cast<MultiOpConstruct *>(c)->elems)
             fn(p.second.get());
-        }
-    } else if (auto *n = dynamic_cast<TypedScalarExpr *>(c)) {
-        /* an M8 specialized node: same elems shape as MultiOpConstruct. The
-         * inliner normally runs before specialize_types and never sees one,
-         * but a CROSS-INPUT inlined prior body is already specialized. */
-        for (auto &p : n->elems) fn(p.second.get());
-    } else if (auto *n = dynamic_cast<IncDecExpr *>(c)) {
-        fn(n->lvalue.get());
-    } else if (auto *n = dynamic_cast<TernaryExpr *>(c)) {
+        break;
+    }
+    case ConstructType::typed_scalar: {
+        /* an M8 specialized node: same elems shape as
+         * MultiOpConstruct. The inliner normally runs before
+         * specialize_types and never sees one, but a CROSS-INPUT
+         * inlined prior body is already specialized. */
+        for (auto &p : static_cast<TypedScalarExpr *>(c)->elems)
+            fn(p.second.get());
+        break;
+    }
+    case ConstructType::incdec: {
+        fn(static_cast<IncDecExpr *>(c)->lvalue.get());
+        break;
+    }
+    case ConstructType::deref: {
+        fn(static_cast<DerefExpr *>(c)->elem.get());
+        break;
+    }
+    case ConstructType::cast: {
+        fn(static_cast<CastExpr *>(c)->elem.get());
+        break;
+    }
+    case ConstructType::ternary: {
+        auto *n = static_cast<TernaryExpr *>(c);
         fn(n->condExpr.get());
         fn(n->thenExpr.get());
         fn(n->elseExpr.get());
-    } else if (auto *n = dynamic_cast<CoalesceExpr *>(c)) {
+        break;
+    }
+    case ConstructType::coalesce: {
+        auto *n = static_cast<CoalesceExpr *>(c);
         fn(n->lhs.get());
         fn(n->rhs.get());
-    } else if (auto *n = dynamic_cast<CallExpr *>(c)) {
+        break;
+    }
+    case ConstructType::call: {
+        auto *n = static_cast<CallExpr *>(c);
         fn(n->what.get());
         fn(n->args.get());
-    } else if (auto *n = dynamic_cast<IfStmt *>(c)) {
+        break;
+    }
+    case ConstructType::if_stmt: {
+        auto *n = static_cast<IfStmt *>(c);
         fn(n->condExpr.get());
         fn(n->thenBlock.get());
         fn(n->elseBlock.get());
-    } else if (auto *n = dynamic_cast<WhileStmt *>(c)) {
+        break;
+    }
+    case ConstructType::while_stmt: {
+        auto *n = static_cast<WhileStmt *>(c);
         fn(n->condExpr.get());
         fn(n->body.get());
-    } else if (auto *n = dynamic_cast<Subscript *>(c)) {
+        break;
+    }
+    case ConstructType::subscript: {
+        auto *n = static_cast<Subscript *>(c);
         fn(n->what.get());
         fn(n->index.get());
-    } else if (auto *n = dynamic_cast<Slice *>(c)) {
+        break;
+    }
+    case ConstructType::slice: {
+        auto *n = static_cast<Slice *>(c);
         fn(n->what.get());
         fn(n->start_idx.get());
         fn(n->end_idx.get());
-    } else if (auto *n = dynamic_cast<MemberExpr *>(c)) {
-        fn(n->what.get());
-    } else if (auto *n = dynamic_cast<ReturnStmt *>(c)) {
-        fn(n->elem.get());
-    } else if (auto *n = dynamic_cast<LiteralDictKVPair *>(c)) {
+        break;
+    }
+    case ConstructType::member: {
+        fn(static_cast<MemberExpr *>(c)->what.get());
+        break;
+    }
+    case ConstructType::ret: {
+        fn(static_cast<ReturnStmt *>(c)->elem.get());
+        break;
+    }
+    case ConstructType::lit_dict_kv: {
+        auto *n = static_cast<LiteralDictKVPair *>(c);
         fn(n->key.get());
         fn(n->value.get());
-    } else if (auto *n = dynamic_cast<MultiElemConstruct<Construct> *>(c)) {
-        /* ExprList, LiteralArray (Block is handled in walk) */
-        for (auto &e : n->elems) {
-            fn(e.get());
-        }
-    } else if (auto *n = dynamic_cast<MultiElemConstruct<Identifier> *>(c)) {
-        /* IdList */
-        for (auto &e : n->elems) {
-            fn(e.get());
-        }
-    } else if (auto *n =
-                   dynamic_cast<MultiElemConstruct<LiteralDictKVPair> *>(c)) {
-        /* LiteralDict */
-        for (auto &e : n->elems) {
-            fn(e.get());
-        }
+        break;
     }
-    /* literals, Identifier and childless constructs have no children */
+    case ConstructType::lit_arr:
+    case ConstructType::expr_list: {
+        /* ExprList, LiteralArray (Block is handled in walk) */
+        for (auto &e : static_cast<MultiElemConstruct<Construct> *>(c)
+                           ->elems)
+            fn(e.get());
+        break;
+    }
+    case ConstructType::idlist: {
+        for (auto &e : static_cast<MultiElemConstruct<Identifier> *>(c)
+                           ->elems)
+            fn(e.get());
+        break;
+    }
+    case ConstructType::lit_dict: {
+        auto *n = static_cast<MultiElemConstruct<LiteralDictKVPair> *>(c);
+        for (auto &e : n->elems)
+            fn(e.get());
+        break;
+    }
+    /* literals, Identifier and childless constructs have no
+     * children; the scope nodes (block/for/for-range/foreach/try/
+     * expr14/func_decl/struct_decl) are walk()'s, never walked
+     * here */
+    case ConstructType::other:
+    case ConstructType::nop:
+    case ConstructType::brk:
+    case ConstructType::cont:
+    case ConstructType::rethrow:
+    case ConstructType::lit_int:
+    case ConstructType::lit_bool:
+    case ConstructType::lit_float:
+    case ConstructType::lit_none:
+    case ConstructType::lit_str:
+    case ConstructType::lit_obj:
+    case ConstructType::id:
+    case ConstructType::block:
+    case ConstructType::expr14:
+    case ConstructType::for_stmt:
+    case ConstructType::for_range:
+    case ConstructType::foreach_stmt:
+    case ConstructType::try_catch:
+    case ConstructType::func_decl:
+    case ConstructType::struct_decl:
+        break;
+    }
 }
 
 /*
@@ -1617,13 +3245,18 @@ for_each_child(Construct *c, const std::function<void(Construct *)> &fn)
 static const UniqueId *fmi_base_id(const Construct *lv)
 {
     while (lv) {
-        if (auto *id = dynamic_cast<const Identifier *>(lv))
+        if (auto *id = node_cast<const Identifier>(lv))
             return id->uid;
-        if (auto *s = dynamic_cast<const Subscript *>(lv)) {
+        if (ctag(lv) == ConstructType::subscript) {
+            auto *s = static_cast<const Subscript *>(lv);
             lv = s->what.get(); continue;
         }
-        if (auto *m = dynamic_cast<const MemberExpr *>(lv)) {
+        if (ctag(lv) == ConstructType::member) {
+            auto *m = static_cast<const MemberExpr *>(lv);
             lv = m->what.get(); continue;
+        }
+        if (ctag(lv) == ConstructType::deref) {
+            lv = static_cast<const DerefExpr *>(lv)->elem.get(); continue;
         }
         return nullptr;
     }
@@ -1637,32 +3270,211 @@ static void fmi_children(Construct *c,
 {
     if (!c)
         return;
-    if (auto *b = dynamic_cast<Block *>(c)) {
-        for (auto &e : b->elems) fn(e.get());
-    } else if (auto *f = dynamic_cast<ForStmt *>(c)) {
+    /* #102: tag dispatch for the five added kinds; everything else
+     * falls to the (already tag-switched) for_each_child */
+    switch (c->ct) {
+    case ConstructType::block: {
+        for (auto &e : static_cast<Block *>(c)->elems)
+            fn(e.get());
+        return;
+    }
+    case ConstructType::for_stmt: {
+        auto *f = static_cast<ForStmt *>(c);
         fn(f->init.get()); fn(f->cond.get());
         fn(f->inc.get()); fn(f->body.get());
-    } else if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+        return;
+    }
+    case ConstructType::foreach_stmt: {
+        auto *fe = static_cast<ForeachStmt *>(c);
         fn(fe->container.get()); fn(fe->body.get());
-    } else if (auto *t = dynamic_cast<TryCatchStmt *>(c)) {
-        fn(t->tryBody.get());
-        for (auto &p : t->catchStmts) fn(p.second.get());
-        fn(t->finallyBody.get());
-    } else if (auto *e = dynamic_cast<Expr14 *>(c)) {
+        return;
+    }
+    case ConstructType::try_catch: {
+        auto *tc = static_cast<TryCatchStmt *>(c);
+        fn(tc->tryBody.get());
+        for (auto &p : tc->catchStmts) fn(p.second.get());
+        fn(tc->finallyBody.get());
+        return;
+    }
+    case ConstructType::expr14: {
+        auto *e = static_cast<Expr14 *>(c);
         fn(e->lvalue.get()); fn(e->rvalue.get());
-    } else {
+        return;
+    }
+    default:
         for_each_child(c, fn);
     }
+}
+
+/* The identifier at the ROOT of an lvalue chain (`p`, `p[i]`, `p.f[j]`,
+ * `*p`), or null when the chain is rooted at anything else. */
+static const Identifier *lvalue_chain_root(const Construct *c)
+{
+    for (;;) {
+        switch (ctag(c)) {
+        case ConstructType::id:
+            return static_cast<const Identifier *>(c);
+        case ConstructType::subscript:
+            c = static_cast<const Subscript *>(c)->what.get();
+            break;
+        case ConstructType::member:
+            c = static_cast<const MemberExpr *>(c)->what.get();
+            break;
+        case ConstructType::deref:
+            c = static_cast<const DerefExpr *>(c)->elem.get();
+            break;
+        default:
+            return nullptr;
+        }
+    }
+}
+
+/*
+ * Does `body` WRITE THROUGH an identifier `is_param` accepts - use it as the
+ * root of an assignment target (`p[0] = v`, `p.f += v`), of an inc-dec
+ * operand (`p[i]++`), or as the first argument of a builtin that takes an
+ * lvalue (`append(p, v)`, `pop(p)`)? Those positions need an LVALUE: in a
+ * physical call the parameter slot is one, so an inliner may substitute an
+ * argument there only when the argument is itself a name. A literal or a
+ * computed value put there turns a legal store into a store to a temporary -
+ * `NotLValueEx` in the tree-walker where the call succeeded, and a
+ * construct the codegen cannot lower (NotLoweredEx) - a RULE 2 break.
+ * A complete walk (fmi_children); a nested function body is not entered
+ * (the inliners refuse a callee that nests one).
+ */
+/* The identifier at the root of a WRITE-THROUGH chain whose first step is
+ * a MEMBER (`p.f = v`, `p.f[i] += v`, `p.f.g++`, `append(p.f, x)`): a write
+ * into the struct `p` holds - or into the dict, which is a reference, but
+ * the chain's shape cannot tell them apart. Null for any other target. */
+static const Identifier *member_write_root(const Construct *c)
+{
+    const Construct *above = nullptr;
+    for (;;) {
+        switch (ctag(c)) {
+        case ConstructType::id:
+            return ctag(above) == ConstructType::member
+                ? static_cast<const Identifier *>(c) : nullptr;
+        case ConstructType::subscript:
+            above = c;
+            c = static_cast<const Subscript *>(c)->what.get();
+            break;
+        case ConstructType::member:
+            above = c;
+            c = static_cast<const MemberExpr *>(c)->what.get();
+            break;
+        default:
+            return nullptr;
+        }
+    }
+}
+
+/*
+ * `member_only`: count only a write whose first step on the identifier is
+ * a MEMBER (member_write_root) - a write INTO a struct the identifier
+ * holds. A struct is a VALUE: a parameter holding one is the call's own
+ * copy, so a write into it must not reach the caller's variable, which
+ * substituting even a NAME for the parameter would do.
+ */
+static bool writes_through(const Construct *body,
+                           const std::function<bool(const Identifier *)>
+                               &is_param,
+                           bool member_only = false)
+{
+    bool found = false;
+    const auto root_of = [&](const Construct *t) {
+        return member_only ? member_write_root(t) : lvalue_chain_root(t);
+    };
+    std::function<void(const Construct *)> go = [&](const Construct *c) {
+        if (!c || found)
+            return;
+        const Construct *target = nullptr;
+        switch (ctag(c)) {
+        case ConstructType::expr14:
+            target = static_cast<const Expr14 *>(c)->lvalue.get();
+            if (ctag(target) == ConstructType::idlist) {
+                for (auto &e : static_cast<const IdList *>(target)->elems) {
+                    const Identifier *r = root_of(e.get());
+                    if (r && is_param(r))
+                        found = true;
+                }
+                target = nullptr;
+            }
+            break;
+        case ConstructType::incdec:
+            target = static_cast<const IncDecExpr *>(c)->lvalue.get();
+            break;
+        case ConstructType::call: {
+            auto *ce = static_cast<const CallExpr *>(c);
+            auto *callee = node_cast<const Identifier>(ce->what.get());
+            if (callee && ce->args && !ce->args->elems.empty()
+                    && is_lvalue_arg_builtin(callee->get_str()))
+                target = ce->args->elems[0].get();
+            break;
+        }
+        default:
+            break;
+        }
+        if (target) {
+            const Identifier *r = root_of(target);
+            if (r && is_param(r))
+                found = true;
+        }
+        fmi_children(const_cast<Construct *>(c),
+                     [&](Construct *ch) { go(ch); });
+    };
+    go(body);
+    return found;
+}
+
+/*
+ * The CALL at the root of `c`'s store target, if any: `f()` in
+ * `f()[0] = v`, `f().x++`, `append(f(), v)`, `pop(f()[k])`. A store there
+ * goes into the VALUE the call returns (held, `{ var t = f(); t[0] = v; }`);
+ * inlining the body would put its expression - a name, an element - in
+ * the call's place, and the store would land in THAT location: a slice
+ * view's copy detaches on a write where the variable's own view does not,
+ * and a flat struct element read is a copy. So no inliner splices it.
+ */
+static const Construct *store_root_call(const Construct *c)
+{
+    const Construct *target = nullptr;
+    switch (ctag(c)) {
+    case ConstructType::expr14:
+        target = static_cast<const Expr14 *>(c)->lvalue.get();
+        break;
+    case ConstructType::incdec:
+        target = static_cast<const IncDecExpr *>(c)->lvalue.get();
+        break;
+    case ConstructType::call: {
+        auto *ce = static_cast<const CallExpr *>(c);
+        auto *callee = node_cast<const Identifier>(ce->what.get());
+        if (callee && ce->args && !ce->args->elems.empty()
+                && is_lvalue_arg_builtin(callee->get_str()))
+            target = ce->args->elems[0].get();
+        break;
+    }
+    default:
+        return nullptr;
+    }
+    while (target && (ctag(target) == ConstructType::subscript
+                      || ctag(target) == ConstructType::member
+                      || ctag(target) == ConstructType::deref))
+        target = ctag(target) == ConstructType::subscript
+                     ? static_cast<const Subscript *>(target)->what.get()
+                 : ctag(target) == ConstructType::member
+                     ? static_cast<const MemberExpr *>(target)->what.get()
+                     : static_cast<const DerefExpr *>(target)->elem.get();
+    return ctag(target) == ConstructType::call ? target : nullptr;
 }
 
 /* `e`'s subtree reads some tainted id (over-approximates "may alias one"). */
 static bool fmi_mentions(const Construct *e,
                          const std::unordered_set<const UniqueId *> &t)
 {
-    if (!e || dynamic_cast<const FuncDeclStmt *>(e))
+    if (!e || e->ct == ConstructType::func_decl)
         return false;
-    if (auto *id = dynamic_cast<const Identifier *>(e))
-        return t.count(id->uid) != 0;
+    if (e->ct == ConstructType::id)
+        return t.count(static_cast<const Identifier *>(e)->uid) != 0;
     bool found = false;
     fmi_children(const_cast<Construct *>(e),
                  [&](Construct *ch) { if (fmi_mentions(ch, t)) found = true; });
@@ -1676,9 +3488,10 @@ static void fmi_propagate(Construct *c,
                           std::unordered_set<const UniqueId *> &t,
                           bool &changed)
 {
-    if (!c || dynamic_cast<FuncDeclStmt *>(c))
+    if (!c || ctag(c) == ConstructType::func_decl)
         return;
-    if (auto *e = dynamic_cast<Expr14 *>(c)) {
+    if (ctag(c) == ConstructType::expr14) {
+        auto *e = static_cast<Expr14 *>(c);
         /* Only an IDENTIFIER-lvalue assignment makes the lhs alias the rhs
          * (`var b = a` / `b = a`); an element store `r[i] = a` writes the
          * (possibly fresh) container `r`, it does not make `r` alias `a`. So an
@@ -1687,15 +3500,17 @@ static void fmi_propagate(Construct *c,
          * tainted value placed in a literal initializer, `var r = [a]`, DOES
          * taint r, since that is an identifier-lvalue assignment.) */
         if (fmi_mentions(e->rvalue.get(), t)) {
-            if (auto *il = dynamic_cast<IdList *>(e->lvalue.get())) {
+            if (ctag(e->lvalue.get()) == ConstructType::idlist) {
+                auto *il = static_cast<IdList *>(e->lvalue.get());
                 for (auto &p : il->elems)
                     if (t.insert(p->uid).second) changed = true;
-            } else if (dynamic_cast<Identifier *>(e->lvalue.get())) {
+            } else if (node_cast<Identifier>(e->lvalue.get())) {
                 if (const UniqueId *b = fmi_base_id(e->lvalue.get()))
                     if (t.insert(b).second) changed = true;
             }
         }
-    } else if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+    } else if (ctag(c) == ConstructType::foreach_stmt) {
+        auto *fe = static_cast<ForeachStmt *>(c);
         if (fe->ids && fmi_mentions(fe->container.get(), t))
             for (auto &p : fe->ids->elems)
                 if (t.insert(p->uid).second) changed = true;
@@ -1708,15 +3523,16 @@ static void fmi_propagate(Construct *c,
 static bool fmi_has_tainted_write(
     const Construct *c, const std::unordered_set<const UniqueId *> &t)
 {
-    if (!c || dynamic_cast<const FuncDeclStmt *>(c))
+    if (!c || ctag(c) == ConstructType::func_decl)
         return false;
     const Construct *lv = nullptr;
-    if (auto *e = dynamic_cast<const Expr14 *>(c))
+    if (auto *e = node_cast<const Expr14>(c))
         lv = e->lvalue.get();
-    else if (auto *idc = dynamic_cast<const IncDecExpr *>(c))
+    else if (auto *idc = node_cast<const IncDecExpr>(c))
         lv = idc->lvalue.get();
-    if (lv && (dynamic_cast<const Subscript *>(lv) ||
-               dynamic_cast<const MemberExpr *>(lv))) {
+    if (lv && (node_cast<const Subscript>(lv) ||
+               node_cast<const MemberExpr>(lv) ||
+               ctag(lv) == ConstructType::deref)) {
         const UniqueId *b = fmi_base_id(lv);
         if (b && t.count(b))
             return true;
@@ -1726,6 +3542,671 @@ static bool fmi_has_tainted_write(
         if (fmi_has_tainted_write(ch, t)) found = true;
     });
     return found;
+}
+
+/*
+ * THE PARAMETER ESCAPE ANALYSIS (#93, 2026-08-14).
+ *
+ * Answers, per parameter: can the REFERENCE this parameter is bound to
+ * still be reachable after the call returns? If it cannot, the callee's
+ * slot does not need its own count on it - the CALLER's slot holds one for
+ * the whole of a synchronous call - and the retain/release pair a
+ * reference argument pays today (measured 44 Ir to bind + its share of 30
+ * to release, ~12% of 76_funcval_dispatch) is removable.
+ *
+ * ⛔ THIS PASS ONLY ANSWERS THE QUESTION. Wiring the answer to an actual
+ * borrow needs ONE more thing, which is NOT here: an element write through
+ * a SLICE materializes it in place (`flat_store_core`'s
+ * `arr.materialize_slice()`, `LValue::write_target`), and that RELEASES the
+ * old SharedObject - a reference a borrowed slot never took, so a refcount
+ * underflow. Sliceness is a RUNTIME property, so the bind has to decide
+ * per call and record it: a borrow mask on the window record, which
+ * `pop_window` then consults, with a slice argument falling back to a real
+ * retain.
+ *
+ * A SECOND hazard was recorded here and is WRONG, corrected 2026-08-15
+ * rather than deleted, because the reasoning is the kind that looks right:
+ * the three element-store paths gate `clone_aliased_slices` on
+ * `use_count() > 1`, and a borrow does not bump the count - so it seemed a
+ * live slice of the argument could observe a write it must not. It cannot.
+ * `use_count()` is the count on the SharedObject, and a slice HOLDS ITS
+ * OWN intrusive_ptr to that same object; so a live slice already makes the
+ * count >= 2 by itself. The borrow can only take the count 2 -> 1 in the
+ * case where the callee's handle was the second one, i.e. where there are
+ * no slices at all and `clone_aliased_slices` would be a no-op.
+ * So this lands on its own, with its own tests, and the consumer follows.
+ *
+ * THE RULES, deliberately conservative - a false "does not escape" is a
+ * use-after-free, a false "escapes" only costs the optimization. A param
+ * does not escape iff ALL of:
+ *   - it is never REASSIGNED (an assignment to the param would release
+ *     whatever the slot holds, which a borrowed slot must never do);
+ *   - EVERY occurrence of it is the base of a subscript or member access
+ *     (`p[i]`, `p.f`, and those as assignment targets). Anything else -
+ *     a bare read, an argument, a return operand, a capture, a throw -
+ *     is treated as an escape, because each of those can outlive the call;
+ *   - the body contains NO call of any kind. This is what makes the pass
+ *     non-transitive and therefore cheap AND sound: a callee could pass
+ *     the param on, or reassign the global the argument came from, and
+ *     either would need a whole-program fixpoint to bound. The transitive
+ *     version is the natural increment 2;
+ *   - the body writes NO global, for the same reason: the argument
+ *     expression at the call site may BE that global, and dropping its
+ *     last reference mid-call would leave the borrow dangling;
+ *   - the body declares no nested function (a capture list could take it);
+ *   - every node in the body is a shape the walker can ENUMERATE
+ *     (esc_known_shape) - an unknown kind hides occurrences, so it declines
+ *     rather than guessing that it has none.
+ *
+ * Each rule is pinned by a row of the `param_escape_analysis` test that
+ * FAILS when the rule is deleted, except the reassignment one, which is
+ * proven redundant by an ML_CHECK instead - see the note at the check.
+ */
+static bool esc_is_base_position(const Construct *c, const Construct *child)
+{
+    if (auto *s = node_cast<const Subscript>(c))
+        return s->what.get() == child;
+    if (auto *m = node_cast<const MemberExpr>(c))
+        return m->what.get() == child;
+    return false;
+}
+
+/*
+ * ⛔ FAIL CLOSED ON A NODE KIND THE WALKER DOES NOT KNOW.
+ *
+ * `fmi_children` delegates to `for_each_child`, a dynamic_cast chain whose
+ * fallthrough means "this node has no children". For its original caller
+ * (func_mutates_input) an unknown kind costs a pure classification. HERE it
+ * would hide an occurrence of the parameter, mark it non-escaping, and the
+ * consumer would drop a reference that is still reachable - a use-after-free
+ * from a node kind nobody remembered to add.
+ *
+ * So the escape analysis does not trust the fallthrough: it names the kinds
+ * whose children it knows are visited, plus the kinds that genuinely have
+ * none, and treats ANYTHING ELSE as opaque. A node kind added later, or one
+ * that exists at a stage this pass does not run at today, then costs the
+ * optimization instead of soundness. `ForRangeStmt` is the live example -
+ * absent from `for_each_child`, and only out of reach because this pass runs
+ * before `specialize_types` builds one. Moving the pass later (which the
+ * consumer may want) must not silently turn that into a dangling borrow.
+ */
+static bool esc_known_shape(const Construct *c)
+{
+    /* A switch over the tag with no `default`, so a new node kind fails
+     * the build until it is classified here - and no per-class
+     * dynamic_cast, whose null test was a branch no call could take (c
+     * is never null here). */
+    switch (ctag(c)) {
+    /* enumerable: fmi_children / for_each_child walk every child */
+    case ConstructType::block:
+    case ConstructType::for_stmt:
+    case ConstructType::foreach_stmt:
+    case ConstructType::try_catch:
+    case ConstructType::expr14:
+    case ConstructType::expr01:         /* SingleChildConstruct */
+    case ConstructType::inlined_call:
+    case ConstructType::throw_stmt:
+    case ConstructType::expr02:         /* MultiOpConstruct */
+    case ConstructType::expr03:
+    case ConstructType::expr04:
+    case ConstructType::expr05:
+    case ConstructType::expr06:
+    case ConstructType::expr07:
+    case ConstructType::expr08:
+    case ConstructType::expr09:
+    case ConstructType::expr10:
+    case ConstructType::expr11:
+    case ConstructType::expr12:
+    case ConstructType::typed_scalar:
+    case ConstructType::incdec:
+    case ConstructType::ternary:
+    case ConstructType::coalesce:
+    case ConstructType::call:
+    case ConstructType::if_stmt:
+    case ConstructType::while_stmt:
+    case ConstructType::subscript:
+    case ConstructType::slice:
+    case ConstructType::member:
+    case ConstructType::ret:
+    case ConstructType::lit_dict_kv:
+    case ConstructType::lit_arr:        /* MultiElemConstruct */
+    case ConstructType::expr_list:
+    case ConstructType::idlist:
+    case ConstructType::lit_dict:
+    /* childless: a leaf cannot hide an occurrence */
+    case ConstructType::lit_int:
+    case ConstructType::lit_bool:
+    case ConstructType::lit_float:
+    case ConstructType::lit_none:
+    case ConstructType::lit_str:
+    case ConstructType::lit_obj:
+    case ConstructType::id:
+    case ConstructType::brk:            /* ChildlessConstruct */
+    case ConstructType::cont:
+    case ConstructType::rethrow:
+    case ConstructType::nop:
+    case ConstructType::struct_decl:
+    case ConstructType::func_decl:
+        return true;
+    /* NOT known: a ForRangeStmt (specialize_types makes it, after this
+     * pass), a DerefExpr and a CastExpr (`cast<dyn?>(p)` IS `p`) have
+     * never been audited against the walkers here, and an unknown kind
+     * hides occurrences - so they decline */
+    case ConstructType::for_range:
+    case ConstructType::deref:
+    case ConstructType::cast:
+    case ConstructType::other:
+        break;
+    }
+    return false;
+}
+
+/* Does this statement write a GLOBAL (`g = ..`, `g[i] = ..`, `g.f++`)? The
+ * argument at some call site may BE that global, so dropping its last
+ * reference mid-call would leave a borrow dangling. */
+static bool esc_writes_global(const Construct *c)
+{
+    const Construct *lv = nullptr;
+    if (auto *e = node_cast<const Expr14>(c))
+        lv = e->lvalue.get();
+    else if (auto *idc = node_cast<const IncDecExpr>(c))
+        lv = idc->lvalue.get();
+    while (lv) {
+        if (auto *id = node_cast<const Identifier>(lv))
+            return id->sym.kind == SymKind::global;
+        if (ctag(lv) == ConstructType::subscript) {
+            auto *s = static_cast<const Subscript *>(lv);
+            lv = s->what.get(); continue;
+        }
+        if (ctag(lv) == ConstructType::member) {
+            auto *m = static_cast<const MemberExpr *>(lv);
+            lv = m->what.get(); continue;
+        }
+        break;
+    }
+    return false;
+}
+
+/*
+ * THE BUILTIN ARGUMENT-CAPTURE TABLE.
+ *
+ * A builtin is C++, so nothing about it can be derived from the AST: the
+ * question "can a reference I hand this builtin still be reachable after it
+ * returns?" is answered by READING ITS IMPLEMENTATION, once, here.
+ *
+ * A listed builtin is TRANSPARENT, which is three claims at once:
+ *   1. it stores no reference to an argument anywhere that outlives the
+ *      call;
+ *   2. it does not return an argument ITSELF. Returning something reached
+ *      THROUGH one is fine - `min(a)` hands back an ELEMENT of `a`, which
+ *      carries its own count and stays alive on its own; the borrow is on
+ *      the container;
+ *   3. it invokes no MyLang CALLBACK. This is why a listed builtin skips
+ *      the `callable_arg_mask` test at the call site: `len` cannot run user
+ *      code whatever its argument's static type is, and refusing it for a
+ *      `dyn` argument would cost the single most common shape in the
+ *      language for no reason.
+ *
+ * ⛔ IT IS AN ALLOWLIST, SO IT FAILS CLOSED. An unlisted builtin - and any
+ * builtin added later - captures every argument and is assumed to invoke,
+ * costing the optimization and never soundness. That is what CLAUDE.md's
+ * audit-table trap asks for: this table is read at a stage where a missing
+ * entry cannot be noticed, so forgetting one has to be harmless.
+ *
+ * ⛔ AND CLAIM 3 IS WHY THE LIST IS AUDITED BY GREP, NOT BY EYE. `sum` was
+ * on it in a first version, on the obvious reasoning that a sum is a number
+ * - but `sum(arr, func)` is a REDUCE, and its second form calls
+ * `eval_func` per element. The mechanical check is an awk over
+ * src/builtins/ that prints the enclosing `EvalValue builtin_...` header of
+ * every line mentioning `VmInvoker` or `eval_func(` - i.e. every builtin
+ * that can run user code: make_array, make_dict, map/filter, find, sort,
+ * and sum. RE-RUN IT when adding an entry.
+ *
+ * The instructive EXCLUSIONS, since "why is X not here" is the question a
+ * future reader will have:
+ *   runtime(a)          returns the argument ITSELF - the identity function
+ *                       is the exact shape claim 2 exists for, and it is a
+ *                       builtin real programs use
+ *   append/push/insert  store the argument INTO a container that outlives
+ *   dict(pairs)         builds a dict holding them
+ *   sum/sort/map/       may run a callback (claim 3)
+ *   filter/find/
+ *   make_array/make_dict
+ *   reverse/pop/erase/  mutate or hand back pieces in ways worth reading
+ *   top/get             one at a time before trusting; not needed yet
+ */
+static bool esc_builtin_transparent(const UniqueId *name)
+{
+    static const char *const transparent[] = {
+        "abs", "array_storage", "chr", "endswith", "float", "hash",
+        "int", "intptr", "join", "kindstr", "len", "max", "min", "ord",
+        "print", "refcount", "split", "splitlines", "startswith", "str",
+        "typestr",
+    };
+    for (const char *n : transparent)
+        if (name->val == n)
+            return true;
+    return false;
+}
+
+/*
+ * THE CALL-GRAPH ESCAPE FIXPOINT.
+ *
+ * One `EscFn` per analysable function body. `mask` starts OPTIMISTIC (every
+ * candidate param assumed non-escaping) and only ever loses bits, so the
+ * iteration is a greatest fixpoint - which is what makes RECURSION come out
+ * right rather than needing a special case: `func f(a) { f(a); }` passes `a`
+ * to a position that does not escape, so nothing clears it, and the answer
+ * "the reference never leaves" is correct. Mutual recursion makes the graph
+ * cyclic, so there is no traversal order and it has to be a fixpoint at all
+ * - the same argument `build_reachable_reads` makes for the unbound-call
+ * prover, which this deliberately mirrors.
+ */
+struct EscEdge {
+    int callee;                 /* index into the EscFn vector */
+    int argpos;                 /* my param sits at this argument position */
+    int mine;                   /* ... and is my parameter number `mine` */
+};
+
+struct EscFn {
+    FuncDeclStmt *fd = nullptr;
+    uint64_t mask = 0;          /* candidates; shrinks to the fixpoint */
+    uint64_t cands = 0;         /* the initial mask, kept for the reach stat */
+    uint64_t written = 0;       /* params the body reassigns */
+    bool unsafe = false;        /* writes a global, or calls something we
+                                 * cannot name (which might write one) */
+    std::vector<EscEdge> edges;
+    std::vector<int> calls;     /* known callees, for the `unsafe` fixpoint */
+};
+
+#ifdef TESTS
+/* #116 inc 4 REACH: how many call sites the callee-set analysis named
+ * that the slot lookup could not. It is the number that says whether
+ * the wiring does anything at all - a silent zero here and the
+ * increment is inert, however green the tests are. */
+#define ESC_NAMED(ctr) ((ctr)++)
+#else
+#define ESC_NAMED(ctr) ((void) 0)
+#endif
+
+#ifdef TESTS
+/* WHY a function was poisoned - the reach diagnostic. Counted once per
+ * function, at the FIRST rule that fires, so the columns sum to the number
+ * of locally-poisoned functions and the rest were poisoned transitively. */
+#define ESC_POISON(f, ctr) do { if (!(f)->unsafe) (ctr)++; \
+                                (f)->unsafe = true; } while (0)
+#else
+#define ESC_POISON(f, ctr) ((f)->unsafe = true)
+#endif
+
+struct EscWorld {
+    std::unordered_map<int, int> slot2fn;    /* global slot -> EscFn index */
+    std::unordered_set<int> struct_slots;    /* global slot -> a struct name */
+    std::unordered_set<int> written_slots;   /* reassigned global slots */
+    /* INLINE LAMBDA -> EscFn index. A lambda has no name and no global
+     * slot, so `slot2fn` cannot reach it; this is how a callback written
+     * in the argument list is recognised as an ordinary callee. Keyed by
+     * the node, which is safe here because the map is built and consumed
+     * inside ONE run of the pass - the long-lived-node-pointer hazard
+     * needs the map to outlive the tree. */
+    std::unordered_map<const FuncDeclStmt *, int> fd2fn;
+};
+
+struct EscCtx {
+    std::unordered_map<const UniqueId *, int> pidx;   /* param name -> index */
+    const EscWorld *w;
+    EscFn *self;
+};
+
+static void esc_scan(const Construct *c, EscCtx &ctx);
+
+/*
+ * The function a possibly-callable ARGUMENT names, or -1 if this pass cannot
+ * say. Two shapes it can name, and they are the two that occur: an INLINE
+ * LAMBDA, which is a FuncDeclStmt sitting in the argument list, and a NAMED
+ * function in a global slot nothing reassigns - the same slot question an
+ * ordinary direct call already asks. A parameter, a container element
+ * (`ops[i]`) or a reassigned name is -1.
+ */
+static int esc_callback_fn(const Construct *arg, const EscCtx &ctx)
+{
+    if (ctag(arg) == ConstructType::func_decl) {
+        auto *fd = static_cast<const FuncDeclStmt *>(arg);
+        auto it = ctx.w->fd2fn.find(fd);
+        return it != ctx.w->fd2fn.end() ? it->second : -1;
+    }
+    auto *id = node_cast<const Identifier>(arg);
+    if (!id || id->sym.kind != SymKind::global
+            || ctx.w->written_slots.count(id->sym.slot))
+        return -1;
+    auto it = ctx.w->slot2fn.find(id->sym.slot);
+    return it != ctx.w->slot2fn.end() ? it->second : -1;
+}
+
+/*
+ * A HIGHER-ORDER BUILTIN runs a MyLang callback, and the pass cannot see
+ * through the C++ that calls it - `map`/`filter`/`sort`/`find`/`make_array`/
+ * `make_dict` all do. The first version therefore POISONED the whole
+ * enclosing function, which is sound but very blunt: it was 9 of the 12
+ * poisoned functions across samples/ + bench/my.
+ *
+ * It cannot see THROUGH the builtin, but it can nearly always see the
+ * CALLBACK ITSELF - and a callback is just a callee. What the poison was
+ * actually guarding against is a callback that writes a global (dropping a
+ * reference some caller passed us) or reaches a function we cannot analyse;
+ * both of those are exactly the `unsafe` flag the fixpoint already computes
+ * per function and already propagates along `calls`. So NAME the callback
+ * and add the edge. What the callback is HANDED is the container's elements,
+ * never our parameters, so it owes no argument edges - only the unsafe one.
+ *
+ * ⛔ IT STILL FAILS CLOSED, in three places. An argument count past the mask's
+ * width, a mask that was never stamped (`callable_arg_mask` defaults to ~0u,
+ * so a bit outside the argument range is the tell - the same test LICM makes
+ * for the same reason), and any callable argument this pass cannot NAME all
+ * poison exactly as before. A callback reached through a parameter or a
+ * container element is unanalysable, and saying so is the whole point.
+ */
+/*
+ * Builtins that run NO MyLang code. A second allowlist, and a strictly
+ * weaker claim than `esc_builtin_transparent`'s three - these MAY store an
+ * argument or return one, they simply never call back into the language - so
+ * it is a superset and is consulted only by the callback rule below.
+ *
+ * ⛔ IT IS AN ALLOWLIST OF NON-INVOKERS, NOT A LIST OF INVOKERS, AND THAT IS
+ * DELIBERATE. The obvious alternative - list the higher-order builtins and
+ * poison only for those - reads as more precise and is not auditable: the
+ * mechanical grep for `VmInvoker`/`eval_func(` finds `make_array`,
+ * `make_dict`, `sum`, `find_arr` and `hash`, and MISSES `map`, `filter` and
+ * `sort`, which reach their callback through a shared helper whose enclosing
+ * function is not named `builtin_*`. A list built from that grep would have
+ * declared `sort` safe. Inverted, the same imprecision is harmless: an
+ * invoker left off this list is simply not skipped.
+ *
+ * Each entry is a one-line builtin whose body can be read whole. The ones
+ * that must NEVER appear here are the six the grep does find plus the three
+ * it misses: map, filter, sort, find, sum, make_array, make_dict, range,
+ * hash.
+ */
+static bool esc_builtin_no_invoke(const UniqueId *name)
+{
+    static const char *const quiet[] = {
+        "append", "array", "clone", "deepclone", "dict",
+        "erase", "exit", "insert", "keys", "pop", "push", "reverse",
+        "runtime", "top", "values",
+    };
+    if (esc_builtin_transparent(name))
+        return true;                     /* the stronger claim implies this */
+    for (const char *q : quiet)
+        if (name->val == q)
+            return true;
+    return false;
+}
+
+static void esc_scan_ho_builtin(const CallExpr *call, EscCtx &ctx)
+{
+    const size_t na = call->args->elems.size();
+    if (na >= 32) {
+        ESC_POISON(ctx.self, g_esc_p_hobuiltin);
+        return;
+    }
+    const uint32_t valid = na ? ((1u << na) - 1u) : 0u;
+    const uint32_t m = call->callable_arg_mask;
+    if (m & ~valid) {                    /* never stamped - see above */
+        ESC_POISON(ctx.self, g_esc_p_hobuiltin);
+        return;
+    }
+    for (size_t j = 0; j < na; j++) {
+        if (!(m >> j & 1))
+            continue;
+        const int cb = esc_callback_fn(call->args->elems[j].get(), ctx);
+        if (cb < 0) {
+            ESC_POISON(ctx.self, g_esc_p_hobuiltin);
+            return;
+        }
+        ctx.self->calls.push_back(cb);
+    }
+}
+
+/* Classify one call: which bits it clears, which edges it owes, and whether
+ * it can reach code that writes a global. */
+static void esc_scan_call(const CallExpr *call, EscCtx &ctx)
+{
+    auto *cid = node_cast<const Identifier>(call->what.get());
+    const bool is_builtin = cid && cid->sym.kind == SymKind::builtin;
+    /*
+     * A STRUCT CONSTRUCTION is a CallExpr whose callee names a struct. The
+     * inferencer's `vm_struct_ctor_def`/`vm_struct_boxed_def` stamps say so
+     * for the calls IT typed, but a TEMPLATE body is skipped by the check
+     * pass and carries neither - so the slot the resolver hoisted the
+     * struct name into is the reliable question. Without that, `B(a)` in a
+     * template read as a callee we cannot name and poisoned the function
+     * (watched: the struct-ctor row answered 0x0 instead of 0x2).
+     */
+    const bool is_ctor = call->vm_struct_ctor_def || call->vm_struct_boxed_def
+        || (cid && call->direct_func_slot >= 0
+            && ctx.w->struct_slots.count(call->direct_func_slot));
+
+    int callee = -1;
+    if (!is_builtin && !is_ctor && cid && call->direct_func_slot >= 0
+        && !ctx.w->written_slots.count(call->direct_func_slot)) {
+        auto it = ctx.w->slot2fn.find(call->direct_func_slot);
+        if (it != ctx.w->slot2fn.end())
+            callee = it->second;
+    }
+
+    /*
+     * #116 increment 4: A CALLEE THIS PASS CANNOT NAME MAY STILL BE
+     * NAMEABLE. The slot lookup above answers for `f(x)` only when `f` is
+     * an identifier bound to a global slot; a parameter (`func apply(f, x)
+     * => f(x);`) or a closure held in a variable has no slot at all, and
+     * that poisoned the whole enclosing function. The callee-set analysis
+     * answers exactly that question and stamps its answer on the node
+     * (`CallExpr::callee_fn`, syntax.h) - a MUST answer: one candidate, not
+     * ⊤, not escaped.
+     *
+     * ⛔ IT IS AN ADDITION, NEVER AN OVERRIDE. Consulted only where the
+     * slot lookup already failed, so no existing decision changes, and a
+     * missing stamp (no inference, a node the inliner cloned - clones do
+     * NOT inherit it, deliberately) leaves the poison exactly as it was.
+     * The `fd2fn` lookup is the second half of the proof: it fails unless
+     * the named decl is a function THIS run collected, so a stamp naming
+     * anything else declines rather than inventing an edge.
+     */
+    if (!is_builtin && !is_ctor && callee < 0 && call->callee_fn) {
+        auto it = ctx.w->fd2fn.find(call->callee_fn);
+        if (it != ctx.w->fd2fn.end()) {
+            callee = it->second;
+            ESC_NAMED(g_esc_named_by_cs);
+        }
+    }
+
+    /*
+     * A callee we cannot NAME could do anything, including reassigning the
+     * global some caller passed us - so it poisons this function the same
+     * way a direct global write does. A STRUCT CONSTRUCTION is named and
+     * harmless in that respect (it binds fields, calls nothing), it merely
+     * captures whatever it is given. And a HIGHER-ORDER builtin runs a
+     * MyLang callback that this pass cannot see: `callable_arg_mask` is the
+     * inferencer's existing answer to "which arguments might be callable"
+     * (LICM asks it for the same reason), and it defaults to ~0u, so an
+     * unstamped call declines.
+     */
+    const bool transparent = is_builtin && esc_builtin_transparent(cid->uid);
+    if (!is_builtin && !is_ctor && callee < 0)
+        ESC_POISON(ctx.self, g_esc_p_callee);
+    if (is_builtin && !transparent && call->args
+            && !esc_builtin_no_invoke(cid->uid))
+        esc_scan_ho_builtin(call, ctx);
+    if (callee >= 0)
+        ctx.self->calls.push_back(callee);
+
+    /* the callee EXPRESSION: `p()` is a bare read of p, `p[0]()` is not */
+    if (cid) {
+        auto it = ctx.pidx.find(cid->uid);
+        if (it != ctx.pidx.end())
+            ctx.self->mask &= ~(uint64_t(1) << it->second);
+    } else {
+        esc_scan(call->what.get(), ctx);
+    }
+
+    if (!call->args)
+        return;
+    for (size_t j = 0; j < call->args->elems.size(); j++) {
+        const Construct *arg = call->args->elems[j].get();
+        auto *aid = node_cast<const Identifier>(arg);
+        auto it = aid ? ctx.pidx.find(aid->uid) : ctx.pidx.end();
+        if (it == ctx.pidx.end()) {
+            esc_scan(arg, ctx);
+            continue;
+        }
+        if (transparent)
+            continue;                       /* audited: stores nothing */
+        if (callee >= 0 && j < 64) {
+            ctx.self->edges.push_back(
+                EscEdge{ callee, static_cast<int>(j), it->second });
+            continue;                       /* resolved by the fixpoint */
+        }
+        ctx.self->mask &= ~(uint64_t(1) << it->second);
+    }
+}
+
+/* Clear a param's bit the moment it is used anywhere but a base position (or
+ * an argument position the fixpoint can discharge). */
+static void esc_scan(const Construct *c, EscCtx &ctx)
+{
+    if (!c)
+        return;
+    if (!esc_known_shape(c)) {
+        ESC_POISON(ctx.self, g_esc_p_shape); /* see esc_known_shape */
+        return;
+    }
+    /*
+     * A NESTED FUNCTION READS NOTHING BUT ITS CAPTURE LIST, and in MyLang
+     * that list is EXPLICIT - a lambda is `func [x, y] (...)` and a NAMED
+     * nested function may not have one at all (the grammar rejects it). Its
+     * body is parented to `capture_root`, the program root, so it cannot
+     * reach this frame by any other route. So the list IS the answer: clear
+     * the bits of the parameters it names and do not descend.
+     *
+     * A first version poisoned the whole function for any nested decl, and
+     * the reach measurement is what argued it down: 8 of the 15
+     * candidate-bearing functions in samples/ + bench/my lost everything
+     * that way. Clearing the captured bits is still conservative - a
+     * capture SNAPSHOTS the value, taking a reference of its own, so it may
+     * well be borrowable - but conservative here costs only the
+     * optimization.
+     */
+    if (ctag(c) == ConstructType::func_decl) {
+        auto *nested = static_cast<const FuncDeclStmt *>(c);
+        if (nested->captures) {
+            for (auto &cap : nested->captures->elems) {
+                auto it = ctx.pidx.find(cap->uid);
+                if (it != ctx.pidx.end())
+                    ctx.self->mask &= ~(uint64_t(1) << it->second);
+            }
+        }
+        return;
+    }
+    if (ctag(c) == ConstructType::call) {
+        auto *call = static_cast<const CallExpr *>(c);
+        esc_scan_call(call, ctx);
+        return;
+    }
+    if (esc_writes_global(c))
+        ESC_POISON(ctx.self, g_esc_p_gwrite);
+    fmi_children(const_cast<Construct *>(c), [&](Construct *ch) {
+        if (!ch)
+            return;
+        if (ctag(ch) == ConstructType::id) {
+            auto *id = static_cast<const Identifier *>(ch);
+            auto it = ctx.pidx.find(id->uid);
+            if (it != ctx.pidx.end() && !esc_is_base_position(c, ch))
+                ctx.self->mask &= ~(uint64_t(1) << it->second);
+            return;                        /* an Identifier has no children */
+        }
+        esc_scan(ch, ctx);
+    });
+}
+
+/*
+ * The LOCAL half: this body's own contribution, before the fixpoint. Bit i
+ * set == param i does not escape as far as this body alone can tell.
+ *
+ * ⛔ THE BODY IS SCANNED EVEN WHEN THERE IS NOTHING TO CLAIM. `unsafe` is
+ * not a fact about this function's own parameters, it is a fact its CALLERS
+ * need - "code reachable from here may reassign a global" - so a body with
+ * no candidate params (all scalar, or none at all) must still be walked for
+ * its writes and its call edges. Returning early there is the bug that made
+ * the global-write row pass its poison nowhere: `func h(k) { g = [k]; }`
+ * has one int param, so it had no candidates, so it was never scanned, so
+ * `f` calling it stayed clean and marked its own parameter safe.
+ */
+static void esc_scan_body(EscFn &f, const EscWorld &w)
+{
+    FuncDeclStmt *fd = f.fd;
+    if (!fd->body)
+        return;
+    const size_t n = fd->params ? fd->params->elems.size() : 0;
+
+    EscCtx ctx;
+    ctx.w = &w;
+    ctx.self = &f;
+    uint64_t mask = 0, written = 0;
+    for (size_t i = 0; i < n && i < 64; i++) {
+        Identifier *p = node_cast<Identifier>(fd->params->elems[i].get());
+        if (!p)
+            continue;
+        /* A SCALAR param is a by-value copy - there is no reference to
+         * borrow, so it is neither interesting nor claimed here. Asked of
+         * the DESCRIPTOR (ParamDesc::binds_scalar), which is the same
+         * predicate codegen's ref_slots join uses to decide the slot can
+         * never hold a reference; the param DECL's own `th` is not stamped
+         * by annotate_hints, so testing that answered "not scalar" for
+         * every param and the skip never fired. */
+        if (fd->desc && i < fd->desc->params.size()
+            && fd->desc->params[i].binds_scalar())
+            continue;
+        if (i < fd->slot_writes.size() && fd->slot_writes[i])
+            written |= uint64_t(1) << i;
+        ctx.pidx.emplace(p->uid, static_cast<int>(i));
+        mask |= uint64_t(1) << i;
+    }
+    f.mask = mask;
+    f.cands = mask;
+    f.written = written;
+    /* past 64 params nothing is claimable, but the body still has to be
+     * walked for `unsafe` and for the call edges (see the note above) */
+    if (n > 64)
+        f.mask = 0;
+    esc_scan(fd->body.get(), ctx);
+}
+
+/*
+ * REASSIGNMENT: an assignment to the parameter itself would release whatever
+ * the slot holds, which a borrowed slot must never do.
+ *
+ * ⛔ THE GUARD IS PROVEN REDUNDANT RATHER THAN TESTED, on purpose - and the
+ * proof is the CHECK, not a comment. No program can reach it: every spelling
+ * of a write to a parameter - `a = e`, `a += e`, `a++`, `a, b = pair` - puts
+ * the parameter's Identifier somewhere that is not a subscript/member BASE,
+ * so the scan has already cleared the bit. A test row for it is therefore
+ * impossible to write, and one that merely LOOKS like a test of it (an
+ * ordinary `a = [9]` row) passes with the guard deleted - which is what
+ * "defensive, not proven" meant, and the sabotage run confirms: deleting the
+ * guard leaves the whole suite green.
+ *
+ * The check earns its place by firing on the change that would make the
+ * guard load-bearing again. WATCHED: make `esc_is_base_position` answer true
+ * for everything and this assert - not any test row - is what stops the
+ * build, because a reassigned param then survives the scan. Keep both; the
+ * failure direction here is a use-after-free.
+ */
+static uint64_t esc_final_mask(const EscFn &f)
+{
+    if (f.unsafe)
+        return 0;
+    ML_CHECK((f.mask & f.written) == 0);
+    return f.mask & ~f.written;
 }
 
 /* True if `fd` may mutate a reference-typed parameter (so it is not pure). */
@@ -1754,28 +4235,33 @@ func_body_is_pure(const Construct *c,
     if (!c)
         return true;
 
-    if (auto *id = dynamic_cast<const Identifier *>(c))
-        return id->sym.kind == SymKind::local || id->is_const ||
-               pure_names.count(id->uid) != 0;
+    if (auto *id = node_cast<const Identifier>(c))
+        return !id->names_class &&        /* a construction: a new object */
+               (id->sym.kind == SymKind::local || id->is_const ||
+                pure_names.count(id->uid) != 0) &&
+               /* a redirected lambda call reads its variable too */
+               func_body_is_pure(id->bind_guard.get(), pure_names);
 
-    if (dynamic_cast<const FuncDeclStmt *>(c))
+    if (ctag(c) == ConstructType::func_decl)
         return false;   /* a nested function: be conservative */
 
-    if (auto *b = dynamic_cast<const Block *>(c)) {
+    if (ctag(c) == ConstructType::block) {
+        auto *b = static_cast<const Block *>(c);
         for (auto &e : b->elems)
             if (!func_body_is_pure(e.get(), pure_names))
                 return false;
         return true;
     }
-    if (auto *f = dynamic_cast<const ForStmt *>(c))
+    if (auto *f = node_cast<const ForStmt>(c))
         return func_body_is_pure(f->init.get(), pure_names)
             && func_body_is_pure(f->cond.get(), pure_names)
             && func_body_is_pure(f->inc.get(), pure_names)
             && func_body_is_pure(f->body.get(), pure_names);
-    if (auto *fe = dynamic_cast<const ForeachStmt *>(c))
+    if (auto *fe = node_cast<const ForeachStmt>(c))
         return func_body_is_pure(fe->container.get(), pure_names)
             && func_body_is_pure(fe->body.get(), pure_names);
-    if (auto *tc = dynamic_cast<const TryCatchStmt *>(c)) {
+    if (ctag(c) == ConstructType::try_catch) {
+        auto *tc = static_cast<const TryCatchStmt *>(c);
         if (!func_body_is_pure(tc->tryBody.get(), pure_names))
             return false;
         for (auto &p : tc->catchStmts)
@@ -1783,9 +4269,19 @@ func_body_is_pure(const Construct *c,
                 return false;
         return func_body_is_pure(tc->finallyBody.get(), pure_names);
     }
-    if (auto *e14 = dynamic_cast<const Expr14 *>(c))
+    if (auto *e14 = node_cast<const Expr14>(c)) {
+        /* an assignment to a NON-LOCAL name writes program state, whatever
+         * the name reads as: `tw = th` inside a body, where `tw` is a pure
+         * function's name, passed the identifier test below and made the
+         * writer auto-pure - then folded at compile time */
+        if (!(e14->fl & pFlags::pInDecl)
+                && ctag(e14->lvalue.get()) == ConstructType::id
+                && static_cast<const Identifier *>(e14->lvalue.get())
+                       ->sym.kind != SymKind::local)
+            return false;
         return func_body_is_pure(e14->lvalue.get(), pure_names)
             && func_body_is_pure(e14->rvalue.get(), pure_names);
+    }
 
     bool ok = true;
     for_each_child(const_cast<Construct *>(c), [&](Construct *ch) {
@@ -1901,7 +4397,8 @@ Resolver::process_function(FuncDeclStmt *fd)
          * NOT eagerly const-folded - see register_pure_funcs / the ctor guard.)
          */
         bool added_self = false;
-        if (fd->id && !pure_func_names.count(fd->id->uid)) {
+        if (fd->id && !pure_func_names.count(fd->id->uid)
+                && !rebound_names.count(fd->id->uid)) {
             pure_func_names.insert(fd->id->uid);
             added_self = true;
         }
@@ -1917,13 +4414,14 @@ Resolver::process_function(FuncDeclStmt *fd)
 
     /* record any proven-pure function (auto OR explicit) so a LATER function
      * that calls it is recognized pure too (see func_body_is_pure). */
-    if (fd->desc->effective_pure && fd->id)
+    if (fd->desc->effective_pure && fd->id
+            && !rebound_names.count(fd->id->uid))
         pure_func_names.insert(fd->id->uid);
 
     if (st.slottable && st.next_slot > 0) {
         fd->desc->resolved = true;
         fd->desc->frame_size = st.next_slot;
-        fd->slot_writes = move(st.writes);
+        fd->slot_writes = std::move(st.writes);
     }
 }
 
@@ -1940,7 +4438,8 @@ Resolver::walk(Construct *c, FuncState *cur)
         return;
 
     /* --- nested function: own scope; its captures see the enclosing one --- */
-    if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+    if (ctag(c) == ConstructType::func_decl) {
+        auto *fd = static_cast<FuncDeclStmt *>(c);
 
         if (fd->captures) {
             for (auto &cap : fd->captures->elems) {
@@ -1951,11 +4450,13 @@ Resolver::walk(Construct *c, FuncState *cur)
              * FuncObject ctor reads kind/slot (read_sym), never the capture
              * Identifiers, so closure creation is AST-free. Unresolved (REPL
              * top-level) captures keep the by-name map fallback via `name`. */
-            fd->desc->captures.clear();
-            fd->desc->captures.reserve(fd->captures->elems.size());
-            for (auto &cap : fd->captures->elems)
-                fd->desc->captures.push_back(
-                    { cap->uid, cap->sym.kind, cap->sym.slot });
+            sync_capture_desc(fd);
+            /* ...but an ESCAPED GLOBAL capture is stamped only AFTER pass 2
+             * (escaped_refs), so this snapshot would record `unresolved` and
+             * silently fall back to the by-name map walk - which in a SCRIPT
+             * is the asserted-empty map, so the read reported "undefined"
+             * instead of UnboundSymbolEx (#131). Re-sync at the end. */
+            capture_funcs.push_back(fd);
         }
 
         /* A hoisted top-level function already has a GLOBAL slot (resolved via
@@ -1975,28 +4476,37 @@ Resolver::walk(Construct *c, FuncState *cur)
     }
 
     /* --- identifier reference --- */
-    if (auto *id = dynamic_cast<Identifier *>(c)) {
+    if (ctag(c) == ConstructType::id) {
+        auto *id = static_cast<Identifier *>(c);
+        /* a redirected lambda-template call reads its variable first
+         * (Identifier::bind_guard): the TDZ applies to it, and a global
+         * one is stamped like any escaped read */
+        if (id->bind_guard)
+            resolve_ref(cur, id->bind_guard.get());
         resolve_ref(cur, id);
         return;
     }
 
     /* --- ++ / -- : resolve the operand AND count it as a write (so the var is
      * not treated as write-once / auto-const-promotable). --- */
-    if (auto *idc = dynamic_cast<IncDecExpr *>(c)) {
+    if (ctag(c) == ConstructType::incdec) {
+        auto *idc = static_cast<IncDecExpr *>(c);
         walk(idc->lvalue.get(), cur);
         count_write(cur, idc->lvalue.get());
         return;
     }
 
     /* --- assignment / declaration --- */
-    if (auto *e = dynamic_cast<Expr14 *>(c)) {
+    if (ctag(c) == ConstructType::expr14) {
+        auto *e = static_cast<Expr14 *>(c);
 
         /* The rvalue is evaluated first, so it must see the scope BEFORE this
          * declaration (so `var x = x + 1` reads the outer x). */
         walk(e->rvalue.get(), cur);
 
         if (e->fl & pFlags::pInDecl) {
-            declare_lvalue(cur, e->lvalue.get());
+            declare_lvalue(cur, e->lvalue.get(),
+                           (e->fl & pFlags::pInConstDecl) != 0);
         } else {
             walk(e->lvalue.get(), cur);     /* assignment: resolve the target */
             count_write(cur, e->lvalue.get());
@@ -2006,13 +4516,21 @@ Resolver::walk(Construct *c, FuncState *cur)
     }
 
     /* --- block: own scope; record slot range for live-bit clearing --- */
-    if (auto *b = dynamic_cast<Block *>(c)) {
+    if (ctag(c) == ConstructType::block) {
+        auto *b = static_cast<Block *>(c);
 
         const bool track = cur && cur->slottable;
         const int start = track ? cur->next_slot : 0;
 
-        if (track)
+        if (track) {
             cur->scopes.emplace_back();
+            /* FIX-1: record what this block declares, INCLUDING below the
+             * walk position, before any statement resolves against it. */
+            collect_scope_names(b, cur->scopes.back());
+            if (cur->is_main && cur->scopes.size() == 1)
+                for (const UniqueId *n : cur->scopes.back().all_names)
+                    root_decl_names.insert(n);
+        }
 
         /* Hoist non-capturing nested funcs / structs into THIS scope first, so a
          * forward / mutual reference within the block resolves to its (block-
@@ -2044,7 +4562,8 @@ Resolver::walk(Construct *c, FuncState *cur)
     }
 
     /* --- for: a scope for the loop variable spanning cond/inc/body --- */
-    if (auto *f = dynamic_cast<ForStmt *>(c)) {
+    if (ctag(c) == ConstructType::for_stmt) {
+        auto *f = static_cast<ForStmt *>(c);
 
         const bool track = cur && cur->slottable;
 
@@ -2063,7 +4582,8 @@ Resolver::walk(Construct *c, FuncState *cur)
     }
 
     /* --- foreach: container evaluated before the loop vars exist --- */
-    if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+    if (ctag(c) == ConstructType::foreach_stmt) {
+        auto *fe = static_cast<ForeachStmt *>(c);
 
         walk(fe->container.get(), cur);
 
@@ -2092,7 +4612,8 @@ Resolver::walk(Construct *c, FuncState *cur)
     }
 
     /* --- try/catch/finally: each catch clause scopes its `as` variable --- */
-    if (auto *tc = dynamic_cast<TryCatchStmt *>(c)) {
+    if (ctag(c) == ConstructType::try_catch) {
+        auto *tc = static_cast<TryCatchStmt *>(c);
 
         walk(tc->tryBody.get(), cur);
 
@@ -2116,19 +4637,68 @@ Resolver::walk(Construct *c, FuncState *cur)
         return;
     }
 
+    /* --- if: a `defined()` guard vouches for its name (#135) --- */
+    if (ctag(c) == ConstructType::if_stmt) {
+        auto *iff = static_cast<IfStmt *>(c);
+
+        std::vector<const UniqueId *> names;
+        collect_defined_guards(iff->condExpr.get(), names);
+
+        const size_t mark = guarded.size();
+        for (const UniqueId *u : names)
+            guarded.push_back(u);
+
+        /* the CONDITION is walked with them active, so a later conjunct may
+         * use the name (`if (defined(x) && isbound(x))`) */
+        walk(iff->condExpr.get(), cur);
+        walk(iff->thenBlock.get(), cur);
+
+        guarded.resize(mark);       /* the ELSE arm proves nothing */
+        walk(iff->elseBlock.get(), cur);
+        return;
+    }
+
     /* --- call: resolve callee + args, then devirtualize a global callee --- */
-    if (auto *call = dynamic_cast<CallExpr *>(c)) {
+    if (ctag(c) == ConstructType::call) {
+        auto *call = static_cast<CallExpr *>(c);
         walk(call->what.get(), cur);
+
+        /* A LAZY builtin (`defined`/`isbound`/`isconst`/`isconstdecl`) never
+         * EVALUATES its argument - it asks a question ABOUT the name - so
+         * asking about a name inside its TDZ is legal for all of them and
+         * must answer rather than throw (that is what lets try_fold_defined /
+         * try_fold_isbound fold it).
+         *
+         * `isbound` is exempt TOO (maintainer, 2026-08-09 - it was not, until
+         * the short form proved to be what programs want): asking whether a
+         * name that exists nowhere is bound has the obvious answer `false`,
+         * and refusing it forced every feature test to spell out
+         * `defined(x) && isbound(x)`. The typo hazard that buys is one
+         * `defined()` already accepts - `defined(confg)` folds to false in
+         * silence - so this makes the two lazy queries consistent rather than
+         * adding a new class of risk. */
+        const bool lazy = lazy_builtin_callee(call) != nullptr;
+        const bool saved_nc = no_undef_check;
+        const bool saved_tz = no_tdz_check;
+
+        if (lazy) {
+            no_tdz_check = true;
+            no_undef_check = true;
+        }
+
         if (call->args)
             for (auto &a : call->args->elems)
                 walk(a.get(), cur);
+
+        no_undef_check = saved_nc;
+        no_tdz_check = saved_tz;
 
         /* If the callee resolved to a global-table slot (a top-level / scoped
          * function, or a struct descriptor), record it so do_eval can read the
          * callable straight from the slot. A struct construction or a slot that
          * later holds a non-function falls through at runtime (is<FuncObject>),
          * so recording any global slot is sound. */
-        if (auto *id = dynamic_cast<Identifier *>(call->what.get()))
+        if (auto *id = node_cast<Identifier>(call->what.get()))
             if (id->sym.kind == SymKind::global)
                 call->direct_func_slot = id->sym.slot;
 
@@ -2145,19 +4715,21 @@ Resolver::walk(Construct *c, FuncState *cur)
 
 /*
  * Size-only inlining of expression-bodied, top-level, non-capturing,
- * non-recursive functions at direct call sites (plans/function-inlining.md).
+ * non-recursive functions at direct call sites (plans/archived/function-inlining.md).
  * Splices the callee body in place of the call, substituting parameters with
  * the arguments. Spliced nodes carry an InlineCtx so the backtrace is identical
  * with inlining on or off (the Construct::eval / do_func_call flush points
  * rebuild the virtual frame from it).
  *
- * Expression bodies have no locals, so after param substitution the spliced
+ * Expression bodies have no locals (one an earlier splice gave some goes
+ * through the slot-remapping splice_block_call), so after param substitution
+ * the spliced
  * expression contains only the caller's argument subtrees (already resolved)
  * and free identifiers (map-resolved, scope-independent) - no re-resolution is
  * needed. A body that was itself inlined-into keeps correct frames via chain
- * rebasing. Argument substitution is sound: an argument is evaluated exactly as
- * often as the parameter is used, and side-effecting args are never dropped or
- * duplicated.
+ * rebasing. Only an INERT argument is substituted (THE ARGUMENT RULE,
+ * arg_substitutable); any other is bound to a temp before the body, exactly
+ * where a real call evaluates it.
  */
 
 /*
@@ -2186,70 +4758,179 @@ void
 for_each_child_slot(Construct *c,
                     const std::function<void(unique_ptr<Construct> &)> &fn)
 {
-    if (auto *n = dynamic_cast<SingleChildConstruct *>(c)) {
-        fn(n->elem);
-    } else if (auto *n = dynamic_cast<MultiOpConstruct *>(c)) {
-        for (auto &p : n->elems) fn(p.second);
-    } else if (auto *n = dynamic_cast<TypedScalarExpr *>(c)) {
-        /* M8 specialized node (same elems shape); a cross-input inlined prior
-         * body is already specialized, so substitution must descend here. */
-        for (auto &p : n->elems) fn(p.second);
-    } else if (auto *n = dynamic_cast<IncDecExpr *>(c)) {
-        fn(n->lvalue);
-    } else if (auto *n = dynamic_cast<CallExpr *>(c)) {
+    /* #102: a TAG SWITCH (see Inferencer::for_each_child's note) -
+     * the dynamic_cast chain here was the resolver's share of the
+     * compile RTTI bill. NO default: -Werror=switch keeps it
+     * exhaustive. Child sets and null guards are EXACTLY the old
+     * chain's. */
+    switch (c->ct) {
+    case ConstructType::expr01:
+    case ConstructType::inlined_call:
+    case ConstructType::throw_stmt: {
+        fn(static_cast<SingleChildConstruct *>(c)->elem);
+        break;
+    }
+    case ConstructType::expr02:
+    case ConstructType::expr03:
+    case ConstructType::expr04:
+    case ConstructType::expr05:
+    case ConstructType::expr06:
+    case ConstructType::expr07:
+    case ConstructType::expr08:
+    case ConstructType::expr09:
+    case ConstructType::expr10:
+    case ConstructType::expr11:
+    case ConstructType::expr12: {
+        for (auto &p : static_cast<MultiOpConstruct *>(c)->elems)
+            fn(p.second);
+        break;
+    }
+    case ConstructType::typed_scalar: {
+        /* M8 specialized node (same elems shape); a cross-input
+         * inlined prior body is already specialized, so substitution
+         * must descend here. */
+        for (auto &p : static_cast<TypedScalarExpr *>(c)->elems)
+            fn(p.second);
+        break;
+    }
+    case ConstructType::incdec: {
+        fn(static_cast<IncDecExpr *>(c)->lvalue);
+        break;
+    }
+    case ConstructType::deref: {
+        fn(static_cast<DerefExpr *>(c)->elem);
+        break;
+    }
+    case ConstructType::cast: {
+        fn(static_cast<CastExpr *>(c)->elem);
+        break;
+    }
+    case ConstructType::call: {
+        auto *n = static_cast<CallExpr *>(c);
         fn(n->what);
         for (auto &e : n->args->elems) fn(e);
-    } else if (auto *n = dynamic_cast<IfStmt *>(c)) {
+        break;
+    }
+    case ConstructType::if_stmt: {
+        auto *n = static_cast<IfStmt *>(c);
         fn(n->condExpr);
         if (n->thenBlock) fn(n->thenBlock);
         if (n->elseBlock) fn(n->elseBlock);
-    } else if (auto *n = dynamic_cast<WhileStmt *>(c)) {
+        break;
+    }
+    case ConstructType::while_stmt: {
+        auto *n = static_cast<WhileStmt *>(c);
         fn(n->condExpr); fn(n->body);
-    } else if (auto *n = dynamic_cast<ForStmt *>(c)) {
+        break;
+    }
+    case ConstructType::for_stmt: {
+        auto *n = static_cast<ForStmt *>(c);
         if (n->init) fn(n->init);
         if (n->cond) fn(n->cond);
         if (n->inc) fn(n->inc);
         fn(n->body);
-    } else if (auto *n = dynamic_cast<ForeachStmt *>(c)) {
+        break;
+    }
+    case ConstructType::foreach_stmt: {
+        auto *n = static_cast<ForeachStmt *>(c);
         fn(n->container); fn(n->body);
-    } else if (auto *n = dynamic_cast<ForRangeStmt *>(c)) {
-        /* post-specialize node (fold_show_calls walks the FINAL tree) */
+        break;
+    }
+    case ConstructType::for_range: {
+        /* post-specialize node (fold_show_calls walks the FINAL
+         * tree) */
+        auto *n = static_cast<ForRangeStmt *>(c);
         if (n->init) fn(n->init);
         fn(n->bound);
         if (n->step) fn(n->step);
         fn(n->body);
-    } else if (auto *n = dynamic_cast<Subscript *>(c)) {
+        break;
+    }
+    case ConstructType::subscript: {
+        auto *n = static_cast<Subscript *>(c);
         fn(n->what); fn(n->index);
-    } else if (auto *n = dynamic_cast<Slice *>(c)) {
+        break;
+    }
+    case ConstructType::slice: {
+        auto *n = static_cast<Slice *>(c);
         fn(n->what);
         if (n->start_idx) fn(n->start_idx);
         if (n->end_idx) fn(n->end_idx);
-    } else if (auto *n = dynamic_cast<MemberExpr *>(c)) {
-        fn(n->what);
-    } else if (auto *n = dynamic_cast<TernaryExpr *>(c)) {
+        break;
+    }
+    case ConstructType::member: {
+        fn(static_cast<MemberExpr *>(c)->what);
+        break;
+    }
+    case ConstructType::ternary: {
+        auto *n = static_cast<TernaryExpr *>(c);
         fn(n->condExpr); fn(n->thenExpr); fn(n->elseExpr);
-    } else if (auto *n = dynamic_cast<CoalesceExpr *>(c)) {
+        break;
+    }
+    case ConstructType::coalesce: {
+        auto *n = static_cast<CoalesceExpr *>(c);
         fn(n->lhs); fn(n->rhs);
-    } else if (auto *n = dynamic_cast<ReturnStmt *>(c)) {
+        break;
+    }
+    case ConstructType::ret: {
+        auto *n = static_cast<ReturnStmt *>(c);
         if (n->elem) fn(n->elem);
-    } else if (auto *n = dynamic_cast<Expr14 *>(c)) {
+        break;
+    }
+    case ConstructType::expr14: {
+        auto *n = static_cast<Expr14 *>(c);
         if (n->lvalue) fn(n->lvalue);
         if (n->rvalue) fn(n->rvalue);
-    } else if (auto *n = dynamic_cast<LiteralDictKVPair *>(c)) {
+        break;
+    }
+    case ConstructType::lit_dict_kv: {
+        auto *n = static_cast<LiteralDictKVPair *>(c);
         fn(n->key); fn(n->value);
-    } else if (auto *n = dynamic_cast<FuncDeclStmt *>(c)) {
+        break;
+    }
+    case ConstructType::func_decl: {
+        auto *n = static_cast<FuncDeclStmt *>(c);
         if (n->body) fn(n->body);
-    } else if (auto *n = dynamic_cast<TryCatchStmt *>(c)) {
+        break;
+    }
+    case ConstructType::try_catch: {
+        auto *n = static_cast<TryCatchStmt *>(c);
         fn(n->tryBody);
         for (auto &p : n->catchStmts) fn(p.second);
         if (n->finallyBody) fn(n->finallyBody);
-    } else if (auto *n = dynamic_cast<MultiElemConstruct<Construct> *>(c)) {
-        for (auto &e : n->elems) fn(e);   /* Block, ExprList, LiteralArray */
-    } else if (auto *n =
-                   dynamic_cast<MultiElemConstruct<LiteralDictKVPair> *>(c)) {
+        break;
+    }
+    case ConstructType::block:
+    case ConstructType::lit_arr:
+    case ConstructType::expr_list: {
+        /* Block, ExprList, LiteralArray */
+        for (auto &e : static_cast<MultiElemConstruct<Construct> *>(c)
+                           ->elems)
+            fn(e);
+        break;
+    }
+    case ConstructType::lit_dict: {
+        auto *n = static_cast<MultiElemConstruct<LiteralDictKVPair> *>(c);
         for (auto &e : n->elems) { fn(e->key); fn(e->value); }
+        break;
     }
     /* literals, Identifier, IdList, childless: nothing inlinable */
+    case ConstructType::other:
+    case ConstructType::nop:
+    case ConstructType::brk:
+    case ConstructType::cont:
+    case ConstructType::rethrow:
+    case ConstructType::lit_int:
+    case ConstructType::lit_bool:
+    case ConstructType::lit_float:
+    case ConstructType::lit_none:
+    case ConstructType::lit_str:
+    case ConstructType::lit_obj:
+    case ConstructType::id:
+    case ConstructType::idlist:
+    case ConstructType::struct_decl:
+        break;
+    }
 }
 
 /* True if `c` holds a ForRangeStmt anywhere (walking statement containers - a
@@ -2259,24 +4940,26 @@ static bool has_for_range(const Construct *c)
 {
     if (!c)
         return false;
-    if (dynamic_cast<const ForRangeStmt *>(c))
+    if (ctag(c) == ConstructType::for_range)
         return true;
-    if (auto *b = dynamic_cast<const Block *>(c)) {
+    if (ctag(c) == ConstructType::block) {
+        auto *b = static_cast<const Block *>(c);
         for (auto &e : b->elems)
             if (has_for_range(e.get()))
                 return true;
         return false;
     }
-    if (auto *i = dynamic_cast<const IfStmt *>(c))
+    if (auto *i = node_cast<const IfStmt>(c))
         return has_for_range(i->thenBlock.get()) ||
                has_for_range(i->elseBlock.get());
-    if (auto *w = dynamic_cast<const WhileStmt *>(c))
+    if (auto *w = node_cast<const WhileStmt>(c))
         return has_for_range(w->body.get());
-    if (auto *f = dynamic_cast<const ForStmt *>(c))
+    if (auto *f = node_cast<const ForStmt>(c))
         return has_for_range(f->body.get());
-    if (auto *fe = dynamic_cast<const ForeachStmt *>(c))
+    if (auto *fe = node_cast<const ForeachStmt>(c))
         return has_for_range(fe->body.get());
-    if (auto *t = dynamic_cast<const TryCatchStmt *>(c)) {
+    if (ctag(c) == ConstructType::try_catch) {
+        auto *t = static_cast<const TryCatchStmt *>(c);
         if (has_for_range(t->tryBody.get()))
             return true;
         for (auto &p : t->catchStmts)
@@ -2321,6 +5004,17 @@ class Inliner {
     std::vector<unique_ptr<Construct>> new_funcs;
     int spec_counter = 0;
 
+    /* The global slots of the TOP-LEVEL named functions (arg_is_inert). */
+    std::unordered_set<int> func_global_slots;
+
+    /* Walking a TEMPLATE BASE's body in the REPL. A later input CLONES that
+     * body into a new instance and RE-RESOLVES the clone, and the resolver
+     * cannot take a frame slot it did not allocate itself - so no splice
+     * that adds slots (an arg temp, a callee's remapped locals) may land
+     * in it. (A script instantiates every template BEFORE the inliner
+     * runs, so its bases are never cloned afterwards.) */
+    bool in_repl_tmpl_base = false;
+
     /*
      * Fixpoint bounds. Re-scanning a spliced body can expose more inlining (a
      * forward-declared callee, a call revealed by const-folding), so the
@@ -2350,11 +5044,11 @@ class Inliner {
     static const int REC_UNROLL_MAX = 3;
     /* A high node backstop for a pathological body (many self-calls x depth). */
     static const int REC_NODE_CAP = 600;
-    /* Max weight of an arg that is DIRECT-substituted (re-evaluated at each param
-     * use) instead of bound to a temp. Only for a PURE callee (its args are
-     * side-effect-free, so re-evaluation is sound); the cap keeps re-eval cheap
-     * and excludes a nested call (weight ~21). A temp-free body is what lets a
-     * guard body convert to an EXPRESSIBLE ternary (guard_to_ternary). */
+    /* Max weight of a write-once local's rvalue that collapse_locals copies
+     * into its uses (re-evaluated at each one): the cap keeps re-evaluation
+     * cheap. The rvalue must also be INERT (arg_is_inert) - which argument
+     * is substituted rather than bound is THE ARGUMENT RULE's call, not a
+     * weight. */
     static const long ARG_SUBST_MAX = 8;
     int rec_depth = 0;   /* current self-inline depth along the walk path */
     long inline_budget = 0;
@@ -2389,9 +5083,24 @@ class Inliner {
               std::string(f->id->get_str()) + " w0=" + std::to_string(w0) +
               " branching=" + std::to_string(branching) +
               " -> " + std::to_string(k) + " level(s)");
+        ML_INT_ONLY(k = int_unroll_depth(f, k);)
         rec_levels[f] = k;
         return k;
     }
+
+#ifdef INT_TESTS
+    /* #107 P3: the unroll depth as an enumerated decision - any depth up
+     * to REC_UNROLL_MAX is legal (0 simply leaves the recursion a call),
+     * so each is RULE 2 checked against the cost model's choice. */
+    static int int_unroll_depth(const FuncDeclStmt *f, int k) noexcept
+    {
+        const std::string key = std::string(f->id->get_str()) + "/unroll";
+        const int pick = int_choose(key, REC_UNROLL_MAX + 1, k);
+        ML_INT(unroll_choice, key, int64_t(REC_UNROLL_MAX + 1), int64_t(k),
+               int64_t(pick));
+        return pick;
+    }
+#endif
 
 public:
 
@@ -2409,8 +5118,14 @@ public:
     {
         root_block = root;   /* for slotting spec-clone names in script mode */
         for (auto &e : root->elems) {
-            auto *fd = dynamic_cast<FuncDeclStmt *>(e.get());
+            auto *fd = node_cast<FuncDeclStmt>(e.get());
             if (!fd || !fd->id)
+                continue;
+            if (fd->id->sym.kind == SymKind::global)
+                func_global_slots.insert(fd->id->sym.slot);
+            /* a REBOUND name (`sq = ng;` somewhere) may call anything
+             * assigned to it: neither inline nor specialize through it */
+            if (global_name_rebound(root, fd->id.get()))
                 continue;
             if (inlinable_decl(fd))
                 add_unique(funcs, fd);
@@ -2434,10 +5149,15 @@ public:
          * define, so a current redefinition wins (and a redirected call already
          * points at the current input's own instance). */
         if (prior_scope) {
+            /* nor for a name this input ASSIGNS: a call through it reaches
+             * whatever it holds by then, not the prior function */
+            std::unordered_set<const UniqueId *> assigned;
+            collect_rebound_names(root, assigned);
             std::vector<std::pair<const UniqueId *, const LValue *>> syms;
             prior_scope->collect_symbols(syms);
             for (const auto &kv : syms) {
-                if (funcs.count(kv.first) || spec_funcs.count(kv.first))
+                if (funcs.count(kv.first) || spec_funcs.count(kv.first)
+                        || assigned.count(kv.first))
                     continue;
                 const EvalValue &v = kv.second->get();
                 if (!v.is<intrusive_ptr<FuncObject>>())
@@ -2508,11 +5228,11 @@ private:
     void seed_const_globals(Block *root)
     {
         for (auto &e : root->elems) {
-            auto *e14 = dynamic_cast<Expr14 *>(e.get());
+            auto *e14 = node_cast<Expr14>(e.get());
             if (!e14 || !(e14->fl & pFlags::pInConstDecl))
                 continue;
-            auto *id = dynamic_cast<Identifier *>(e14->lvalue.get());
-            if (!id || !dynamic_cast<LiteralObj *>(e14->rvalue.get()))
+            auto *id = node_cast<Identifier>(e14->lvalue.get());
+            if (!id || !node_cast<LiteralObj>(e14->rvalue.get()))
                 continue;
             try {
                 cctx.emplace(id, RValue(e14->rvalue->eval(&cctx)), true);
@@ -2539,10 +5259,12 @@ private:
              * `x += ...` where the target is the param itself - can't be
              * inlined: the param is a by-value copy, so the call leaves the
              * caller's variable untouched, but substituting the arg would
-             * mutate it. (A mutation THROUGH a param - `p.f++`, `p[i]++` - is
-             * NOT blocked: that already mutates the caller's object by
-             * reference, so inlining gives the same effect. Tail-inline rejects
-             * a reassigned param; specialization never seeds a written one.) */
+             * mutate it. (A mutation THROUGH a param - `p[i]++` - is NOT
+             * blocked: an array or a dict is a reference, so inlining
+             * gives the same effect. A write into a STRUCT param - `p.f++`
+             * - makes arg_substitutable refuse the argument, which is then
+             * temp-bound: the struct is a value. Tail-inline rejects a
+             * reassigned param; specialization never seeds a written one.) */
             && !mutates_a_param(fd);
     }
 
@@ -2575,20 +5297,20 @@ private:
         if (!b || b->elems.empty())
             return nullptr;
         const size_t n = b->elems.size();
-        auto *last = dynamic_cast<const ReturnStmt *>(b->elems[n - 1].get());
+        auto *last = node_cast<const ReturnStmt>(b->elems[n - 1].get());
         if (!last || !last->elem)
             return nullptr;
         auto guard_ret = [](const Construct *thenB) -> const ReturnStmt * {
-            if (auto *r = dynamic_cast<const ReturnStmt *>(thenB))
+            if (auto *r = node_cast<const ReturnStmt>(thenB))
                 return r;
-            if (auto *blk = dynamic_cast<const Block *>(thenB))
+            if (auto *blk = node_cast<const Block>(thenB))
                 if (blk->elems.size() == 1)
-                    return dynamic_cast<const ReturnStmt *>(
+                    return node_cast<const ReturnStmt>(
                         blk->elems[0].get());
             return nullptr;
         };
         for (size_t i = 0; i + 1 < n; i++) {
-            auto *iff = dynamic_cast<const IfStmt *>(b->elems[i].get());
+            auto *iff = node_cast<const IfStmt>(b->elems[i].get());
             if (!iff || iff->elseBlock)
                 return nullptr;
             const ReturnStmt *r = guard_ret(iff->thenBlock.get());
@@ -2597,36 +5319,96 @@ private:
         }
         unique_ptr<Construct> acc = last->elem->clone();
         for (size_t i = n - 1; i-- > 0; ) {
-            auto *iff = dynamic_cast<const IfStmt *>(b->elems[i].get());
+            auto *iff = node_cast<const IfStmt>(b->elems[i].get());
             const ReturnStmt *r = guard_ret(iff->thenBlock.get());
             auto tern = make_unique<TernaryExpr>();
             tern->condExpr = iff->condExpr->clone();
             tern->thenExpr = r->elem->clone();
-            tern->elseExpr = move(acc);
-            acc = move(tern);
+            tern->elseExpr = std::move(acc);
+            acc = std::move(tern);
         }
         return acc;
     }
 
     /* A write to a resolved LOCAL slot (assignment LHS or ++/--). */
+    /* Every write to a local slot, COMPLETE: an assignment (plain or to an
+     * IdList destructure target), ++/--, a foreach loop variable and a
+     * catch binding. The last three were not counted, so a slot a
+     * destructure rewrites could read as "write-once" here. */
     static int count_slot_writes(Construct *c, int slot)
     {
         if (!c)
             return 0;
         int n = 0;
-        if (auto *e14 = dynamic_cast<Expr14 *>(c)) {
-            if (auto *id = dynamic_cast<Identifier *>(e14->lvalue.get()))
-                if (id->sym.kind == SymKind::local && id->sym.slot == slot)
+        /* the slot itself, or the root of a chain written THROUGH: a
+         * write into the struct a local holds changes its value (a struct
+         * is a value), and one into a slice's element detaches the slice -
+         * either way a copy of it taken before no longer reads the same */
+        auto is_slot = [&](const Construct *x) {
+            const Identifier *id = lvalue_chain_root(x);
+            return id && id->sym.kind == SymKind::local
+                && id->sym.slot == slot;
+        };
+        if (ctag(c) == ConstructType::expr14) {
+            auto *e14 = static_cast<Expr14 *>(c);
+            if (is_slot(e14->lvalue.get()))
+                n++;
+            if (ctag(e14->lvalue.get()) == ConstructType::idlist)
+                for (auto &id : static_cast<IdList *>(e14->lvalue.get())
+                                    ->elems)
+                    if (is_slot(id.get()))
+                        n++;
+        } else if (ctag(c) == ConstructType::foreach_stmt) {
+            auto *fe = static_cast<ForeachStmt *>(c);
+            if (fe->ids)
+                for (auto &id : fe->ids->elems)
+                    if (is_slot(id.get()))
+                        n++;
+        } else if (ctag(c) == ConstructType::try_catch) {
+            for (auto &p : static_cast<TryCatchStmt *>(c)->catchStmts)
+                if (p.first.asId && is_slot(p.first.asId.get()))
                     n++;
-        } else if (auto *inc = dynamic_cast<IncDecExpr *>(c)) {
-            if (auto *id = dynamic_cast<Identifier *>(inc->lvalue.get()))
-                if (id->sym.kind == SymKind::local && id->sym.slot == slot)
-                    n++;
+        } else if (ctag(c) == ConstructType::incdec) {
+            auto *inc = static_cast<IncDecExpr *>(c);
+            if (is_slot(inc->lvalue.get()))
+                n++;
+        } else if (ctag(c) == ConstructType::call) {
+            /* a mutating builtin's first argument (`append(t, x)`) */
+            auto *ce = static_cast<CallExpr *>(c);
+            auto *callee = node_cast<const Identifier>(ce->what.get());
+            if (callee && ce->args && !ce->args->elems.empty()
+                    && is_lvalue_arg_builtin(callee->get_str())
+                    && is_slot(ce->args->elems[0].get()))
+                n++;
         }
         for_each_child_slot(c,
             [&](unique_ptr<Construct> &ch) { n += count_slot_writes(ch.get(),
                                                                     slot); });
         return n;
+    }
+
+    /* True iff no local slot read by `rv` is written by body->elems[i+1..]
+     * (collapse_locals' value-stability half). */
+    static bool rvalue_stable_after(Block *body, size_t i, Construct *rv)
+    {
+        bool ok = true;
+        std::function<void(Construct *)> scan = [&](Construct *c) {
+            if (!c || !ok)
+                return;
+            if (ctag(c) == ConstructType::id) {
+                auto *id = static_cast<Identifier *>(c);
+                if (id->sym.kind == SymKind::local)
+                    for (size_t j = i + 1; j < body->elems.size(); j++)
+                        if (count_slot_writes(body->elems[j].get(),
+                                              id->sym.slot) != 0)
+                            ok = false;
+                return;
+            }
+            for_each_child_slot(c,
+                [&](unique_ptr<Construct> &ch) { scan(ch.get()); });
+        };
+        scan(rv);
+        return ok;
     }
 
     /* Replace every READ of local `slot` with a clone of `repl` (keeping the
@@ -2637,13 +5419,14 @@ private:
     {
         if (!ref)
             return;
-        if (auto *id = dynamic_cast<Identifier *>(ref.get())) {
+        if (ctag(ref.get()) == ConstructType::id) {
+            auto *id = static_cast<Identifier *>(ref.get());
             if (id->sym.kind == SymKind::local && id->sym.slot == slot) {
                 auto r = repl->clone();
                 r->th = ref->th;
                 r->start = ref->start;
                 r->end = ref->end;
-                ref = move(r);
+                ref = std::move(r);
             }
             return;
         }
@@ -2658,8 +5441,8 @@ private:
     {
         if (!c)
             return false;
-        if (dynamic_cast<CallExpr *>(c) || dynamic_cast<InlinedCallExpr *>(c)
-                || dynamic_cast<IncDecExpr *>(c) || dynamic_cast<Expr14 *>(c))
+        if (ctag(c) == ConstructType::call || ctag(c) == ConstructType::inlined_call
+                || ctag(c) == ConstructType::incdec || ctag(c) == ConstructType::expr14)
             return true;
         bool se = false;
         for_each_child_slot(c,
@@ -2685,20 +5468,30 @@ private:
         while (changed) {
             changed = false;
             for (size_t i = 0; i < body->elems.size(); i++) {
-                auto *e14 = dynamic_cast<Expr14 *>(body->elems[i].get());
+                auto *e14 = node_cast<Expr14>(body->elems[i].get());
                 if (!e14 || !(e14->fl & pFlags::pInDecl)
                         || e14->op != Op::assign || !e14->rvalue)
                     continue;
-                auto *lv = dynamic_cast<Identifier *>(e14->lvalue.get());
+                auto *lv = node_cast<Identifier>(e14->lvalue.get());
                 if (!lv || lv->sym.kind != SymKind::local)
                     continue;
+                /* INERT (arg_is_inert), not merely side-effect-free: the
+                 * decl runs unconditionally, once, HERE, while its uses
+                 * may be conditional, repeated, or absent - so a throwing
+                 * rvalue (`var q = a / b; return 1;`) moved into them
+                 * would throw conditionally or not at all (RULE 2). */
                 if (body_weight(e14->rvalue.get()) > ARG_SUBST_MAX
-                        || expr_has_side_effect(e14->rvalue.get()))
+                        || !arg_is_inert(e14->rvalue.get()))
                     continue;
                 const int slot = lv->sym.slot;
                 if (count_slot_writes(body, slot) != 1)   /* not write-once */
                     continue;
-                unique_ptr<Construct> rv = move(e14->rvalue);
+                /* ...and VALUE-STABLE: every local the rvalue reads keeps
+                 * its value from here to the end of the block, or a use
+                 * re-evaluating it would read the NEW value */
+                if (!rvalue_stable_after(body, i, e14->rvalue.get()))
+                    continue;
+                unique_ptr<Construct> rv = std::move(e14->rvalue);
                 body->elems.erase(body->elems.begin() +
                                   static_cast<long>(i));
                 for (size_t j = i; j < body->elems.size(); j++)
@@ -2735,18 +5528,20 @@ private:
             return true;
         if (!a || !b)
             return false;
-        if (auto *ia = dynamic_cast<const Identifier *>(a)) {
-            auto *ib = dynamic_cast<const Identifier *>(b);
+        if (ctag(a) == ConstructType::id) {
+            auto *ia = static_cast<const Identifier *>(a);
+            auto *ib = node_cast<const Identifier>(b);
             return ib && ia->uid == ib->uid
                 && ia->sym.kind == ib->sym.kind
                 && ia->sym.slot == ib->sym.slot;
         }
-        if (auto *la = dynamic_cast<const LiteralInt *>(a)) {
-            auto *lb = dynamic_cast<const LiteralInt *>(b);
+        if (ctag(a) == ConstructType::lit_int) {
+            auto *la = static_cast<const LiteralInt *>(a);
+            auto *lb = node_cast<const LiteralInt>(b);
             return lb && la->ival() == lb->ival();
         }
-        if (auto *ma = dynamic_cast<const MultiOpConstruct *>(a)) {
-            auto *mb = dynamic_cast<const MultiOpConstruct *>(b);
+        if (auto *ma = node_cast<const MultiOpConstruct>(a)) {
+            auto *mb = node_cast<const MultiOpConstruct>(b);
             if (!mb || ma->elems.size() != mb->elems.size())
                 return false;
             for (size_t i = 0; i < ma->elems.size(); i++)
@@ -2775,9 +5570,14 @@ private:
         auto lit = make_unique<LiteralInt>(k);
         lit->th = TypeHint::i;
         auto mul = make_unique<Expr03>();
+        /* carry the TERM's loc + inlined-at chain onto the synthetic node -
+         * a rebuilt chain with EMPTY base fields loses the caret AND the
+         * virtual backtrace frames for any error thrown through it (the
+         * tw-vs-VM backtrace divergence, task #75) */
+        e->copy_base_fields(*mul);
         mul->th = TypeHint::i;
-        mul->elems.emplace_back(Op::invalid, move(lit));
-        mul->elems.emplace_back(Op::times, move(e));
+        mul->elems.emplace_back(Op::invalid, std::move(lit));
+        mul->elems.emplace_back(Op::times, std::move(e));
         return mul;
     }
 
@@ -2793,21 +5593,21 @@ private:
      */
     void fold_addsub(unique_ptr<Construct> &slot)
     {
-        auto *mo = dynamic_cast<Expr04 *>(slot.get());
+        auto *mo = node_cast<Expr04>(slot.get());
         if (!mo || mo->elems.size() < 2 || !is_addsub_chain(mo))
             return;
 
         /* FLATTEN a nested +/- base (already folded bottom-up); its signs carry
          * directly (the base has sign +). */
-        if (auto *base = dynamic_cast<Expr04 *>(mo->elems[0].second.get()))
+        if (auto *base = node_cast<Expr04>(mo->elems[0].second.get()))
             if (mo->elems[0].second->th == TypeHint::i
                     && is_addsub_chain(base)) {
                 std::vector<std::pair<Op, unique_ptr<Construct>>> merged;
                 for (auto &pr : base->elems)
-                    merged.push_back(move(pr));
+                    merged.push_back(std::move(pr));
                 for (size_t i = 1; i < mo->elems.size(); i++)
-                    merged.push_back(move(mo->elems[i]));
-                mo->elems = move(merged);
+                    merged.push_back(std::move(mo->elems[i]));
+                mo->elems = std::move(merged);
             }
 
         /* COLLECT: a constant + signed terms (like terms merged by coefficient
@@ -2816,22 +5616,29 @@ private:
         struct STerm { unique_ptr<Construct> expr; int_type coeff; bool grp; };
         std::vector<STerm> terms;
         auto add = [&](unique_ptr<Construct> e, int_type sign) {
-            if (auto *li = dynamic_cast<LiteralInt *>(e.get())) {
+            if (ctag(e.get()) == ConstructType::lit_int) {
+                auto *li = static_cast<LiteralInt *>(e.get());
                 constant += sign * li->ival();
                 return;
             }
-            const bool grp = !expr_has_side_effect(e.get());
+            /* only an INERT term may merge (arg_is_inert): merging moves
+             * the later occurrence's evaluation to the first one's place
+             * and cancelling (`t - t`) drops both, so a term that can
+             * throw (`k / z`, `a[i]`) or that reads something a sibling
+             * can change (a global) must stay verbatim - `-ni`, which
+             * skips this pass, evaluates every occurrence (RULE 2) */
+            const bool grp = arg_is_inert(e.get());
             if (grp)
                 for (auto &t : terms)
                     if (t.grp && expr_equal(t.expr.get(), e.get())) {
                         t.coeff += sign;
                         return;
                     }
-            terms.push_back({ move(e), sign, grp });
+            terms.push_back({ std::move(e), sign, grp });
         };
-        add(move(mo->elems[0].second), 1);
+        add(std::move(mo->elems[0].second), 1);
         for (size_t i = 1; i < mo->elems.size(); i++)
-            add(move(mo->elems[i].second),
+            add(std::move(mo->elems[i].second),
                 mo->elems[i].first == Op::minus ? -1 : 1);
 
         /* nothing merged/cancelled and no flatten benefit: leave it (the common
@@ -2845,14 +5652,14 @@ private:
                 continue;
             const int_type s = t.coeff > 0 ? 1 : -1;
             const int_type mag = t.coeff > 0 ? t.coeff : -t.coeff;
-            out.emplace_back(s, mag == 1 ? move(t.expr)
-                                         : make_int_mul(mag, move(t.expr)));
+            out.emplace_back(s, mag == 1 ? std::move(t.expr)
+                                         : make_int_mul(mag, std::move(t.expr)));
         }
         if (constant != 0) {
             auto lit = make_unique<LiteralInt>(
                 constant < 0 ? -constant : constant);
             lit->th = TypeHint::i;
-            out.emplace_back(constant < 0 ? -1 : 1, move(lit));
+            out.emplace_back(constant < 0 ? -1 : 1, std::move(lit));
         }
 
         /* REBUILD a +/- chain. The base (elems[0]) must be positive (op
@@ -2860,7 +5667,7 @@ private:
         if (out.empty()) {
             auto z = make_unique<LiteralInt>(0);
             z->th = TypeHint::i;
-            slot = move(z);
+            slot = std::move(z);
             return;
         }
         int base_i = -1;
@@ -2868,24 +5675,27 @@ private:
             if (out[i].first > 0) { base_i = static_cast<int>(i); break; }
 
         auto chain = make_unique<Expr04>();
+        /* base fields from the ORIGINAL chain (loc + inline_ctx - see the
+         * make_int_mul note; slot is still the original node here) */
+        slot->copy_base_fields(*chain);
         chain->th = TypeHint::i;
         if (base_i < 0) {                    /* all negative: 0 - a - b ... */
             auto z = make_unique<LiteralInt>(0);
             z->th = TypeHint::i;
-            chain->elems.emplace_back(Op::invalid, move(z));
+            chain->elems.emplace_back(Op::invalid, std::move(z));
         } else {
-            chain->elems.emplace_back(Op::invalid, move(out[base_i].second));
+            chain->elems.emplace_back(Op::invalid, std::move(out[base_i].second));
         }
         for (size_t i = 0; i < out.size(); i++) {
             if (static_cast<int>(i) == base_i)
                 continue;
             chain->elems.emplace_back(out[i].first > 0 ? Op::plus : Op::minus,
-                                      move(out[i].second));
+                                      std::move(out[i].second));
         }
         if (chain->elems.size() == 1)
-            slot = move(chain->elems[0].second);   /* a single positive term */
+            slot = std::move(chain->elems[0].second);   /* a single positive term */
         else
-            slot = move(chain);
+            slot = std::move(chain);
     }
 
     /*
@@ -2897,37 +5707,40 @@ private:
      */
     void fold_mul(unique_ptr<Construct> &slot)
     {
-        auto *mo = dynamic_cast<Expr03 *>(slot.get());
+        auto *mo = node_cast<Expr03>(slot.get());
         if (!mo || mo->elems.size() < 2 || !is_mul_chain(mo))
             return;
 
-        if (auto *base = dynamic_cast<Expr03 *>(mo->elems[0].second.get()))
+        if (auto *base = node_cast<Expr03>(mo->elems[0].second.get()))
             if (mo->elems[0].second->th == TypeHint::i && is_mul_chain(base)) {
                 std::vector<std::pair<Op, unique_ptr<Construct>>> merged;
                 for (auto &pr : base->elems)
-                    merged.push_back(move(pr));
+                    merged.push_back(std::move(pr));
                 for (size_t i = 1; i < mo->elems.size(); i++)
-                    merged.push_back(move(mo->elems[i]));
-                mo->elems = move(merged);
+                    merged.push_back(std::move(mo->elems[i]));
+                mo->elems = std::move(merged);
             }
 
         int_type product = 1;
         std::vector<unique_ptr<Construct>> factors;     /* non-constant */
         bool side_effects = false;
         for (auto &pr : mo->elems) {
-            if (auto *li = dynamic_cast<LiteralInt *>(pr.second.get()))
+            if (auto *li = node_cast<LiteralInt>(pr.second.get()))
                 product *= li->ival();
             else {
-                if (expr_has_side_effect(pr.second.get()))
+                /* `x * 0 -> 0` DROPS x: only sound when x is inert - a
+                 * throwing factor (`(k / z) * 0`, `a[i] * 0`) must still
+                 * throw (RULE 2; arg_is_inert) */
+                if (!arg_is_inert(pr.second.get()))
                     side_effects = true;
-                factors.push_back(move(pr.second));
+                factors.push_back(std::move(pr.second));
             }
         }
 
         if (product == 0 && !side_effects) {            /* x * 0 -> 0 */
             auto z = make_unique<LiteralInt>(0);
             z->th = TypeHint::i;
-            slot = move(z);
+            slot = std::move(z);
             return;
         }
         if (factors.empty())                            /* all constant */
@@ -2935,18 +5748,19 @@ private:
 
         /* rebuild factor0 (* factor1 ...) (* product) */
         auto chain = make_unique<Expr03>();
+        slot->copy_base_fields(*chain);      /* loc + inline_ctx (see above) */
         chain->th = TypeHint::i;
-        chain->elems.emplace_back(Op::invalid, move(factors[0]));
+        chain->elems.emplace_back(Op::invalid, std::move(factors[0]));
         for (size_t i = 1; i < factors.size(); i++)
-            chain->elems.emplace_back(Op::times, move(factors[i]));
+            chain->elems.emplace_back(Op::times, std::move(factors[i]));
         if (product != 1)
             chain->elems.emplace_back(Op::times,
                 [&] { auto l = make_unique<LiteralInt>(product);
                       l->th = TypeHint::i; return l; }());
         if (chain->elems.size() == 1)
-            slot = move(chain->elems[0].second);        /* x * 1 -> x */
+            slot = std::move(chain->elems[0].second);        /* x * 1 -> x */
         else
-            slot = move(chain);
+            slot = std::move(chain);
     }
 
     /* Int-arithmetic algebraic simplification: combine constants, collect like
@@ -2962,9 +5776,9 @@ private:
 
         if (slot->th != TypeHint::i)
             return;
-        if (dynamic_cast<Expr04 *>(slot.get()))
+        if (node_cast<Expr04>(slot.get()))
             fold_addsub(slot);
-        else if (dynamic_cast<Expr03 *>(slot.get()))
+        else if (node_cast<Expr03>(slot.get()))
             fold_mul(slot);
     }
 
@@ -2997,7 +5811,7 @@ private:
     static bool target_is_param(const Construct *lv,
             const std::unordered_set<const UniqueId *> &params)
     {
-        auto *id = dynamic_cast<const Identifier *>(lv);
+        auto *id = node_cast<const Identifier>(lv);
         return id && params.count(id->uid) != 0;
     }
 
@@ -3006,15 +5820,15 @@ private:
     {
         if (!c)
             return false;
-        if (auto *idc = dynamic_cast<const IncDecExpr *>(c))
+        if (auto *idc = node_cast<const IncDecExpr>(c))
             if (target_is_param(idc->lvalue.get(), params))
                 return true;
-        if (auto *e = dynamic_cast<const Expr14 *>(c))
+        if (auto *e = node_cast<const Expr14>(c))
             if (!(e->fl & pFlags::pInDecl)
                     && target_is_param(e->lvalue.get(), params))
                 return true;
         bool found = false;
-        for_each_child(const_cast<Construct *>(c),
+        fmi_children(const_cast<Construct *>(c),
             [&](Construct *ch) {
                 if (body_mutates_param(ch, params)) found = true;
             });
@@ -3041,26 +5855,28 @@ private:
     {
         if (!c)
             return false;
-        if (dynamic_cast<const FuncDeclStmt *>(c))
+        if (ctag(c) == ConstructType::func_decl)
             return true;
-        if (auto *b = dynamic_cast<const Block *>(c)) {
+        if (ctag(c) == ConstructType::block) {
+            auto *b = static_cast<const Block *>(c);
             for (auto &e : b->elems)
                 if (contains_func(e.get())) return true;
             return false;
         }
-        if (auto *f = dynamic_cast<const ForStmt *>(c))
+        if (auto *f = node_cast<const ForStmt>(c))
             return contains_func(f->init.get()) || contains_func(f->cond.get())
                 || contains_func(f->inc.get()) || contains_func(f->body.get());
-        if (auto *fe = dynamic_cast<const ForeachStmt *>(c))
+        if (auto *fe = node_cast<const ForeachStmt>(c))
             return contains_func(fe->container.get())
                 || contains_func(fe->body.get());
-        if (auto *tc = dynamic_cast<const TryCatchStmt *>(c)) {
+        if (ctag(c) == ConstructType::try_catch) {
+            auto *tc = static_cast<const TryCatchStmt *>(c);
             if (contains_func(tc->tryBody.get())) return true;
             for (auto &p : tc->catchStmts)
                 if (contains_func(p.second.get())) return true;
             return contains_func(tc->finallyBody.get());
         }
-        if (auto *e = dynamic_cast<const Expr14 *>(c))
+        if (auto *e = node_cast<const Expr14>(c))
             return contains_func(e->lvalue.get())
                 || contains_func(e->rvalue.get());
         bool found = false;
@@ -3098,6 +5914,10 @@ private:
      * nullptr means the enclosing function is unresolved (no frame), so block-
      * body inlining is skipped there.
      */
+    /* INT_TESTS: the function whose body the walk is in (null = main),
+     * for the inline_ast event's `caller` field */
+    ML_INT_FIELD(const FuncDeclStmt *, int_caller, nullptr)
+
     void walk(unique_ptr<Construct> &slot, int depth, int *fsize,
               bool no_block = false)
     {
@@ -3107,10 +5927,20 @@ private:
         /* A nested function owns a separate frame: walk its body with that
          * function's frame size (or no frame if unresolved). Its name, params
          * and capture list hold no calls. */
-        if (auto *fd = dynamic_cast<FuncDeclStmt *>(slot.get())) {
+        if (ctag(slot.get()) == ConstructType::func_decl) {
+            auto *fd = static_cast<FuncDeclStmt *>(slot.get());
+            const bool saved = in_repl_tmpl_base;
+            in_repl_tmpl_base = repl_mode && fd->is_template;
+            ML_INT_ONLY(const FuncDeclStmt *int_saved = int_caller;
+                        int_caller = fd;)
+            const FuncDeclStmt *fn_saved = cur_fn;
+            cur_fn = fd;
             if (fd->body)
                 walk(fd->body, depth,
                      fd->desc->resolved ? &fd->desc->frame_size : nullptr);
+            cur_fn = fn_saved;
+            ML_INT_ONLY(int_caller = int_saved;)
+            in_repl_tmpl_base = saved;
             return;
         }
 
@@ -3125,41 +5955,156 @@ private:
          * body inlining is NOT suppressed: it yields a for-range-recognizable
          * arithmetic expression, not an InlinedCallExpr.
          */
-        if (auto *fs = dynamic_cast<ForStmt *>(slot.get())) {
+        if (ctag(slot.get()) == ConstructType::for_stmt) {
+            auto *fs = static_cast<ForStmt *>(slot.get());
             if (fs->init) walk(fs->init, depth, fsize, no_block);
             if (fs->cond) walk(fs->cond, depth, fsize, /*no_block*/true);
             if (fs->inc)  walk(fs->inc,  depth, fsize, no_block);
             if (fs->body) walk(fs->body, depth, fsize, no_block);
             return;
         }
-        if (auto *ws = dynamic_cast<WhileStmt *>(slot.get())) {
+        if (ctag(slot.get()) == ConstructType::while_stmt) {
+            auto *ws = static_cast<WhileStmt *>(slot.get());
             if (ws->condExpr) walk(ws->condExpr, depth, fsize, /*no_block*/true);
             if (ws->body)     walk(ws->body, depth, fsize, no_block);
             return;
         }
 
-        /* Recurse into children at the same splice depth. */
+        /* Recurse into children at the same splice depth; a call at the
+         * root of this node's store target stays a call (store_root_call) */
+        const Construct *held = store_root_call(slot.get());
+        if (held)
+            held_roots.insert(held);
         for_each_child_slot(slot.get(),
             [&](unique_ptr<Construct> &ch) { walk(ch, depth, fsize, no_block); });
+        if (held)
+            held_roots.erase(held);
 
-        try_inline(slot, depth, fsize);   /* re-scans its splice (depth + 1) */
+        /* A call that must read its variable first (a lambda template's
+         * instance call through a global, Identifier::bind_guard) stays a
+         * call: inlined or specialized, it would lose the read. EACH
+         * engine below declines it itself (`live_guard()`), because each
+         * may be handed a call it did not see here: the tail engine finds
+         * its call through the ReturnStmt, and the block and specialize
+         * engines run on whatever the expression engine left in the slot
+         * - the guarded call of a body it just inlined. */
+
+        /* re-scans its splice (depth + 1) */
+        try_inline(slot, depth, fsize, no_block);
         try_inline_tail(slot, depth, fsize);   /* tail call to a block func */
         if (!no_block)
             try_inline_block(slot, depth, fsize); /* non-tail block func */
         try_specialize(slot);   /* if still a call to a block-bodied func */
     }
 
-    void try_inline(unique_ptr<Construct> &slot, int depth, int *fsize)
+    /* the function whose body walk() is in (null: main) */
+    const FuncDeclStmt *cur_fn = nullptr;
+
+    /* the calls at a store root inside the node walk() is under */
+    std::unordered_set<const Construct *> held_roots;
+
+    /*
+     * RULE 1: may an argument of `ce` bind `none` to a parameter of `f`
+     * that is not declared `opt`? The CALL's bind refuses that - inlined,
+     * nothing would bind it, and the body would run on a none its
+     * parameter can never hold - so such a call stays a call, in every
+     * engine (the tree is shared). An argument is cleared by its mask bit
+     * (CallExpr::none_arg_mask - the inferencer's type answer), by its
+     * SHAPE (CallExpr::arg_never_none), by `f`'s parameter being `opt`,
+     * or by naming a parameter of the enclosing function that is not
+     * `opt` and is never written: its own bind already refused a none.
+     * The last two need no inference, so an unstamped call (-nti, a
+     * harness running the resolver alone) still inlines `f(n)`.
+     * #49: the same holds for a MISFIT - an argument that may not fit a
+     * parameter's declared type (CallExpr::fit_args, a parameter with a
+     * ParamDesc::fit) is refused by the bind, so that call stays a call
+     * too.
+     */
+    bool binds_none(const CallExpr *ce, const FuncDeclStmt *f) const
     {
-        auto *ce = dynamic_cast<CallExpr *>(slot.get());
+        /* every caller checked the argument count against f's parameters */
+        const size_t n = ce->args->elems.size();
+        const FuncDescriptor *d = f->desc;
+        for (size_t i = 0; i < n; i++) {
+            if (ce->fit_args && d->params[i].fit)
+                return true;
+            const Construct *a = ce->args->elems[i].get();
+            if (!ce->arg_may_be_none(i))
+                continue;
+            if (d->params[i].opt)
+                continue;
+            if (names_settled_param(a))
+                continue;
+            return true;
+        }
+        return false;
+    }
+
+    /*
+     * Does an argument of `ce` hold a struct declaration that OWNS its
+     * definition (a function literal declaring a struct in its body)?
+     * Every inlining engine CLONES an argument into the body it pastes -
+     * a substitution, or the `$a = arg` temp - and the call it replaces
+     * dies with the original. A clone of a struct declaration shares the
+     * definition and owns nothing (StructDeclStmt::clone), so the pasted
+     * function then built instances of a definition freed with the call:
+     * `app(func(v) { struct E { int n; } return E(v).n; }, x)` with an
+     * inlinable `app` was a heap-use-after-free in the default engine
+     * (codegen read the freed definition; -ni ran). Such a call stays a
+     * call - the literal, and the definition with it, stay in the tree.
+     */
+    static bool owns_struct_def(Construct *c)
+    {
+        if (!c)
+            return false;
+        if (ctag(c) == ConstructType::struct_decl)
+            return static_cast<StructDeclStmt *>(c)->def_owner != nullptr;
+        bool found = false;
+        for_each_child_of(c, [&](Construct *ch) {
+            found = found || owns_struct_def(ch);
+        });
+        return found;
+    }
+
+    static bool arg_owns_struct_def(const CallExpr *ce)
+    {
+        for (const auto &a : ce->args->elems)
+            if (owns_struct_def(a.get()))
+                return true;
+        return false;
+    }
+
+    /* `a` reads a parameter of cur_fn that is not `opt` and that the body
+     * never writes - a value its bind refused none for. Slots below the
+     * parameter count are the parameters (inlining remaps a callee's
+     * locals above the caller's frame, so none lands there), and a LOCAL
+     * identifier means cur_fn was resolved, so slot_writes covers them. */
+    bool names_settled_param(const Construct *a) const
+    {
+        if (!cur_fn || ctag(a) != ConstructType::id)
+            return false;
+        const auto *id = static_cast<const Identifier *>(a);
+        const size_t s = static_cast<size_t>(id->sym.slot);
+        const FuncDescriptor *d = cur_fn->desc;
+        return id->sym.kind == SymKind::local && s < d->params.size()
+               && !d->params[s].opt && cur_fn->slot_writes[s] == 0;
+    }
+
+    void try_inline(unique_ptr<Construct> &slot, int depth, int *fsize,
+                    bool no_block = false)
+    {
+        auto *ce = node_cast<CallExpr>(slot.get());
         if (!ce)
             return;
-
         /* The callee must be a plain name that is NOT a resolved local (a local
          * could shadow a same-named top-level function). */
-        auto *callee = dynamic_cast<Identifier *>(ce->what.get());
+        auto *callee = node_cast<Identifier>(ce->what.get());
         if (!callee || callee->sym.kind == SymKind::local)
             return;
+        if (callee->live_guard())
+            return;                     /* reads its variable: see walk() */
+        if (held_roots.count(ce))
+            return;                     /* a store root: store_root_call */
 
         auto it = funcs.find(callee->uid);
         if (it == funcs.end() || !it->second)
@@ -3171,23 +6116,64 @@ private:
         /* Arg count must match, else the runtime arity error must survive. */
         if (ce->args->elems.size() != nparams)
             return;
+        if (binds_none(ce, f))
+            return;                     /* RULE 1: see binds_none */
+        if (arg_owns_struct_def(ce))
+            return;                     /* its clone would own nothing */
 
         /* The body EXPRESSION (the splice source): the `=> expr` sugar's
          * inner expr - the Block/Return wrapper is not spliced (it would put
          * a statement in expression position) and is not counted (the size
-         * gate measures the expression, exactly as before the desugar). */
+         * gate measures the expression, exactly as before the desugar).
+         *
+         * NULL is possible (#150): registration checked the body at run()
+         * time, but a LATER pass of this same walk can TAIL-SPLICE a
+         * callee into the registered function's own body - `{ return
+         * aa(k); }` becomes `{ <aa's block> }`, no longer a single-return
+         * shape - so the funcs entry goes stale. Seen with a lambda
+         * template instance whose body tail-called one of a mutually-
+         * recursive pair (mutual recursion is what makes the callee
+         * tail-inlinable but not expr-inlinable). DECLINE, never assert:
+         * the call stays a runtime call, which is always correct. */
         Construct *fexpr = func_expr_body(f);
-        ML_CHECK(fexpr != nullptr);   /* inlinable_decl guaranteed it */
+        if (!fexpr)
+            return;
 
         const int bsz = node_count(fexpr);
         if (bsz > max_nodes)
             return;
 
+        /* THE ARGUMENT RULE (arg_substitutable): an argument that is not
+         * inert cannot be pasted into the body - it must be evaluated
+         * ONCE, before the body, like the call it replaces. The splice
+         * then goes through the block engine's arg-temp form instead,
+         * where every such argument is bound to a frame temp first. In a
+         * loop condition that form is suppressed (for-range must still
+         * see the CALL - see walk's no_block), so the call stays. */
+        bool need_block = false;
         for (size_t i = 0; i < nparams; i++) {
             const int uses = count_uses(fexpr,
                                         f->params->elems[i]->uid);
-            if (!sub_ok(uses, ce->args->elems[i].get()))
-                return;
+            if (!arg_substitutable(f, i, ce->args->elems[i].get(), uses))
+                need_block = true;
+        }
+        /* ...and the body must be LOCAL-FREE for the uid substitution
+         * below: a block splice INTO this body (an arg temp, a callee's
+         * remapped locals) left slots of f's own frame in it, which only
+         * the slot-remapping splice can move into the caller's frame -
+         * pasted as they are, they index past the caller's frame. */
+        if (!need_block && f->desc->resolved) {
+            const int np = static_cast<int>(nparams);
+            need_block = count_matching(fexpr,
+                [&](const Identifier *id) {
+                    return id->sym.kind == SymKind::local
+                        && id->sym.slot >= np;
+                }) != 0;
+        }
+        if (need_block) {
+            if (!no_block)
+                splice_block_call(slot, depth, fsize, ce, f);
+            return;
         }
 
         /* Fixpoint bounds: stop nesting at the depth cap (terminates mutual
@@ -3195,6 +6181,7 @@ private:
          * Either way the call is left for runtime - still correct. */
         if (depth >= MAX_INLINE_DEPTH || bsz > inline_budget)
             return;
+        ML_INT_ONLY(if (int_inline_declined(ce)) return;)
         inline_budget -= bsz;
 
         /*
@@ -3212,8 +6199,8 @@ private:
          * chains under it, so arbitrarily deep nesting renders correctly.
          */
         const InlineCtx *ic = alloc_inline_ctx(
-            { std::string(f->id->get_str()), param_names(f),
-              ce->start, ce->inline_ctx });
+            { inline_frame_name(f), param_names(f),
+              ce->start, ce->inline_ctx, ce->end });
 
         unique_ptr<Construct> body = fexpr->clone();
 
@@ -3222,18 +6209,23 @@ private:
                        ce->args->elems[i].get());
 
         tag_inline(body.get(), ic);
+        /* #68: the body's root stands where the call stood */
+        body->inline_call = ic;
 
         if (analysis)
             analysis->mark(callee->start,
                 static_cast<int>(callee->get_str().length()),
                 AnnoKind::inlined);
+        ML_INT(inline_ast, "expr", int_caller_name(),
+               std::string(inline_frame_name(f)),
+               ce->start.line, ce->start.col);
 
         TRACE(inlining, 0, std::string(f->id->get_str()) + "(" +
               std::to_string(nparams) + " arg(s))  body " +
               std::to_string(bsz) + " nodes -> splice");
 
         /* Replaces (frees) the old CallExpr; its args were already cloned. */
-        slot = move(body);
+        slot = std::move(body);
 
         /*
          * Re-fold: a const argument substituted into the body can make a
@@ -3267,7 +6259,7 @@ private:
     static bool block_always_returns(const Block *b)
     {
         return b && !b->elems.empty()
-            && dynamic_cast<const ReturnStmt *>(b->elems.back().get());
+            && node_cast<const ReturnStmt>(b->elems.back().get());
     }
 
     /*
@@ -3283,28 +6275,33 @@ private:
     {
         if (!c)
             return 0;
-        if (auto *id = dynamic_cast<const Identifier *>(c))
+        if (auto *id = node_cast<const Identifier>(c))
             return pred(id) ? 1 : 0;
 
         int n = 0;
-        if (auto *b = dynamic_cast<const Block *>(c)) {
+        if (ctag(c) == ConstructType::block) {
+            auto *b = static_cast<const Block *>(c);
             for (auto &e : b->elems)
                 n += count_matching(e.get(), pred);
-        } else if (auto *e14 = dynamic_cast<const Expr14 *>(c)) {
+        } else if (ctag(c) == ConstructType::expr14) {
+            auto *e14 = static_cast<const Expr14 *>(c);
             n += count_matching(e14->lvalue.get(), pred);
             n += count_matching(e14->rvalue.get(), pred);
-        } else if (auto *fs = dynamic_cast<const ForStmt *>(c)) {
+        } else if (ctag(c) == ConstructType::for_stmt) {
+            auto *fs = static_cast<const ForStmt *>(c);
             n += count_matching(fs->init.get(), pred);
             n += count_matching(fs->cond.get(), pred);
             n += count_matching(fs->inc.get(), pred);
             n += count_matching(fs->body.get(), pred);
-        } else if (auto *fe = dynamic_cast<const ForeachStmt *>(c)) {
+        } else if (ctag(c) == ConstructType::foreach_stmt) {
+            auto *fe = static_cast<const ForeachStmt *>(c);
             if (fe->ids)
                 for (auto &id : fe->ids->elems)
                     n += count_matching(id.get(), pred);
             n += count_matching(fe->container.get(), pred);
             n += count_matching(fe->body.get(), pred);
-        } else if (auto *tc = dynamic_cast<const TryCatchStmt *>(c)) {
+        } else if (ctag(c) == ConstructType::try_catch) {
+            auto *tc = static_cast<const TryCatchStmt *>(c);
             n += count_matching(tc->tryBody.get(), pred);
             for (auto &p : tc->catchStmts) {
                 if (p.first.asId)
@@ -3338,13 +6335,14 @@ private:
         if (!c)
             return;
 
-        if (auto *id = dynamic_cast<Identifier *>(c)) {
+        if (ctag(c) == ConstructType::id) {
+            auto *id = static_cast<Identifier *>(c);
             if (id->sym.kind == SymKind::local) {
                 if (id->sym.slot < nparams) {
                     unique_ptr<Construct> a = args[id->sym.slot]->clone();
                     a->start = id->start;     /* keep the param's source loc */
                     a->end = id->end;
-                    ref = move(a);
+                    ref = std::move(a);
                 } else {
                     id->sym.slot += off;
                 }
@@ -3357,31 +6355,36 @@ private:
                 id->sym.slot += off;
         };
 
-        if (auto *il = dynamic_cast<IdList *>(c)) {
+        if (ctag(c) == ConstructType::idlist) {
+            auto *il = static_cast<IdList *>(c);
             for (auto &id : il->elems)
                 remap_id(id.get());
             return;
         }
-        if (auto *b = dynamic_cast<Block *>(c)) {
+        if (ctag(c) == ConstructType::block) {
+            auto *b = static_cast<Block *>(c);
             if (b->slot_count > 0)
                 b->slot_start += off;
             for (auto &e : b->elems)
                 splice_tail(e, args, nparams, off);
             return;
         }
-        if (auto *e14 = dynamic_cast<Expr14 *>(c)) {
+        if (ctag(c) == ConstructType::expr14) {
+            auto *e14 = static_cast<Expr14 *>(c);
             splice_tail(e14->lvalue, args, nparams, off);
             splice_tail(e14->rvalue, args, nparams, off);
             return;
         }
-        if (auto *fs = dynamic_cast<ForStmt *>(c)) {
+        if (ctag(c) == ConstructType::for_stmt) {
+            auto *fs = static_cast<ForStmt *>(c);
             splice_tail(fs->init, args, nparams, off);
             splice_tail(fs->cond, args, nparams, off);
             splice_tail(fs->inc, args, nparams, off);
             splice_tail(fs->body, args, nparams, off);
             return;
         }
-        if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+        if (ctag(c) == ConstructType::foreach_stmt) {
+            auto *fe = static_cast<ForeachStmt *>(c);
             if (fe->ids)
                 for (auto &id : fe->ids->elems)
                     remap_id(id.get());
@@ -3389,7 +6392,8 @@ private:
             splice_tail(fe->body, args, nparams, off);
             return;
         }
-        if (auto *tc = dynamic_cast<TryCatchStmt *>(c)) {
+        if (ctag(c) == ConstructType::try_catch) {
+            auto *tc = static_cast<TryCatchStmt *>(c);
             splice_tail(tc->tryBody, args, nparams, off);
             for (auto &p : tc->catchStmts) {
                 remap_id(p.first.asId.get());
@@ -3419,21 +6423,49 @@ private:
      */
     void try_inline_block(unique_ptr<Construct> &slot, int depth, int *fsize)
     {
-        auto *ce = dynamic_cast<CallExpr *>(slot.get());
+        auto *ce = node_cast<CallExpr>(slot.get());
         if (!ce)
             return;
 
-        auto *callee = dynamic_cast<Identifier *>(ce->what.get());
+        auto *callee = node_cast<Identifier>(ce->what.get());
         if (!callee || callee->sym.kind == SymKind::local)
             return;
+        if (callee->live_guard())
+            return;                     /* reads its variable: see walk() */
+        if (held_roots.count(ce))
+            return;                     /* a store root: store_root_call */
 
         auto it = block_funcs.find(callee->uid);
         if (it == block_funcs.end() || !it->second)
             return;
 
-        FuncDeclStmt *f = it->second;
+        splice_block_call(slot, depth, fsize, ce, it->second);
+    }
+
+    /*
+     * The block engine's splice of the call `ce` to `f`, shared by
+     * try_inline_block and by the EXPRESSION engine when one of its
+     * arguments is not substitutable (THE ARGUMENT RULE) - an `=> expr`
+     * body is a `{ return expr; }` Block, so it splices here exactly like
+     * a hand-written one.
+     */
+    void splice_block_call(unique_ptr<Construct> &slot, int depth,
+                           int *fsize, CallExpr *ce, FuncDeclStmt *f)
+    {
+        auto *callee = static_cast<Identifier *>(ce->what.get());
         if (!f->desc->resolved)
             return;       /* its locals aren't slotted: nothing to remap into */
+        if (in_repl_tmpl_base)
+            return;       /* see in_repl_tmpl_base */
+
+        const int nparams = f->params
+            ? static_cast<int>(f->params->elems.size()) : 0;
+        if (static_cast<int>(ce->args->elems.size()) != nparams)
+            return;   /* arity mismatch: let the runtime error survive */
+        if (binds_none(ce, f))
+            return;       /* RULE 1: see binds_none */
+        if (arg_owns_struct_def(ce))
+            return;                     /* its clone would own nothing */
 
         /*
          * A SELF-RECURSIVE callee (block_inlinable_decl admitted it only if it
@@ -3456,27 +6488,25 @@ private:
                 return;
             if (!rec_orig.count(f))
                 rec_orig[f] = f->body->clone();
-            f->desc->cache_results = true;
+            /* a cached result is keyed by the argument VALUES: an argument
+             * compared by identity (a class instance, a box) may change
+             * between two calls and still match (args_cache_safe) */
+            if (f->args_cache_safe)
+                f->desc->cache_results = true;
         }
-
-        const int nparams = f->params
-            ? static_cast<int>(f->params->elems.size()) : 0;
-        if (static_cast<int>(ce->args->elems.size()) != nparams)
-            return;   /* arity mismatch: let the runtime error survive */
 
         /*
          * Decide each param. A param REASSIGNED in the body can't be inlined (it
          * is a by-value copy; substituting the arg would wrongly alias it).
-         * Otherwise: a VALUE-STABLE arg (`tail_arg_ok` - a caller LOCAL or const
-         * literal the body can't reassign) is substituted DIRECTLY (cheap, read
-         * at each param use). Any other arg (a non-trivial expression, a global,
-         * a side-effecting call) is bound to a fresh frame TEMP once at the top
-         * of the body (`$a = arg`) and the param reads the temp - "args as
-         * locals". Evaluating once captures the call-time value, so a body that
-         * mutates the global / a multi-use side-effecting arg stays sound; it
-         * also lets `f(a+b)`, `f(g())`, `f(global)` inline (and is what the
-         * recursion-unroll needs, since a self-call's arg is `n-1`). Use count
-         * is by SLOT so a shadowing local doesn't mislead.
+         * Otherwise THE ARGUMENT RULE (arg_substitutable): an INERT arg - it
+         * cannot throw, has no effect, and reads nothing the body can
+         * change - is substituted DIRECTLY (read at each param use). Any
+         * other arg (a call, a global, a subscript, a division, an arg a
+         * typed param would COERCE) is bound to a fresh frame TEMP once, at
+         * the top of the body, in param order (`$a = arg`), and the param
+         * reads the temp - "args as locals": the evaluation a real call
+         * makes, at the time it makes it. Use count is by SLOT so a
+         * shadowing local doesn't mislead.
          */
         std::vector<bool> needs_temp(nparams, false);
         int ntemps = 0;
@@ -3490,14 +6520,11 @@ private:
                         && id->sym.slot == i;
                 });
             const Construct *arg = ce->args->elems[i].get();
-            /* A cheap arg to a PURE callee is direct-substituted (no temp): the
-             * callee's purity makes the arg side-effect-free, so re-evaluating
-             * it at each param use is sound, and a temp-free body can become an
-             * expressible ternary. Otherwise temp-bind (capture-once). */
-            const bool subst = tail_arg_ok(uses, arg)
-                || (f->desc->effective_pure
-                    && body_weight(arg) <= ARG_SUBST_MAX);
-            if (!subst) {
+            /* NOT "a cheap arg to a PURE callee" (the rule this replaced):
+             * the callee's purity says nothing about the ARGUMENT, and
+             * `f(12 / z)` pasted into a guard arm skipped the division's
+             * throw whenever the arm was not taken. */
+            if (!arg_substitutable(f, static_cast<size_t>(i), arg, uses)) {
                 needs_temp[i] = true;
                 ntemps++;
             }
@@ -3517,6 +6544,7 @@ private:
         const int bsz = count_all_nodes(f->body.get());
         if (depth >= MAX_INLINE_DEPTH || bsz > inline_budget)
             return;
+        ML_INT_ONLY(if (int_inline_declined(ce)) return;)
         inline_budget -= bsz;
 
         /* Splice: substitute params (by slot) + remap locals to [*fsize, ...).
@@ -3534,8 +6562,10 @@ private:
                 auto id = make_unique<Identifier>(
                     "$a" + std::to_string(temp_base + t));
                 id->sym = ResolvedSym{ SymKind::local, temp_base + t };
-                id->th = ce->args->elems[i]->th;   /* keep M8 hint if any */
-                temp_reads.push_back(move(id));
+                /* the temp holds the BOUND value: the param's hint */
+                id->th = temp_hint(f, static_cast<size_t>(i),
+                                   ce->args->elems[i].get());
+                temp_reads.push_back(std::move(id));
                 args.push_back(temp_reads.back().get());
                 t++;
             } else {
@@ -3549,40 +6579,24 @@ private:
             is_rec ? rec_orig.at(f)->clone() : f->body->clone();
         splice_tail(body, args, nparams, off);
 
-        /* Prepend `$a = arg` for each temp-bound param, in PARAM ORDER so the
-         * args evaluate left-to-right (insert at front in reverse). The arg is
-         * the ORIGINAL caller expression (not remapped). */
-        auto *blk = dynamic_cast<Block *>(body.get());
+        auto *blk = node_cast<Block>(body.get());
         ML_CHECK(blk != nullptr);   /* block_inlinable_decl required is_block */
-        t = ntemps;
-        for (int i = nparams - 1; i >= 0; i--) {
-            if (!needs_temp[i])
-                continue;
-            t--;
-            auto asn = make_unique<Expr14>();
-            asn->op = Op::assign;
-            auto lv = make_unique<Identifier>(
-                "$a" + std::to_string(temp_base + t));
-            lv->sym = ResolvedSym{ SymKind::local, temp_base + t };
-            lv->th = ce->args->elems[i]->th;
-            asn->lvalue = move(lv);
-            asn->rvalue = ce->args->elems[i]->clone();
-            blk->elems.insert(blk->elems.begin(), move(asn));
-        }
 
         if (fsize)
             *fsize += grow;   /* the caller's frame absorbed locals + arg temps */
 
         const InlineCtx *ic = alloc_inline_ctx(
-            { std::string(f->id->get_str()), param_names(f),
-              ce->start, ce->inline_ctx });
+            { inline_frame_name(f), param_names(f),
+              ce->start, ce->inline_ctx, ce->end });
 
         /* If the spliced body is a temp-free guard chain, emit an EXPRESSIBLE
          * ternary instead of an InlinedCall(Block(...return...)). The ternary is
          * a normal expression - it runs in the caller's frame (no flow boundary)
          * and the frontier self-calls in its branches still hit the per-frame
          * cache. Otherwise keep the InlinedCall (a body with locals / arg temps
-         * / a loop is not yet expression-convertible). */
+         * / a loop is not yet expression-convertible). Temp-free means every
+         * argument was INERT, so nothing in the ternary evaluates an argument
+         * that could throw - tagging it all as the callee's is exact. */
         unique_ptr<Construct> spliced;
         if (ntemps == 0) {
             /* copy-propagate write-once cheap locals so a simple body collapses
@@ -3592,21 +6606,116 @@ private:
             if (auto tern = guard_to_ternary(blk)) {
                 ce->copy_base_fields(*tern);   /* loc + th of the call site */
                 tag_inline(tern.get(), ic);
-                spliced = move(tern);
+                spliced = std::move(tern);
             }
         }
         if (!spliced) {
-            tag_inline(body.get(), ic);
+            /* Tag the BODY's statements - and only them - as inlined code
+             * BEFORE the arg temps go in: an argument is evaluated by the
+             * CALLER, so an error in one must render the caller's frames
+             * (the call site's own chain), never the callee's. The Block
+             * keeps the call site's chain too: the tree-walker flushes the
+             * innermost CHAINED node an exception crosses, and a Block
+             * tagged with the callee would name it for an argument error
+             * that crossed only untagged caller nodes. */
+            for (auto &st : blk->elems)
+                tag_inline(st.get(), ic);
+            blk->inline_ctx = ce->inline_ctx;
+
+            /* Prepend `$a = arg` for each temp-bound param, in PARAM ORDER
+             * so the args evaluate left-to-right (insert at front in
+             * reverse). The arg is the ORIGINAL caller expression (not
+             * remapped), with its own locs and chain; the store carries
+             * the arg's span, which is where a real call's bind carets a
+             * failed coercion (bind_arg). A param declared int/float
+             * coerces: the temp carries its decl_type, so the store runs
+             * the same coerce_to_decl_type the bind runs.
+             *
+             * A real call evaluates EVERY argument before it binds any, so
+             * a coercion that throws must not skip a later argument's
+             * evaluation (`g(d, tick())` with a float `d` into `int a`
+             * printed nothing inlined, `tick` with -ni). A coercing temp
+             * with another temp-bound argument after it therefore takes the
+             * argument as is, untyped, and is coerced in place once all of
+             * them are evaluated (`$a = $a`, with the argument's span). */
+            const auto coerces = [&](int i) {
+                const DeclType dt = param_decl_type(f, static_cast<size_t>(i));
+                return dt == DeclType::i || dt == DeclType::f;
+            };
+            const auto temp_id = [&](int slot, const Construct *arg) {
+                auto id = make_unique<Identifier>("$a" + std::to_string(slot));
+                id->sym = ResolvedSym{ SymKind::local, slot };
+                id->start = arg->start;
+                id->end = arg->end;
+                id->inline_ctx = ce->inline_ctx;
+                return id;
+            };
+            /* the deferred coercions first: each insert goes to the front,
+             * so they end up after every evaluation below. Both loops walk
+             * the parameters BACKWARDS, so `later` - "a temp-bound
+             * argument follows this one" - is a running flag. */
+            int tt = ntemps;
+            bool later = false;
+            for (int i = nparams - 1; i >= 0; i--) {
+                if (!needs_temp[i])
+                    continue;
+                tt--;
+                const bool defer = coerces(i) && later;
+                later = true;
+                if (!defer)
+                    continue;
+                const size_t pi = static_cast<size_t>(i);
+                const Construct *arg = ce->args->elems[pi].get();
+                auto asn = make_unique<Expr14>();
+                asn->op = Op::assign;
+                auto lv = temp_id(temp_base + tt, arg);
+                lv->th = temp_hint(f, pi, arg);
+                lv->decl_type = param_decl_type(f, pi);
+                asn->start = arg->start;
+                asn->end = arg->end;
+                asn->inline_ctx = ce->inline_ctx;
+                asn->lvalue = std::move(lv);
+                asn->rvalue = temp_id(temp_base + tt, arg);  /* untyped */
+                blk->elems.insert(blk->elems.begin(), std::move(asn));
+            }
+            tt = ntemps;
+            later = false;
+            for (int i = nparams - 1; i >= 0; i--) {
+                if (!needs_temp[i])
+                    continue;
+                tt--;
+                const size_t pi = static_cast<size_t>(i);
+                const Construct *arg = ce->args->elems[pi].get();
+                const bool deferred = coerces(i) && later;
+                later = true;
+                auto asn = make_unique<Expr14>();
+                asn->op = Op::assign;
+                auto lv = temp_id(temp_base + tt, arg);
+                if (!deferred) {
+                    lv->th = temp_hint(f, pi, arg);
+                    lv->decl_type = param_decl_type(f, pi);
+                }
+                asn->start = arg->start;
+                asn->end = arg->end;
+                asn->inline_ctx = ce->inline_ctx;
+                asn->lvalue = std::move(lv);
+                asn->rvalue = arg->clone();
+                blk->elems.insert(blk->elems.begin(), std::move(asn));
+            }
+
             auto ica = make_unique<InlinedCallExpr>();
             ce->copy_base_fields(*ica);   /* loc + inline_ctx of the call site */
-            ica->elem = move(body);
-            spliced = move(ica);
+            ica->elem = std::move(body);
+            spliced = std::move(ica);
         }
 
         if (analysis)
             analysis->mark(callee->start,
                 static_cast<int>(callee->get_str().length()),
                 AnnoKind::inlined);
+        ML_INT(inline_ast, "block", int_caller_name(),
+               std::string(inline_frame_name(f)),
+               ce->start.line, ce->start.col);
 
         TRACE(inlining, 0, std::string(f->id->get_str()) + "(" +
               std::to_string(nparams) + " arg(s))  block body " +
@@ -3614,7 +6723,7 @@ private:
               std::to_string(nlocals) + " local, +" +
               std::to_string(ntemps) + " arg-temp slot(s))");
 
-        slot = move(spliced);
+        slot = std::move(spliced);
         /* Re-scan to collapse nested calls in the spliced body. For a recursive
          * self-inline, bump rec_depth around the re-scan so the next level's
          * self-calls see the deeper bound (and stop at REC_UNROLL_LEVELS). Every
@@ -3642,19 +6751,21 @@ private:
      */
     void try_inline_tail(unique_ptr<Construct> &slot, int depth, int *fsize)
     {
-        if (!fsize)
-            return;       /* the enclosing function has no frame to grow */
+        if (!fsize || in_repl_tmpl_base)
+            return;       /* no frame to grow / see in_repl_tmpl_base */
 
-        auto *ret = dynamic_cast<ReturnStmt *>(slot.get());
+        auto *ret = node_cast<ReturnStmt>(slot.get());
         if (!ret)
             return;
-        auto *ce = dynamic_cast<CallExpr *>(ret->elem.get());
+        auto *ce = node_cast<CallExpr>(ret->elem.get());
         if (!ce)
             return;
 
-        auto *callee = dynamic_cast<Identifier *>(ce->what.get());
+        auto *callee = node_cast<Identifier>(ce->what.get());
         if (!callee || callee->sym.kind == SymKind::local)
             return;
+        if (callee->live_guard())
+            return;                     /* reads its variable: see walk() */
 
         auto it = spec_funcs.find(callee->uid);   /* block-bodied, no capture/
                                                    * nested func */
@@ -3665,7 +6776,7 @@ private:
         if (!f->desc->resolved)
             return;       /* its locals aren't slotted: nothing to remap into */
 
-        auto *body = dynamic_cast<const Block *>(f->body.get());
+        auto *body = node_cast<const Block>(f->body.get());
         if (!body || !block_always_returns(body))
             return;
 
@@ -3673,6 +6784,10 @@ private:
             ? static_cast<int>(f->params->elems.size()) : 0;
         if (static_cast<int>(ce->args->elems.size()) != nparams)
             return;
+        if (binds_none(ce, f))
+            return;                     /* RULE 1: see binds_none */
+        if (arg_owns_struct_def(ce))
+            return;                     /* its clone would own nothing */
 
         const int bsz = node_count(f->body.get());
         if (bsz > max_nodes)
@@ -3699,7 +6814,11 @@ private:
                     return id->sym.kind == SymKind::local
                         && id->sym.slot == i;
                 });
-            if (!tail_arg_ok(uses, ce->args->elems[i].get()))
+            const Construct *arg = ce->args->elems[i].get();
+            if (!tail_arg_ok(uses, arg)
+                    || !bind_is_identity(f, static_cast<size_t>(i), arg)
+                    || param_written_through(f, static_cast<size_t>(i))
+                    || param_member_written(f, static_cast<size_t>(i)))
                 return;
         }
 
@@ -3708,6 +6827,7 @@ private:
             return;       /* would overflow the 64-slot frame */
         if (depth >= MAX_INLINE_DEPTH || bsz > inline_budget)
             return;
+        ML_INT_ONLY(if (int_inline_declined(ce)) return;)
         inline_budget -= bsz;
 
         /* Splice: substitute params, remap locals into [caller_fsize, ...). */
@@ -3723,39 +6843,256 @@ private:
         *fsize += nlocals;   /* the caller's frame absorbed f's locals */
 
         const InlineCtx *ic = alloc_inline_ctx(
-            { std::string(f->id->get_str()), param_names(f),
-              ce->start, ce->inline_ctx });
+            { inline_frame_name(f), param_names(f),
+              ce->start, ce->inline_ctx, ce->end });
         tag_inline(spliced.get(), ic);
 
         if (analysis)
             analysis->mark(callee->start,
                 static_cast<int>(callee->get_str().length()),
                 AnnoKind::inlined);
+        ML_INT(inline_ast, "tail", int_caller_name(),
+               std::string(inline_frame_name(f)),
+               ce->start.line, ce->start.col);
 
         TRACE(inlining, 0, std::string(f->id->get_str()) +
               "  tail call -> splice (+" + std::to_string(nlocals) +
               " local slot(s))");
 
-        slot = move(spliced);   /* the ReturnStmt becomes f's (spliced) body */
+        slot = std::move(spliced);   /* the ReturnStmt becomes f's (spliced) body */
         refold(slot);
         walk(slot, depth + 1, fsize);   /* re-scan: nested tail/expr calls */
     }
 
-    /* Sound iff the argument is evaluated as often as the param is used and a
-     * side-effecting arg is neither dropped nor duplicated. An identifier or a
-     * self-contained constant (scalar, or array/dict literal of constants) is
-     * side-effect-free, so it can be duplicated; a constant can also be dropped
-     * (an identifier cannot - that would skip an undefined-variable error). */
-    static bool sub_ok(int uses, const Construct *arg)
+    /*
+     * THE ARGUMENT RULE (RULE 2). A real call - what `-ni` runs - evaluates
+     * every argument ONCE, left to right, BEFORE the body; binds it,
+     * coercing a param declared int/float; and an error in an argument is
+     * the CALLER's, with the argument's own caret. Pasting the argument
+     * EXPRESSION into the body instead moves its evaluation to wherever the
+     * parameter is used: after a side effect of the body, into a ternary
+     * arm or a short-circuit tail (conditionally), zero times (dropped) or
+     * several, and under the callee's inlined-at chain (one extra virtual
+     * frame). All of that is unobservable exactly when the argument is
+     * INERT - it cannot throw, has no side effect, and reads nothing the
+     * body can change - and its bind is the identity. Every other argument
+     * is bound to a frame temp first ("args as locals", splice_block_call).
+     *
+     * A WHITELIST, fail-closed: a node kind not listed is not inert.
+     *  - a scalar literal, or a baked deep read-only (shared) value;
+     *  - a caller LOCAL read (a slot the spliced body cannot reach: its own
+     *    locals are remapped to fresh slots, and a read cannot fail - the
+     *    TDZ refuses a use above the declaration at compile time);
+     *  - a TOP-LEVEL FUNCTION name nothing reassigns (bound at scope entry,
+     *    #134, so the read cannot fail and never changes) - what lets
+     *    `apply(sq, i)` inline to `sq(i)` and then to `i * i`;
+     *  - `+ - *`, comparisons, `& | ^`, `&& ||` and unary `- + ! ~` over
+     *    inert operands that inference proved scalar (`th`): int arithmetic
+     *    WRAPS (-fwrapv), float arithmetic is IEEE, so none of them can
+     *    throw; `/` and `%` only by a literal divisor other than 0 and
+     *    -1 (INT_MIN / -1). NOT a runtime divisor, NOT the shifts (a
+     *    negative count throws), NOT a subscript / member / call / string
+     *    concatenation, and nothing at all under `-nti` (no `th`).
+     */
+    bool arg_is_inert(const Construct *c) const
     {
-        if (uses == 1)
-            return true;       /* single evaluation: any argument is fine */
+        ML_CHECK(c);
+        switch (ctag(c)) {
+        case ConstructType::lit_int:
+        case ConstructType::lit_bool:
+        case ConstructType::lit_float:
+        case ConstructType::lit_none:
+        case ConstructType::lit_str:
+            return true;
+        case ConstructType::lit_obj:
+            /* a baked DEEP READ-ONLY value is one shared object: every
+             * evaluation yields it, so it may be read any number of times
+             * (a MUTABLE one is a fresh copy per evaluation - duplicating
+             * it would split one argument into several objects) */
+            return static_cast<const LiteralObj *>(c)->is_immutable();
+        case ConstructType::id: {
+            auto *id = static_cast<const Identifier *>(c);
+            if (id->sym.kind == SymKind::local)
+                return true;
+            if (id->sym.kind != SymKind::global || repl_mode || !root_block)
+                return false;
+            const int sl = id->sym.slot;
+            if (!func_global_slots.count(sl))
+                return false;
+            const auto &re = root_block->global_slot_reassigned;
+            return sl >= 0 && static_cast<size_t>(sl) < re.size()
+                && !re[static_cast<size_t>(sl)];
+        }
+        case ConstructType::expr02: {
+            /* pExpr02 builds one only for a prefix + - ! ~ over one
+             * operand, and `~` over a non-int is a type error */
+            auto *u = static_cast<const MultiOpConstruct *>(c);
+            ML_CHECK(u->elems.size() == 1);
+            /* the operator is read by the checks alone (no local: an
+             * ASSERTS=0 build compiles them out) */
+            const Construct *e = u->elems[0].second.get();
+            ML_CHECK(e && (u->elems[0].first == Op::plus
+                           || u->elems[0].first == Op::minus
+                           || u->elems[0].first == Op::lnot
+                           || u->elems[0].first == Op::bnot));
+            if (e->th == TypeHint::none)
+                return false;
+            ML_CHECK(u->elems[0].first != Op::bnot || e->th == TypeHint::i);
+            return arg_is_inert(e);
+        }
+        case ConstructType::expr03:
+        case ConstructType::expr04:
+        case ConstructType::expr06:
+        case ConstructType::expr07:
+        case ConstructType::expr08:
+        case ConstructType::expr09:
+        case ConstructType::expr10:
+        case ConstructType::expr11:
+        case ConstructType::expr12: {
+            auto *mo = static_cast<const MultiOpConstruct *>(c);
+            for (size_t k = 0; k < mo->elems.size(); k++) {
+                const Op op = mo->elems[k].first;
+                const Construct *e = mo->elems[k].second.get();
+                ML_CHECK(e);
+                if (e->th == TypeHint::none || !arg_is_inert(e))
+                    return false;
+                switch (op) {
+                case Op::invalid:
+                    ML_CHECK(k == 0);       /* only the first operand */
+                    break;
+                case Op::plus: case Op::minus: case Op::times:
+                case Op::lt: case Op::gt: case Op::le: case Op::ge:
+                case Op::eq: case Op::noteq:
+                case Op::land: case Op::lor:
+                    break;
+                case Op::band: case Op::bor: case Op::bxor:
+                    break;
+                case Op::div: case Op::mod:
+                    /* only by a LITERAL that cannot fail: not 0 (the
+                     * division by zero) and not -1 (INT_MIN / -1) -
+                     * `n % 2 - 5` is the recursion unroll's own shape */
+                    if (ctag(e) == ConstructType::lit_int) {
+                        const int_type d =
+                            static_cast<const LiteralInt *>(e)->ival();
+                        if (d == 0 || d == -1)
+                            return false;
+                    } else if (ctag(e) == ConstructType::lit_float) {
+                        if (static_cast<const LiteralFloat *>(e)->fval()
+                                == 0.0)
+                            return false;
+                    } else {
+                        return false;
+                    }
+                    break;
+                default:
+                    return false;   /* a shift, a runtime divisor: throws */
+                }
+                /* the bitwise ops take only ints (and bools, stamped
+                 * `i`): any other operand is a type error */
+                ML_CHECK((ctag(c) != ConstructType::expr08
+                          && ctag(c) != ConstructType::expr09
+                          && ctag(c) != ConstructType::expr10)
+                         || e->th == TypeHint::i);
+            }
+            return !mo->elems.empty();
+        }
+        default:
+            return false;
+        }
+    }
 
-        if (uses >= 2)
-            return dynamic_cast<const Identifier *>(arg)
-                || is_const_literal(arg);
+    /* The declared type a parameter's BIND coerces to - read off the
+     * descriptor, which is what every engine's bind reads. */
+    static DeclType param_decl_type(const FuncDeclStmt *f, size_t i)
+    {
+        const auto &ps = f->desc->params;
+        return i < ps.size() ? ps[i].decl_type : DeclType::none;
+    }
 
-        return is_const_literal(arg);     /* uses == 0: drop a const only */
+    /* Is binding `arg` to param i the identity? A param declared int/float
+     * WIDENS an int/bool into it (and throws on a dyn value that does not
+     * fit), so only an argument inference proved to already be exactly
+     * that type binds unchanged. */
+    static bool bind_is_identity(const FuncDeclStmt *f, size_t i,
+                                 const Construct *arg)
+    {
+        switch (param_decl_type(f, i)) {
+        case DeclType::i:
+            return arg->th == TypeHint::i && !arg->th_bool;
+        case DeclType::f:
+            return arg->th == TypeHint::f;
+        default:
+            return true;
+        }
+    }
+
+    /* The type hint of a temp holding param i's BOUND value. */
+    static TypeHint temp_hint(const FuncDeclStmt *f, size_t i,
+                              const Construct *arg)
+    {
+        switch (param_decl_type(f, i)) {
+        case DeclType::i: return TypeHint::i;
+        case DeclType::f: return TypeHint::f;
+        default:          return arg->th;
+        }
+    }
+
+    /* May `arg` be pasted into the body for a param used `uses` times? An
+     * inert arg any number of times; a constant array/dict literal (it
+     * cannot throw, but each evaluation is a fresh object) at most once. */
+    /* Does f's body WRITE THROUGH parameter i (see writes_through)? By
+     * NAME, so it serves the expression engine (which substitutes by uid)
+     * and the block engines alike; a same-named shadowing local can only
+     * make it answer yes, which costs a substitution, never soundness. */
+    static bool param_written_through(const FuncDeclStmt *f, size_t i)
+    {
+        if (!f->params || i >= f->params->elems.size())
+            return false;
+        const UniqueId *puid = f->params->elems[i]->uid;
+        return writes_through(f->body.get(), [&](const Identifier *id) {
+            return id->uid == puid;
+        });
+    }
+
+    /* Does f's body write INTO the struct parameter i may hold (writes_
+     * through, member_only)? Then the parameter is the call's own copy of
+     * a value, and no argument - not even a name - may stand for it: the
+     * write would reach the caller's variable. It is bound to a temp,
+     * which the write then makes its own (struct_own). */
+    static bool param_member_written(const FuncDeclStmt *f, size_t i)
+    {
+        if (!f->params || i >= f->params->elems.size())
+            return false;
+        const UniqueId *puid = f->params->elems[i]->uid;
+        return writes_through(f->body.get(), [&](const Identifier *id) {
+            return id->uid == puid;
+        }, /*member_only=*/true);
+    }
+
+    bool arg_substitutable(const FuncDeclStmt *f, size_t i,
+                           const Construct *arg, int uses) const
+    {
+        if (!bind_is_identity(f, i, arg))
+            return false;
+        /*
+         * A parameter the body writes through is bound, never pasted - not
+         * even a NAME. A write position needs an lvalue, and the write must
+         * go where the call's would: through the parameter's own copy of
+         * the handle. For an array that copy shares the storage, so the
+         * write reaches the caller's array either way. A SLICE's copy used
+         * to be its own view (2026-10-12: pasted, `f(u)` with `x[0] = 77`
+         * changed u inlined and left it alone under -ni); since question 3
+         * (Python's rule) it is the same slice, so for a name the rule is
+         * only conservative now. A write INTO a struct the parameter holds
+         * needs the call's own copy (a struct is a value).
+         */
+        if (param_written_through(f, i))
+            return false;
+        if (param_member_written(f, i))
+            return false;
+        if (arg_is_inert(arg))
+            return true;
+        return uses <= 1 && is_const_literal(arg);
     }
 
     /*
@@ -3772,7 +7109,7 @@ private:
      */
     static bool tail_arg_ok(int uses, const Construct *arg)
     {
-        auto *id = dynamic_cast<const Identifier *>(arg);
+        auto *id = node_cast<const Identifier>(arg);
         const bool local = id && id->sym.kind == SymKind::local;
 
         if (!local && !is_const_literal(arg))
@@ -3784,6 +7121,50 @@ private:
         return dynamic_cast<const Literal *>(arg)   /* scalar: drop or dup ok */
             || (uses >= 2 && local);                /* identifier: same slot */
     }
+
+    /* The name an inlined (virtual) frame renders: the SAME one a
+     * physical frame of `f` renders (format_backtrace prefers the
+     * descriptor's display_name), so a template instance `f$0` or a
+     * specialization clone `f$s0` reads `f` whether or not the call
+     * was inlined - RULE 2 (#38). */
+    static std::string inline_frame_name(const FuncDeclStmt *f)
+    {
+        if (!f->desc->display_name.empty())
+            return f->desc->display_name;
+        return std::string(f->id->get_str());
+    }
+
+#ifdef INT_TESTS
+    /* The caller as a backtrace names it: `main` at the top level,
+     * `<lambda>` for an anonymous function (inline_frame_name assumes a
+     * named one - a lambda has no `id`). */
+    /* #107 P3: the AST INLINE of a site as an enumerated decision - the
+     * engines ask at their commit point (eligible, within budget, nothing
+     * mutated yet) and pick 1 declines: the call stays a call, which RULE
+     * 2 says must not change anything observable. One key per call site,
+     * not per engine, so a forced decline is a decline by every engine. */
+    bool int_inline_declined(const CallExpr *ce) const
+    {
+        const std::string caller =
+            !int_caller ? std::string("main")
+            : int_caller->id ? std::string(int_caller->id->get_str())
+            : "<lambda>@" + std::to_string(int_caller->start.line);
+        const std::string key = caller + "/inline@"
+                              + std::to_string(ce->start.line) + ":"
+                              + std::to_string(ce->start.col);
+        const int pick = int_choose(key, 2, 0);
+        ML_INT(inline_choice, key, int64_t(2), int64_t(0), int64_t(pick));
+        return pick == 1;
+    }
+    std::string int_caller_name() const
+    {
+        if (!int_caller)
+            return "main";
+        if (!int_caller->desc->display_name.empty() || int_caller->id)
+            return inline_frame_name(int_caller);
+        return "<lambda>";
+    }
+#endif
 
     static std::vector<std::string> param_names(const FuncDeclStmt *f)
     {
@@ -3820,10 +7201,10 @@ private:
 
     static int node_weight(const Construct *c)
     {
-        if (dynamic_cast<const CallExpr *>(c))    return CALL_WEIGHT; /* +Direct*/
-        if (dynamic_cast<const Expr14 *>(c))      return 11;  /* assignment    */
-        if (dynamic_cast<const IfStmt *>(c))      return 7;
-        if (dynamic_cast<const ReturnStmt *>(c))  return 3;
+        if (ctag(c) == ConstructType::call)    return CALL_WEIGHT; /* +Direct*/
+        if (ctag(c) == ConstructType::expr14)      return 11;  /* assignment    */
+        if (ctag(c) == ConstructType::if_stmt)      return 7;
+        if (ctag(c) == ConstructType::ret)  return 3;
         /* id / literal / arith / compare / structural: ~1 */
         return 1;
     }
@@ -3835,22 +7216,24 @@ private:
         if (!c)
             return 0;
         int w = node_weight(c);
-        if (auto *b = dynamic_cast<const Block *>(c)) {
+        if (ctag(c) == ConstructType::block) {
+            auto *b = static_cast<const Block *>(c);
             for (auto &e : b->elems) w += body_weight(e.get());
             return w;
         }
-        if (auto *f = dynamic_cast<const ForStmt *>(c))
+        if (auto *f = node_cast<const ForStmt>(c))
             return w + body_weight(f->init.get()) + body_weight(f->cond.get())
                  + body_weight(f->inc.get()) + body_weight(f->body.get());
-        if (auto *fe = dynamic_cast<const ForeachStmt *>(c))
+        if (auto *fe = node_cast<const ForeachStmt>(c))
             return w + body_weight(fe->container.get())
                  + body_weight(fe->body.get());
-        if (auto *tc = dynamic_cast<const TryCatchStmt *>(c)) {
+        if (ctag(c) == ConstructType::try_catch) {
+            auto *tc = static_cast<const TryCatchStmt *>(c);
             w += body_weight(tc->tryBody.get());
             for (auto &p : tc->catchStmts) w += body_weight(p.second.get());
             return w + body_weight(tc->finallyBody.get());
         }
-        if (auto *e = dynamic_cast<const Expr14 *>(c))
+        if (auto *e = node_cast<const Expr14>(c))
             return w + body_weight(e->lvalue.get())
                  + body_weight(e->rvalue.get());
         for_each_child(const_cast<Construct *>(c),
@@ -3871,21 +7254,26 @@ private:
             return 0;
         int n = 1;
 
-        if (auto *b = dynamic_cast<const Block *>(c)) {
+        if (ctag(c) == ConstructType::block) {
+            auto *b = static_cast<const Block *>(c);
             for (auto &e : b->elems)
                 n += count_all_nodes(e.get());
-        } else if (auto *e14 = dynamic_cast<const Expr14 *>(c)) {
+        } else if (ctag(c) == ConstructType::expr14) {
+            auto *e14 = static_cast<const Expr14 *>(c);
             n += count_all_nodes(e14->lvalue.get());
             n += count_all_nodes(e14->rvalue.get());
-        } else if (auto *f = dynamic_cast<const ForStmt *>(c)) {
+        } else if (ctag(c) == ConstructType::for_stmt) {
+            auto *f = static_cast<const ForStmt *>(c);
             n += count_all_nodes(f->init.get());
             n += count_all_nodes(f->cond.get());
             n += count_all_nodes(f->inc.get());
             n += count_all_nodes(f->body.get());
-        } else if (auto *fe = dynamic_cast<const ForeachStmt *>(c)) {
+        } else if (ctag(c) == ConstructType::foreach_stmt) {
+            auto *fe = static_cast<const ForeachStmt *>(c);
             n += count_all_nodes(fe->container.get());
             n += count_all_nodes(fe->body.get());
-        } else if (auto *tc = dynamic_cast<const TryCatchStmt *>(c)) {
+        } else if (ctag(c) == ConstructType::try_catch) {
+            auto *tc = static_cast<const TryCatchStmt *>(c);
             n += count_all_nodes(tc->tryBody.get());
             for (auto &p : tc->catchStmts)
                 n += count_all_nodes(p.second.get());
@@ -3902,7 +7290,7 @@ private:
         if (!c)
             return 0;
         int n = 0;
-        if (auto *id = dynamic_cast<const Identifier *>(c))
+        if (auto *id = node_cast<const Identifier>(c))
             if (id->uid == uid)
                 n = 1;
         for_each_child(const_cast<Construct *>(c),
@@ -3923,15 +7311,17 @@ private:
         if (!c)
             return false;
         if (dynamic_cast<const Literal *>(c)
-                || dynamic_cast<const LiteralObj *>(c))
+                || ctag(c) == ConstructType::lit_obj)
             return true;
-        if (auto *la = dynamic_cast<const LiteralArray *>(c)) {
+        if (ctag(c) == ConstructType::lit_arr) {
+            auto *la = static_cast<const LiteralArray *>(c);
             for (auto &e : la->elems)
                 if (!is_const_literal(e.get()))
                     return false;
             return true;
         }
-        if (auto *ld = dynamic_cast<const LiteralDict *>(c)) {
+        if (ctag(c) == ConstructType::lit_dict) {
+            auto *ld = static_cast<const LiteralDict *>(c);
             for (auto &kv : ld->elems)
                 if (!is_const_literal(kv->key.get())
                         || !is_const_literal(kv->value.get()))
@@ -3944,12 +7334,12 @@ private:
     /* A read-expression node we may try to evaluate-and-fold. */
     static bool is_foldable_expr(const Construct *c)
     {
-        return dynamic_cast<const MultiOpConstruct *>(c)
-            || dynamic_cast<const TypedScalarExpr *>(c)  /* M8: cross-input */
-            || dynamic_cast<const Subscript *>(c)
-            || dynamic_cast<const Slice *>(c)
-            || dynamic_cast<const MemberExpr *>(c)
-            || dynamic_cast<const CallExpr *>(c);
+        return node_cast<const MultiOpConstruct>(c)
+            || ctag(c) == ConstructType::typed_scalar  /* M8: cross-input */
+            || ctag(c) == ConstructType::subscript
+            || ctag(c) == ConstructType::slice
+            || ctag(c) == ConstructType::member
+            || ctag(c) == ConstructType::call;
     }
 
     /*
@@ -3962,7 +7352,7 @@ private:
     {
         if (!c)
             return false;
-        if (auto *id = dynamic_cast<const Identifier *>(c))
+        if (auto *id = node_cast<const Identifier>(c))
             return id->sym.kind == SymKind::local;
         bool found = false;
         for_each_child(const_cast<Construct *>(c),
@@ -3990,11 +7380,13 @@ private:
 
         /* Recurse, skipping lvalue positions. */
         Construct *cc = slot.get();
-        if (auto *e14 = dynamic_cast<Expr14 *>(cc)) {
+        if (ctag(cc) == ConstructType::expr14) {
+            auto *e14 = static_cast<Expr14 *>(cc);
             refold(e14->rvalue);                 /* skip assignment target */
-        } else if (auto *ce = dynamic_cast<CallExpr *>(cc)) {
+        } else if (ctag(cc) == ConstructType::call) {
+            auto *ce = static_cast<CallExpr *>(cc);
             refold(ce->what);
-            auto *callee = dynamic_cast<Identifier *>(ce->what.get());
+            auto *callee = node_cast<Identifier>(ce->what.get());
             const bool lval0 = callee && ce->args && !ce->args->elems.empty()
                             && is_lvalue_arg_builtin(callee->get_str());
             for (size_t i = 0; i < ce->args->elems.size(); i++)
@@ -4007,7 +7399,7 @@ private:
              * execution-order-dependent property. (An inlined `return
              * defined(gg)` body exposed this; the resolver's try_fold_defined
              * already folded every soundly-foldable case.) */
-            if (callee && is_lazy_builtin(callee->uid))
+            if (lazy_builtin_callee(ce))
                 return;
         } else {
             for_each_child_slot(cc,
@@ -4025,7 +7417,7 @@ private:
                 lit->start = c->start;
                 lit->end = c->end;
                 lit->inline_ctx = c->inline_ctx;
-                slot = move(lit);
+                slot = std::move(lit);
             }
         } catch (const Exception &) {
             /* not const-foldable / would throw: leave it for runtime */
@@ -4041,13 +7433,15 @@ private:
      */
     void try_specialize(unique_ptr<Construct> &slot)
     {
-        auto *ce = dynamic_cast<CallExpr *>(slot.get());
+        auto *ce = node_cast<CallExpr>(slot.get());
         if (!ce)
             return;
 
-        auto *callee = dynamic_cast<Identifier *>(ce->what.get());
+        auto *callee = node_cast<Identifier>(ce->what.get());
         if (!callee || callee->sym.kind == SymKind::local)
             return;
+        if (callee->live_guard())
+            return;                     /* reads its variable: see walk() */
 
         auto it = spec_funcs.find(callee->uid);
         if (it == spec_funcs.end() || !it->second)
@@ -4073,6 +7467,13 @@ private:
 
             Construct *arg = ce->args->elems[i].get();
 
+            /* RULE 1: a none into a parameter not declared `opt` stays an
+             * argument, for the clone's bind to refuse (folding it in would
+             * bind nothing; -nti is the only way such a call compiles) */
+            if (ctag(arg) == ConstructType::lit_none
+                    && !f->desc->params[i].opt)
+                continue;
+
             if (dynamic_cast<Literal *>(arg)) {
                 seed[static_cast<int>(i)] = arg->eval(&cctx);
                 continue;
@@ -4080,12 +7481,12 @@ private:
 
             /* A baked const array/dict literal, or an identifier bound to a
              * const global; bind only when its value is deep read-only. */
-            if (dynamic_cast<LiteralObj *>(arg)
-                    || dynamic_cast<Identifier *>(arg)) {
+            if (ctag(arg) == ConstructType::lit_obj
+                    || ctag(arg) == ConstructType::id) {
                 try {
                     EvalValue v = RValue(arg->eval(&cctx));
                     if (is_readonly_value(v))
-                        seed[static_cast<int>(i)] = move(v);
+                        seed[static_cast<int>(i)] = std::move(v);
                 } catch (const Exception &) {
                     /* not const-evaluable (a runtime local/global): skip */
                 }
@@ -4116,7 +7517,7 @@ private:
 
         TRACE(specialize, 0, std::string(callee->get_str()) +
               "  const arg(s) folded -> " +
-              std::string(clone->id->get_str()));
+              std::string(clone->id->get_str()) + clone->spec_args_str());
 
         /* Redirect to the clone (same args; the const ones are now ignored).
          * Carry the clone's resolved sym onto the new callee so the call reads
@@ -4125,7 +7526,7 @@ private:
         what->start = ce->what->start;
         what->end = ce->what->end;
         what->sym = clone->id->sym;
-        ce->what = move(what);
+        ce->what = std::move(what);
 
         /* Re-point the devirtualized-call slot at the CLONE (the resolver set it
          * to the original function before this redirect). Script mode: the clone
@@ -4155,7 +7556,7 @@ private:
             base + "$s" + std::to_string(spec_counter++));
         fc->sync_params();   /* re-snapshot desc->name from the synthetic id */
 
-        auto *body = dynamic_cast<Block *>(fc->body.get());
+        auto *body = node_cast<Block>(fc->body.get());
         if (!body)
             return nullptr;
 
@@ -4168,6 +7569,18 @@ private:
 
         if (count_all_nodes(fc->body.get()) >= before)
             return nullptr;        /* folding didn't shrink it: not worth it */
+
+        /* what each bound parameter holds, for `:globals` and the trace */
+        const size_t np = fc->params ? fc->params->elems.size() : 0;
+        fc->spec_args.assign(np, std::string());
+        for (const auto &kv : seed) {
+            if (kv.first < 0 || static_cast<size_t>(kv.first) >= np)
+                continue;
+            std::string r = kv.second.to_string_repr();
+            if (r.size() > 40)
+                r = r.substr(0, 37) + "...";
+            fc->spec_args[static_cast<size_t>(kv.first)] = r;
+        }
 
         /*
          * Give the clone's name a GLOBAL-table slot (script mode), so its decl
@@ -4185,7 +7598,7 @@ private:
         }
 
         FuncDeclStmt *raw = fc;
-        new_funcs.push_back(move(clone));
+        new_funcs.push_back(std::move(clone));
         return raw;
     }
 
@@ -4240,12 +7653,15 @@ private:
         if (!slot)
             return;
 
-        if (auto *id = dynamic_cast<Identifier *>(slot.get())) {
-            if (id->uid == uid) {
+        if (ctag(slot.get()) == ConstructType::id) {
+            auto *id = static_cast<Identifier *>(slot.get());
+            /* a builtin_only reference (#94) names the builtin, never a
+             * parameter of the same name */
+            if (id->uid == uid && !id->builtin_only) {
                 unique_ptr<Construct> a = arg->clone();  /* fresh per use */
                 a->start = slot->start;   /* keep the param's source position */
                 a->end = slot->end;       /* so errors point as in the callee */
-                slot = move(a);
+                slot = std::move(a);
                 return;
             }
         }
@@ -4264,7 +7680,8 @@ private:
             return root;
         return alloc_inline_ctx({ chain->callee_name, chain->params,
                                   chain->call_site,
-                                  rebase(chain->parent, root) });
+                                  rebase(chain->parent, root),
+                                  chain->call_end });
     }
 
     static void tag_inline(Construct *c, const InlineCtx *ic)
@@ -4272,7 +7689,15 @@ private:
         if (!c)
             return;
         c->inline_ctx = rebase(c->inline_ctx, ic);
-        for_each_child(c, [&](Construct *ch) { tag_inline(ch, ic); });
+        /* fmi_children, NOT for_each_child: the latter omits the nodes
+         * the resolver's walk() handles itself (Block, for, foreach,
+         * try, Expr14), so every STATEMENT of a spliced block body -
+         * `var t = ...`, a loop, a try - kept no inlined-at chain and
+         * an error there lost the inlined callee's frame (#38 repro B).
+         * A nested FuncDeclStmt is still not entered: a lambda's body
+         * runs in its own PHYSICAL frame, whose virtual frames are its
+         * call site's, never the enclosing splice's. */
+        fmi_children(c, [&](Construct *ch) { tag_inline(ch, ic); });
     }
 };
 
@@ -4298,12 +7723,13 @@ devirtualize_calls(unique_ptr<Construct> &slot,
     if (!slot)
         return;
 
-    if (auto *call = dynamic_cast<CallExpr *>(slot.get())) {
+    if (ctag(slot.get()) == ConstructType::call) {
+        auto *call = static_cast<CallExpr *>(slot.get());
         /* Skip an already-specialized node (idempotent). */
         if (!dynamic_cast<DirectCallExpr *>(call) &&
             !dynamic_cast<DirectBuiltinCallExpr *>(call)) {
 
-            auto *id = dynamic_cast<Identifier *>(call->what.get());
+            auto *id = node_cast<Identifier>(call->what.get());
 
             if (id && id->sym.kind == SymKind::builtin) {
                 /* Unshadowed builtin: bake its (immutable, singleton-table)
@@ -4311,6 +7737,7 @@ devirtualize_calls(unique_ptr<Construct> &slot,
                  * map-resident (sym.kind isn't builtin). */
                 auto d = make_unique<DirectBuiltinCallExpr>();
                 call->copy_base_fields(*d);
+                call->copy_call_fields(*d);   /* incl. tq_folded, vm_len_kind */
                 d->lvalue_arg0 = is_lvalue_arg_builtin(id->get_str());
                 d->lvalue_rest_native =
                     is_lvalue_rest_native_builtin(id->get_str());
@@ -4318,11 +7745,10 @@ devirtualize_calls(unique_ptr<Construct> &slot,
                     is_lvalue_rest_capable_builtin(id->get_str());
                 d->map_filter_kind = id->get_str() == "map"    ? 1
                                    : id->get_str() == "filter" ? 2 : 0;
-                d->tq_folded = call->tq_folded;   /* folded type query -> elide */
-                d->what = move(call->what);
-                d->args = move(call->args);
+                d->what = std::move(call->what);
+                d->args = std::move(call->args);
                 d->builtin = builtin_slot(id->sym.slot).getval<Builtin>();
-                slot = move(d);
+                slot = std::move(d);
             } else if (call->direct_func_slot >= 0) {
                 /* Global-slot callee (function / struct / escaped global). A
                  * cacheable pure-recursive callee becomes a CachedCallExpr so
@@ -4334,13 +7760,10 @@ devirtualize_calls(unique_ptr<Construct> &slot,
                         ? unique_ptr<DirectCallExpr>(new CachedCallExpr())
                         : make_unique<DirectCallExpr>();
                 call->copy_base_fields(*d);
-                d->what = move(call->what);
-                d->args = move(call->args);
-                d->direct_func_slot = call->direct_func_slot;
-                d->vm_direct_func = call->vm_direct_func;
-                d->vm_struct_ctor_def = call->vm_struct_ctor_def;
-                d->vm_struct_boxed_def = call->vm_struct_boxed_def;
-                slot = move(d);
+                call->copy_call_fields(*d);
+                d->what = std::move(call->what);
+                d->args = std::move(call->args);
+                slot = std::move(d);
             }
         }
     }
@@ -4357,7 +7780,8 @@ collect_cacheable_slots(Construct *c, std::unordered_set<int> &out)
 {
     if (!c)
         return;
-    if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+    if (ctag(c) == ConstructType::func_decl) {
+        auto *fd = static_cast<FuncDeclStmt *>(c);
         if (fd->id && fd->id->sym.kind == SymKind::global
                 && fd->desc->cache_results)
             out.insert(fd->id->sym.slot);
@@ -4365,11 +7789,170 @@ collect_cacheable_slots(Construct *c, std::unordered_set<int> &out)
             collect_cacheable_slots(fd->body.get(), out);
         return;
     }
-    if (auto *b = dynamic_cast<Block *>(c)) {
+    if (ctag(c) == ConstructType::block) {
+        auto *b = static_cast<Block *>(c);
         for (auto &e : b->elems) collect_cacheable_slots(e.get(), out);
         return;
     }
     for_each_child(c, [&](Construct *ch) { collect_cacheable_slots(ch, out); });
+}
+
+/*
+ * #93: stamp every function's per-parameter escape bits.
+ *
+ * ⛔ IT RUNS HERE, AT THE END OF resolve_names, AND NOT IN
+ * process_function WHERE ITS SIBLING func_mutates_input LIVES - because
+ * the answer depends on `SymKind::global`, which pass 2 has not stamped
+ * yet when a body is walked. A first version did stamp it there and was
+ * caught by the analysis' own test: `func f(a) { g = [9]; a[0] = 1; }`
+ * came back with `a` marked non-escaping, because the write to the global
+ * `g` still looked like a write to an unresolved name. That is the
+ * audit-table stage trap in its usual shape - a pass reading a table one
+ * stage before it is filled - and here the failure direction is a
+ * use-after-free, so the stage matters more than the tidiness of sitting
+ * next to the related analysis.
+ */
+#ifdef TESTS
+unsigned long g_noescape_funcs = 0;    /* functions with >=1 marked param */
+unsigned long g_noescape_marks = 0;    /* parameters marked, in total */
+/* the DENOMINATOR, so the reach number can be read as a hit rate rather
+ * than an absolute nobody can size: how many parameters were even
+ * candidates (a reference param of an analysable function), and how many
+ * candidate-bearing functions lost everything to the all-or-nothing
+ * `unsafe` poison rather than to a per-parameter rule */
+unsigned long g_noescape_cands = 0;
+unsigned long g_noescape_unsafe = 0;
+unsigned long g_esc_p_callee = 0, g_esc_p_gwrite = 0,
+              g_esc_p_hobuiltin = 0, g_esc_p_shape = 0;
+unsigned long g_esc_named_by_cs = 0;   /* #116 inc 4 reach - see ESC_NAMED */
+#endif
+
+/* every named function body, plus which global slot names it and which
+ * global slots some assignment writes (a slot a program reassigns cannot be
+ * trusted to still hold the function whose name it is) */
+static void esc_collect(Construct *c, std::vector<EscFn> &fns, EscWorld &w)
+{
+    if (!c)
+        return;
+    if (ctag(c) == ConstructType::func_decl) {
+        auto *fd = static_cast<FuncDeclStmt *>(c);
+        if (fd->desc) {
+            if (fd->id && fd->id->sym.kind == SymKind::global)
+                w.slot2fn[fd->id->sym.slot] = static_cast<int>(fns.size());
+            w.fd2fn[fd] = static_cast<int>(fns.size());
+            EscFn f;
+            f.fd = fd;
+            fns.push_back(f);
+        }
+        /*
+         * ⛔ WALK THE BODY EXPLICITLY: `for_each_child` has NO FuncDeclStmt
+         * arm, so the generic descent below sees a function declaration as
+         * childless and this collection stopped at the TOP LEVEL. Two
+         * things were wrong with that, one of them pre-dating the borrow:
+         *
+         *  - a LAMBDA or a nested named function never entered `fns` at
+         *    all, so it could not be recognised as a callback (which is
+         *    what made the higher-order-builtin rule unable to name any
+         *    real callback), and its own parameters were never analysed;
+         *  - `written_slots` - the reassigned-global-slot set that decides
+         *    whether a call may be resolved through `slot2fn` at all - was
+         *    collected from top-level statements ONLY. A function body
+         *    doing `helper = other;` was invisible, so a call to `helper`
+         *    elsewhere resolved to the ORIGINAL function and the fixpoint
+         *    answered for a callee that may no longer be there. That is
+         *    the unsound direction, and it is why this is a fix and not
+         *    just an enabler.
+         */
+        esc_collect(fd->body.get(), fns, w);
+        return;
+    } else if (ctag(c) == ConstructType::struct_decl) {
+        auto *sd = static_cast<StructDeclStmt *>(c);
+        if (sd->id && sd->id->sym.kind == SymKind::global)
+            w.struct_slots.insert(sd->id->sym.slot);
+    } else if (esc_writes_global(c)) {
+        const Construct *lv = nullptr;
+        if (auto *e = node_cast<const Expr14>(c))
+            lv = e->lvalue.get();
+        else if (auto *idc = node_cast<const IncDecExpr>(c))
+            lv = idc->lvalue.get();
+        /* only a WHOLE-slot write can replace the function; `g[i] = v`
+         * mutates the object the slot points at */
+        if (auto *id = node_cast<const Identifier>(lv))
+            w.written_slots.insert(id->sym.slot);
+    }
+    fmi_children(c, [&](Construct *ch) { esc_collect(ch, fns, w); });
+}
+
+/*
+ * #93: stamp every function's per-parameter escape bits - see THE
+ * PARAMETER ESCAPE ANALYSIS and THE CALL-GRAPH ESCAPE FIXPOINT above.
+ *
+ * ⛔ IT RUNS HERE, AT THE END OF resolve_names, AND NOT IN
+ * process_function WHERE ITS SIBLING func_mutates_input LIVES - because
+ * the answer depends on `SymKind::global`, which pass 2 has not stamped
+ * yet when a body is walked, and (since the fixpoint) on
+ * `direct_func_slot`, which `devirtualize_direct_calls` stamps one line
+ * above this call. A first version did stamp it in process_function and
+ * was caught by the analysis' own test: `func f(a) { g = [9]; a[0] = 1; }`
+ * came back with `a` marked non-escaping, because the write to the global
+ * `g` still looked like a write to an unresolved name. That is the
+ * audit-table stage trap in its usual shape - a pass reading a table one
+ * stage before it is filled - and here the failure direction is a
+ * use-after-free, so the stage matters more than the tidiness of sitting
+ * next to the related analysis.
+ */
+static void stamp_noescape_params(Construct *root)
+{
+    std::vector<EscFn> fns;
+    EscWorld w;
+    esc_collect(root, fns, w);
+
+    for (EscFn &f : fns)
+        esc_scan_body(f, w);
+
+    /*
+     * THE FIXPOINT. Two facts travel the call graph, and both only ever get
+     * WORSE, so the iteration terminates: `unsafe` spreads from a callee to
+     * its callers (whatever it may do to a global, calling it may do too),
+     * and an edge "my param i is argument j of g" clears i as soon as g's
+     * param j turns out to escape - or g turns out to be unsafe.
+     */
+    for (bool changed = true; changed; ) {
+        changed = false;
+        for (EscFn &f : fns) {
+            for (int c : f.calls)
+                if (fns[c].unsafe && !f.unsafe) {
+                    f.unsafe = true;
+                    changed = true;
+                }
+            for (const EscEdge &e : f.edges) {
+                const EscFn &g = fns[e.callee];
+                const bool ok = !g.unsafe
+                    && e.argpos < 64
+                    && (g.mask >> e.argpos & 1)
+                    && !(g.written >> e.argpos & 1);
+                if (!ok && (f.mask >> e.mine & 1)) {
+                    f.mask &= ~(uint64_t(1) << e.mine);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    for (EscFn &f : fns) {
+        f.fd->desc->noescape_params = esc_final_mask(f);
+#ifdef TESTS
+        for (uint64_t m = f.cands; m; m &= m - 1)
+            g_noescape_cands++;
+        if (f.cands && f.unsafe)
+            g_noescape_unsafe++;
+        if (f.fd->desc->noescape_params) {
+            g_noescape_funcs++;
+            for (uint64_t m = f.fd->desc->noescape_params; m; m &= m - 1)
+                g_noescape_marks++;
+        }
+#endif
+    }
 }
 
 static void
@@ -4390,13 +7973,14 @@ resolve_names(Construct *root, bool enable_inline, int inline_threshold,
     Resolver().run(root, analysis, repl_mode, prior_pure);
 
     if (enable_inline)
-        if (auto *rb = dynamic_cast<Block *>(root))
+        if (auto *rb = node_cast<Block>(root))
             Inliner(inline_threshold, analysis, prior_pure, repl_mode).run(rb);
 
     /* Devirtualize direct (global-slot) calls into DirectCallExpr nodes. After
      * the inliner so spec clones + redirected calls are covered; before
      * specialize_types, which treats a DirectCallExpr as the CallExpr it is. */
     devirtualize_direct_calls(root);
+    stamp_noescape_params(root);
 }
 
 void
@@ -4413,7 +7997,7 @@ void
 mark_implicit_globals(Construct *root,
                       const std::unordered_set<const UniqueId *> &known)
 {
-    Block *rb = dynamic_cast<Block *>(root);
+    Block *rb = node_cast<Block>(root);
     if (!rb)
         return;
 
@@ -4423,9 +8007,9 @@ mark_implicit_globals(Construct *root,
      * top-level assignment to it is recognized as an assignment, not a fresh
      * implicit var (`var a = 1; a = 2;` -> the second is an assignment). */
     auto record = [&](Construct *lv) {
-        if (auto *id = dynamic_cast<Identifier *>(lv))
+        if (auto *id = node_cast<Identifier>(lv))
             declared.insert(id->uid);
-        else if (auto *il = dynamic_cast<IdList *>(lv))
+        else if (auto *il = node_cast<IdList>(lv))
             for (auto &e : il->elems)
                 declared.insert(e->uid);
     };
@@ -4433,18 +8017,20 @@ mark_implicit_globals(Construct *root,
     for (auto &up : rb->elems) {
         Construct *c = up.get();
 
-        if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+        if (ctag(c) == ConstructType::func_decl) {
+            auto *fd = static_cast<FuncDeclStmt *>(c);
             if (fd->id)
                 declared.insert(fd->id->uid);
             continue;
         }
-        if (auto *sd = dynamic_cast<StructDeclStmt *>(c)) {
+        if (ctag(c) == ConstructType::struct_decl) {
+            auto *sd = static_cast<StructDeclStmt *>(c);
             if (sd->id)
                 declared.insert(sd->id->uid);
             continue;
         }
 
-        auto *e = dynamic_cast<Expr14 *>(c);
+        auto *e = node_cast<Expr14>(c);
         if (!e)
             continue;
 
@@ -4456,7 +8042,8 @@ mark_implicit_globals(Construct *root,
         /* A plain `name = expr` to an undeclared, non-builtin name: implicit
          * `var`. Only a bare identifier at the outermost scope qualifies. */
         if (e->op == Op::assign) {
-            if (auto *id = dynamic_cast<Identifier *>(e->lvalue.get())) {
+            if (ctag(e->lvalue.get()) == ConstructType::id) {
+                auto *id = static_cast<Identifier *>(e->lvalue.get());
                 if (!declared.count(id->uid) &&
                     builtin_slot_index(id->uid) < 0) {
                     e->fl |= pFlags::pInDecl;
@@ -4485,7 +8072,8 @@ void collect_resolver_analysis(Construct *root, AnalysisInfo &out)
         if (!c)
             return;
 
-        if (auto *fd = dynamic_cast<FuncDeclStmt *>(c)) {
+        if (ctag(c) == ConstructType::func_decl) {
+            auto *fd = static_cast<FuncDeclStmt *>(c);
 
             if (fd->id && fd->desc->effective_pure
                     && !fd->desc->explicit_pure)
@@ -4504,20 +8092,25 @@ void collect_resolver_analysis(Construct *root, AnalysisInfo &out)
             return;
         }
 
-        if (auto *b = dynamic_cast<Block *>(c)) {
+        if (ctag(c) == ConstructType::block) {
+            auto *b = static_cast<Block *>(c);
             for (auto &e : b->elems)
                 walk(e.get());
-        } else if (auto *f = dynamic_cast<ForStmt *>(c)) {
+        } else if (ctag(c) == ConstructType::for_stmt) {
+            auto *f = static_cast<ForStmt *>(c);
             walk(f->init.get()); walk(f->cond.get());
             walk(f->inc.get());  walk(f->body.get());
-        } else if (auto *fe = dynamic_cast<ForeachStmt *>(c)) {
+        } else if (ctag(c) == ConstructType::foreach_stmt) {
+            auto *fe = static_cast<ForeachStmt *>(c);
             walk(fe->container.get()); walk(fe->body.get());
-        } else if (auto *tc = dynamic_cast<TryCatchStmt *>(c)) {
+        } else if (ctag(c) == ConstructType::try_catch) {
+            auto *tc = static_cast<TryCatchStmt *>(c);
             walk(tc->tryBody.get());
             for (auto &p : tc->catchStmts)
                 walk(p.second.get());
             walk(tc->finallyBody.get());
-        } else if (auto *e14 = dynamic_cast<Expr14 *>(c)) {
+        } else if (ctag(c) == ConstructType::expr14) {
+            auto *e14 = static_cast<Expr14 *>(c);
             walk(e14->lvalue.get()); walk(e14->rvalue.get());
         } else {
             for_each_child(c, walk);

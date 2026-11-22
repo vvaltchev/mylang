@@ -1,0 +1,2042 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
+/*
+ * Native x86-64 AOT - the incremental baseline tier (plans/archived/native-aot.md).
+ *
+ * jit_compile_chunk runs LAST in codegen_chunk (after the peephole,
+ * extract_locs, ref_slots and specialize_arith_ops - and, later, after a
+ * `.myv` load): it finds maximal straight-line RUNS of proven-scalar int
+ * ops, compiles each into a frameless x86-64 fragment in a per-chunk
+ * mmap'd W^X buffer (Chunk::native), INSERTS an EnterNative op at each
+ * run head (remapping every pc field + the pc-keyed side tables with the
+ * original ops left in place, so any BAIL pc resumes interpreted), and
+ * flips the buffer executable.
+ *
+ * On unsupported platforms (non-x86-64, Windows) or under -nj /
+ * MYLANG_JIT=0 it is a no-op and the interpreter runs everything - the
+ * fallback story is inherent, not bolted on.
+ */
+
+#pragma once
+
+#include <cstddef>   /* size_t (jit_enter) */
+#include <cstdint>   /* uint32_t (the store helpers' pc) */
+#include <vector>    /* JitCtx's slot tables (#55 STEP 2.1) */
+
+#include "defs.h"    /* int_type */
+
+struct Chunk;
+struct Instr;                        /* bytecode.h; the census shims */
+enum class OpCode : uint8_t;         /* bytecode.h; no include needed */
+struct NorecSite;
+class LValue;
+
+/*
+ * THE JIT'S SUPPORTED PLATFORMS - one macro, because the condition is a
+ * POLICY and a policy stated in 28 places drifts.
+ *
+ * Linux x86-64 ONLY today. The emitter itself only needs x86-64 and a
+ * non-Windows ABI, but "the code would probably run" is not the bar for
+ * shipping a code generator - a platform is supported once it is TESTED
+ * there, and CI tests Linux. The others, by maintainer decision
+ * (2026-08-02):
+ *
+ *   FreeBSD x86-64  - to be enabled after it is actually tested there.
+ *   Darwin  x86-64  - NEVER. A deprecated platform; not worth the risk.
+ *   Windows (any)   - VM-only for a long time.
+ *   aarch64         - when the arm64 backend lands, on all three.
+ *
+ * Off-platform the whole tier compiles out and `g_jit_enabled` is always
+ * false, so the VM runs pure bytecode - the same thing `-nj` selects.
+ */
+#if defined(__linux__) && defined(__x86_64__)
+#  define ML_JIT_SUPPORTED 1
+#else
+#  define ML_JIT_SUPPORTED 0
+#endif
+
+/* The kill switch: -nj / MYLANG_JIT=0; always false off-platform. */
+extern bool g_jit_enabled;
+
+/* -vdj: record per-fragment op-boundary marks so the disassembler can
+ * interleave the native code with the VM ops. Off (zero cost) normally. */
+extern bool g_jit_annotate;
+
+/* The Type-tag singletons the emitter bakes into `movabs` immediates
+ * (rsi = int, r8 = float, r9 = array). The -vdj disassembler compares an
+ * immediate against these to label it `<int-tag>` etc. rather than a raw
+ * address. All null off-platform (no fragments there). */
+void jit_type_singletons(const void *&t_int, const void *&t_float,
+                         const void *&t_arr);
+
+/* Fragments compiled process-wide (tests / -vd audit). */
+extern unsigned long g_jit_frags;
+
+struct FuncDescriptor;   /* #55 STEP 2.1 - native call (pointers only here) */
+class LValue;
+
+/*
+ * #55 STEP 2.1: program context a caller's jit needs to decide+emit a NATIVE
+ * CallV (a compile-time decision - jit_op_eligible(Instr) alone can't see it).
+ *   slot_desc[global slot]      -> the callee FuncDescriptor* (null if that
+ *                                  slot isn't a native-callable function),
+ *   slot_reassigned[global slot]-> 1 if the slot is reassigned (NOT write-once),
+ *   caller_desc                 -> THIS chunk's own function descriptor (its
+ *                                  vm_chunk is the record's ret_chunk); null for
+ *                                  main -> no native call from main in v1.
+ * Null (the disasm / -rt / default path) -> no native calls emitted.
+ */
+struct JitCtx {
+    const std::vector<const FuncDescriptor *> *slot_desc = nullptr;
+    const std::vector<char> *slot_reassigned = nullptr;
+    const FuncDescriptor *caller_desc = nullptr;
+};
+
+void jit_compile_chunk(Chunk &chunk, const JitCtx *jc = nullptr);
+
+/*
+ * plans/archived/model-flip.md M1: the CONTAINER PLAN - a compile-time view of how a
+ * chunk partitions into NATIVE segments (maximal runs of native-eligible ops,
+ * incl. an already-inserted EnterNative) and ISLAND segments (maximal runs of
+ * un-nativizable ops). This is the analysis surface for the "native containers
+ * with bytecode islands" model flip: `container_ready` == "the whole body could
+ * be ONE native container" (every op native-eligible - a stronger bar than
+ * native_leaf, which also needs a single fully-native run ending in ReturnV).
+ * M1 is DUMP-ONLY (surfaced in -vd); later milestones consume the segments for
+ * whole-function emission. Segments are maximal runs (no basic-block splitting
+ * yet - that arrives when emission needs it). Empty (JIT unsupported) off
+ * platform. Pass the same JitCtx a caller's jit uses so a native CallV counts
+ * as native; null -> a CallV counts as an island (conservative).
+ */
+struct ContainerSeg {
+    size_t begin, end;   /* [begin, end) in the chunk's current pc space */
+    bool native;         /* true = native-eligible run (or EnterNative) */
+};
+struct ContainerPlan {
+    std::vector<ContainerSeg> segs;    /* ordered, cover [0,n); {} if JIT off */
+    bool container_ready = false;      /* >=1 seg AND every seg native */
+    int island_count = 0;
+    int island_op_count = 0;
+    int native_op_count = 0;
+};
+ContainerPlan jit_container_plan(const Chunk &chunk, const JitCtx *jc = nullptr);
+
+/* #55 STEP 2.1 layout offsets (probed in vm.cpp, which has the full defs; baked
+ * as immediates by the emitter). */
+ptrdiff_t jit_off_desc_vm_chunk();      /* FuncDescriptor::vm_chunk */
+ptrdiff_t jit_off_chunk_native_base();  /* Chunk::native.base */
+ptrdiff_t jit_off_chunk_native_entry(); /* Chunk::native_entry_off */
+
+/* Step 7a (the INLINE exception ops): the activation-side layout (probed in
+ * vm.cpp) + the cold grow path of the inline PushHandler. */
+struct VmActivation;
+VmActivation **jit_addr_vm_act();       /* &g_vm_act (file-static) */
+ptrdiff_t jit_off_act_handlers();       /* VmActivation::handlers */
+ptrdiff_t jit_off_act_records();        /* VmActivation::records */
+ptrdiff_t jit_off_act_rec_n();          /* VmActivation::rec_n */
+ptrdiff_t jit_sizeof_vm_rec();          /* sizeof(VmCallRec) */
+/* #78: the per-try-region pend/exc addressing (VmPendState, vm.cpp) -
+ * pends[rec.pend_base + region], entry stride jit_sizeof_pend_state(). */
+ptrdiff_t jit_off_act_top_rec();
+ptrdiff_t jit_off_act_pends();
+ptrdiff_t jit_off_rec_pend_base();
+ptrdiff_t jit_sizeof_pend_state();
+ptrdiff_t jit_off_pend_state_pend();           /* VmCallRec::pend */
+extern "C" void jit_push_handler_grow(int_type region) noexcept;
+/* question 12: a flagged SetPend frees the parked caught exception */
+extern "C" void jit_drop_caught(void *pend_state) noexcept;
+/* #78 step E: EndFinally's cold reraise arm (0 dispatched / 1 boundary /
+ * 2 conveyed / 3 nothing pending). See the definition in vm.cpp. */
+extern "C" int jit_end_finally(int_type region, int_type pc,
+                               int_type inline_chain,
+                               const void *frag_rbp,
+                               const void *raise_desc) noexcept;
+/* #80: the native `rethrow` - same 0/1/2 contract as jit_throw. */
+extern "C" int jit_rethrow(int_type region, int_type pc, const void *lep,
+                           int_type inline_chain,
+                           const void *frag_rbp,
+                           const void *raise_desc) noexcept;
+
+/* De-helperize 6b: the ctx-indirect address chain (probed in vm.cpp). */
+class EvalContext;
+EvalContext **jit_addr_current_ctx();   /* &g_current_ctx (file-static) */
+/* Re-raise deletability: the cold-side caret stamp - a conveying fragment's
+ * failure branch writes the op's baked start/end Locs DIRECTLY into the
+ * exception object in g_vm_jit_exc (null-checked: a bail conveys nothing,
+ * so nothing is written - no stale side-state is possible), making the
+ * caret pc-independent. The emitter needs the unique_ptr's storage address
+ * and the Loc offsets inside the object (probed, so they cannot drift). */
+void **jit_addr_exc();
+ptrdiff_t jit_off_exc_loc_start();
+ptrdiff_t jit_off_exc_loc_end();
+ptrdiff_t jit_off_exc_inline_frame();
+ptrdiff_t jit_off_exc_bind_arg();       /* Exception::bind_arg */
+ptrdiff_t jit_off_exc_op_caret();       /* Exception::op_caret */
+ptrdiff_t jit_off_ctx_captures();       /* EvalContext::captures */
+ptrdiff_t jit_off_ctx_gfuncs();         /* EvalContext::gfuncs */
+ptrdiff_t jit_off_ctx_flow();           /* EvalContext::flow (C4c) */
+ptrdiff_t jit_off_gft_slots();          /* GlobalFuncTable::slots */
+ptrdiff_t jit_off_gft_defined();        /* GlobalFuncTable::defined */
+
+/*
+ * #55 STEP 2.1: the native CallV setup helper (vm.cpp, extern "C" noexcept,
+ * baked as a call target). A caller fragment, at a native CallV, calls this to
+ * push the callee frame: resolve the FuncObject from the callee global slot
+ * (write-once => always a defined FuncObject, the gate proved it), then
+ * vm_frame_setup (ret_chunk = caller_desc->vm_chunk, ret_pc = callv_pc+1).
+ * Returns the callee window's slots ptr, which the caller loads into rdi before
+ * `call`ing the callee fragment; on StackOverflow (or any bind throw) it stashes
+ * the exception in g_vm_jit_exc and returns null, and the caller exits to
+ * callv_pc so EnterNative re-raises (caret from the loc table). noexcept: any
+ * RuntimeException is caught here, never a C++ throw out of native code.
+ */
+extern "C" LValue *jit_call_setup(int_type callee_slot, int_type argbase,
+                                  size_t nargs, int_type dst,
+                                  const FuncDescriptor *caller_desc,
+                                  size_t callv_pc) noexcept;
+
+/* M5: the SYNCHRONOUS native call - run a CallV's callee to completion
+ * inside the helper (the LEAN SYNC ENTER: a non-boundary frame whose
+ * ret_chunk is the sentinel stop chunk - see vm.cpp), so the CALLER
+ * fragment continues natively across the call. 0 = done (dst written);
+ * 1 = bail pre-side-effect (the interpreter re-runs the op); 2 = the callee
+ * threw (g_vm_jit_exc, or g_vm_jit_eptr for a plain exception).
+ * `site_packed` = the call-site loc (line << 32 | col) for the backtrace's
+ * innermost frame. jit_call_sync_cached is CachedCallV (probes the caller's
+ * per-frame pure cache first; a miss's key rides the callee record and is
+ * stored by the normal return pop); jit_call_sync_value is CallValueV (the
+ * callee VALUE sits in a frame temp, not a global slot). */
+/* Lever 1 step 5 + M5b: the sync call is fully emitted at the site (the
+ * push inline via emit_sync_push_native/JitPushLayout); jit_sync_postexit
+ * handles a direct-entered callee's non-sentinel exit (shared with the
+ * helper path's direct branch). */
+extern "C" int jit_sync_postexit(size_t r, int_type site_packed,
+                                 LValue *caller_win,
+                                 int_type caller_total) noexcept;
+/* #97 increment 2: the FRAMELESS callee's post-exit (an exception left
+ * a frameless frame; its window died with the native frame, released
+ * by the callee's own epilogue - no release, no segment adjust here) */
+extern "C" int jit_frameless_postexit(size_t r, int_type site_packed,
+                                      LValue *caller_win,
+                                      int_type caller_total) noexcept;
+extern "C" int jit_cached_probe(const void *desc, int_type argbase,
+                                int_type nargs, int_type dst) noexcept;
+void *jit_addr_pending_key();
+/* #88: the emitted sync call's baked call site (chain index + pool base),
+ * handed to the helper by side channel - see vm.cpp. */
+void *jit_addr_call_inline_chain();
+void *jit_addr_call_inline_pool();
+void *jit_addr_sync_depth();
+/* #97 E2: the decline relay - set by a frameless frame's slow tail, read
+ * and cleared by jit_call_sync(_cached): run the callee as a BOUNDARY
+ * call, so no depth-cap switch can propagate into that frame */
+void *jit_addr_nosw();
+/* #97 G2: an empty CaptureSlots, ctx.captures for a capture-free callee
+ * whose FuncObject a site no longer loads */
+const void *jit_empty_captures();
+int jit_sync_depth_cap();
+void jit_set_sync_depth_cap(int cap);   /* M5a: raised when the native
+                                         * stack arms; tests pin it low */
+void jit_native_stack_init();
+/* #97 E2d: set the native stack's self-site floor, returning the old one
+ * (a boundary call blocks it; null/unarmed builds ignore it) */
+char *jit_nstack_floor_swap(char *floor);
+#ifdef TESTS
+bool jit_test_nstack_armed();
+void jit_test_nstack_floor(size_t bytes_below_top);
+#endif
+
+/* M5b - the FULLY-INLINE record push: every offset/size the emitted push
+ * needs, probed from REAL objects in vm.cpp (the TU that owns
+ * VmActivation/VmCallRec/VmStackSeg) - the SharedArrayObj::jit_probe
+ * philosophy: measured from live members, so a layout change cannot
+ * silently drift. Filled once by jit_fill_push_layout. */
+struct JitPushLayout {
+    /* VmActivation */
+    ptrdiff_t act_segs, act_cur_seg, act_recs_high, act_diters_n,
+              act_dyiters_n, act_cur_sg, act_top_rec, act_vframe,
+              act_handlers2;
+    /* Frame (the view) */
+    ptrdiff_t frame_slots, frame_size, frame_pure_cache;
+    /* VmStackSeg (seg_cap: the PRECOMPUTED slot capacity - the emitted fit
+     * test used to rebuild it from the vector's two pointers and an imul) */
+    ptrdiff_t seg_slots, seg_cur, seg_end;
+    /* VmCallRec */
+    ptrdiff_t rec_window, rec_nslots, rec_seg, 
+              rec_run_chunk, rec_ret_chunk, rec_ret_pc, rec_dst, rec_desc,
+              rec_caller_caps, rec_handler_base, rec_diter_base,
+              rec_dyiter_base, rec_boundary, rec_sync_stop,
+              rec_cache_key, rec_caller_cache, rec_norec_site,
+              rec_native_rbp,
+              rec_parent_window, rec_parent_nslots, rec_parent_seg,
+              rec_parent_sg;
+    /* FuncDescriptor */
+    /* desc_bind_req: FuncDescriptor::bind_req (vector; data at +0) - the
+     * per-parameter required Type singleton, read only when !fast_bind */
+    ptrdiff_t desc_params, desc_frame_size, desc_fast_bind, desc_bind_req;
+    /* #94: FuncDescriptor::noescape_params - the escape analysis's
+     * per-parameter bit, read in the emitted push's REFERENCE arm to pick
+     * between the retaining and the borrowing helper. The callee is an
+     * inline CACHE here, not a compile-time constant, so this cannot be
+     * resolved at emit time the way the C++ bind resolves it. */
+    ptrdiff_t desc_noescape;
+    size_t param_desc_size;
+    /* Chunk (ck_plain_frame: the DERIVED byte flag that already means
+     * "no trys, no dict iters, no dyn iters" - one test for three) */
+    ptrdiff_t ck_n_temps, ck_plain_frame, ck_sync_entry, ck_norec_ok;
+    /* FuncObject */
+    ptrdiff_t fo_func, fo_capture_slots;
+    /* singletons/constants */
+    const void *t_func;
+    const void *stop_chunk;           /* &vm_sync_stop_chunk() */
+};
+void jit_fill_push_layout(JitPushLayout *out);
+
+extern "C" int jit_call_sync(int_type callee_slot, int_type ab_n,
+                             int_type resume_pc, int_type dst,
+                             int_type site_packed,
+                             const void *lep) noexcept;
+extern "C" int jit_call_sync_cached(int_type callee_slot, int_type argbase,
+                                    int_type nargs, int_type dst,
+                                    int_type site_packed,
+                             const void *lep) noexcept;
+extern "C" int jit_call_sync_value(int_type callee_temp, int_type argbase,
+                                   int_type nargs, int_type dst,
+                                   int_type site_packed,
+                             const void *lep) noexcept;
+
+/* #55 STEP 2.1: native CallVs SET UP process-wide (a `jit:` coverage counter -
+ * proves the native call path actually ran). */
+extern unsigned long g_jit_native_calls;
+
+/* model-flip M3: native-container island calls (jit_exec_block) run process-wide
+ * - a coverage counter proving the container path executed. */
+extern unsigned long g_jit_container_calls;
+
+/* #56: times an inlined-frame flush used the chain BAKED by a fragment
+ * (Exception::jit_inline_frame) instead of the pc lookup - the coverage
+ * counter proving the collapse-safe path ran, since a deleted run's pcs
+ * cannot discriminate between two inlined bodies. */
+extern unsigned long g_jit_inline_baked;
+/* #88: the same proof for the CALL SITE's baked chain (the side channel) -
+ * the twin mechanism, counted separately so a test can tell which ran. */
+extern unsigned long g_jit_inline_call_baked;
+
+/*
+ * D3.b step 2a (plans/register-allocator-endgame.md): PER-INTERVAL
+ * QUALIFICATION - the raw classification facts for ONE live interval
+ * (codegen.h's LiveInterval), produced by driving pick_visit_op
+ * (jit.cpp) over the run with the interval side's callbacks. Raw
+ * facts only; the consumer derives the pools:
+ *   GP candidate   : uses_int + uses_ret as weight; ADMISSION needs
+ *                    uses_int > 0 (an int-op touch is the TYPE
+ *                    evidence the t_int flush relies on - a ReturnV
+ *                    read is weight, never evidence: it reads ANY
+ *                    type); !mem_int; uses_float == 0 &&
+ *                    !wrote_float (disjoint pools)
+ *   XMM candidate  : wrote_float && uses_float > 0; !mem_float;
+ *                    uses_int == 0 (uses_ret is EXEMPT - the emit
+ *                    flushes before jit_ret; the pick's ReturnV note)
+ *   type-elidable  : wrote_int && !full_read (C3's rule)
+ * `orphans` (out-param of the builder) counts classification events
+ * whose (slot, pc) NO interval covers - a drift detector between
+ * visit_use_def (the liveness the intervals derive from) and
+ * pick_visit_op (the classification); asserted ZERO by the -rt check.
+ * The builder returns false when some op is unclassifiable - the
+ * pick's cache-nothing answer, and the scan must decline the same way.
+ */
+struct LiveInterval;                              /* codegen.h */
+struct IntervalQual {
+    int uses_int = 0;        /* countable int uses (usei / usei_dst) */
+    int uses_ret = 0;        /* ReturnV reads (weight, no float disq) */
+    int uses_float = 0;      /* countable float uses (usef) */
+    bool wrote_int = false;      /* an int op wrote it (usei_dst) */
+    bool wrote_float = false;    /* a float op wrote it (fdst) */
+    bool full_read = false;      /* read as a full 32-byte value */
+    bool mem_int = false;        /* memory-demanded for the GP pool */
+    bool mem_float = false;      /* memory-demanded for the xmm pool */
+};
+/* One memory-demand event: at `pc`, `slot`'s value must be IN ITS
+ * FRAME SLOT (a bad()/badi() site - the op takes the slot's address or
+ * a helper reads it via g_current_ctx). For the D3 scan this is a
+ * FORCED INTERVAL END: the interval is cut there, and only the
+ * mem-free pieces are register-allocatable (the design decision that
+ * retires the pick's run-wide bad() semantics). gp_only marks a
+ * badi() - the float side may still hold the slot across it. */
+struct MemEvent {
+    uint32_t pc;
+    int slot;
+    bool gp_only;
+};
+/* `int_uses` (optional): one {pc, slot} per countable INT-OP touch
+ * (usei / usei_dst; gp_only unused). The scan's PER-PIECE type
+ * evidence: an interval's evidence must not cross a cut - a dyn
+ * slot's single interval can span `d = 5; d = "hi"; d = [1,2]`
+ * (boxed redefinitions are liveness barriers that glue the defs
+ * together), and the post-cut remainder then holds an ARRAY while
+ * the interval still counts pc 0's int use. Admission therefore
+ * asks for an int touch INSIDE the piece, never inside the
+ * interval (the d1 finding). */
+/* One float-side event, for the FLOAT twin's per-piece evidence
+ * (the F ladder). `kind`: a usef READ, an fdst WRITE, or a MEM
+ * demand. The stream is SELF-CONTAINED for cutting - mem entries
+ * come from BOTH bad() (both-pool demands) and badf() (float-only:
+ * MoveV's boxed dest, CmpFloatV's bool dst), so the float scan
+ * never merges with the GP mem_events stream (whose badi() entries
+ * must NOT cut the float side).
+ * ⛔ THE EVIDENCE ASYMMETRY vs int_uses: a READ is NOT float type
+ * evidence - a float op legitimately reads a definitely-int slot
+ * through the promote arm, and a float entry-load movsd would
+ * reinterpret its int payload as a double. Admission needs a WRITE
+ * (the pick's fdst rule, per piece: the first float event in the
+ * piece must be a write; the pre-write entry-load is then dead by
+ * def-before-use inside the piece). */
+struct FltEvent {
+    uint32_t pc;
+    int slot;
+    enum Kind : uint8_t { read, write, mem } kind;
+};
+bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
+                           const std::vector<LiveInterval> &iv,
+                           std::vector<IntervalQual> &out,
+                           int *orphans = nullptr,
+                           std::vector<MemEvent> *mem_events = nullptr,
+                           std::vector<MemEvent> *int_uses = nullptr,
+                           std::vector<FltEvent> *flt_events = nullptr);
+
+/*
+ * D3.b step 2b-i (plans/register-allocator-endgame.md): THE LINEAR
+ * SCAN, as PURE ANALYSIS - no lever, no emission change; the output is
+ * a plan and the -rt net checks its invariants. GP pool only (the
+ * float twin is a recorded sibling case for 2b-ii).
+ *
+ * Each D1 interval is first CUT at its slot's MemEvent pcs (a
+ * memory-demanding op is a forced interval end - the design decision
+ * that retires the pick's run-wide bad()): the event pc itself becomes
+ * a one-pc forced-memory piece, the stretches between events stay
+ * allocatable. An interval with float facts, or with no use inside a
+ * piece (jit_next_use), is not a candidate. Then the walk -
+ * EVENT-DRIVEN since the second chance (#103b-2): piece starts and
+ * RE-BIDS process in (pc, kind, slot) order with expire-and-free,
+ * take a free register, and at
+ * pressure EVICT the piece with the LOWEST use DENSITY over its
+ * remaining interval - uses-remaining / span-remaining, the newcomer
+ * competing too (a heuristic, so a wrong choice costs a reload, never
+ * an answer; it replaced furthest-next-use after 89_regs_float_08
+ * showed distance evicting a 2-op/iter recurrence to keep a 1-op
+ * index and leaving the far-loop index unserved) - splitting the
+ * loser at the contested pc: the evicted piece keeps
+ * its register UP TO the contested pc, the remainder goes to memory.
+ * That split is what lets one variable use different registers - or
+ * none - in different parts of one run. A contest LOSER is not memory
+ * forever: it PARKS and re-bids at the next lin point (one pending
+ * re-bid per piece; a body has no lin points, so no ping-pong inside
+ * a loop), and a WON re-bid splits its piece - [s, at) memory,
+ * [at, e) resident (LsraOut::rebids counts the wins; the
+ * `lsra_rebids` JITSTATS row is their compile-time reach). The first
+ * build of the idea was rejected (+7.9%/iter on 83) under
+ * furthest-next-use eviction; the density contest closes that churn
+ * direction - a sparse re-entrant cannot displace a dense holder -
+ * and 83's plan now takes 2 re-bids at zero per-iteration cost. Registers are abstract indices
+ * 0..K-1 here; the physical binding (pool order, callee/caller-saved
+ * cost, rax's ISA facts) is 2b-ii's cost model.
+ *
+ * Pieces of one interval tile it exactly; every piece carries its
+ * verdict: reg >= 0, or -1 == memory (forced_mem says WHY when it was
+ * an event pc / float facts rather than pressure). Returns false when
+ * the inputs are inconsistent (an event outside every interval).
+ */
+struct LsraPiece {
+    int iv_idx;              /* the D1 interval this piece tiles */
+    int slot;
+    uint32_t start, end;     /* [start, end) pcs */
+    int reg;                 /* abstract register 0..K-1, or -1 */
+    bool forced_mem;         /* event pc / float facts - never a reg */
+};
+struct LsraOut {
+    std::vector<LsraPiece> pieces;   /* sorted by (start, slot) */
+    int cuts = 0;            /* extra pieces made by event cutting */
+    int evictions = 0;       /* pressure splits */
+    int rebids = 0;          /* WON second-chance re-entries: a
+                              * contest loser that parked, re-bid at
+                              * a lin point and took a register for
+                              * its remainder (#103b-2) */
+};
+/* FLOAT MODE (F2, the xmm twin): pass `fev` non-null and the scan
+ * allocates the FLOAT pool instead - cuts, evidence, the admission
+ * floor and the split-worthiness count all derive from the FltEvent
+ * stream (`mem` and `int_uses` are ignored; pass empty). The three
+ * rule flips vs GP: an interval with ANY countable int use is
+ * disqualified (uses_ret exempt - the emit flushes before jit_ret);
+ * cut pcs come from FltEvent::mem entries (bad() + badf() - a
+ * badi() must NOT cut this side); and ⛔ per-piece evidence is a
+ * float WRITE with NO READ AT A STRICTLY EARLIER PC in the piece -
+ * a read is not type evidence (the promote arm reads int slots),
+ * and a same-pc read+write pair is one dst touch, admissible. The
+ * floor counts read-kind events (== the pick's use_f weight). */
+bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
+                     const std::vector<LiveInterval> &iv,
+                     const std::vector<IntervalQual> &q,
+                     const std::vector<MemEvent> &mem,
+                     const std::vector<MemEvent> &int_uses,
+                     int K, LsraOut &out,
+                     const std::vector<FltEvent> *fev = nullptr,
+                     bool locals_only = false);
+/* `locals_only` (#124(a)): a TEMP slot (>= ck.slot_count) is never a
+ * candidate. The emitter pins locals only (v1), so a temp that won a
+ * contest used to be stripped AFTER the walk - and the local it had
+ * evicted never got the register back (program A at K=4: three of four
+ * registers used, `c` in memory). Keeping temps out of the contest is
+ * what hands that register to a local. */
+
+/*
+ * D3.b step 2b-iii-a (plans/register-allocator-endgame.md): SNAP the
+ * plan to the run's LINEARIZATION POINTS and translate it into the
+ * seam vocabulary the emitter already executes (#96 inc-2's
+ * ShareSeam, generalized).
+ *
+ * The executable condition comes from the share plan's soundness note,
+ * which REFUTED per-edge reasoning about intervals: a register-state
+ * transition may only sit at a pc NO branch edge crosses in either
+ * direction (an edge TARGETING the pc is legal - the emitter's
+ * seam_pre patching sends pre-transition sources before it and
+ * post-transition sources past it, which is exactly how a loop-head
+ * install becomes the loop-carried pin). A resident piece whose
+ * interior START, or whose interior MEM-CUT end (the flush the event
+ * pc demands), cannot sit on such a pc is DEMOTED to memory -
+ * demotion only, never a new resident pc.
+ *
+ * EVERY interior piece end (p.end < the run's end) emits a FLUSH
+ * transition, uniformly. A continuation end (mem-cut / eviction-
+ * split remainder) NEEDS it - memory is read right after; a death or
+ * hole end's flush merely writes a dead value (unread by liveness) -
+ * one wasted store, and what it buys is that the emitter's cache is
+ * TRUTHFUL at every pc: a silently-dropped dead hold would leave a
+ * stale cache entry that every cache-aware op keeps honoring, and a
+ * later mem-event read of the slot would then see stale memory (the
+ * hazard that killed the silent-drop design). A piece ending AT the
+ * run's end emits nothing - the exit flush machinery owns it.
+ * Installs never evict: the previous occupant's end flushed first.
+ *
+ * Replaying `entry_by_reg` + `trans` in pc order MUST reproduce the
+ * (post-demotion) pieces' residency at every pc - the -rt net derives
+ * that replay independently. Registers are still the plan's abstract
+ * indices.
+ */
+struct LsraTrans {
+    uint32_t pc;             /* a linearization point in [begin, end) */
+    int reg;                 /* abstract register index */
+    int evict_slot;          /* occupant flushed here, or -1 */
+    int install_slot;        /* new occupant loaded here, or -1 */
+};
+/* The run's non-sequential branch edges (fall-through excluded) -
+ * the ONE edge scan, shared by the share plan, the snap, and the
+ * snap's -rt net (which re-derives only the CROSSING rule from the
+ * spec; a second edge scan would drift). */
+void jit_run_edges(const Chunk &ck, size_t begin, size_t end,
+                   std::vector<std::pair<int, int>> &edges);
+/* `q` and `int_uses` feed THE WHOLE-RUN RESCUE (pick parity): when
+ * demotion would strike a piece of a slot the PICK would pin whole-
+ * run (no mem_int on any interval, no float facts, run-wide int
+ * weight >= 3), ALL the slot's pieces merge into ONE resident piece
+ * [begin, end) on a register free over the whole run - the pick's
+ * pin as the degenerate snap output, needing NO transitions and
+ * therefore immune to linearization points (44_primes_sqrt's
+ * -3.2%/iter shape: the snap shredded what the pick pins). */
+/* FLOAT MODE (F3): non-null `fev` flips the RESCUE's eligibility to
+ * the pick's fhot rule - sum(uses_float) >= 3, wrote_float somewhere
+ * (the pick's fdst requirement: its whole-run soundness note is the
+ * argument), no mem_float anywhere, and uses_int == 0 on every
+ * interval (the disjoint-pools rule; uses_ret exempt). Everything
+ * else - lin points, demotion, translation, the occupancy model -
+ * is register-file-agnostic and shared verbatim. */
+/* `noreach` (the C2b tmode lift): pc ranges (T, L+1] of the run's
+ * hoist REGIONS, where a transition may NOT sit - the region's cold
+ * copy is entered by the failed C1 guard (an emission edge the edge
+ * scan cannot see), replays [T, L] and rejoins at label[L+1], PAST
+ * anything emitted there; a transition in (T, L+1] simply never
+ * runs on the cold path. A transition AT T is legal - it is emitted
+ * before the guard, so both paths see it - and the cold copy is
+ * emitted against the replayed state at T, which the refusal makes
+ * constant across the region. Interior region pcs are already
+ * non-lin-points (the loop back edge), so in practice this bounds
+ * only L+1 and start-relocation scans. */
+bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
+                   const std::vector<LiveInterval> &iv,
+                   const std::vector<IntervalQual> &q,
+                   const std::vector<MemEvent> &int_uses, int K,
+                   std::vector<LsraPiece> &pieces,
+                   std::vector<int> &entry_by_reg,
+                   std::vector<LsraTrans> &trans,
+                   const std::vector<FltEvent> *fev = nullptr,
+                   const std::vector<std::pair<size_t, size_t>>
+                       *noreach = nullptr);
+#ifdef TESTS
+/* Test-only export of the (static) pick - the D3 qualification check
+ * asserts per-interval facts against the pick's public answer. */
+std::vector<int>
+jit_test_pick_cached_slots(const Chunk &ck, size_t begin, size_t end,
+                           int slot_count, size_t max_pins,
+                           std::vector<int> *fhot,
+                           /* #97 1b: the pick's BARRIER marks, one
+                            * char per pc in [begin, end) - which ops the
+                            * emitter brackets with flush/reload */
+                           std::vector<char> *barrier = nullptr);
+
+/* #98: the opcode-keyed tables, exported for the census ratchet
+ * (opcode_table_census, tests.cpp) - every opcode in the enum must be
+ * decided against each, or the test fails naming the op. */
+bool jit_test_op_eligible(const Instr &in);
+bool jit_test_op_never_exits(const Instr &in);
+bool jit_test_op_fully_native(const Instr &in);
+bool jit_test_op_is_simple_island(OpCode op);
+bool jit_test_pick_op_classified(const Chunk &ck, const Instr &in);
+#endif
+
+#ifdef TESTS
+/*
+ * #96 (c): re-derive the register model's capability table from the
+ * ENCODERS and check the pool invariants and the allocator contract.
+ * False + a named reason on any disagreement. See reg_model_check
+ * (jit.cpp) for which half of it is strong and which is drift-only.
+ */
+bool jit_reg_model_check(std::string &err);
+
+/* REGTRACK: drive every failure arm of the register tracker with a
+ * deliberately wrong emission and return, per named scenario, every
+ * verdict the tracker gave (recorded, not aborted). False when the
+ * tracker is compiled out (NDEBUG). The expectations live in tests.cpp
+ * (regtrack_failure_arms). */
+struct JitTrkCase {
+    const char *name;
+    std::vector<std::string> said;
+};
+bool jit_test_regtrack(std::vector<JitTrkCase> &out);
+
+/* #78 step E: times EndFinally's cold RERAISE arm ran natively (see
+ * jit_end_finally, vm.cpp) - the coverage counter for the arm that used
+ * to bail to the interpreter. */
+extern unsigned long g_jit_end_finally_reraise;
+/* #80: times the native `rethrow` ran (see jit_rethrow, vm.cpp). */
+extern unsigned long g_jit_rethrow_native;
+#endif
+
+/*
+ * #55 STEP 2: is this chunk's WHOLE body a single fully-native run ending in
+ * ReturnV (a `native_leaf` a caller fragment can `call` directly)? Computed
+ * from the OPS ALONE - no fragment emit - so codegen_chunk can set the flag
+ * BEFORE jit_compile_chunk, which lets the precompile codegen ALL bodies (flags
+ * set) then jit ALL bodies (a caller's native-call gate sees every callee's
+ * flag). Off-platform / -nj -> false. Matches jit_compile_chunk's native_leaf
+ * exactly (it sets native_entry_off when this holds).
+ */
+bool jit_chunk_is_native_leaf(const Chunk &chunk);
+/*
+ * #97 - is this chunk a FRAMELESS CANDIDATE (see Chunk::frameless_ok)?
+ * A REACH PROBE: nothing consumes the answer to decide emission yet.
+ */
+bool jit_chunk_frameless_ok(const Chunk &chunk);
+/* #97 inc 3 (W3): Chunk::frameless_init_free - derived beside
+ * frameless_ok, at the same three sites, for the same reason (the
+ * CALLER's site reads it, after this chunk's originals are gone). */
+uint64_t jit_chunk_frameless_init_free(const Chunk &chunk);
+/* THE derivation point for frameless_ok / frameless_init_free /
+ * frameless_read_first - codegen_chunk, the bytecode splice and the
+ * image loader all call this one (2026-09-22). */
+void jit_chunk_frameless_derive(Chunk &chunk);
+#ifdef TESTS
+bool jit_test_instr_stores_dst_raw(const Instr &in);   /* W3's whitelist */
+#endif
+/* #97 inc 2 (F6): the pre-pass that sets Chunk::frameless_wanted on
+ * every callee MAIN will call framelessly (see bytecode.h). Run with the
+ * SAME JitCtx main will be jitted with, before any body is jitted. */
+void jit_mark_frameless_wanted(const Chunk &main, const JitCtx *jc);
+/* the native-stack window a frameless callee may allocate, in SLOTS -
+ * 64 x 48 bytes = 3KB, the same bound Frame::init already imposes. */
+enum { FRAMELESS_MAX_SLOTS = 64 };
+/* #97 inc 3 (W1): where a frameless callee finds the window its CALLER
+ * built - above the residue's two words and the return address, so
+ * rbp + this (Chunk::frameless_entry_off has the layout). */
+enum { JIT_FRAMELESS_WIN_OFF = 32 };
+/* REACH (TESTS): chunks that qualify, and calls made to one. */
+/*
+ * #111 EXECUTION PROOF: bumped by the EMITTED capture read/write once
+ * per access that took the proven-scalar shape. An emitted-code
+ * counter, not an emit-time one: the tier is a shorter INSTRUCTION
+ * SEQUENCE that still runs, so it can prove it RAN.
+ */
+extern unsigned long g_jit_cap_scalar;
+extern unsigned long g_jit_frameless_chunks;
+extern unsigned long g_jit_frameless_calls;
+extern unsigned long g_jit_frameless_entries;   /* inc 2 (emit-time) */
+extern unsigned long g_jit_frameless_sites;     /* inc 2 (emit-time): the
+                                                 * SITE took the frameless
+                                                 * tail */
+extern unsigned long g_jit_frameless_pushes;    /* inc 2 (emitted code) */
+extern unsigned long g_jit_frameless_self_sites; /* E2: self sites EMITTED */
+extern unsigned long g_jit_frameless_nonmain; /* F1: frameless sites
+                                                * in a non-main caller to
+                                                * ANOTHER function (emit) */
+extern unsigned long g_jit_frameless_mutual;  /* G1: frameless sites to
+                                                * ANOTHER calling function
+                                                * (emit-time) */
+extern unsigned long g_jit_frameless_fixed;   /* G2: non-self sites
+                                                * without the identity
+                                                * chain (emit-time) */
+extern unsigned long g_jit_vframe_publish;     /* E2e: vframe
+                                                * publishes EMITTED */
+extern unsigned long g_jit_frameless_self_floor; /* E2d: self sites
+                                                * bounded by the floor alone
+                                                * (emit-time) */
+extern unsigned long g_jit_frameless_self_id;  /* E2c: self sites whose
+                                                * callee identity chain
+                                                * was elided (emit-time) */
+extern unsigned long g_jit_frameless_boundary;  /* E2: boundary calls RUN */
+extern unsigned long g_jit_frameless_rets;      /* inc 2 (emitted code) */
+extern unsigned long g_jit_frameless_ret_regs;  /* REGCALL 1B (emitted) */
+extern unsigned long g_jit_regcall_args;        /* REGCALL 1A (emitted) */
+extern unsigned long g_jit_regcall_pinned;      /* REGCALL 1A entry: a
+                                                 * parameter moved straight
+                                                 * into its pin (emit-time) */
+extern unsigned long g_jit_frameless_init_free; /* inc 3 W3 (emit-time):
+                                                 * window slots a site
+                                                 * left UNINITIALISED */
+/*
+ * #97 inc 3 W3 (TESTS): the POISON type. A frameless site writes it as
+ * the type word of every window slot it deliberately leaves
+ * uninitialised, so a helper that reads the old state of such a slot
+ * (LValue::put / rebind / a release scan) aborts BY NAME in every test
+ * lane instead of dereferencing stack garbage. Its `t` is non-trivial,
+ * so every reader that tests `t >= t_str` takes the releasing path and
+ * lands in one of its lifecycle ops, all of which abort.
+ */
+const void *jit_poison_type();
+#ifdef TESTS
+/* W4 (TESTS): the CaptureSlots a W4 site installs as ctx.captures - 64
+ * slots whose type word is jit_poison_type; see vm.cpp */
+const void *jit_poison_captures();
+/* #97 E2e: a window of poison slots (the lazy vframe's stale state) */
+const void *jit_poison_window();
+/* #97 R3: a W4 callee returned with ctx.captures no longer the poison
+ * its site installed - some site wrote it, and the release arm would
+ * not restore it. Aborts by name. */
+extern "C" [[noreturn]] void jit_w4_captures_replaced();
+/* #97 R4: a site whose callee claims a quiet vframe found the cell
+ * written after the call. Aborts by name. */
+extern "C" [[noreturn]] void jit_vframe_published();
+#endif
+extern unsigned long g_jit_frameless_capbase;
+extern unsigned long g_jit_vframe_quiet_sites;  /* #97 R4 (emit-time):
+                                                 * sites that skip the
+                                                 * vframe restore */
+extern unsigned long g_jit_vframe_quiet_lost;   /* #97 R4: leaves whose
+                                                 * bet lost (re-emitted
+                                                 * eagerly) */   /* W4 (emit-time): sites
+                                                 * that skip the repoint */
+extern unsigned long g_jit_borrow_inline;       /* W5 (emitted code): a
+                                                 * borrow bound INLINE at
+                                                 * a frameless site */
+
+/*
+ * Call a compiled fragment (frameless: slots base in, resume pc out).
+ * Marked no_sanitize("function") - the JIT fragment has no clang/UBSan
+ * CFI type header, so the -fsanitize=function check would read the
+ * (unmapped) word before the fragment and fault. class LValue is opaque
+ * here, so the arg is void* (the real ABI is size_t(LValue*)).
+ */
+size_t jit_enter(const void *frag, void *slots);
+/* #84 step 3: jit_enter plus the fragment's RDX (rax:rdx - see jit.cpp) */
+struct JitRet2 { size_t r; uint64_t pay; };
+JitRet2 jit_enter2(const void *frag, void *slots);
+
+/* Register-cache audit (env MYLANG_CACHEAUDIT=1): print, per opcode, how
+ * many slot candidacies its disqualification killed. The "what to make
+ * cache-aware next" surface - see pick_cached_slots. */
+void jit_cache_audit_report();
+
+/* #96: MAX_CACHED + MAX_XCACHED - the int pin budget a fragment can
+ * spend. Exported for jit_telide_c3, which must build a program with
+ * MORE hot int locals than this or it exercises nothing. */
+size_t jit_pin_budget();
+/* #96 inc-1: how many hot slots past the pins get native-stack spill
+ * homes - a test sizing an overflow shape must clear pins + spills. */
+size_t jit_spill_budget();
+
+/*
+ * #96: ROTATE the caller-saved pin pool so member N is handed out
+ * FIRST (env MYLANG_JIT_XROT=N; settable in-process so a test can
+ * sweep it). take_reg scans the pool in preference order, so its LAST
+ * member is reached only by a run with the maximum pin count - which
+ * is how an UNSAFE register sat in the pool for a day, exercised by
+ * nothing (the r9 bug; see XCACHE_ORDER in jit.cpp). Rotating makes
+ * every member take the first-choice traffic.
+ */
+extern unsigned g_jit_xrot;
+/* D3.b 2b-ii: the `lsra` LEVER - ⛔ DEFAULT ON (flipped 2026-08-26
+ * by maintainer decision on the completed ledger; MYLANG_JIT_LSRA=0
+ * is the debugging opt-out, settable in-process for tests). ON
+ * means: the linear scan (jit_lsra_assign) chooses the register
+ * plan - whole-run pins, per-pc pieces with transitions, spill
+ * homes, the float pool - and every downstream stage runs on it.
+ * OFF restores the pick end to end, so a suspected allocator bug
+ * has a same-binary A/B one env var away. */
+size_t jit_xrot_width();
+/*
+ * REACH (env MYLANG_JITSTATS=1): print the emitted-code counters after a
+ * script run - which TIER each shape actually took, on a real program.
+ *
+ * The arc kept needing this and kept not having it. The counters exist and
+ * every JIT test asserts on them, but they were readable only from INSIDE
+ * `-rt`, so a question like "does ordinary recursion reach the inline call
+ * push, or decline to the C++ tier?" could be asked of a hand-written probe
+ * and of nothing else. That is how the G1 preparation came to quote a per-
+ * call cost for a path a large fraction of real calls never take.
+ *
+ * A TESTS=1 build only: the bumps are `#ifdef TESTS` emitted code, so a
+ * release genuinely has no counters and printing zeros would be a lie. Say
+ * so rather than print them.
+ */
+void jit_stats_report();
+/* the SWITCHING entry (M5a): jit_call_sync_core's direct callee entry -
+ * brackets its level's native-stack switch; plain when already active */
+size_t jit_enter_deep(const void *frag, void *slots);
+
+/* Approach A: a native fragment that hits a proven EXCEPTION condition
+ * (a[i] out of bounds, a negative shift count) does NOT re-interpret the
+ * op - it stores a raise KIND here and returns the op's pc; the EnterNative
+ * handler then raises the matching exception via vm_raise (exact caret from
+ * the loc table, no re-run). JR_NONE (0) on a normal fragment exit. */
+enum JitRaiseKind { JR_NONE = 0, JR_OOB = 1, JR_NEG_SHIFT = 2,
+                    JR_DIV0 = 3, JR_DIV_OVF = 4 /* INT_MIN / -1 */ };
+extern int g_vm_jit_raise;
+
+/* Approach A (container-store helper ops, plans/archived/native-aot.md): a native
+ * a[i]=v / a[i] OP= v fragment marshals the base LValue*, the index and the
+ * value and CALLS one of these instead of splitting the run at the store, so
+ * the enclosing loop stays native. They run the interpreter's EXACT store
+ * body (vm.cpp), noexcept: a raised exception is thrown LOC-LESS, caught,
+ * stashed, and reported by a non-0 return (eax), which the fragment turns
+ * into an exit; EnterNative re-raises it (stamping the caret from the live
+ * chunk at the op's pc). `aop` is the base arith op (Op) as an int. No chunk
+ * arg: the fragment can't hold a chunk pointer (stack-built, moved out). */
+extern "C" int jit_store_elem_int(LValue *base, int_type idx, int_type rhs,
+                                  int aop) noexcept;
+/* #92 prep: the COW clone alone, so the emitted store can RESUME the
+ * fast path (see vm.cpp). 0 = normalized, retry; 1 = go to the full
+ * helper. */
+extern "C" int jit_store_elem_prep(LValue *base, int_type idx) noexcept;
+extern "C" int jit_store_elem_float(LValue *base, int_type idx,
+                                    double rhs, int aop) noexcept;
+/* d[k] = v / d[k] OP= v: base dict LValue* + the key/value slot EvalValue*s
+ * (boxed - the fragment leas the slot addresses) + the Expr14 op. */
+class EvalValue;
+extern "C" int jit_dict_store(LValue *base, const EvalValue *key,
+                              const EvalValue *val, int op) noexcept;
+
+/* The UNIVERSAL subscript store a[i] = v / a[i] OP= v (flat/general/dict). The
+ * base may be a global/capture container, so `kind` (0 local/1 global/2 capture)
+ * + base_slot form it (not an lea'd frame slot); idx/val are frame slots, aop
+ * the Expr14 op. Returns 0 (ok), or 1 to exit (an undefined-global base bails to
+ * the interpreter with NO g_vm_jit_exc; a vm_subscript_store RuntimeException
+ * sets g_vm_jit_exc for EnterNative to re-raise). */
+extern "C" int jit_store_elem_value(int_type kind, int_type base_slot,
+                                    int_type idx_slot, int_type val_slot,
+                                    int_type aop) noexcept;
+
+/* A struct field store s.f = v / s.f OP= v. Like jit_store_elem_value but the
+ * key is a MEMBER: `mk` = &chunk.member_keys[idx] (baked pool addr; memUid + the
+ * carets). Same return convention (0 ok / 1 exit: undefined-global bail or a
+ * vm_member_store RuntimeException in g_vm_jit_exc). */
+extern "C" int jit_store_member(int_type kind, int_type base_slot,
+                                int_type val_slot, int_type aop,
+                                const void *mk) noexcept;
+
+/* The nested-chain stores. StoreElem2V a[i][j]=v: LOCAL base + k1/k2/val slots +
+ * `locs` = chunk.chain_locs[idx].data() (the per-step carets). StoreElemChainV
+ * a[k0..kn]=v: `kind` base + kbase (key run) + `cl` = &chunk.chain_locs[idx].
+ * StoreLValueChainV base.step..=v (mixed member/subscript): `kind` base +
+ * `steps` = &chunk.chain_steps[idx] + `mkeys` = chunk.member_keys.data(). Same
+ * return convention (0 ok / 1 exit: an undefined-global base bails, a store
+ * RuntimeException in g_vm_jit_exc). */
+extern "C" int jit_store_elem2(int_type base_slot, int_type k1_slot,
+                               int_type k2_slot, int_type val_slot,
+                               int_type aop, const void *locs) noexcept;
+extern "C" int jit_store_elem_chain(int_type kind, int_type base_slot,
+                                    int_type kbase, int_type val_slot,
+                                    int_type aop, const void *cl) noexcept;
+extern "C" int jit_store_lvalue_chain(int_type kind, int_type base_slot,
+                                      int_type val_slot, int_type aop,
+                                      const void *steps,
+                                      const void *mkeys) noexcept;
+
+/*
+ * model-flip (nativize-ops): MoveV natively - `slots[dst] = slots[src].get()`,
+ * the interpreter's EXACT MoveV (an alias-copy, ref-aware via LValue::put; never
+ * throws). A boxed slot copy needs the type-erased copy path, so it CALLS this
+ * helper (like the store ops) rather than inlining. `slots` is the frame base
+ * (rdi). One island op fewer; the enclosing run no longer splits at a MoveV. */
+extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept;
+
+/*
+ * Bind ONE reference argument for the fragment-inline sync push. The inline
+ * push copies a scalar argument as raw bytes and used to DECLINE the whole
+ * push when any argument held a reference; it now calls this instead. The
+ * copy cannot be an inlined refcount bump - a SLICE registers itself in its
+ * parent's `slices` set on copy - so this runs fast_bind's exact per-argument
+ * step. `g_jit_ref_arg_binds` is the execution proof (TESTS builds).
+ */
+/*
+ * `can_borrow` is #94 THE BORROW BIND: the escape analysis proved the
+ * reference bound to this parameter cannot outlive the call, so the slot
+ * takes a raw bit-copy with NO retain and the frame pop must not release it
+ * either (LValue::frame_release). The emitted push reads the bit out of the
+ * callee descriptor - which is an inline CACHE there, not a compile-time
+ * constant - and the helper applies the one dynamic exclusion (a slice).
+ */
+extern "C" void jit_bind_ref_arg(LValue *dst, const LValue *src,
+                                 int_type can_borrow) noexcept;
+extern unsigned long g_jit_ref_arg_binds;
+extern unsigned long g_arg_borrow, g_arg_borrow_slice,
+                     g_arg_borrow_scalar;
+
+/*
+ * THE IN-PLACE ARGUMENT's cold arm (#162). A fused call site binds some
+ * arguments straight from the caller slot the staging MoveV would have
+ * copied them from, and therefore never emits that MoveV - so every arm
+ * that hands the argument RUN to a C++ tier (the guard declines, and with
+ * them the depth-cap SWITCH and the bail whose re-run re-executes the
+ * INTERPRETED call op) must first materialise it. `pairs` is the site's
+ * baked (dst, src) slot array, `n` its pair count; each pair is exactly
+ * the MoveV that was skipped, in the order codegen emitted them.
+ *
+ * noexcept and it means it: `put` on a plain frame slot runs the value
+ * model's assign, which cannot throw for any value a slot can hold (see
+ * the noexcept-helper rule - a helper the emitter takes no status from
+ * must have a defined outcome, never a throw).
+ */
+extern "C" void jit_stage_args(const int32_t *pairs, int_type n) noexcept;
+/* Execution proof for the FUSED bind - bumped by the EMITTED copy loop,
+ * so it cannot be satisfied by the helper tier (TESTS builds). */
+extern unsigned long g_jit_arg_inplace;
+/* ...and for the COLD arm that replays them - the path where a mistake is
+ * a use-after-free rather than a wrong number, so it gets its own proof. */
+extern unsigned long g_jit_arg_stage;
+/*
+ * ⛔ AN EMIT-TIME COUNTER, DELIBERATELY - and the distinction matters.
+ * Every other counter here is bumped by EMITTED code, because the thing
+ * being proved is "this tier RAN". What #97 step 4 does to a scalar
+ * argument bind is an ELISION: the source-type test and the reference
+ * arm are simply not emitted, so there is no instruction left to bump
+ * anything, and an emitted-code counter would be structurally incapable
+ * of seeing it. This counts the binds the elision CLAIMED, so a test can
+ * assert it fires on a scalar argument and does NOT on a ref-listed one.
+ */
+extern unsigned long g_jit_arg_scalar;
+
+/*
+ * model-flip (nativize-ops): SubscriptV natively - `dst = base[idx]` via the
+ * runtime Type::subscript (any base: array/dict/string), the interpreter's
+ * EXACT read. base_lv/dst are frame-slot LValue*s, idx the index slot's
+ * EvalValue*. CAN throw (OOB / KeyNotFound / type) -> caught LOC-LESS into
+ * g_vm_jit_exc, reported by a non-0 return; the fragment exits and EnterNative
+ * re-raises (caret from the loc side table at the op's pc). Keeps a
+ * subscript-in-a-loop native instead of splitting the run. */
+extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
+                             LValue *dst) noexcept;
+
+/* Lever 4b - the fused ord(s[i]) body: TypeStr::subscript's wrap + bounds
+ * (the OOB conveys loc-less -> the fragment's exc-stamp), then the raw byte
+ * as int into dst. The base is compile-proven a non-opt string. */
+extern "C" int jit_ord_char(LValue *base_lv, int_type idx,
+                            LValue *dst) noexcept;
+
+/* #56 delete-originals: the LoadElemInt/LoadElemFloat slow tiers (every
+ * inline-declined shape via the interpreter's exact core; OOB conveys). */
+extern "C" int jit_load_elem_int(LValue *base_lv, int_type idx,
+                                 LValue *dst) noexcept;
+extern "C" int jit_load_elem_float(LValue *base_lv, int_type idx,
+                                   LValue *dst) noexcept;
+
+/* The NESTED-READ FUSION `dst = base[i][j]` (plans/archived/unboxing.md option A):
+ * the row is BORROWED inside the helper, never boxed into a frame slot.
+ * `locs` is the baked chain_locs pair - [0] carets an OOB on the outer
+ * index, [1] one on the inner - so these throw WITH a caret rather than
+ * loc-less like the single-level tiers above. (`locs` is a `void *` for the
+ * same reason the store helpers' is: jit.h does not pull in errors.h.) */
+extern "C" int jit_load_elem2_int(LValue *base_lv, int_type oidx,
+                                  int_type iidx, LValue *dst,
+                                  const void *locs) noexcept;
+extern "C" int jit_load_elem2_float(LValue *base_lv, int_type oidx,
+                                    int_type iidx, LValue *dst,
+                                    const void *locs) noexcept;
+
+/* #56: the #9 fusions' slow tiers - the shared element-value read (every
+ * inline-declined shape; conveys) and ForStepElemInt's full-op form (the
+ * gate declines BEFORE the step, so the helper does step+test+read). */
+/* #56: the native `throw` (the interpreted op's body; 0 = dispatched to a
+ * same-frame handler at g_vm_resume_pc, 1 = boundary, 2 = conveyed). */
+extern "C" int jit_throw(int_type val_slot, int_type pc,
+                         const void *lep, const void *frag_rbp,
+                         const void *raise_desc) noexcept;
+void *jit_addr_resume_pc();         /* the parked handler pc's address */
+
+extern int_type g_jit_elem_tmp;     /* the slow tiers' value scratch */
+extern "C" int jit_elem_int_value(LValue *base_lv, int_type idx,
+                                  int_type *out) noexcept;
+
+/* model-flip (nativize-ops): the native SliceV `dst = base[start:end]` via the
+ * runtime Type::slice (COW-registered sub-view). base/start/end/dst are frame
+ * slots (start/end == -1 -> none); frame via g_current_ctx. Only TypeErrorEx
+ * (RuntimeException) is thrown -> caught loc-less into g_vm_jit_exc, non-0
+ * return; EnterNative re-raises (caret from the loc side table). */
+extern "C" int jit_slice(int_type base_slot, int_type start_slot,
+                         int_type end_slot, int_type dst_slot) noexcept;
+
+/* model-flip (nativize-ops): LoadBuiltinV natively - `slots[dst] =
+ * builtin_slot[idx].get()` (the program-wide builtin table; a trivial value,
+ * never throws). `slots` = the frame base (rdi). */
+extern "C" void jit_load_builtin(LValue *slots, int_type dst,
+                                 int_type idx) noexcept;
+
+/* model-flip (nativize-ops): LoadCaptureV natively - `frame[dst] =
+ * (*ctx->captures)[idx]`, a copy of a snapshot capture value (always defined ->
+ * never throws). Uses g_current_ctx (captures + frame). */
+extern "C" void jit_load_capture(int_type dst, int_type idx) noexcept;
+
+/* model-flip (nativize-ops): LoadConstV natively - `slots[dst] = *src`, a copy
+ * of a baked const-pool EvalValue (never throws; ref-aware for a non-trivial
+ * const). `src` is `&chunk.consts[idx]` - the const-pool vector's heap BUFFER
+ * address, which survives the chunk's std::move (unlike `&chunk` itself). */
+extern "C" void jit_load_const(LValue *slots, int_type dst,
+                               const EvalValue *src) noexcept;
+
+/* model-flip (nativize-ops): MemberV natively - `dst = base.member` via the
+ * shared member_read_core (struct field / const / dict key / optional). `base`
+ * is the base slot's EvalValue*, `dst` the dst slot LValue*, `mk` a baked
+ * `&chunk.member_keys[idx]` (the member-key pool BUFFER address, void* since
+ * Chunk::MemberKey is a nested type). CAN throw (missing field/key) -> caught
+ * loc-less (the caret is already on the exception, from the member key's
+ * carets) into g_vm_jit_exc, reported by a non-0 return; EnterNative re-raises
+ * (the existing loc is preserved). */
+extern "C" int jit_member(const EvalValue *base, LValue *dst,
+                          const void *mk) noexcept;
+
+/* model-flip (nativize-ops): a PLAIN global store `g = <expr>` (aop invalid) -
+ * `gfuncs->slots[gslot] = RValue(*src); defined[gslot]=1` (the interpreter's
+ * exact decl/reassign; never throws). gfuncs via g_current_ctx. `src` is the
+ * rhs value slot's EvalValue*. The COMPOUND case (g OP= / g++) stays interpreted
+ * (it throws on an undefined slot + runs num_bin_op). */
+extern "C" void jit_store_global(int_type gslot, const EvalValue *src) noexcept;
+
+/* model-flip (nativize-ops): the native StoreCaptureV PLAIN `cap = <expr>` -
+ * `(*ctx->captures)[cap_slot] = RValue(*src)`. A capture is always defined ->
+ * never throws (op_fully_native). PLAIN only (like StoreGlobalV; a compound
+ * `cap OP= v` runs num_bin_op, stays interpreted). */
+extern "C" void jit_store_capture(int_type cap_slot,
+                                  const EvalValue *src) noexcept;
+/* #97 inc 3 W4: the BASE-RELATIVE twins for a run holding capbase - the
+ * helper reads the array the register names, never ctx->captures */
+extern "C" void jit_load_capture_at(int_type dst, const LValue *base,
+                                    int_type idx) noexcept;
+extern "C" void jit_store_capture_at(LValue *base, int_type cap_slot,
+                                     const EvalValue *src) noexcept;
+
+/* model-flip (nativize-ops): the native LoadGlobalV read `frame[dst] =
+ * gfuncs->slots[gslot]`. Returns 0 on success; 1 to BAIL (the global is
+ * undefined - a use-before-def) so the emit exits to the op's pc and the
+ * interpreter re-runs LoadGlobalV + throws UndefinedVariableEx (a plain
+ * Exception, not conveyable via g_vm_jit_exc). NOT op_fully_native (the
+ * original is kept for the bail). gfuncs/frame via g_current_ctx. */
+extern "C" int jit_load_global(int_type dst_gslot,
+                               const void *lep) noexcept;
+
+/* model-flip (nativize-ops): LoadLiteralObjV natively - materialize a baked
+ * const array/dict/struct literal via the shared eval_literal_obj (immutable
+ * share vs a fresh mutable clone; never throws). `lo` is a baked
+ * `&chunk.literal_objs[idx]` - the literal-objs pool BUFFER address (void* since
+ * Chunk::LiteralObjEntry is nested), stable across the chunk's std::move. */
+extern "C" void jit_load_literal_obj(LValue *slots, int_type dst,
+                                     const void *lo) noexcept;
+
+/* model-flip (nativize-ops): ArrLen natively - the foreach snapshot bound
+ * `n = size(frame[base])`. `base` is a proven flat array (ForeachStmt::elem_th),
+ * so size() never throws. */
+extern "C" void jit_arr_len(LValue *slots, int_type dst,
+                            int_type base) noexcept;
+
+/* #53 option 1: the foreach shift guard (bytecode.h, ArrEpochMark). The
+ * mark never throws; the check is the COLD tier of an inline compare -
+ * 1 = conveyed a loc-less OutOfBoundsEx through g_vm_jit_exc (the emitter
+ * stamps the container caret), 0 = no raise. */
+extern "C" void jit_arr_epoch_mark(LValue *slots, int_type dst,
+                                   int_type base) noexcept;
+/* UnpackLenCheck's cold tier: 1 = conveyed the strict unpack TypeErrorEx
+ * loc-less (the emitter stamps the caret), 0 = the length is right (the
+ * flag slot `dst`, if >= 0, then written) */
+extern "C" int jit_unpack_len_check(LValue *slots, int_type base,
+                                    int_type n, int_type flags,
+                                    int_type dst) noexcept;
+extern "C" int jit_arr_epoch_check(LValue *slots, int_type base,
+                                   int_type m) noexcept;
+
+/* model-flip (nativize-ops): DictLoadInt/Float natively - the typed scalar dict
+ * read. `key` is a baked const-pool value (member `d.k`) or a lea'd key-temp
+ * slot (subscript `d[k]`). A missing key / non-dict base runs the shared
+ * Type::subscript LOC-LESS and, on throw, catches into g_vm_jit_exc + returns 1
+ * (EnterNative re-raises with the loc from the side table); returns 0 on the
+ * hot present-key path. `is_int` selects the DictLoadInt vs Float result. */
+extern "C" int jit_dict_load_int(int_type dst, int_type base_slot,
+                                 const EvalValue *key) noexcept;
+extern "C" int jit_dict_load_float(int_type dst, int_type base_slot,
+                                   const EvalValue *key) noexcept;
+
+/* model-flip (nativize-ops): MakeClosureV natively - create a closure +
+ * snapshot captures from the running ctx. `def` is the closure's
+ * program-lifetime FuncDescriptor* (baked as a value). Never throws. */
+/* returns 1 and sets g_vm_jit_exc when a captured GLOBAL is not bound yet
+ * (UnboundSymbolEx, #131); 0 on success */
+extern "C" int jit_make_closure(int_type dst, const void *def) noexcept;
+/* #97 step 3: the CONSTRUCT-ONLY form - returns the fresh closure with
+ * its count already at 1 (ownership transferred), so emitted code can
+ * do the slot store inline instead of paying EvalValue::operator='s
+ * two type-erased indirect calls. Null after conveying a throw. */
+extern "C" void *jit_make_closure_ptr(const void *def) noexcept;
+/* #97 R2: the all-local-captures form - (def, &slot 0) -> the pointer,
+ * count 1; cannot throw */
+extern "C" void *jit_make_closure_locals(const void *def,
+                                         const LValue *frame) noexcept;
+/* #97 R2c: exactly one local capture - (def, &its source slot) */
+extern "C" void *jit_make_closure_1(const void *def,
+                                    const LValue *src) noexcept;
+/* #97 R4: the frame window jit_ret_audit scans, stored by the emitted
+ * code right before the call (so the call need not publish) */
+extern const LValue *g_jit_audit_window;
+/* #97 R3: the all-local STORING form, for a site with no scratch -
+ * (dst, def); cannot throw, reads no ctx->captures (W4-safe) */
+extern "C" void jit_make_closure_locals_st(int_type dst,
+                                           const void *def,
+                                           int_type off) noexcept;
+
+/* model-flip (nativize-ops): MakeArrayV natively - build an array LITERAL from
+ * the element run [base, base+n) via the shared build_array_from_values, honoring
+ * `hint` (an ArrHint: flat int/float/bool/struct or general). Never throws
+ * (op_fully_native). */
+struct TypeAnnot;     /* Q2: a container's type (structtype.h) */
+extern "C" void jit_make_array(int_type dst, int_type base, int_type n,
+                               int_type hint, const TypeAnnot *ct) noexcept;
+
+/* model-flip (nativize-ops): MakeDictV natively - build a dict LITERAL from the
+ * interleaved key/value run [base, base + 2*npairs) via the shared
+ * build_dict_from_pairs (freezing each key). An UNHASHABLE key (a dyn-laundered
+ * function) throws TypeErrorEx -> g_vm_jit_exc + return 1 (EnterNative re-raises
+ * with the literal's caret from the loc side table); 0 otherwise. */
+extern "C" int jit_make_dict(int_type dst, int_type base,
+                             int_type npairs, const TypeAnnot *ct) noexcept;
+
+/* model-flip (nativize-ops): the STRUCT BUILDS. `def` is the program-lifetime
+ * StructTypeDef* from the struct_defs pool (baked as a VALUE); `bc` is a baked
+ * `&chunk.boxed_ctors[idx]` (def + per-arg carets). All three re-raise a
+ * TypeErrorEx via g_vm_jit_exc + return 1:
+ *  - jit_struct_ctor: a POD `P(x, y)` from its field run (H1 dst-slot reuse);
+ *  - jit_struct_ctor_boxed: a non-POD `B(a, x)` - the throw carries the
+ *    offending arg's POOLED caret, which vm_raise's empty-loc-only stamp keeps;
+ *  - jit_make_struct_array: the fused flat array<PodStruct> literal (`n` is the
+ *    ELEMENT count; the run holds n * nfields values). */
+extern "C" int jit_struct_ctor(const void *def, int_type base, int_type nf,
+                               int_type dst) noexcept;
+extern "C" int jit_struct_ctor_boxed(int_type dst, int_type base,
+                                     const void *bc) noexcept;
+extern "C" int jit_make_struct_array(const void *def, int_type base,
+                                     int_type n, int_type dst) noexcept;
+/* the planned POD ctor's slow branch (never throws -> void) */
+extern "C" void jit_struct_ctor_planned(const void *def, const void *plan,
+                                        int_type dst) noexcept;
+
+/* model-flip (nativize-ops): the FOREACH element/field LOADS. The `idx` arrives
+ * as a VALUE (the emitter materializes the op's slot-or-literal operand with the
+ * cache-aware load_operand before the call), so an N5-pinned foreach counter is
+ * read from the register, not a stale slot. All non-throwing (index loop-bounded,
+ * base kind proven) -> void + op_fully_native, except jit_load_elem_value, which
+ * bounds-checks: an OOB sets g_vm_jit_exc LOC-LESS (EnterNative stamps from the
+ * loc side table) and a non-general/non-str base BAILS to the interpreter. */
+/* model-flip (nativize-ops): the JumpUnlessTrueV CONDITION - the boxed
+ * truthiness test. Returns 1 = true, 0 = false, -1 = THREW (is_true's base Type
+ * op throws for a value with no bool conversion; the exception rides
+ * g_vm_jit_exc LOC-LESS and EnterNative stamps the condition's caret from the
+ * loc side table). The JUMP itself is emitted by the fragment, so a loop with a
+ * boxed condition no longer splits the run at the branch. */
+extern "C" int jit_is_true(int_type cond_slot) noexcept;
+
+/* LoadElemBool's decline tier (#53, and its own helper again since
+ * 2026-11-14: a general element that is no bool is a TypeErrorEx, which
+ * jit_load_elem_value - the decline until then - cannot see). Returns
+ * non-zero when it raised, conveying loc-less. */
+extern "C" int jit_load_elem_bool(int_type dst, int_type base,
+                                  int_type idx) noexcept;
+extern "C" void jit_load_str_char(int_type dst, int_type base,
+                                  int_type idx) noexcept;
+extern "C" void jit_load_struct_field(int_type dst, int_type base, int_type idx,
+                                      int_type fidx, int is_float) noexcept;
+/* G4: the CHECKED (subscript) twin - `a[i].f`. Returns non-zero when it
+ * raised, conveying a loc-less OutOfBoundsEx like jit_load_elem_value. */
+extern "C" int jit_load_struct_elem_field(int_type dst, int_type base,
+                                          int_type idx, int_type fidx,
+                                          int is_float) noexcept;
+/* The whole-`p` foreach bind. Returns non-zero when it raised (only an
+ * IMAGE can make it: a corrupt base - fat-676), conveying via
+ * g_vm_jit_exc. */
+extern "C" int jit_load_struct_elem(int_type dst, int_type base,
+                                    int_type idx) noexcept;
+extern "C" int jit_load_elem_value(int_type dst, int_type base,
+                                   int_type idx) noexcept;
+
+/* model-flip (nativize-ops): the ITERATOR ops. The per-loop state lives on the
+ * activation (a watermarked slice indexed by the current record's base +
+ * iter_id), reached via g_vm_act; each helper runs the SHARED body its
+ * interpreter handler runs. The Next pair BRANCHES: the helper returns the
+ * verdict and the FRAGMENT jumps (like JumpUnlessTrueV), so a dict/dyn foreach
+ * loop's back edge stays inside the fragment.
+ *  - jit_dict_iter_init: pin the proven dict + iterator=begin(); never throws.
+ *  - jit_dict_iter_next: 1 = bound (fall through), 0 = end (jump to end_pc);
+ *    never throws.
+ *  - jit_foreach_dyn_init: dispatch the dyn container once (`targets` = the
+ *    baked &chunk.unpack_targets[idx]); a non-container -> TypeErrorEx via
+ *    g_vm_jit_exc + return 1 (loc side table), else 0.
+ *  - jit_foreach_dyn_next: 1 = bound, 0 = end, -1 = THREW (the strict N-var
+ *    unpack's TypeErrorEx via g_vm_jit_exc, loc side table). */
+/* model-flip (nativize-ops): the CHECKED INC-DEC ops. Each forms its base /
+ * root like the interpreter EXCEPT an undefined GLOBAL, which BAILS (return 1
+ * with no exception - UndefinedVariableEx is not conveyable); every other
+ * throw is a RuntimeException -> g_vm_jit_exc + return 1 (the Elem/Member/
+ * Chain throws carry their POOLED carets). `site` / `chain` are baked
+ * &chunk.incdec_sites[idx] / &chunk.incdec_chains[idx]; `mkeys` the
+ * member_keys BUFFER. */
+extern "C" int jit_incdec_checked(int_type slot, int_type kind,
+                                  int_type is_inc) noexcept;
+extern "C" int jit_incdec_elem(int_type kind, int_type base_slot,
+                               int_type key_slot, int_type is_inc,
+                               const void *site) noexcept;
+extern "C" int jit_incdec_member(int_type kind, int_type base_slot,
+                                 int_type is_inc, const void *site) noexcept;
+extern "C" int jit_incdec_chain(int_type root_kind, int_type root_slot,
+                                int_type dst, int_type is_inc,
+                                const void *chain, const void *mkeys) noexcept;
+
+/* model-flip (nativize-ops): the STRICT-unpack ops. jit_unpack_elem serves
+ * all four UnpackElem* (n_kind = N | kind << 8, kind 0 int / 1 float / 2
+ * value; `targets` = the baked &chunk.unpack_targets[idx] for the Targets
+ * variant, else null and the consecutive run at dst_base). jit_multi_unpack
+ * is MultiUnpackV (targets/coerce = baked pool entries; aop = the compound
+ * base op or Op::invalid). Throws -> g_vm_jit_exc + return 1. */
+extern "C" int jit_unpack_elem(int_type dst_base, int_type base_slot,
+                               int_type idx, int_type n_kind,
+                               const void *targets) noexcept;
+extern "C" int jit_multi_unpack(int_type rval_slot, const void *targets,
+                                const void *coerce, int_type aop) noexcept;
+
+/* model-flip (nativize-ops): DeclConstV (bind a const decl's slot, local or
+ * global; never throws) and DefinedGlobalV (`defined(g)` = the slot's
+ * defined-flag as a bool; never throws). */
+extern "C" void jit_decl_const(int_type dst, int_type is_global,
+                               int_type src) noexcept;
+extern "C" void jit_defined_global(int_type dst, int_type gslot) noexcept;
+
+/* model-flip (nativize-ops): the StructFieldAddInt READ half (the #9 fusion
+ * `dst = other + a[i].f`) - vm_struct_field_int, proven no-fault; the add +
+ * dst write run in the fragment. And the EmplaceStruct body -
+ * append(struct_arr, Ctor(args)): arg0 by kind (0 local / 1 global, nullptr
+ * when undefined / 2 capture), the shared vm_do_emplace, dst written; a
+ * throw -> g_vm_jit_exc + return 1. `site` = a baked
+ * &chunk.emplace_sites[idx]. */
+extern "C" int_type jit_struct_field_add_int(int_type base_slot, int_type idx,
+                                             int_type fidx) noexcept;
+extern "C" int jit_emplace_struct(int_type dst, int_type base_slot,
+                                  int_type kind, const void *site,
+                                  int_type run_base) noexcept;
+
+/* model-flip (nativize-ops): LoadMemberInt/Float natively - the H1 typed
+ * standalone struct-member read `p.x` (POD byte fast path; boxed/dict/const
+ * fallback via member_read_core). `mk` = a baked &chunk.member_keys[idx]; a
+ * fallback throw carries the member caret -> g_vm_jit_exc + return 1. */
+extern "C" int jit_load_member(int_type dst, int_type base_slot,
+                               const void *mk, int is_int) noexcept;
+
+extern "C" void jit_dict_iter_init(int_type iter_id,
+                                   int_type dict_slot) noexcept;
+extern "C" int jit_dict_iter_next(int_type iter_id, int_type k_slot,
+                                  int_type v_slot) noexcept;
+extern "C" int jit_foreach_dyn_init(int_type iter_id, int_type cont_slot,
+                                    int_type shape,
+                                    const void *targets) noexcept;
+extern "C" int jit_foreach_dyn_next(int_type iter_id) noexcept;
+
+/* model-flip (nativize-ops): the BOXED-ARITH ops BinOpV / CmpV / CompoundV -
+ * the interpreter's exact boxed_operand + vm_num_binop bodies. `bop` is a baked
+ * `&chunk.boxed_ops[idx]` (the op's operand data - target/a/b/aop - copied into
+ * a stable serializable pool, since baking &code[pc] is unsafe). A num_bin_op
+ * throw (div0 / type) catches into g_vm_jit_exc + returns 1 (EnterNative
+ * re-raises with the loc from the side table); returns 0 otherwise. */
+extern "C" int jit_boxed_binop(const void *bop) noexcept;
+extern "C" int jit_boxed_cmp(const void *bop) noexcept;
+extern "C" int jit_boxed_compound(const void *bop) noexcept;
+/* Compound global/capture stores `g OP=`/`cap OP=` - reuse the boxed_ops pool
+ * (bo->target = the GLOBAL/CAPTURE slot, bo->a = the rhs, bo->aop). Return 1 to
+ * exit: an undefined-global BAIL (global only, no g_vm_jit_exc) or a num_bin_op
+ * RuntimeException (g_vm_jit_exc, re-raised). */
+extern "C" int jit_store_global_compound(const void *bop) noexcept;
+extern "C" int jit_store_capture_compound(const void *bop) noexcept;
+/* LogV (eager && / ||): is_true() never throws -> void (op_fully_native). */
+extern "C" int jit_boxed_log(const void *bop) noexcept;
+
+/* UnaryV (boxed unary -/~/!/+ over a dyn): reuses the boxed_ops pool. `-str`/
+ * `~str` throw -> g_vm_jit_exc + returns 1 (re-raise); 0 otherwise. */
+extern "C" int jit_unary(const void *bop) noexcept;
+
+/* model-flip (nativize-ops): CoerceNumV - the typed-store numeric coerce of a
+ * dyn value (widen / pass-none / TypeError-throw). Fits in registers (dst +
+ * src_slot + is_float flag), no pool. A throw catches into g_vm_jit_exc +
+ * returns 1 (EnterNative re-raises with the Expr14 caret); 0 otherwise. */
+extern "C" int jit_coerce_num(int_type dst, int_type src_slot,
+                              int is_float) noexcept;
+
+/* #97 closure inlining: LoadCaptureOfV / StoreCaptureOfV's helper arm -
+ * capture `idx` of the closure in frame slot `fn_slot`, through the
+ * interpreter's checked vm_closure_capture. 0 = done; 1 = a conveyed
+ * RuntimeException in g_vm_jit_exc (EnterNative re-raises). */
+extern "C" int jit_load_capture_of(int_type dst, int_type fn_slot,
+                                   int_type idx) noexcept;
+extern "C" int jit_store_capture_of(int_type fn_slot, int_type idx,
+                                    int_type src) noexcept;
+
+/* model-flip (nativize-ops): CallBuiltinV - a value-ABI read-only builtin call.
+ * `bc` is a baked `&chunk.builtin_calls[idx]` (func_v ptr + arg carets). Args
+ * are copied from frame slots [base, base+n); a throw catches into g_vm_jit_exc
+ * (loc from the pool) + returns 1. A callback builtin re-enters vm_dispatch. */
+extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
+                                const void *bc) noexcept;
+
+/* model-flip (nativize-ops): CheckFuncV (map/filter's arg0 guard - a non-func
+ * conveys a loc-less TypeErrorEx, stamped at the op pc by the re-raise) and
+ * MapFilterV (the shared vm_map_filter body; callback re-enters vm_dispatch). */
+extern "C" int jit_check_func(int_type slot) noexcept;
+
+/* RULE 1: CheckNoneArgsV - refuse a none bound to a parameter not declared
+ * `opt` before the call that follows enters its callee. kind 0 = the
+ * callee is frame slot `callee`, 1 = a global slot. A refusal conveys a
+ * loc-less TypeErrorEx carrying bind_arg (the emitter's stamp selects the
+ * argument's caret) + returns 1. */
+extern "C" int jit_check_none_args(int_type kind, int_type callee,
+                                   int_type argbase, int_type nargs) noexcept;
+extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
+                              int_type dst, int_type is_map,
+                              int_type site, int_type cend) noexcept;
+/* Q2: stamp the container in `dst` with the type it is made with (the
+ * MapFilterV result - its helper's argument registers are all taken) */
+extern "C" void jit_stamp_ctype(int_type dst, const TypeAnnot *ct) noexcept;
+
+/* class step 4: the native LoadBoxV / StoreBoxV - the interpreted ops'
+ * box_load_want / box_store (plans/class-and-box.md). A raise (`*` of a
+ * non-box, the want check, a misfit store, a constant box) conveys a
+ * loc-less TypeErrorEx / CannotChangeConstEx, stamped with the `*b` caret
+ * at the op pc, and returns 1. `def` is the box<P>'s struct for want 5,
+ * else null. */
+extern "C" int jit_load_box(int_type box_slot, int_type dst, int_type want,
+                            const void *def) noexcept;
+extern "C" int jit_store_box(int_type box_slot, int_type val_slot) noexcept;
+
+/* #49: the native CheckFitV - check_fit of slot `slot` against the
+ * Chunk::fit_specs entry `spec` (baked). A misfit conveys a loc-less
+ * TypeErrorEx, stamped with the value's caret at the op pc, and returns
+ * 1. */
+extern "C" int jit_check_fit(int_type slot, const void *spec) noexcept;
+
+/* the native CastV (plans/cast.md) - slot `dst` = cast_value(slot `src`,
+ * the Chunk::cast_types entry `t`, baked). A refusal conveys a loc-less
+ * InvalidValueEx / TypeErrorEx, stamped with the argument's caret at the
+ * op pc, and returns 1. */
+extern "C" int jit_cast(int_type src, int_type dst, const void *t) noexcept;
+
+/* model-flip (nativize-ops): the dyn-callee generic call pair. CheckCallableV
+ * (the callable guard - conveys a loc-less NotCallableEx, exc-stamped with
+ * the callee caret) and CallValueGenericV (the full by-Kind dispatch over
+ * the baked CallSite pool; a FuncObject callee runs via the lean sync core;
+ * dst_callee packs dst lo32 | callee-temp hi32). */
+extern "C" int jit_check_callable(int_type slot) noexcept;
+
+/* Re-raise deletability: builds the JR_DIV0 / JR_NEG_SHIFT exception
+ * loc-less into g_vm_jit_exc (the emit's exc-stamp adds the caret), so the
+ * int div/mod/shift arms convey instead of signalling g_vm_jit_raise. */
+extern "C" void jit_raise_kind_exc(int kind) noexcept;
+
+/* Re-raise deletability: ThrowRuntimeV builds its pooled exception natively
+ * (`t` = a baked &chunk.throws[idx]) into g_vm_jit_exc, with its pooled
+ * caret: every kind is a RuntimeException (the rebind ones uncatchable). */
+extern "C" int jit_throw_runtime(const void *t) noexcept;
+extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
+                                      int_type nargs, const void *cs,
+                                      const void *mkeys,
+                                      int_type site_packed) noexcept;
+
+/* model-flip (nativize-ops): AppendV - `append(a, x)`/`push(a, x)`. Forms arg0's
+ * LValue* from kind (0 loc/1 gbl/2 cap) + arg0_slot, runs the never-throwing
+ * arr_append_fast; a decline falls back to vm_call_builtin_lv_rest (builtin_
+ * append, all RuntimeException throws now) -> g_vm_jit_exc + return 1. dst_slot
+ * = the result dst (-1 = discarded). `bc` = &chunk.builtin_calls[idx]. */
+extern "C" int jit_append(int_type kind, int_type arg0_slot, int_type val_slot,
+                          int_type dst_slot, const void *bc) noexcept;
+
+/* model-flip (nativize-ops): CallBuiltinLV - a mutating lvalue-ABI builtin
+ * (pop/insert/erase/sort/reverse/intptr). Forms arg0 from kind + arg0_slot;
+ * rest_base >= 0 = the value-args run base (vm_call_builtin_lv_rest), -1 = no
+ * value args (func_lv, empty rest). All throws are RuntimeExceptions ->
+ * g_vm_jit_exc + return 1. `bc` = &chunk.builtin_calls[idx]. */
+extern "C" int jit_call_builtin_lv(int_type kind, int_type arg0_slot,
+                                   int_type dst_slot, int_type rest_base,
+                                   const void *bc) noexcept;
+
+/* model-flip (nativize-ops): CallBuiltinLVElem / CallBuiltinLVMember - a mutating
+ * lvalue builtin whose arg0 is a SUBSCRIPT (`append(a[i], x)`) or struct-MEMBER
+ * (`append(s.f, x)`, or the #32 chain form `append(o.i.a, x)`) target. Form
+ * the base by kind + base_slot, derive the element/field LValue*, then
+ * func_lv. `run_base` = the value-args run (for elem, run[0] is the index +
+ * run[1..] the values; for member, run[0..] the values). All throws are
+ * RuntimeExceptions -> g_vm_jit_exc + return 1. `bc` =
+ * &chunk.builtin_calls[idx], `mkeys` = chunk.member_keys.data() (the chain
+ * form's member steps).
+ *
+ * These two, jit_append, jit_call_builtin_lv and jit_emplace_struct
+ * return 2 for an UNBOUND GLOBAL base (#32): g_vm_jit_exc then holds a
+ * loc-less UnboundSymbolEx, which the emitted code stamps with the base's
+ * caret (base_locs) before the op's own. */
+extern "C" int jit_call_builtin_lv_elem(int_type kind, int_type base_slot,
+                                        int_type dst_slot, int_type run_base,
+                                        const void *bc) noexcept;
+extern "C" int jit_call_builtin_lv_member(int_type kind, int_type base_slot,
+                                          int_type dst_slot, int_type run_base,
+                                          const void *bc,
+                                          const void *mkeys) noexcept;
+
+/* model-flip (nativize-ops): PER-OP runtime coverage - g_jit_op_run[op] is
+ * bumped by that op's nativized helper (jit_move/jit_subscript/...), PROVING
+ * the native code for each op actually RAN (not merely that the op is
+ * jit_op_eligible / classified native in the hypothetical container view - the
+ * "prove the code ran" rule). Read per-op by a `jit:` test. Bumps are gated to
+ * TESTS via ML_JIT_OP_RAN so a release build pays nothing. */
+extern unsigned long g_jit_op_run[];
+/*
+ * ⛔ THE DECLINE LEDGER (#97 increment 2) - "WHICH GUARD did this
+ * value take?", the question a fast-path counter structurally cannot
+ * answer.
+ *
+ * An emitted-code counter proves a tier RAN. It says nothing about
+ * whether a test's values ever REACHED a given guard - and a guard no
+ * value reaches is a guard whose test passes with the guard DELETED.
+ * That is not hypothetical: the first slice-decline test for the
+ * boxed-element tier passed with the guard removed while
+ * g_jit_elemv_fast read 17, because a later MoveV laundered the raw
+ * copy before the program could look at it. The fast counter was
+ * green, the tier had run, and the test proved nothing.
+ *
+ * So every decline arm gets its own counter, bumped from a per-reason
+ * LANDING PAD the emitter inserts between the fast path and the slow
+ * tier. A test then asserts `this guard fired N >= 1 times`, which
+ * makes vacuity for THAT guard impossible rather than unlikely.
+ *
+ * TESTS-ONLY: the pads are emitted only under -DTESTS (bump_counter is
+ * already a no-op otherwise), so a shipping fragment is byte-identical
+ * to one built without the ledger.
+ *
+ * Reasons are declared HERE, in one X-macro, so the enum, the name
+ * table and the MYLANG_JITSTATS rows cannot drift apart.
+ */
+#define ML_FOR_EACH_JIT_DECLINE(X) \
+    X(elemv_base_not_arr) X(elemv_base_slice) X(elemv_base_kind) \
+    X(elemv_scale_wrap) X(elemv_bounds) X(elemv_elem_ex) \
+    X(elemv_elem_slice) X(elemv_str_null) X(elemv_obj_null) \
+    X(storev_base_not_arr) X(storev_base_const) X(storev_base_slice) \
+    X(storev_readonly) X(storev_base_kind) X(storev_has_slices) \
+    X(storev_scale_wrap) X(storev_bounds) X(storev_elem_const) \
+    X(storev_val_ex) X(storev_val_slice) X(storev_ctype) \
+    X(memberv_base_not_struct) X(memberv_def) \
+    X(memberv_readonly) X(memberv_val_kind) X(memberv_val_ex) \
+    X(memberv_val_slice) X(memberv_shared) X(memberv_borrowed) \
+    X(elemb_base_not_arr) X(elemb_base_slice) X(elemb_base_kind) \
+    X(elemb_bounds) \
+    X(epoch_base_not_arr) X(epoch_shifted) \
+    X(arrlen_base_not_arr) X(arrlen_base_slice) X(arrlen_base_kind) \
+    X(unpacklen_base_not_arr) X(unpacklen_base_slice) \
+    X(unpacklen_base_kind) X(unpacklen_len) \
+    X(unpackv_base_not_arr) X(unpackv_base_slice) X(unpackv_base_kind) \
+    X(unpackv_scale_wrap) X(unpackv_bounds) X(unpackv_row_not_arr) \
+    X(unpackv_row_slice) X(unpackv_row_kind) X(unpackv_len) \
+    X(unpackv_elem_ex) X(unpackv_elem_slice) \
+    X(box_not_box) X(box_kind) X(box_readonly) X(box_val_kind)
+
+enum JitDecline {
+#define ML_JD_ENUM(n) JD_##n,
+    ML_FOR_EACH_JIT_DECLINE(ML_JD_ENUM)
+#undef ML_JD_ENUM
+    JD_COUNT
+};
+extern "C" unsigned long g_jit_decline[JD_COUNT];
+/* the reason's name, for a report row or a failing test's message */
+const char *jit_decline_name(int reason);
+#ifdef TESTS
+/* Execution-proof counters for the struct BAKED fast paths - bumped by the
+ * EMITTED inline code itself (the helpers bump g_jit_op_run), so a test can
+ * prove the inline path ran, not just the slow helper. */
+extern "C" unsigned long g_jit_member_fast, g_jit_ctor_fast;
+extern "C" unsigned long g_jit_ctor_bb_moved; /* #96 grant != r9 */
+extern "C" unsigned long g_jit_boxed_fast;  /* #60: inline int-int boxed ops */
+/* the constant-divisor STRENGTH REDUCTION: bumped by the EMITTED
+ * multiply-shift sequence, so a test can prove idiv was replaced (the
+ * VALUES are identical either way, so nothing else can tell). */
+extern "C" unsigned long g_jit_divmagic;
+extern "C" unsigned long g_jit_divpow2;
+/* #106 phase 2: of the pow2 reductions, those whose DIVIDEND was proven
+ * non-negative (Chunk::nonneg_slots) - the arm that emits ONE
+ * instruction instead of the six-instruction truncating-sign bias. */
+extern "C" unsigned long g_jit_divpow2_nn;
+extern "C" unsigned long g_jit_boxed_fastf; /* H6: inline float-float ones */
+/* H6 REACH: the boxed ops that DECLINED to the exact-helper path, and how
+ * many of those were float-float. The difference is the residue no inline
+ * arm covers - which is what says whether another arm would pay. */
+extern "C" unsigned long g_jit_boxed_slow, g_jit_boxed_slow_f,
+                          g_jit_boxed_slow_m;
+/* #92: element stores served by the EMITTED inline tier, never the helper -
+ * the only thing that can prove the fast path executed. */
+extern "C" unsigned long g_jit_store_fast;
+extern "C" unsigned long g_jit_store_prep;
+extern "C" unsigned long g_jit_elem2_fast;
+/* G5: emitted-code proof that the INLINE len(str) ran (the helper is gone
+ * for a proven-string base, so jit_str_len's own counter cannot say). */
+extern "C" unsigned long g_jit_strlen_fast;
+/* the inline flat-array len (ArrLen) runs - bumped by EMITTED code */
+extern "C" unsigned long g_jit_arrlen_fast;
+/* #95: the EMITTED inline ord(s[i]) arm (execution proof) */
+extern "C" unsigned long g_jit_ord_inline;
+/* G4: execution proof for the CHECKED a[i].f helper (the subscript form). */
+extern "C" unsigned long g_jit_sfield_checked;
+extern "C" unsigned long g_jit_store2_fast;   /* #95: nested-store tier */
+extern "C" unsigned long g_jit_elem_slice_fast; /* #95: slice-read arms */
+extern "C" unsigned long g_jit_fwd;           /* lever A: fwd consumers */
+extern "C" unsigned long g_jit_fwd_local;     /* ... source was a LOCAL */
+/* lever A: ref-listed dead-temp writes skipped on C5's proof (#95) */
+extern "C" unsigned long g_jit_fwd_skip_rel;
+/* #95: 1 iff the SharedStr char-data probe VERIFIED (see jit.cpp) */
+extern "C" unsigned long g_jit_str_probe_ok;
+extern "C" unsigned long g_jit_hoist;         /* C1: hoisted-nav entries */
+extern "C" unsigned long g_jit_hoist_rmw;     /* C1e: hoisted-COMPOUND
+                                               * element stores (the RMW
+                                               * off r10/r11) */
+/* #96: the element tier's ElemScratch plan found no free register and
+ * DECLINED to the helper (emit-time), and the pool members the
+ * reservation withheld to stop that happening. See elem_scratch_reserve.
+ * TESTS-only, like every counter in this block - their DEFINITIONS live
+ * inside jit.cpp's `#ifdef TESTS`, so a bump outside one breaks the
+ * plain-release build. It did, for five commits (see the note there). */
+extern "C" unsigned long g_jit_elem_noreg;
+extern "C" unsigned long g_jit_elem_reserve;
+/* #96: fragment entries that spent a CALLER-saved pin (XCACHE_REGS -
+ * r10/r11). The emitted-code proof that the extension reaches a real
+ * program, and the discriminator between "the pool is wide" and "the
+ * pool is wide AND something used the width". */
+extern "C" unsigned long g_jit_xcache;
+/* #96: fragment entries that ran with RAX itself pinned - the 13th
+ * and last register's own execution proof (see run_may_pin_rax). */
+extern "C" unsigned long g_jit_rax_pin;
+/* #96 inc-1: fragment entries that ran with >= 1 spill-homed slot. */
+extern "C" unsigned long g_jit_scache;
+/* D3.b 2b-ii: fragments ENTERED whose pin set came from the linear
+ * scan (the lsra lever) - the bridge's execution proof. */
+extern "C" unsigned long g_jit_lsra_pins;
+extern "C" unsigned long g_jit_call_pinned_sites;  /* #97 1b (emit-time) */
+/* F4a: entries of a fragment whose FLOAT pin set the lsra float
+ * fallback chose (the facts-based fhot replacement) */
+extern "C" unsigned long g_jit_lsra_fpins;
+/* F4b: float transitions EXECUTED (bumped from the emitted seam code;
+ * g_jit_lsra_trans counts the GP pool only) */
+extern "C" unsigned long g_jit_lsra_ftrans;
+extern "C" unsigned long g_jit_lsra_rebids;
+/* seams the share plan refused inside a C2b hoist region (the
+ * cold-path-bypass hazard; compile-time, not from emitted code) */
+extern "C" unsigned long g_jit_share_clamped;
+/* C1: region cold-copy ENTRIES (a failed guard took the copy) - the
+ * per-verdict twin of g_jit_hoist's per-preheader count */
+extern "C" unsigned long g_jit_cold_copy;
+/* D3.b 2b-iii-b: lsra TRANSITIONS executed (bumped by the emitted
+ * transition code itself - flush and install arms alike). */
+extern "C" unsigned long g_jit_lsra_trans;
+/* #96 inc-2: range seams EXECUTED (eviction + install ran). */
+extern "C" unsigned long g_jit_range_share;
+/* the in-process FORCE override (a bitmask of JitLever bits), for
+ * tests exercising a cost-declined mechanism - the g_jit_xrot
+ * pattern. Zero outside tests. */
+extern unsigned g_jit_force_extra;
+/* a lever's g_jit_force_extra bit, resolved by NAME (0 if unknown) */
+unsigned jit_lever_bit(const char *name);
+/* #96: `<op> [slot], reg` emitted instead of the four-instruction
+ * load/load/apply/store shape - the two-address form. */
+extern "C" unsigned long g_jit_two_addr;
+/* #96 increment 2: `<op> pin, <src>` - the two-address form with a
+ * PINNED destination, which collapses four instructions to one uop. */
+extern "C" unsigned long g_jit_two_addr_reg;
+/* #100: a literal multiply emitted as shl/lea/neg forms instead of
+ * imul (the #91 div-magic sibling). Bumped from the EMITTED code, so
+ * it is an execution count - the "prove the code ran" counter for the
+ * strength-reduced forms (TESTS builds only, like its siblings). */
+extern "C" unsigned long g_jit_mul_strength;
+/* #101 (the peephole, level 1-2): COMPILE-time counts - an immediate
+ * load emitted in a short form instead of the 10-byte movabs, and a
+ * literal compare operand folded into the cmp. The encoding IS the
+ * artifact here (disasmcheck/objdump prove the bytes), so a compile
+ * count is the right reach evidence, unlike the runtime tiers. */
+extern "C" unsigned long g_jit_peep_short;
+extern "C" unsigned long g_jit_peep_fold;
+extern "C" unsigned long g_jit_peep_selfmov;
+/* #97: the boxed-element inline READ tier (LoadElemValue's fast path -
+ * general-storage array, in-range index, non-ex non-slice value; the
+ * reference lifecycle inline: retain-new, dec-release-old with a cold
+ * C++ arm for destruction). Bumped from the EMITTED code. */
+extern "C" unsigned long g_jit_elemv_fast;
+extern "C" unsigned long g_jit_unpackv_fast;
+/* #97 inc 3: the boxed-element inline STORE tier (`a[i] = v` into a
+ * general array: retain-new, release-old with a cold arm, the COW
+ * guards the interpreter's put would run, and the hash byte). Bumped
+ * from the EMITTED code. */
+extern "C" unsigned long g_jit_storev_fast;
+/* #97 inc 4: the inline struct FIELD store tier (StoreMemberV) - a POD
+ * field written straight to its baked byte offset, or a boxed field's
+ * LValue with the reference lifecycle. Bumped from the EMITTED code. */
+extern "C" unsigned long g_jit_memberv_fast;
+/* class step 4: the inline `*b` arm (LoadBoxV / StoreBoxV) - an int or
+ * float box read or written in place. Bumped from the EMITTED code. */
+extern "C" unsigned long g_jit_box_fast;
+/* class step 4: the baked member read's BOXED-field form (a class
+ * instance's field, a non-POD struct's) ran. Bumped from EMITTED code. */
+extern "C" unsigned long g_jit_member_bfast;
+/* class step 4: the boxed-element tier's array<C> arm (Storage::objs)
+ * ran. Bumped from EMITTED code. */
+extern "C" unsigned long g_jit_elemo_fast;
+/* #97 step 3: the inline closure STORE ran (the construct-only helper
+ * handed the pointer over and emitted code stored it). */
+extern "C" unsigned long g_jit_closure_fast;
+extern "C" unsigned long g_jit_peep_depbrk;
+/* the in-process OFF override for the lever mask (tests; pairs with
+ * jit_lever_bit) - the env masks are cached statics. */
+extern "C" unsigned g_jit_off_extra;
+/* the in-process twin of MYLANG_JIT_COLD: OR'd into the parsed mask, so
+ * a test can drive a cold arm and restore it (bit = 1 << JitColdTier) */
+extern "C" unsigned g_jit_cold_extra;
+static const unsigned JIT_COLD_GUARD_BIT = 1u << 1;   /* `guard` */
+extern "C" unsigned long g_jit_rax_retries;
+/* #96 increment 3: a counted loop whose counter is PINNED - the step
+ * and the bound test run entirely in registers, RAX untouched. */
+extern "C" unsigned long g_jit_step_imm;
+extern "C" unsigned long g_jit_fcache;        /* C2a: float-pinned fragment
+                                               * entries (xmm4-7) */
+extern "C" unsigned long g_jit_hoist2;        /* C2b: second-base preheader
+                                               * entries (the callee-saved
+                                               * pair) */
+extern "C" unsigned long g_jit_capbase;       /* #112: fragment entries with
+                                               * ctx->captures->data() pinned
+                                               * for the run */
+/* #97 closure inlining (bumped by EMITTED code): guards that fell into
+ * the inlined body; explicit-closure capture accesses served by the
+ * inline copy; CoerceNumV inline-arm executions */
+extern "C" unsigned long g_jit_guard_hits;
+extern "C" unsigned long g_jit_guard_proven;
+extern "C" unsigned long g_jit_ghoist_pre;
+extern "C" unsigned long g_jit_ghoist_hot;
+extern "C" unsigned long g_jit_ghoist_stub;
+extern "C" unsigned long g_jit_capof_fast;
+extern "C" unsigned long g_jit_coerce_fast;
+extern "C" unsigned long g_jit_coerce_pin;
+/* SP: every emitted call goes through Emitter::call_direct or
+ * call_reg; this counts them, and `spcheck_sites` the MYLANG_JIT_SPCHECK
+ * runtime alignment checks emitted beside them. */
+extern "C" unsigned long g_jit_call_sites;
+extern "C" unsigned long g_jit_lea_addsub;      /* #97 1b(ii) reach */
+extern "C" unsigned long g_jit_entry_pad_off;   /* SP3 reach */
+extern "C" unsigned long g_jit_pins_cs;        /* REGCALL 1 reach */
+extern "C" unsigned long g_jit_pins_cs_lost;   /* ...and lost bets */
+extern "C" unsigned long g_jit_ret_unflushed;  /* REGCALL 2 reach */
+extern "C" unsigned long g_jit_regcall_proven; /* REGCALL 3 reach */
+extern "C" unsigned long g_jit_regcall_fargs;   /* REGCALL 4 reach */
+extern "C" unsigned long g_jit_xcall_brackets;  /* #124(b) reach */
+extern "C" unsigned long g_jit_xcall_lost;      /* ...and lost bets */
+extern "C" unsigned long g_jit_temp_regs;       /* #86 reach */
+extern "C" unsigned long g_jit_ret_truth_slow;  /* #84 slow-tier rdx */
+extern "C" unsigned long g_jit_regcall_fpinned; /* ...into a pin */
+extern "C" unsigned long g_jit_call_align;      /* SP3: self-aligned */
+extern "C" unsigned long g_jit_call_dead_model; /* SP3: unreachable */
+extern "C" unsigned long g_jit_spcheck_sites;
+#if defined(TESTS) && ML_JIT_SUPPORTED
+extern "C" bool g_jit_spcheck;      /* MYLANG_JIT_SPCHECK=1 */
+#endif
+extern "C" unsigned long g_jit_capbase_cs;    /* W6: runs whose capture base
+                                               * is CALLER-saved (a call-free
+                                               * run: no entry push/pop) */
+extern "C" unsigned long g_jit_telide;        /* C3: type-elided fragment
+                                               * entries */
+extern "C" unsigned long g_jit_fread;         /* C4a-i: float read-dispatch
+                                               * elision entries */
+extern unsigned long g_jit_sync_switch;         /* #56: cap SWITCH pushes */
+extern unsigned long g_jit_cached_probe_calls;  /* probe elision (2026-09-19) */
+extern unsigned long g_jit_sync_boundary_call;  /* #56: chunk-less calls */
+/* G1: HITS of the emitted monomorphic callee cache - the same callee as last
+ * time at this site, so the five callee-property guards are skipped. Bumped
+ * by EMITTED code on the hit arm only (a miss falls into the full chain). */
+/*
+ * #97 step 4: the BAKED-CALLEE arm, bumped by EMITTED code once per call
+ * that passed the identity compare. An emitted-code counter is the right
+ * proof here (unlike g_jit_arg_scalar's emit-time one): the baked arm IS
+ * an instruction sequence, and what it replaced - the cache probe and the
+ * five gates - would otherwise be indistinguishable from it in any
+ * value-level test.
+ */
+extern "C" unsigned long g_jit_bake_push;
+extern "C" unsigned long g_jit_bake_widen;   /* #97 1c */
+extern "C" unsigned long g_jit_callee_cache;
+extern "C" unsigned long g_jit_callee_cache2;
+/* G1: inline pushes made to a callee with an int/float-declared param - the
+ * shape that used to decline to the C++ tier outright. */
+extern "C" unsigned long g_jit_bind_coerce;
+/* G1: arguments actually WIDENED by the emitted push (bool -> int,
+ * int/bool -> float) rather than found already exact. */
+extern "C" unsigned long g_jit_bind_widen;
+/* G1: hits on the cache's THIRD entry - the coercing callee, whose five
+ * descriptor properties a pointer match re-establishes (its per-argument
+ * checks still run every call). */
+extern "C" unsigned long g_jit_coerce_cached;
+extern "C" unsigned long g_jit_sync_inline;
+extern "C" unsigned long g_jit_entry_resume;
+
+/* The TESTS-emitted per-push verification (defined in vm.cpp - it reads
+ * the activation's top record, which only vm.cpp can see). NEVER throws
+ * (the #142 rule); a mismatch is a deliberate located abort. */
+extern "C" void jit_norec_push_verify(const void *site,
+                                      const void *rbp) noexcept;
+/* step 4-iii: the record-less return arm's pre-mutation oracle (vm.cpp -
+ * it reads the record the arm is about to NOT use). */
+extern "C" void jit_norec_retarm_verify(const void *dst_addr,
+                                        const void *rbp,
+                                        int_type total) noexcept;
+/*
+ * G1 STEP 2 seed: the HARDWARE return address vs the table. Emitted at
+ * the top of EVERY fragment entry (TESTS): if [rsp] at entry lies in
+ * EMITTED code, the caller was a fragment-to-fragment call - a sync
+ * `call rdx` or a #55 leaf `call rcx` - and the table MUST resolve it to
+ * a site recording exactly that address. This is the check the step-1
+ * sabotage run proved was missing: a corrupted ret-address OFFSET was
+ * self-consistent, because every lookup key came from the same field. A
+ * C++ return address (jit_enter and friends) resolves to no fragment and
+ * passes silently. Defined in jit.cpp (it needs only the registries).
+ */
+extern "C" void jit_norec_ret_verify(const void *ra) noexcept;
+extern unsigned long g_jit_norec_ret_verify;
+/* step 2: frames verified at capture (the table had both halves), and
+ * postexit stamps that matched the table's loc for the popped frame. */
+extern unsigned long g_jit_norec_frame_verify;
+extern unsigned long g_jit_norec_stamp_verify;
+/* step 3: frames the rbp-chain shadow walk matched against records. */
+extern unsigned long g_jit_norec_walk_frames;
+/* step 3b: frames whose descriptor was reconstructed from the site chain
+ * (site.caller_desc == the frame below's desc) and matched the record. */
+extern unsigned long g_jit_norec_desc_chain;
+/* step 3c: frames whose WINDOW was recovered from the native frame alone
+ * ([fp-8] = the rbx the prologue saved = the frame BELOW's window) and
+ * matched the record. This is step 4's record-ful/record-less
+ * DISCRIMINATION mechanism, proven while both sources exist. */
+extern unsigned long g_jit_norec_win_chain;
+/* step 4 GATE REACH, classified per M5b inline push (in push_verify, so
+ * it costs no extra emit): would this call's CALLEE qualify for the
+ * no-record tier? ok = plain_frame + fully-deleted body (every op
+ * EnterNative - the frame can never resume through the interpreter
+ * mid-body) + a short ref_slots list (the C4c release-arm bound);
+ * cached = the pure-cache exclusion (fib's documented decline);
+ * plain / body = which gate refused the rest. */
+extern unsigned long g_jit_norec_gate_ok;
+extern unsigned long g_jit_norec_gate_cached;
+extern unsigned long g_jit_norec_gate_plain;
+extern unsigned long g_jit_norec_gate_body;
+/* step 4-ii: raises whose walk anchored on the fragment's LIVE rbp (the
+ * helpers pass it; interpreted raisers pass null and skip). */
+extern unsigned long g_jit_norec_raise_walk;
+/* ... and the FRAMES those raise walks traversed - separable from the
+ * push walks so a dead anchor (a walk that silently floors at level 0)
+ * is a test failure, not a hidden regression. */
+extern unsigned long g_jit_norec_raise_frames;
+/* step 4-iii (the norec tier, DEFAULT ON): returns served by the emitted
+ * RECORD-LESS arm (the prove-it-ran counter - bumped by the emitted
+ * code, so a dead discrimination byte cannot fake it), and the arm's
+ * pre-mutation shadow verifications. */
+extern unsigned long g_jit_norec_ret_arm;
+extern unsigned long g_jit_norec_retarm_verify;
+/* step 4-iv: the -3/SWITCH MATERIALIZER's shadow (design doc 4d) - runs
+ * in jit_call_sync_switch at every depth-cap switch, walking the native
+ * chain from the relayed rbp and reconstructing, per frame, every field
+ * the 4-v record insert will bake (identity via the site descent seeded
+ * by the RELAYED site, window via the [fp-8] chain, dst/resume from the
+ * frame's own site, seg/watermark from the window pointer, captures from
+ * the residue), compared field-for-field against the records while they
+ * still exist. mat_walk = switches walked; mat_frames = levels verified
+ * (the load-bearing half - a dead anchor floors at 0 silently, the 4-ii
+ * lesson); mat_residue = would-be RECORD-LESS frames whose full insert
+ * reconstruction was verified (moves only with the norec tier on -
+ * the default - where residue frames exist). */
+extern unsigned long g_jit_norec_mat_walk;
+extern unsigned long g_jit_norec_mat_frames;
+extern unsigned long g_jit_norec_mat_residue;
+/* step 4-v: RECORD-LESS pushes actually made (the fork's prove-it-ran
+ * counter - bumped by the emitted norec arm, so a dead gate cannot fake
+ * it). */
+extern unsigned long g_jit_norec_pushes;
+/* step 4-v: records INSERTED by the switch materializer for record-less
+ * frames (the -3 path's prove-it-ran counter). */
+extern unsigned long g_jit_norec_mat_insert;
+/* step 4-ii(b): the backtrace prefix RECONSTRUCTED at the last
+ * rbp-anchored raise, from hardware + baked emit-time constants ONLY
+ * (the chain's return addresses -> sites -> site_loc/caller_desc, seeded
+ * by the raise helper's baked desc) - zero record fields. Each entry is
+ * one physical frame of the topmost native segment, innermost first,
+ * cross-checked against the records at build time; the -rt harness
+ * compares it END-TO-END against the caught exception's actual captured
+ * backtrace (the composition check the per-level invariants cannot do:
+ * ordering, stamps, which frames get entries at all). */
+struct NorecReconFrame {
+    const void *desc;
+    unsigned long long site_loc;
+};
+extern std::vector<NorecReconFrame> g_norec_recon;
+/* C4c: returns served by the EMITTED inline pop (the fast jit_ret shape) -
+ * bumped by the emitted code itself, so it proves the inline tier ran (the
+ * jit_ret helper's own counter also counts declines and cannot). */
+extern "C" unsigned long g_jit_ret_inline;
+/* C4a-i: TEMP slots admitted to the float read-elision set (compile-time -
+ * it proves the AUDIT TABLE is complete, see the definition). */
+extern "C" unsigned long g_jit_fread_temps;
+/* C4a-ii: FLOAT-forwarded consumers RUN (the emitted-code proof, the
+ * float twin of g_jit_fwd). */
+extern "C" unsigned long g_jit_ffwd;
+/* C3 inc 3: TEMP slots admitted to the float TYPE-STORE elision. */
+extern "C" unsigned long g_jit_telide_temps;
+/* C4b: fragment entries that pinned float literals in registers. */
+extern "C" unsigned long g_jit_flit;
+/* C4b inc 2: times the ref-listed float-store arm had to move a
+ * non-xmm0 result into xmm0 for jit_put_float (see the emit). */
+extern "C" unsigned long g_jit_fstore_movx0;
+/* C4d: baked member reads emitted with NO type/def guards, because a
+ * dominating planned StructCtorV proved both (jit_struct_facts).
+ * g_jit_member_fast counts the GUARDED form too, so only this can prove
+ * the elided one ran. */
+extern "C" unsigned long g_jit_member_noguard;
+/* C4e: loop preheaders that established a ctor's H1 invariant (so the
+ * ctors inside emitted no guards at all). */
+extern "C" unsigned long g_jit_ctor_est;
+/* C5: fragment entries / entry stubs that RELEASED a ref-listed temp. */
+extern "C" unsigned long g_jit_release_entry;
+/* C5: scalar store sites emitted with no ref guard (compile-time - the
+ * partner proof to g_jit_release_entry, see the definition). */
+extern "C" unsigned long g_jit_relent_stores;
+#endif
+
+/*
+ * G1 NO-RECORD TIER, STEP 1 (plans/archived/g1-no-record-tier.md). The side table
+ * is emitted in every build; the VERIFICATION - the shadow-oracle seed -
+ * runs only where the counters exist:
+ *   norec_sites         table entries REGISTERED (compile-time)
+ *   norec_verify        emitted verify calls RUN (one per inline push)
+ *   norec_audit_frames  live records re-verified by the FULL-STACK audit
+ *                       (g_norec_audit; the transient-corruption net)
+ * All three defined in vm.cpp beside the helper that bumps them, so the
+ * non-JIT platforms link without stubs.
+ */
+extern unsigned long g_jit_norec_sites;
+extern unsigned long g_jit_norec_verify;
+extern unsigned long g_jit_norec_audit_frames;
+extern bool g_norec_audit;
+/*
+ * NET 2 - the DETERMINISTIC EVENT SWEEP (`MYLANG_RECON_AT=N`, or
+ * g_norec_recon_at from a test). Forces the reconstruction the
+ * record-less unwind would perform at the Nth CALL EVENT and compares
+ * it against the live records, so reconstruction is exercised at every
+ * point it COULD be demanded rather than only where an exception
+ * happens to fall. The driver is tests/norec_sweep.
+ *   norec_events        call events seen so far this run
+ *   norec_recon_probes  probes that actually fired
+ *   norec_recon_frames  frames those probes reconstructed
+ */
+extern unsigned long g_jit_ret_audit_done;
+extern unsigned long g_jit_ret_audit_skipped;
+extern unsigned long g_jit_ret_audit_refscan;
+extern unsigned long g_vm_seg_advance;
+extern unsigned long g_jit_sync_depth_max;
+extern unsigned long g_norec_recon_at;
+extern unsigned long g_norec_events;
+extern unsigned long g_jit_norec_recon_probes;
+extern unsigned long g_jit_norec_recon_frames;
+/* ret-address -> site, and address -> owning fragment's chunk. Real
+ * implementations live in jit.cpp (the registries are filled when a
+ * fragment is placed); the non-JIT build gets null-returning stubs. */
+const NorecSite *jit_norec_site_for(const void *ret_addr);
+const Chunk *jit_norec_frag_for(const void *addr);
+/* G1 step 4's CALLEE gate (design doc 4b): plain_frame + FULLY DELETED
+ * (every op EnterNative - the record is the interpreter's only resume
+ * vehicle, so a record-less frame may never run interpreted) + a short
+ * ref_slots list (the C4c return arm's bound). Per-CALL exclusions (a
+ * cached call) are the site's business. False off-platform. */
+bool jit_chunk_norec_ok(const Chunk &chunk);
+/* is the norec tier ON? Default true (inc 5 flipped it, 2026-08-12);
+ * MYLANG_JIT_OFF=norec disables it. False off-platform. */
+bool jit_norec_on();
+/*
+ * A compiled chunk that MOVES to its final storage (codegen_chunk returns
+ * by value; the lazy vm_func_chunk net jits a stack local and emplaces it)
+ * leaves every site's `caller` and the range registry's chunk pointer at
+ * the OLD address - the audit's chain check found exactly that on its
+ * first -rt run (a 0x7ffc... stack address where a chunk belonged). Call
+ * this at every move DESTINATION; the chain check is the net for a missed
+ * one. No-op when the chunk has no native code.
+ */
+void jit_norec_rebind(Chunk &chunk);
+/*
+ * G1 step 4-iv (plans/archived/g1-no-record-tier.md 4d): the MATERIALIZER ANCHOR
+ * relay. The emitted slow tail stores the site's NorecSite* and the
+ * calling FRAGMENT's rbp here just before invoking the jit_call_sync*
+ * helper (every register is an argument there, and the switch is the
+ * helper's own cold decision), so a depth-cap SWITCH can walk the native
+ * chain from the switching caller and - in 4-v - INSERT records for the
+ * record-less frames the -3 propagation is about to unwind. Fresh at
+ * every helper entry (all three helpers are reached only through a slow
+ * tail); null only when the JL_NOREC lever is off (no sites emitted), in
+ * which case every frame is record-ful and there is nothing to
+ * materialize. Defined in vm.cpp (the reader) beside the other
+ * conveyance globals; single-threaded like the rest of them. */
+extern const void *g_norec_switch_site;
+extern const void *g_norec_switch_rbp;
+/*
+ * 4-v: the EXIT RELAY - every fragment pc-exit stores the exiting
+ * function's FuncDescriptor here (the shared epilogue's last act before
+ * the ret). A conveyed exception out of a RECORD-LESS frame reaches the
+ * caller's site with the frame's native stack dead; the callee's
+ * identity - the one datum the record-less cleanup cannot derive from
+ * live state (the vframe still holds its window and total, the captures
+ * relay its caller's captures) - comes from here. Consumed only when the
+ * window compare says the exited frame was record-less; stale values are
+ * never read. Null for main's fragments (a boundary frame is never the
+ * record-less exited callee). Defined in vm.cpp beside the switch relay.
+ */
+extern const void *g_norec_exit_desc;
+/* 4-iii/4-v: the residue-captures relay (see the emit-side comment in
+ * jit.cpp) - ALSO the record-less postexit's caller-captures source (the
+ * site's residue_pop parks the popped captures value here before the
+ * status dispatch, exception paths included). Defined in vm.cpp. */
+/* a REFERENCE to a low-arena cell (#97 step 1c): the emitter reaches it
+ * with an absolute disp32, one instruction and no scratch register. */
+extern const void *&g_jit_residue_caps;
+/*
+ * LEVER A's whitelists, at the OPCODE level - the input to the
+ * FAMILY-COVERAGE RATCHET (`jit_fwd_family_coverage`, tests.cpp). They
+ * are not a second copy of the tables: the Instr-taking predicates in
+ * jit.cpp are built ON these, so a whitelist has exactly one edit site
+ * and the ratchet cannot drift from what the emitter actually consults.
+ *
+ * `jit_fwd_op_consumer_slots` returns a MASK of forwardable operand
+ * positions (0 == not a consumer) rather than a bool, because the
+ * positions differ per op.
+ */
+enum { JIT_FWD_A = 1u, JIT_FWD_B = 2u };
+enum class OpCode : uint8_t;         /* bytecode.h; no include needed */
+bool jit_fwd_op_is_producer(OpCode op);
+unsigned jit_fwd_op_consumer_slots(OpCode op);
+bool jit_fwd_op_is_fproducer(OpCode op);
+bool jit_fwd_op_is_fconsumer(OpCode op);
+
+#ifdef TESTS
+#  define ML_JIT_OP_RAN(op) (g_jit_op_run[static_cast<size_t>(OpCode::op)]++)
+#else
+#  define ML_JIT_OP_RAN(op) ((void)0)
+#endif
+
+/*
+ * #55 native calls (plans/archived/native-call-impl.md): a fully-native LEAF body's
+ * ReturnV runs IN the fragment. The fragment flushes its register cache and
+ * calls this with the result value's frame slot; jit_ret reads that slot from
+ * the CURRENT callee window, then either pops the frame (an in-VM call -
+ * vm_frame_leave writes the parent's dst + sets the resume globals) or, at a
+ * BOUNDARY frame, sets flow (the do_func_call / callback contract). It returns
+ * a resume SENTINEL the EnterNative handler applies (switch to the parent, or
+ * stop the invocation). Defined in vm.cpp (it needs the in-VM call stack) and
+ * baked as a call target by the emitter. noexcept: a fully-native leaf body is
+ * throw-free, so the pop/leave here cannot throw. */
+extern "C" size_t jit_ret(int_type res_slot) noexcept;
+
+/* 4-v: the RECORD-LESS return's decline tier (an ARRAY result, whose
+ * slice registration names its slot, and a raw bit-1 dst need C++'s
+ * steal/put; #97 R1 moves every other reference) - jit_ret's twin
+ * with no record to read: the destination comes from the residue
+ * (dst_addr), the frame's identity from the BAKED desc (the returning
+ * chunk is known at its own ReturnV's emit), the parent window from the
+ * chain; the caller's sentinel arm restores the vframe + captures, so
+ * this only steals/writes/releases and un-accounts the frame. */
+extern "C" size_t jit_ret_norec(int_type res_slot, LValue *dst_addr,
+                                const void *descv,
+                                const void *rbp) noexcept;
+
+/* C4c: the address of the TU-local g_vm_resume_chunk (the pc twin is
+ * jit_addr_resume_pc above) - the emitted inline pop stores both resume
+ * globals directly instead of calling jit_ret. */
+void *jit_addr_resume_chunk();
+
+/* C4c: the per-slot release the emitted inline pop's cold arm calls for a
+ * ref-listed slot holding a live reference - pop_window's exact per-slot
+ * scan body (an LValue assignment, so slice unregistration is correct by
+ * construction). */
+extern "C" void jit_release_slot(LValue *lv) noexcept;
+/* #97 R1: the native return arm's OLD-dst release - the payload's
+ * destructor in place, no stack temporary (LValue::drop_for_overwrite) */
+extern "C" void jit_drop_dst(LValue *lv) noexcept;
+
+/* C4c: the VM_HARDENING audit the emitted inline pop calls before its
+ * guards - re-runs the every-slot-trivial + plain-frame watermark checks
+ * pop_window's C++ path would have run (the C3 net stays alive on the
+ * hardened lanes while they exercise the same emitted path a release
+ * runs). A no-op body outside ML_VM_HARDENING builds. */
+extern "C" void jit_ret_audit() noexcept;
+
+/* C4d: the VM_HARDENING net for the GUARD-ELIDED member read - re-checks
+ * at RUNTIME, on the same emitted path a release takes, the very fact the
+ * dataflow proved (slot holds a struct of `def`). A stale audit table, a
+ * missed KILL or a predecessor the CFG walk failed to enumerate all show
+ * up here as a located abort instead of a wild pointer read. A no-op body
+ * outside ML_VM_HARDENING builds. */
+extern "C" void jit_member_fact_audit(int_type slot,
+                                      const void *def) noexcept;
+
+/* C4e: establish the H1 reuse invariant on `dst` once, in a loop
+ * preheader, so the ctors inside need no guards. Idempotent and
+ * non-destructive when the slot already holds a reusable instance. */
+extern "C" void jit_struct_ctor_establish(const void *def,
+                                          int_type dst) noexcept;
+
+/* model-flip (nativize-ops): the native Halt - a fall-through body's implicit
+ * `return none`. Like jit_ret but the result is hard-wired to none (no slot).
+ * IN-VM: vm_frame_leave (parent dst = none) -> JIT_RET_SENTINEL. BOUNDARY: bare
+ * JIT_RET_BOUNDARY (flow untouched - a fall-through body's flow is none). */
+extern "C" size_t jit_halt() noexcept;
+
+/*
+ * model-flip M3 (plans/archived/model-flip.md): the native CONTAINER's ISLAND call. A
+ * container fragment, at an interpreted island, `call`s this with its OWN
+ * FuncDescriptor (so vm_exec_block can reach the container's chunk via
+ * desc->vm_chunk) and the island's start pc. Runs the island via vm_exec_block
+ * in the container frame; returns the fall-through resume pc, or a high-bit-set
+ * RAISED sentinel (bridging the pending exception into g_vm_jit_exc) so the
+ * caller fragment can `test rax; jns` and exit to re-raise. noexcept. */
+extern "C" size_t jit_exec_block(const FuncDescriptor *desc,
+                                 size_t from_pc) noexcept;
+
+/* #55: native ReturnVs executed process-wide (a `jit:` coverage counter that
+ * PROVES the native return path actually ran, not the interpreter). */
+extern unsigned long g_jit_native_returns;

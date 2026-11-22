@@ -1,0 +1,93 @@
+# The INTRUSIVE suite's DEEP runs (#107) - ON DEMAND ONLY.
+#
+# The push-triggered part lives in nets.yml (`int`: -rt, tests/int, the
+# corpus with probes and census, the coverage gate; `int-enum`: the
+# decision enumerator's tiers 1 and 2). These two are minutes locally
+# and an hour or more on a hosted runner, so they run when asked:
+#   gh workflow run int-deep.yml --ref exp-work -f tier3=true -f select=true
+#
+# The Actions tab offers "Run workflow" only for a file on the DEFAULT
+# branch, and this one lives on exp-work. The `push` trigger below is
+# what makes GitHub know it at all: a push that changes this file
+# registers it, and every job is skipped on that event. Once registered,
+# it is started through the API (the command above) on exp-work.
+#
+#  - tier3:  the enumerator's tier 3 - a pairwise covering array of
+#            every larger decision scope (~110k runs). Under the
+#            float-pool-restore sabotage it failed 11 programs where
+#            tier 1 failed 4 and tier 2 one.
+#  - select: tests/int_select - every candidate's coverage, the
+#            irredundant cover and its ownership table (a report and a
+#            JSON artifact; it fails only on a wrong answer or a broken
+#            coverage pass).
+name: int-deep
+
+on:
+  push:
+    paths: ['.github/workflows/int-deep.yml']   # registers it; runs nothing
+  workflow_dispatch:
+    inputs:
+      tier3:
+        description: "the enumerator's tier 3 (pairwise covering arrays)"
+        type: boolean
+        default: true
+      select:
+        description: "tests/int_select (cover + ownership table)"
+        type: boolean
+        default: true
+
+jobs:
+  tier3:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.tier3 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+    - uses: actions/checkout@v5
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
+    - name: Build (INT_TESTS, optimized, asserts on)
+      run: |
+        cmake -S $GITHUB_WORKSPACE -B build-enum -DINT_TESTS=ON \
+              -DCMAKE_BUILD_TYPE=Release -DASSERTS=ON -DLTO=OFF
+        cmake --build build-enum -j
+    # tests/run checks the binary first (`int_tests 1`, `asserts 1`),
+    # then runs tier 3 over tests/functional and the input-free samples
+    - name: tests/run int_enum-3
+      run: tests/run -o -a --timeout 17400 --logs test-logs
+           --bin int-rel=build-enum/mylang int_enum-3
+    - name: Upload the logs and failures
+      if: failure()
+      uses: actions/upload-artifact@v6
+      with:
+        name: int-enum-t3
+        path: test-logs/
+        if-no-files-found: ignore
+
+  select:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.select }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      CXX: g++-14        # MC/DC (-fcondition-coverage) needs GCC >= 14
+    steps:
+    - uses: actions/checkout@v5
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
+    - name: Install GCC 14
+      run: sudo apt-get update && sudo apt-get install -y g++-14
+    # The Makefile build: int_select reads the objects and their notes
+    # beside the binary (a CMake tree keeps them under CMakeFiles/)
+    - name: Build (INT_TESTS + GCOV, debug)
+      run: make -j"$(nproc)" CXX=g++-14 OPT=0 TESTS=1 INT_TESTS=1 GCOV=1 \
+                BUILD_DIR=build-sel
+    # the report is the test's log, the cover its JSON (test-logs/)
+    - name: tests/run int_select
+      run: tests/run -o -a --timeout 17400 --logs test-logs
+           --bin int-gcov=build-sel/mylang int_select
+    - name: Upload the report
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: int-select
+        path: test-logs/int_select*
+        if-no-files-found: ignore

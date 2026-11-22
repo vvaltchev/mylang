@@ -1,0 +1,50 @@
+var k = 1
+if (k == 2)
+  print("WRONG: the body ran though k != 2")
+if (k == 2)
+  print("WRONG")
+else
+  print("else ran")
+if (k == 3)
+  print("no")
+else if (k == 1)
+  print("else-if ran")
+else
+  print("no")
+if (k == 1)
+  print("then ran")
+print("next")
+for (var j = 0; j < 3; j++)
+  print(j)
+var n = 0
+while (n < 2)
+  n++
+n
+foreach (e in [7, 8])
+  print(e)
+if (k == 1 &&
+    k > 0)
+  print("two-line header")
+var q = 1; if (q == 1)
+  print("after a semicolon")
+{ print("a block") } if (q == 1)
+  print("after a block")
+if (q == 1) print("on one line")
+if (q == 1)
+  print((func() { if (q > 5) { return 1 } else { return 2 } })())
+struct E { int c; }
+try
+{
+  throw E(5)
+}
+catch (E as e)
+{
+  print(e.c)
+}
+finally
+{
+  print("fin")
+}
+var i = 0
+while (true) { i++; if (i > 2) { break } }
+i

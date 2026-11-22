@@ -1,0 +1,22 @@
+# The REPL's echo, its bookkeeping and its inspection commands at their
+# edges: a value lookup that starts on a later line of a multi-line input
+# (its statement is found past the earlier lines' tokens), a lookup whose
+# expression holds a `;` inside a function literal's body (not the
+# statement's end), an input that fails while it runs after a plain
+# assignment completed (the assignment keeps its effect, and it declared
+# nothing to give back), and :type / :show given a trailing `;`, trailing
+# blanks, nothing, or an expression that does not parse.
+var w1 = 1
+w1 = 7; var dyn q2 = nope()
+w1
+var q = [
+none]; q[0]
+[none, func() { var a = 1; return a; }][0]
+:type 1 + 2;
+:type 1 + 2   
+:type ;
+:type 1 +
+:show 1 + 2;
+:show 1 + 2   
+:show ;
+:show 1 +

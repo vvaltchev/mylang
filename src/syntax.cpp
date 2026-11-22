@@ -3,6 +3,9 @@
 #include "errors.h"
 #include "syntax.h"
 
+#include <algorithm>
+#include <iterator>
+
 using std::string;
 using std::string_view;
 
@@ -60,16 +63,8 @@ uint64_t Construct::live_nodes = 0;
 #  define RECYCLE_UNPOISON(p, n) ((void) 0)
 #endif
 
-/*
- * The recycler never frees, so LeakSanitizer would report every recycled block
- * as a leak. Those leaks are intentional and bounded (one short -rt process),
- * so turn leak detection off for a RECYCLE build. (A weak hook ASan reads at
- * start; harmless if ASan isn't linked.)
- */
-extern "C" const char *__asan_default_options()
-{
-    return "detect_leaks=0";
-}
+/* The recycler never frees, so a RECYCLE build turns LeakSanitizer off:
+ * see __asan_default_options (mylang.cpp), the one copy of that hook. */
 
 namespace {
 
@@ -126,7 +121,7 @@ void Construct::operator delete(void *p) noexcept
  * whole AST, asserts live_nodes == 0, and any residual Construct* now reads
  * zeroed, freed memory - a loud crash, not a silent tree-walk. Plain
  * malloc-backed new/delete otherwise (the sized delete gives memset its
- * length with no header). See plans/vm-ast-free-runtime.md.
+ * length with no header). See plans/archived/vm-ast-free-runtime.md.
  */
 #include <cstdlib>
 #include <cstring>
@@ -360,6 +355,24 @@ void LiteralDictKVPair::serialize(ostream &s, int level) const
     s << ")";
 }
 
+void DerefExpr::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent << "Deref(\n";
+    elem->serialize(s, level + 1);
+    s << endl << indent << ")";
+}
+
+void CastExpr::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent << "Cast<" << annot_type_text(to) << ">(\n";
+    elem->serialize(s, level + 1);
+    s << endl << indent << ")";
+}
+
 void IncDecExpr::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');
@@ -443,6 +456,28 @@ void ExprList::serialize(ostream &s, int level) const
     s << ")";
 }
 
+/* Declared in syntax.h - see the contract there. */
+bool builtin_takes_arr_hint(std::string_view name)
+{
+    return name == "range" || name == "array" || name == "make_array" ||
+           name == "keys" || name == "values" || name == "map" ||
+           name == "filter";
+}
+
+/* Declared in syntax.h - see the contract there. A constexpr array: a
+ * static set's run-time initialisation guard is itself a branch no run
+ * takes twice */
+bool builtin_builds_container(std::string_view n)
+{
+    static constexpr std::string_view names[] = {
+        "range", "array", "make_array", "make_dict", "dict", "keys",
+        "values", "kvpairs", "map", "filter", "split", "splitlines",
+        "readlines", "clone", "deepclone", "sort", "rev_sort",
+        "reverse", "globals", "specializations", "int_events"};
+    return std::find(std::begin(names), std::end(names), n)
+        != std::end(names);
+}
+
 /*
  * Named-argument desugaring (see the declaration in syntax.h). One shared
  * implementation for the parser's const-fold path and the inferencer's
@@ -491,7 +526,7 @@ void desugar_named_call(CallExpr *call, const std::vector<ParamSpec> &params)
                            " (named arguments must follow parameter order)"),
                 anode->start, anode->end);
 
-        bound[slot] = move(args->elems[i]);
+        bound[slot] = std::move(args->elems[i]);
         last = static_cast<int>(slot);
     }
 
@@ -505,7 +540,7 @@ void desugar_named_call(CallExpr *call, const std::vector<ParamSpec> &params)
     for (int slot = 0; slot <= last; slot++) {
         if (bound[slot]) {
             all_const = all_const && bound[slot]->is_const;
-            positional->elems.push_back(move(bound[slot]));
+            positional->elems.push_back(std::move(bound[slot]));
         } else {
             if (!params[slot].opt)
                 throw WrongArgCountEx(
@@ -517,13 +552,14 @@ void desugar_named_call(CallExpr *call, const std::vector<ParamSpec> &params)
     }
 
     positional->is_const = all_const;
-    call->args = move(positional);
+    call->args = std::move(positional);
 }
 
 void StructDeclStmt::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');
-    s << indent << "StructDecl(\"" << def->name->val << "\"";
+    s << indent << (def->is_class ? "ClassDecl(\"" : "StructDecl(\"")
+      << def->name->val << "\"";
 
     for (const auto &f : def->fields)
         s << ", " << f.name->val;
@@ -538,7 +574,13 @@ unique_ptr<Construct> StructDeclStmt::clone() const
     auto c = make_unique<StructDeclStmt>();
     copy_base_fields(*c);
     c->id = clone_as(id);
-    c->set_def(make_unique<StructTypeDef>(*def));
+    /* the SAME definition, which the original keeps owning: a struct is
+     * declared once, however many copies of the function around it are
+     * made (a template's instances, an inlined body, the typed copy a
+     * constant call runs). A definition of its own made each copy's
+     * instances another struct - unequal to the original's, refused by
+     * the copy's own `Q q = Q(x);`, and dead with the copy */
+    c->def = def;
     return c;
 }
 
@@ -659,6 +701,18 @@ void WhileStmt::serialize(ostream &s, int level) const
     s << endl;
     s << indent;
     s << ")";
+}
+
+string FuncDeclStmt::spec_args_str() const
+{
+    string s;
+    for (size_t i = 0; i < spec_args.size(); i++) {
+        if (spec_args[i].empty() || !params || i >= params->elems.size())
+            continue;
+        s += s.empty() ? " with " : ", ";
+        s += string(params->elems[i]->get_str()) + " = " + spec_args[i];
+    }
+    return s;
 }
 
 void FuncDeclStmt::serialize(ostream &s, int level) const
@@ -793,6 +847,8 @@ void TryCatchStmt::serialize(ostream &s, int level) const
 
         } else {
             s << "<anything>";
+            if (asId)
+                s << " as " << asId->get_str() << " ";
         }
 
         s << ") (\n";
@@ -803,11 +859,14 @@ void TryCatchStmt::serialize(ostream &s, int level) const
     }
 
     if (finallyBody) {
+        /* laid out like a Catch: the body on its own lines, the closing
+         * paren at the clause's own indent */
         s << string((level + 1) * 2, ' ');
-        s << "Finally( ";
+        s << "Finally(\n";
 
         finallyBody->serialize(s, level+2);
         s << endl;
+        s << string((level + 1) * 2, ' ');
         s << ")\n";
     }
 
@@ -820,7 +879,8 @@ void ForeachStmt::serialize(ostream &s, int level) const
     string indent(level * 2, ' ');
 
     s << indent;
-    s << name << "(\n";
+    /* `indexed` changes what the variables bind: the header says so */
+    s << name << (indexed ? "(indexed\n" : "(\n");
 
     ids->serialize(s, level + 1);
     s << endl;

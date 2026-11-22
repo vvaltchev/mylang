@@ -67,7 +67,21 @@ EvalValue TypeFunc::intptr(const EvalValue &a)
 
 EvalValue TypeFunc::clone(const EvalValue &a)
 {
-    const FuncObject &func = *a.get<intrusive_ptr<FuncObject>>().get();
+    /*
+     * get_ref, NOT get: `get<T>() const` returns a COPY of the handle, so
+     * reading the pointee afterwards is a read THROUGH a handle that has
+     * already been destroyed. Its ~intrusive_ptr inlines release() ->
+     * `delete ptr` -> FuncObject's pooled operator delete, which writes the
+     * freelist link over the first 8 bytes and ends the object's lifetime -
+     * a path GCC cannot rule out (it cannot prove the count never reaches 0),
+     * so at -flto it reported the `capture_slots.empty()` below as reading
+     * uninitialized storage and -Werror failed the LINK (GCC 16.2, and only
+     * under LTO: the plain -O3 compile of types.cpp inlines the free
+     * differently and stays silent). get_ref borrows the handle that `a`
+     * owns - no retain/release pair, and no phantom free before the read.
+     * TypeDict::clone already reads its handle this way.
+     */
+    const FuncObject &func = *a.get_ref<intrusive_ptr<FuncObject>>();
 
     /* A non-capturing function has no per-instance state, so clone()ing it can
      * share the same object; a capturing one is deep-copied so each clone owns
@@ -82,18 +96,95 @@ FuncObject::FuncObject(const FuncObject &rhs)
     : RefCounted()   /* a clone owns a FRESH count - do NOT copy rhs's */
     , func(rhs.func)
     , capture_slots(rhs.capture_slots)
-    , capture_ctx(rhs.capture_ctx.parent,
-                  rhs.capture_ctx.const_ctx,
-                  rhs.capture_ctx.func_ctx)
+    , capture_root(rhs.capture_root)
+    , const_scope(rhs.const_scope)
+    , const_scope_alive(rhs.const_scope_alive)
 {
+#ifdef TESTS
+    g_live_funcobjs++;
+#endif
+}
+
+#ifdef TESTS
+/* see the note at the declaration: a leaked POOLED object is invisible
+ * to LeakSanitizer, so the live count is the only net that sees a
+ * missing release. */
+unsigned long g_live_funcobjs = 0;
+FuncObject::~FuncObject() { g_live_funcobjs--; }
+#endif
+
+FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *root,
+                       const LValue *frame, LocalCaptures)
+    : func(func)
+    , capture_root(root)
+{
+#ifdef TESTS
+    g_live_funcobjs++;
+#endif
+    capture_slots.reserve(func->captures.size());
+    for (const auto &cap : func->captures) {
+        ML_CHECK(cap.kind == SymKind::local);
+        /*
+         * A SCALAR is copied through its 8-byte payload word, never the
+         * whole union: the generic copy is one 16-byte load, and the
+         * slot was written by EMITTED code a few instructions earlier as
+         * separate 8-byte stores - a load that spans two in-flight
+         * stores cannot be forwarded and stalls until they retire. On
+         * 63_closures that one load was 54% of all cycles (#97 R2b).
+         */
+        const EvalValue &src = frame[cap.slot].get();
+        const Type::TypeE t = src.get_type()->t;
+        if (t == Type::t_int || t == Type::t_float || t == Type::t_bool)
+            capture_slots.emplace_scalar(src);
+        else
+            capture_slots.emplace_back(src, false);
+    }
+}
+
+FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *root,
+                       const LValue &src, OneLocal)
+    : func(func)
+    , capture_root(root)
+{
+#ifdef TESTS
+    g_live_funcobjs++;
+#endif
+    ML_CHECK(func->captures.size() == 1
+             && func->captures[0].kind == SymKind::local);
+    const EvalValue &v = src.get();
+    const Type::TypeE t = v.get_type()->t;
+    capture_slots.set_single(
+        v, t == Type::t_int || t == Type::t_float || t == Type::t_bool);
 }
 
 FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *ctx)
     : func(func)
-    , capture_ctx(get_root_ctx(ctx), false, true)
+    /*
+     * A NULL ctx is legal, for exactly one caller: the .myv loader builds a
+     * pool closure before any EvalContext exists (serialize.cpp). This used
+     * to hand the null straight to get_root_ctx, whose `while (ctx->parent)`
+     * DEREFERENCED it - so `mylang prog.myv` SEGFAULTED for any image whose
+     * pool holds a function value (`const OPS = [sq];`), on a valid image of
+     * our own making. Such a closure is capture-free (the reader refuses any
+     * other kind), so it has nothing to snapshot and no root to remember;
+     * do_func_call substitutes the CALLER's root when it runs one.
+     */
+    , capture_root(ctx ? get_root_ctx(ctx) : nullptr)
 {
+#ifdef TESTS
+    g_live_funcobjs++;
+#endif
+    /* #38 B: remember the defining CONST scope (see const_scope) */
+    if (ctx && ctx->scope_alive) {
+        const_scope = ctx;
+        const_scope_alive = ctx->scope_alive;
+    }
     if (func->captures.empty())
         return;
+
+    /* Past here the snapshot READS from `ctx`; the ctx-less caller above is
+     * capture-free, and the reader refuses an image that says otherwise. */
+    ML_CHECK_MSG(ctx, "a capturing closure needs a context to capture from");
 
     /* Snapshot each captured outer variable into a capture slot, in declaration
      * order (the resolver assigns SymKind::capture indices in the same order).
@@ -103,9 +194,41 @@ FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *ctx)
     capture_slots.reserve(func->captures.size());
 
     for (const auto &cap : func->captures) {
-        capture_slots.emplace_back(
-            RValue(read_sym(ctx, cap.kind, cap.slot, cap.name)),
-            ctx->const_ctx
-        );
+        /* read_sym raises loc-less (it is the descriptor twin of
+         * Identifier::do_eval and has no node); re-stamp with the capture
+         * entry's OWN span so the caret lands on the name inside `[...]`
+         * instead of the whole closure expression (#131 step 4). */
+        try {
+            /*
+             * #114: build the slot STRAIGHT from the source slot. The
+             * old spelling - `emplace_back(RValue(read_sym(...)), ...)`
+             * - put one captured int through FOUR EvalValue lifecycle
+             * events: read_sym boxed the slot's ADDRESS into an
+             * EvalValue, RValue unboxed it into a COPY, emplace_back
+             * MOVED that copy into the LValue, and the temporary was
+             * DESTROYED - each with its own `type->t >= t_str` test and
+             * potential type-erased PMF call. Taking the lvalue and
+             * copy-constructing in place is one event.
+             *
+             * `read_sym_lv` answers null exactly where `read_sym`
+             * answered `UndefinedId`, which is where the RValue() below
+             * throws - so the fallback is the ERROR path and the two
+             * spellings cannot disagree about a value.
+             */
+            if (LValue *src = read_sym_lv(ctx, cap.kind, cap.slot,
+                                          cap.name))
+                capture_slots.emplace_back(src->get(), ctx->const_ctx);
+            else
+                capture_slots.emplace_back(
+                    RValue(read_sym(ctx, cap.kind, cap.slot, cap.name)),
+                    ctx->const_ctx
+                );
+        } catch (Exception &e) {
+            if (!e.loc_start.line) {
+                e.loc_start = cap.start;
+                e.loc_end = cap.end;
+            }
+            throw;
+        }
     }
 }

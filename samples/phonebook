@@ -19,7 +19,7 @@ func load_data(data, file_name) {
 func cmd_add(data) {
 
     write("Name: ");
-    var n = readln();
+    var n = readln() ?? "";
 
     if (!n) {
         print("ERROR: no name");
@@ -32,7 +32,7 @@ func cmd_add(data) {
     }
 
     write("Phones: ");
-    var phones_str = readln();
+    var phones_str = readln() ?? "";
 
     if (!phones_str) {
         print("ERROR: No phones");
@@ -55,7 +55,7 @@ func cmd_view(data) {
 func cmd_save(data) {
 
     write("File name: ");
-    var input = strip(readln());
+    var input = strip(readln() ?? "");
     var file;
 
     if (input) {
@@ -90,7 +90,7 @@ func cmd_save(data) {
 func cmd_delete(data) {
 
     write("Enter name: ");
-    var n = readln();
+    var n = readln() ?? "";
     var success = erase(data, n);
 
     if (success)
@@ -102,7 +102,7 @@ func cmd_delete(data) {
 func cmd_find(data) {
 
     write("Enter name: ");
-    var n = readln();
+    var n = readln() ?? "";
 
     var phones = find(data, n);
 
@@ -154,7 +154,8 @@ func main() {
 
         print();
         write("Enter command: ");
-        var input = readln();
+        # end of input (stdin closed) quits, like "q"
+        var input = readln() ?? "q";
 
         if (input == "q")
             break;

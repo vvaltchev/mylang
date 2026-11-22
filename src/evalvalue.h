@@ -19,6 +19,7 @@
 #include <type_traits>
 #include <cassert>
 #include <cstddef>
+#include <cstring>
 
 class LValue;
 class ExprList;
@@ -29,6 +30,7 @@ class EvalContext;
 class FuncObject;
 struct StructTypeDef;   /* a struct type descriptor (structtype.h) */
 class StructObject;     /* a struct instance (structtype.h) */
+class BoxObj;           /* a box of a scalar or a string (structtype.h) */
 enum class ArrHint : unsigned char;   /* defined in syntax.h */
 
 /*
@@ -51,6 +53,12 @@ struct ArgLocs {
                                          * regardless of arity, so its arity check
                                          * must read this, not n_rest. */
     ArrHint arr_hint;                   /* the array-repr hint (range/array/…) */
+    /* Q2: the type a container this call builds is made with (null:
+     * untyped) - Construct::ctype of the call's args list */
+    const TypeAnnot *ctype = nullptr;
+    /* Q2: the stored value is checked against the container's own type
+     * (append / push / insert through `dyn`) - Construct::ct_store */
+    bool ct_store = false;
     const ArgLoc *arg(size_t i) const { return &args[i]; }
 };
 /*
@@ -122,6 +130,22 @@ struct Builtin {
     Kind kind = Kind::node;
 
     /*
+     * An `lvalue` builtin whose arg0 may also be a plain VALUE (sort,
+     * rev_sort, reverse: `sort([3, 1])` returns a sorted copy). Its func_lv
+     * reads the value THROUGH the target, so a caller that has no LValue
+     * for arg0 must hand it a temporary holding the value
+     * (builtin_lv_target, eval.h) - a null target was dereferenced (a
+     * SEGV on `var dyn s = sort; s([2, 1]);`). For every other lvalue
+     * builtin a null target is the "not an lvalue" answer it throws on.
+     * And for EVERY lvalue builtin a null target is also what an indirect
+     * call with NO argument hands over (`s();`): a func_lv checks its
+     * arity before it reads the target (sort/reverse read it first and
+     * crashed - lv_arg0_value, builtins/arr.cpp.h).
+     * In the padding after `kind`: Builtin does not grow.
+     */
+    bool arg0_value_ok = false;
+
+    /*
      * Explicit ctors so no construction leaves the anonymous union member
      * uninitialized - aggregate init `Builtin{f}` / `Builtin{nullptr}` used to,
      * which -Wmissing-field-initializers (rightly) flagged. Both pointers null
@@ -165,6 +189,7 @@ template <> struct TypeToEnum<intrusive_ptr<ExceptionObject>> { enum { val = Typ
 template <> struct TypeToEnum<intrusive_ptr<DictObject>> { enum { val = Type::t_dict }; };
 template <> struct TypeToEnum<StructTypeDef *> { enum { val = Type::t_structtype }; };
 template <> struct TypeToEnum<intrusive_ptr<StructObject>> { enum { val = Type::t_struct }; };
+template <> struct TypeToEnum<intrusive_ptr<BoxObj>> { enum { val = Type::t_box }; };
 
 /*
  * Binary-operation dispatch with int -> float promotion.
@@ -208,6 +233,7 @@ class EvalValue final {
         FlatVal<intrusive_ptr<ExceptionObject>> ex;
         FlatVal<intrusive_ptr<DictObject>> dict;
         FlatVal<intrusive_ptr<StructObject>> struct_;   /* t_struct */
+        FlatVal<intrusive_ptr<BoxObj>> box;             /* t_box */
 
         ValueU() : ival(0) { }
         ValueU(LValue *val) : lval(val) { }
@@ -227,8 +253,50 @@ class EvalValue final {
 
 public:
 
+    /* #84: the payload read straight, for a caller that has ALREADY
+     * checked the type word (VmInvoker's inline test path: t_bool ->
+     * raw_bval, t_int -> raw_ival). No check here - that is the point. */
+    bool raw_bval() const { return val.bval; }
+    int_type raw_ival() const { return val.ival; }
+
+    /*
+     * Native-AOT layout probes (jit.cpp): the emitter bakes these as x86
+     * addressing displacements. Class-internal offsetof (access-legal;
+     * EvalValue's data members share one access section, so the layout is
+     * standard and the offsets are well-defined).
+     */
+    static constexpr size_t jit_payload_off() {
+        return offsetof(EvalValue, val);
+    }
+    static constexpr size_t jit_type_off() {
+        return offsetof(EvalValue, type);
+    }
+
+
     EvalValue()
         : val(), type(AllTypes[Type::t_none]) { }
+
+    /*
+     * #97 R2b: an int/float/bool copied through ONE 8-byte payload word
+     * (all three live in the union's first word; a bool's ctor zeroes
+     * the whole word). The ordinary copy moves the whole 24-byte union
+     * with a 16-byte load, and when `src` is a frame slot the emitted
+     * code wrote a moment ago as separate 8-byte stores, that load
+     * cannot be forwarded from the store buffer and stalls every time.
+     * Each word of the new value is written ONCE.
+     */
+    struct ScalarWord { };
+    EvalValue(ScalarWord, const EvalValue &src)
+        : val(scalar_word(src)), type(src.type)
+    {
+        ML_CHECK(src.type->t == Type::t_int || src.type->t == Type::t_float
+                 || src.type->t == Type::t_bool);
+    }
+    static int_type scalar_word(const EvalValue &src) {
+        int_type w;
+        std::memcpy(&w, static_cast<const void *>(&src.val), sizeof w);
+        return w;
+    }
 
     /*
      * Constructor accepting bool. SFINAE is used to prevent implicit
@@ -279,8 +347,100 @@ public:
     EvalValue &operator=(EvalValue &&other);
     ~EvalValue();
 
+    /* #97 callback bind: overwrite a TRIVIAL value with a scalar in place
+     * - no destroy/copy dispatch, since the old value owns nothing
+     * (asserted). A bool zeroes the whole ival first, like EvalValue(bool),
+     * so reading the slot as the int 0/1 stays valid. */
+    void set_trivial_int(int_type v) {
+        ML_CHECK(type->t < Type::t_str);
+        val.ival = v;
+        type = AllTypes[Type::t_int];
+    }
+    void set_trivial_float(float_type v) {
+        ML_CHECK(type->t < Type::t_str);
+        val.ldval = v;
+        type = AllTypes[Type::t_float];
+    }
+    void set_trivial_bool(bool v) {
+        ML_CHECK(type->t < Type::t_str);
+        val.ival = v ? 1 : 0;
+        type = AllTypes[Type::t_bool];
+    }
+
     Type *get_type() const {
         return type;
+    }
+
+    /*
+     * DROP the value WITHOUT releasing it: reset the tag to `none` and leave
+     * the payload bytes as they are, so no destructor and no refcount
+     * decrement runs.
+     *
+     * ⛔ CORRECT IN EXACTLY ONE PLACE, and everywhere else it LEAKS: a
+     * BORROWED argument slot (#94), whose payload is a raw bit-copy of a
+     * caller slot that owns the reference for the whole of the synchronous
+     * call. Reached only through LValue::frame_release(), which asks the
+     * slot's own `borrowed` flag - do not call it directly.
+     */
+    void abandon_borrowed() {
+        type = AllTypes[Type::t_none];
+        val.ival = 0;
+    }
+
+    /*
+     * #97 R1: run the payload's destructor IN PLACE and leave `none`
+     * behind - one type-word store. For a slot that is overwritten
+     * right after (the native return arm's old dst). NOT a substitute
+     * for frame_release(): it ignores the borrow, which LValue asks.
+     */
+    void drop_in_place() {
+        destroy_val();
+    }
+
+    /*
+     * #97 increment 3 follow-up: what `*this = EvalValue()` does - the
+     * payload destroyed, `none` left behind with a zero payload word -
+     * but IN PLACE: the assignment from a temporary built a zeroed value
+     * on the stack and read it back with one 16-byte load over two 8-byte
+     * stores, a blocked store-forward on every call (R1's finding, one
+     * helper over).
+     */
+    void release_to_none() {
+        destroy_val();
+        val.ival = 0;
+    }
+
+    /*
+     * The mirror of abandon_borrowed(): take the bits of another value
+     * WITHOUT taking a reference to what they point at. Same single caller
+     * (LValue::borrow_from), same #94 justification.
+     *
+     * This is byte-for-byte what the emitter's SCALAR argument arm already
+     * does - a 24-byte payload copy plus the type word - so writing it in
+     * C++ keeps the two bind paths one implementation rather than two that
+     * must be kept in step.
+     */
+    void copy_bits_borrowed(const EvalValue &src) {
+        std::memcpy(static_cast<void *>(this), &src, sizeof(EvalValue));
+    }
+
+
+    /*
+     * #121: reset the tag to `none` AFTER the payload has already been moved
+     * out by a hand-written, type-specific assign (vm_slot_bind_ref, vm.cpp).
+     * The moved-from handle is null, so no destructor and no decrement is
+     * owed; dropping the tag is what makes this value's own destructor
+     * trivial instead of one more indirect call through the Type table.
+     *
+     * ⛔ NOT abandon_borrowed(), and the difference is the whole safety
+     * argument: THAT one drops a tag over a payload that was NEVER moved out
+     * (a #94 borrow, whose reference the caller's slot owns), and leaks
+     * anywhere else. HERE the move has already happened, so there is nothing
+     * left to release. Calling this on a value whose payload is still live
+     * LEAKS it.
+     */
+    void drop_moved_from_tag() {
+        type = AllTypes[Type::t_none];
     }
 
     template <class T>
@@ -341,6 +501,14 @@ public:
 
     bool is_true() const {
         return type->is_true(*this);
+    }
+
+    /* is_true() with the BOOL answer read inline, for a callback's
+     * result (#97 CB6): a comparator / predicate returns a bool on every
+     * element, and the virtual call was ~10 Ir of 34_sort_custom_cmp's
+     * per-comparison cost. Anything else takes the virtual. */
+    bool truthy() const {
+        return type->t == Type::t_bool ? val.bval : type->is_true(*this);
     }
 
     bool operator!() const {
@@ -599,14 +767,22 @@ private:
      */
     bool is_const;
 
-    LValue clone();
-    EvalValue &get_value_for_put();
+    /*
+     * #94: this slot's value is BORROWED - a raw bit-copy of a reference the
+     * CALLER's slot owns for the whole of the synchronous call, bound with no
+     * retain. So the frame pop must NOT release it (that would decrement a
+     * count this slot never incremented - a use-after-free, not a leak):
+     * frame_release() drops the tag instead. Shares is_const's tail padding,
+     * so the slot does not grow; the setter is mark_borrowed().
+     */
+    bool borrowed;
+
     void put_slow(const EvalValue &v);   /* container-backed (COW) put */
     void put_slow(EvalValue &&v);
 
     void type_checks() const {
-        assert(val.get_type()->t != Type::t_lval);
-        assert(val.get_type()->t != Type::t_undefid);
+        ML_CHECK(val.get_type()->t != Type::t_lval);
+        ML_CHECK(val.get_type()->t != Type::t_undefid);
     }
 
 public:
@@ -616,30 +792,41 @@ public:
      * inline array of slots; the value is always `none` here, so type_checks()
      * would trivially pass and is skipped to keep this cheap (runs per slot).
      */
-    LValue() : val(), container(nullptr), is_const(false) { }
+    LValue() : val(), container(nullptr), is_const(false), borrowed(false) { }
 
     LValue(const EvalValue &val, bool is_const)
         : val(val)
         , container(nullptr)
         , is_const(is_const)
+        , borrowed(false)
     {
         type_checks();
     }
 
+    /* #97 R2b: an int/float/bool slot, each word written once */
+    LValue(EvalValue::ScalarWord t, const EvalValue &src)
+        : val(t, src)
+        , container(nullptr)
+        , is_const(false)
+        , borrowed(false)
+    { }
+
     LValue(EvalValue &&val, bool is_const)
-        : val(move(val))
+        : val(std::move(val))
         , container(nullptr)
         , is_const(is_const)
+        , borrowed(false)
     {
         type_checks();
     }
 
     /* The overwhelmingly common put is a plain slot write (no container
      * back-pointer - frame slots, dict values, globals, captures): keep THAT
-     * inline (H2: the out-of-line get_value_for_put call showed up on every
+     * inline (H2: the out-of-line element-write call showed up on every
      * VM slot write); an ARRAY-ELEMENT put (container set - the COW path)
      * takes the out-of-line slow put. */
     void put(const EvalValue &v) {
+        ML_CHECK(!borrowed);
         if (!container) {
             val = v;
             type_checks();
@@ -648,6 +835,7 @@ public:
         put_slow(v);
     }
     void put(EvalValue &&v) {
+        ML_CHECK(!borrowed);
         if (!container) {
             val = static_cast<EvalValue &&>(v);
             type_checks();
@@ -656,8 +844,195 @@ public:
         put_slow(static_cast<EvalValue &&>(v));
     }
 
+    /*
+     * Bind a FRESH value into this slot as a plain, non-const, non-container
+     * slot - an arg / param bind (or re-bind). The callee frame WINDOWS are
+     * reused across calls, so a slot may carry a prior frame's is_const or a
+     * stale reference; this resets both and releases the old value.
+     *
+     * Equivalent to `*this = LValue(v, false)` but with ONE EvalValue
+     * assignment: that idiom copy-CONSTRUCTED v into a temporary LValue and
+     * then MOVE-ASSIGNED the temp into the slot - the move-assign was a
+     * measured per-call hot spot on every VM arg bind (#60 Tier 1). `val = v`
+     * (copy or move) releases any old ref the slot held.
+     */
+    /*
+     * MOVE the value OUT of a slot that is about to DIE - the callee
+     * window's result slot at a return (the frame pops right after; lever
+     * 1: the return path paid a full EvalValue COPY - a retain/release
+     * pair for a reference result - per call). The slot is left holding
+     * the moved-from value (none), which also spares pop_window's release
+     * for it. NEVER use on a slot that stays live.
+     */
+    EvalValue steal_value() {
+        return static_cast<EvalValue &&>(val);
+    }
+
+    /*
+     * ⛔ The two ML_CHECKs state what makes the borrow (#94) sound and are
+     * PROVEN REDUNDANT rather than tested, the esc_final_mask pattern: a
+     * parameter the escape analysis marks non-escaping is never one the body
+     * WRITES (`f.mask & f.written` is asserted empty there), and the frame pop
+     * clears every ref_slot, so no reused window slot can still be borrowed
+     * when the next call binds it. Overwriting a borrowed slot would release
+     * a count it never took, so the failure direction is a use-after-free -
+     * which is why the invariant is asserted at the write rather than left to
+     * a comment. No test can reach either; both fire if a future change makes
+     * them reachable.
+     */
+    void rebind(const EvalValue &v) {
+        ML_CHECK(!borrowed);
+        val = v;
+        container = nullptr;
+        is_const = false;
+        type_checks();
+    }
+    void rebind(EvalValue &&v) {
+        ML_CHECK(!borrowed);
+        val = static_cast<EvalValue &&>(v);
+        container = nullptr;
+        is_const = false;
+        type_checks();
+    }
+
+    /*
+     * #94: bind this slot to a BORROWED reference - the payload is already a
+     * raw bit-copy of the caller's slot, taken with no retain. See the
+     * `borrowed` member. The caller owns the reference for the whole of the
+     * synchronous call, which is what makes the elided retain sound.
+     */
+    void borrow_from(const EvalValue &v) {
+        ML_CHECK(!borrowed);
+        /*
+         * NO release of what the slot held: a callee window slot is free at
+         * bind time, because the frame pop clears every ref_slot and a
+         * parameter slot is always listed there. The emitter's scalar arm
+         * has always assumed exactly this (it overwrites the slot raw), and
+         * pop_window's ML_VM_HARDENING re-scan - every slot trivial after
+         * the pop - is the standing net for a ref_slots that missed one.
+         */
+        val.copy_bits_borrowed(v);
+        container = nullptr;
+        is_const = false;
+        borrowed = true;
+        type_checks();
+    }
+    bool is_borrowed() const { return borrowed; }
+
+    /*
+     * The slot a write into this one lands in. For an ARRAY ELEMENT (the
+     * container back-pointer TypeArr::subscript sets) the array is detached
+     * first: a slice is made standalone, an alias's live slices covering
+     * the element are cloned. The standalone copy is NEW storage, so the
+     * result is then its element - and `this` may be FREED by then (the
+     * slice was its storage's only owner): a caller uses the result and
+     * never `this` again. Any other slot is its own target.
+     */
+    LValue *write_target();
+
+    /*
+     * THE ONE PLACE A DYING FRAME'S SLOT IS RELEASED. Every release scan
+     * goes through it - pop_window's two arms, the three no-record raise /
+     * return paths, the callback window pop, and the JIT's cold
+     * jit_release_slot - because the borrow (#94) makes the decision
+     * PER SLOT, and a scan that open-codes `lv = LValue()` would release a
+     * count the slot never took. That is a use-after-free, so this is a
+     * method rather than a rule: six of the seven sites predate the flag and
+     * none of them can forget it now.
+     *
+     * The plain assignment is what unregisters a SLICE from its parent's
+     * live-slices set, so it cannot be reduced to a refcount decrement (the
+     * jit_bind_ref_arg lesson, from the push side).
+     */
+    /*
+     * #97 R1: the native return arm's release of the OLD dst, which the
+     * arm overwrites with the result right after. `*this = LValue()`
+     * (frame_release) builds a zeroed temporary on the stack and reads
+     * it back with one 16-byte load over two 8-byte stores - a blocked
+     * store-forward on every call, +10% cycles on 63_closures. A call
+     * dst is never borrowed (a written parameter is never non-escaping),
+     * and its container/flags are those of a frame local.
+     */
+    void drop_for_overwrite() {
+        ML_CHECK(!borrowed);
+        val.drop_in_place();
+    }
+
+    void frame_release() {
+        if (borrowed) {
+            val.abandon_borrowed();
+            borrowed = false;
+            container = nullptr;
+            is_const = false;
+            return;
+        }
+        /*
+         * `*this = LValue()`, in place. The assignment built a zeroed
+         * LValue on the stack with 8-byte stores and copied it in with a
+         * 16-byte load - a BLOCKED STORE-FORWARD on every release, the
+         * shape R1 removed from the return arm (drop_for_overwrite). It
+         * was 1.2M of them on 63_closures once increment 3 released each
+         * iteration's closure here: two per iteration. (container_idx is
+         * left alone: the default constructor never initialised it.)
+         */
+        val.release_to_none();
+        container = nullptr;
+        is_const = false;
+    }
+
     bool is_const_var() const { return is_const; }
+
+    /* #92 Native-AOT layout probe, co-located with the member on purpose
+     * (the SharedArrayObj::jit_probe precedent): the inline STORE tier
+     * must refuse a const-bound slot and needs this flag's byte offset.
+     * Reading the real member means a layout change cannot move it out
+     * from under the emitter. Probe-only, never hot. */
+    const bool &jit_const_probe() const { return is_const; }
+    /* #97 inc 3 W5: the borrowed flag's byte, for the frameless site's
+     * inline borrow (it writes 1 there) and the arm's skip (it tests it) */
+    const bool &jit_borrowed_probe() const { return borrowed; }
     const EvalValue &get() const { return val; }
+    /* #97 callback bind (VmInvoker::call_scalars): a window slot a raw
+     * scalar bind may overwrite in place - it holds nothing to release
+     * and is not borrowed. The binds are rebind() for a scalar, minus the
+     * EvalValue assignment's type dispatch. */
+    bool raw_bindable() const {
+        return val.get_type()->t < Type::t_str && !borrowed;
+    }
+    void bind_scalar_raw(int_type v) {
+        val.set_trivial_int(v);
+        container = nullptr;
+        is_const = false;
+    }
+    void bind_scalar_raw(float_type v) {
+        val.set_trivial_float(v);
+        container = nullptr;
+        is_const = false;
+    }
+    void bind_scalar_raw(bool v) {
+        val.set_trivial_bool(v);
+        container = nullptr;
+        is_const = false;
+    }
+    /* #84: the same bind into a slot whose tail is ALREADY clear - a
+     * prepared callback window between two elements: it is pushed with
+     * container = null and is_const = false, nothing writes either into
+     * a window slot (container belongs to array-element LValues; const
+     * is a compile-time rule here), and every raw bind keeps them so.
+     * Two stores (payload, type) where bind_scalar_raw makes four;
+     * hardened builds check the premise. */
+    void bind_scalar_payload(int_type v) {
+        ML_VM_CHECK(container == nullptr && !is_const);
+        val.set_trivial_int(v);
+    }
+    void bind_scalar_payload(float_type v) {
+        ML_VM_CHECK(container == nullptr && !is_const);
+        val.set_trivial_float(v);
+    }
+    void bind_scalar_payload(bool v) {
+        ML_VM_CHECK(container == nullptr && !is_const);
+        val.set_trivial_bool(v);
+    }
     EvalValue get_rval() const { return val; }
     Type *valtype() const { return val.get_type(); }
 
@@ -678,6 +1053,15 @@ public:
         return val != rhs.val;
     }
 };
+
+/*
+ * #94: `borrowed` shares `is_const`'s tail padding, so a slot did NOT grow -
+ * the emitter bakes a 48-byte stride (jit.cpp static_asserts the concrete
+ * number, but only where ML_JIT_SUPPORTED, so state it here too). Vacuous on
+ * MSVC, whose 8-byte size_type already pushes the flags out of the padding.
+ */
+static_assert(sizeof(size_type) != 4 || sizeof(LValue) == 48,
+              "`borrowed` must fit the tail padding, not grow the slot");
 
 inline EvalValue
 RValue(const EvalValue &v)
@@ -726,3 +1110,34 @@ EvalValue eval_func(EvalContext *ctx,
 EvalValue eval_func(EvalContext *ctx,
                     FuncObject &obj,
                     const std::pair<EvalValue, EvalValue> &args);
+
+/*
+ * #97 B1: A BUILTIN'S ARGUMENT BUFFER, CONSTRUCTING ONLY WHAT IT HOLDS.
+ * `EvalValue buf[8]` default-constructs and destroys all eight on every
+ * call whatever the argument count - measured as most of the ~200 Ir a
+ * JIT'd builtin call cost before the builtin ran (94_builtin_in_helper:
+ * jit_call_builtin 51% of the program). This is aligned raw storage: push()
+ * copy-constructs one argument in place, the destructor destroys exactly
+ * the ones pushed - also when the builtin throws, since it is an ordinary
+ * local. A caller past N keeps its heap vector.
+ */
+template <size_t N> class SmallArgs {
+    alignas(EvalValue) unsigned char raw_[N * sizeof(EvalValue)];
+    size_t n_ = 0;
+public:
+    SmallArgs() = default;
+    SmallArgs(const SmallArgs &) = delete;
+    SmallArgs &operator=(const SmallArgs &) = delete;
+    ~SmallArgs()
+    {
+        for (size_t i = 0; i < n_; i++)
+            data()[i].~EvalValue();
+    }
+    EvalValue *data() { return reinterpret_cast<EvalValue *>(raw_); }
+    void push(const EvalValue &v)
+    {
+        ML_CHECK(n_ < N);
+        new (raw_ + n_ * sizeof(EvalValue)) EvalValue(v);
+        n_++;
+    }
+};

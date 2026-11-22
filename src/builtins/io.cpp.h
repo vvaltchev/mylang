@@ -106,9 +106,13 @@ EvalValue builtin_readln(EvalContext *ctx, const ArgLocs *exprList,
     if (n != 0)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
+    /* none at END OF INPUT, so a script can tell it from an empty line
+     * (both used to read as ""). A last line with no newline is still
+     * returned; the call AFTER it answers none. Typed `opt str`. */
     string str;
-    getline(cin, str);
-    return SharedStr(move(str));
+    if (!getline(cin, str))
+        return EvalValue();
+    return SharedStr(std::move(str));
 }
 
 EvalValue builtin_readlines(EvalContext *ctx, const ArgLocs *exprList,
@@ -139,11 +143,11 @@ EvalValue builtin_readlines(EvalContext *ctx, const ArgLocs *exprList,
     }
 
     while (getline(*s, tmp)) {
-        vec.emplace_back(EvalValue(SharedStr(move(tmp))), false);
+        vec.emplace_back(EvalValue(SharedStr(std::move(tmp))), false);
         tmp.clear();
     }
 
-    return SharedArrayObj(move(vec));
+    return SharedArrayObj(std::move(vec));
 }
 
 EvalValue builtin_writelines(EvalContext *ctx, const ArgLocs *exprList,
@@ -232,5 +236,5 @@ EvalValue builtin_tmpdir(EvalContext *ctx, const ArgLocs *exprList,
     while (s.size() > 1 && (s.back() == '/' || s.back() == '\\'))
         s.pop_back();
 
-    return SharedStr(move(s));
+    return SharedStr(std::move(s));
 }

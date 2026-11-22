@@ -1,0 +1,47 @@
+# INT-ENGINES: default
+# INT-CONFIGS: MYLANG_BCINLINE_TYPED=0 ; MYLANG_BCINLINE_TYPED=0
+#   MYLANG_INT_CHOOSE=frameless@32:66=1,frameless@33:13=1
+#
+# INT test (#107 P3): the JIT's FRAMELESS call tier is an enumerated
+# decision (`frameless_choice`, key `frameless@<line>:<col>`): the push
+# is the general tier, so declining is always legal. The second
+# configuration forces both sites below onto the push, and the answers
+# must not move. The callees take DECLARED ints and hold a loop or a
+# recursion, so neither inliner takes them (the config keeps the
+# bytecode inliner off typed callees).
+
+func leaf(int x) {
+    var s = 0;
+    for (var i = 0; i < 3; i++) s += x;
+    return s;
+}
+var calls = 0;
+func rec(int n) {
+    calls++;
+    if (n < 2) { return n; }
+    var a = rec(n - 1);
+    var b = rec(n - 2);
+    return a + b;
+}
+func drive(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) { var t = leaf(i); s += t; }
+    var r = rec(n);
+    return s + r;
+}
+func drive2(int n) { var s = 0; for (var i = 0; i < n; i++) s += leaf(i);
+    var r = rec(n); return s + r; }
+var res = drive(int(runtime(10)));
+var res2 = drive2(int(runtime(10)));
+print(res, res2, calls);
+assert(res == 135 + 55 && res2 == res && calls == 354);
+
+var ev = int_events("frameless_choice");
+foreach (e in ev) print(e);
+func has(arr, needle) {
+    foreach (e in arr)
+        if (find(e, needle) != none) return true;
+    return false;
+}
+assert(has(ev, "key=\"frameless@32:66\" n=2 dflt=0"));
+assert(has(ev, "key=\"frameless@33:13\" n=2 dflt=0"));

@@ -13,6 +13,15 @@
 #include "eval.h"
 #include "evaltypes.cpp.h"
 
+/* #53 part B: the dict's map is reachable for MUTATION only through
+ * DictObject's methods, each structural one calling will_restructure()
+ * itself - so a new site cannot forget the cursor hook. The whole
+ * guarantee is that no mutable map reference can be obtained. */
+static_assert(std::is_same<
+                  decltype(std::declval<DictObject &>().get_ref()),
+                  const DictObject::inner_type &>::value,
+              "DictObject::get_ref() must never hand out a mutable map");
+
 class TypeDict : public TypeImpl<intrusive_ptr<DictObject>> {
 
 public:
@@ -36,7 +45,67 @@ public:
 
 int_type TypeDict::len(const EvalValue &a)
 {
-    return a.get<intrusive_ptr<DictObject>>().get()->get_ref().size();
+    return a.get_ref<intrusive_ptr<DictObject>>().get()->get_ref().size();
+}
+
+/*
+ * Two dicts are equal when they hold the same keys, each mapped to equal
+ * values, in ANY order (#50: a dict keeps insertion order, and == ignores
+ * it, as Python's does) - spelled out so the
+ * walk runs on the cycle guard's pair stack (cyclewalk.h): a dict may hold
+ * itself (`d["self"] = d`). A key is looked up by ITS OWN equality, with
+ * fresh stacks (CycFreshScope) - the map's key_equal does not depend on
+ * where the dict sits; a value is compared inside this walk, `b`'s value
+ * on the left as the std operator== had it (CycFlip keeps the stack's
+ * sides straight) - a builtin or an exception object has no `==`, so the
+ * operand order is observable.
+ */
+static bool dict_equal(const EvalValue &a, const EvalValue &b)
+{
+    const DictObject::inner_type &dataA
+        = a.get_ref<intrusive_ptr<DictObject>>()->get_ref();
+    const DictObject::inner_type &dataB
+        = b.get_ref<intrusive_ptr<DictObject>>()->get_ref();
+
+    if (dataA.size() != dataB.size())
+        return false;
+
+    CycKey kl, kr;
+    cyc_key(a, kl);
+    cyc_key(b, kr);
+    CycPairStack &st = cyc_eq();
+
+    const int be = st.back_edge(kl, kr);
+    if (be >= 0)
+        return be == 1;
+
+    CycPairGuard g(st, kl, kr);
+
+    for (const auto &kv : dataA) {
+
+        CycKey kk;
+        DictObject::inner_type::const_iterator it;
+
+        if (cyc_key(kv.first, kk)) {
+            CycFreshScope fresh;
+            it = dataB.find(kv.first);
+        } else {
+            it = dataB.find(kv.first);
+        }
+
+        if (it == dataB.end())
+            return false;
+
+        bool same;
+        {
+            CycFlip flip(st);
+            same = it->second.get() == kv.second.get();
+        }
+        if (!same)
+            return false;
+    }
+
+    return true;
 }
 
 void TypeDict::eq(EvalValue &a, const EvalValue &b)
@@ -46,13 +115,8 @@ void TypeDict::eq(EvalValue &a, const EvalValue &b)
         return;
     }
 
-    const DictObject::inner_type &dataA
-        = a.get<intrusive_ptr<DictObject>>()->get_ref();
-
-    const DictObject::inner_type &dataB
-        = b.get<intrusive_ptr<DictObject>>()->get_ref();
-
-    a = dataA == dataB;
+    const bool e = dict_equal(a, b);
+    a = e;
 }
 
 void TypeDict::noteq(EvalValue &a, const EvalValue &b)
@@ -62,18 +126,14 @@ void TypeDict::noteq(EvalValue &a, const EvalValue &b)
         return;
     }
 
-    const DictObject::inner_type &dataA
-        = a.get<intrusive_ptr<DictObject>>()->get_ref();
-
-    const DictObject::inner_type &dataB
-        = b.get<intrusive_ptr<DictObject>>()->get_ref();
-
-    a = dataA != dataB;
+    const bool e = dict_equal(a, b);
+    a = !e;
 }
 
 /*
- * Deep, ORDER-INDEPENDENT hash of a dict. A dict is unordered, so two equal
- * dicts (same pairs, any insertion order) MUST hash equal. Each (k, v) pair is
+ * Deep, ORDER-INDEPENDENT hash of a dict. Two dicts that hold the same
+ * pairs in a different insertion order are == (dict_equal ignores the
+ * order), so they MUST hash equal. Each (k, v) pair is
  * hashed with the order-dependent combine (k before v), then the pair hashes
  * are accumulated commutatively (hash_unordered) so the dict's iteration order
  * does not matter.
@@ -81,12 +141,30 @@ void TypeDict::noteq(EvalValue &a, const EvalValue &b)
 size_t TypeDict::hash(const EvalValue &a)
 {
     const DictObject::inner_type &data
-        = a.get<intrusive_ptr<DictObject>>()->get_ref();
+        = a.get_ref<intrusive_ptr<DictObject>>()->get_ref();
     size_t acc = hash_salt_dict;
+
+    /* A dict may hold itself: met again inside its own hash, it hashes as a
+     * back edge at its depth (cyclewalk.h). A KEY hashes by itself, with
+     * fresh stacks, as dict equality matches it (dict_equal). */
+    CycKey dk;
+    cyc_key(a, dk);
+    const int d = cyc_hash().depth(dk);
+    if (d >= 0)
+        return cyc_backedge_hash(d);
+    CycGuard g(cyc_hash(), dk);
 
     for (const auto &[k, v] : data) {
         size_t pair = hash_salt_dict;
-        hash_combine(pair, k.hash());
+        CycKey kk;
+        size_t kh;
+        if (cyc_key(k, kk)) {
+            CycFreshScope fresh;
+            kh = k.hash();
+        } else {
+            kh = k.hash();
+        }
+        hash_combine(pair, kh);
         hash_combine(pair, v.get().hash());
         hash_unordered(acc, pair);
     }
@@ -98,11 +176,16 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
                               bool for_write)
 {
     const EvalValue &what = RValue(what_lval);
-    intrusive_ptr<DictObject> &&flatObj = what.get<intrusive_ptr<DictObject>>();
+    /* Borrow (get_ref), not copy: `what` is const, so get<>() would COPY the
+     * intrusive_ptr (retain+release the DictObject) on EVERY dict index. A dict
+     * doesn't COW - the mutations below (auto-vivify / freeze-insert) go through
+     * the POINTEE, and operator->/get() on a const intrusive_ptr yield a
+     * MUTABLE DictObject*, so the borrow is sound for read AND write. */
+    const intrusive_ptr<DictObject> &flatObj =
+        what.get_ref<intrusive_ptr<DictObject>>();
     DictObject &obj = *flatObj.get();
-    DictObject::inner_type &data = obj.get_ref();
-
-    const auto &it = data.find(key);
+    const DictObject::mut_iterator it = obj.find_mut(key);
+    const bool present = it != obj.mut_end();
 
     /*
      * A read-only (const) dict never hands out an assignable lvalue: present ->
@@ -110,7 +193,7 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
      * write target a const dict returns an rvalue so the write fails NotLValue.
      */
     if (flatObj->is_readonly()) {
-        if (it != data.end())
+        if (present)
             return it->second.get();
         if (obj.get_has_default())
             return obj.get_default();
@@ -119,10 +202,23 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
         throw KeyNotFoundEx();
     }
 
+    /*
+     * A READ through a handle no variable holds (a call's result, a literal,
+     * an element read as a value) gets the entry's VALUE: the dict may die
+     * when the read ends, and a pointer into its entry dangled -
+     * `[{"k": 1}][0]["k"]` read freed memory, at parse time too, where the
+     * fold evaluates it. Everything else is as for a held dict - the handle
+     * may be one more alias of a live dict (`[d][0]["z"]`), so a default
+     * dict's new key is still inserted. A store holds its base, so it
+     * always arrives with an LValue (TypeArr::subscript makes the same
+     * test).
+     */
+    const bool held = what_lval.is<LValue *>();
+
     /* Present key: hand out the lvalue (a read RValue()s it; a compound assign
      * reads-and-writes it). */
-    if (it != data.end())
-        return &it->second;
+    if (present)
+        return held ? EvalValue(&it->second) : it->second.get();
 
     /*
      * Missing key. A default dict inserts+returns its default (so `d[k]` is
@@ -138,25 +234,32 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
      * (the entry would sit in the wrong bucket). A scalar/string key is
      * immutable already, so make_const_clone returns it as-is (cheap).
      */
-    if (obj.get_has_default()) {
-        EvalValue fk = make_const_clone(key);
-        return &(*data.emplace(std::move(fk),
-                     LValue(obj.get_default(), false)).first).second;
+    /* Q2: a new key fits the dict's own key type - however the dict was
+     * reached (a read of a default dict inserts too) */
+    if (obj.get_has_default()) {          /* a new key: see Cursor */
+        LValue *lv = obj.insert_new(
+            make_const_clone(ct_fit_key(obj, key), true),
+            LValue(obj.get_default(), false));
+        return held ? EvalValue(lv) : lv->get();
     }
 
-    if (for_write) {
-        EvalValue fk = make_const_clone(key);
-        return &(*data.emplace(std::move(fk),
-                     LValue(none, false)).first).second;
-    }
+    if (for_write)
+        return obj.insert_new(make_const_clone(ct_fit_key(obj, key), true),
+                              LValue(none, false));
 
     throw KeyNotFoundEx();
 }
 
 string TypeDict::to_string(const EvalValue &a)
 {
-    const DictObject &obj = *a.get<intrusive_ptr<DictObject>>().get();
+    const DictObject &obj = *a.get_ref<intrusive_ptr<DictObject>>().get();
     const DictObject::inner_type &data = obj.get_ref();
+
+    /* already being printed further up this walk: `{...}` (cyclewalk.h) */
+    const CycKey k = cyc_key_obj(&obj);
+    if (cyc_render().contains(k))
+        return "{...}";
+    CycGuard g(cyc_render(), k);
 
     string res;
     size_type i = 0;
@@ -182,13 +285,18 @@ string TypeDict::to_string(const EvalValue &a)
 
 string TypeDict::pretty(const EvalValue &a, int indent, int width)
 {
+    const DictObject &obj = *a.get_ref<intrusive_ptr<DictObject>>().get();
+    const CycKey k = cyc_key_obj(&obj);
+    if (cyc_render().contains(k))
+        return "{...}";
+
     const string flat = to_string_repr(a);
-    const DictObject &obj = *a.get<intrusive_ptr<DictObject>>().get();
     const DictObject::inner_type &data = obj.get_ref();
 
     if (data.empty() || indent + static_cast<int>(flat.size()) <= width)
         return flat;
 
+    CycGuard g(cyc_render(), k);   /* a value leading back here: {...} */
     string res = "{\n";
     const string pad(indent + 2, ' ');
     size_type i = 0;
@@ -213,24 +321,24 @@ string TypeDict::pretty(const EvalValue &a, int indent, int width)
 
 bool TypeDict::is_true(const EvalValue &a)
 {
-    return a.get<intrusive_ptr<DictObject>>()->get_ref().size() > 0;
+    return a.get_ref<intrusive_ptr<DictObject>>()->get_ref().size() > 0;
 }
 
 int_type TypeDict::use_count(const EvalValue &a)
 {
-    return a.get<intrusive_ptr<DictObject>>().use_count();
+    return a.get_ref<intrusive_ptr<DictObject>>().use_count();
 }
 
 EvalValue TypeDict::intptr(const EvalValue &a)
 {
     return reinterpret_cast<int_type>(
-        &a.get<intrusive_ptr<DictObject>>().get()->get_ref()
+        &a.get_ref<intrusive_ptr<DictObject>>().get()->get_ref()
     );
 }
 
 EvalValue TypeDict::clone(const EvalValue &a)
 {
-    const auto &wrapper = a.get<intrusive_ptr<DictObject>>();
+    const auto &wrapper = a.get_ref<intrusive_ptr<DictObject>>();
     const DictObject &dict = *wrapper.get();
     auto copy = make_intrusive<DictObject>(dict);
 

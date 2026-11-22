@@ -1,0 +1,62 @@
+# Rule 8.1 (plans/strict-container-types.md; README, *Static type
+# inference*): an un-annotated `opt` parameter is a TEMPLATE parameter,
+# keyed by the argument's type without its `?`; a `none` or omitted
+# argument is an instance of its own, where the parameter is a `dyn?`. It
+# used to join its call sites, so `f(2)` and `f(2.5)` both returned
+# floats and `f(2)` then `f("s")` was refused.
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+
+# ---- an instance per argument type, none and omitted included
+func inc(opt x) {
+    if (x == none)
+        return 0;
+    return x + 1;
+}
+want("int", str(inc(2)), "3");
+want("float", str(inc(2.5)), "3.500000");
+want("none", inc(none), 0);
+want("omitted", inc(), 0);
+func show(opt x) => x == none ? "-" : str(x);
+want("other types", show(2) + show("s") + show(none) + show(), "2s--");
+
+# ---- int and int? share an instance
+var maybe = runtime(true) ? 5 : none;
+int? m2 = maybe;
+want("int?", str(inc(m2)), "6");
+if (typed)
+    want("an int? result is the int instance's", typestr(inc(4)), "int");
+
+# ---- with another template parameter
+func pair(a, opt b) => typestr(a) + "/" + (b == none ? "-" : typestr(b));
+if (typed) {
+    want("pair omitted", pair(1), "int/-");
+    want("pair float", pair(1, 2.5), "int/float?");
+    want("pair str", pair("s", "t"), "str/str?");
+}
+
+# ---- a nullable bare container (rules 5 and 8.1)
+func size(array? a) => a == none ? -1 : len(a);
+want("bare opt", size([1, 2]) + size(["s"]) + size(none), 2);
+
+# ---- a var-bound lambda
+var orl = func(opt x) => x ?? 7;
+want("lambda", str(orl()) + str(orl(3)) + orl("s"), "73s");
+
+# ---- through a function value the untyped base runs, folded or not:
+# the calls through the array disagree (`int` and omitted)
+pure func o2(opt v) { var x = 0.5; x = v ?? 1; return str(x); }
+const T2 = [o2];
+want("base through a const array", T2[0](3) + T2[int(runtime(0))](3),
+     "33");
+want("base, omitted", T2[0](), "1");
+
+assert(bad == 0);
+print("ok");

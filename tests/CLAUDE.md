@@ -1,0 +1,356 @@
+# tests/CLAUDE.md - working notes for the test tools
+
+The human overview is tests/README.md (keep it human: plain prose, aligned
+tables, no markup clutter). This file is the operational detail: rules,
+traps, APIs. The root CLAUDE.md holds the project-wide testing rules
+(the INSTRUMENTS list, THE VACUOUS-TEST TRAP, Testing an AST TRANSFORM,
+the INT_TESTS section); read those first.
+
+## Layout
+
+- Every program in tests/ (and the test tools in scripts/) has NO
+  extension, mode 755 and a shebang: people run `tests/nested_fuzz`, not
+  `python3 tests/nested_fuzz.py` (maintainer-set, 2026-10-04). A new tool
+  follows suit - `git add --chmod=+x` if the mode does not stick.
+- Library code lives in tests/lib/ and keeps `.py` (Python cannot import
+  an extensionless file): testrun.py (progress, resume), testjobs.py
+  (core counts, the idle re-exec), intcov.py (`mylang -v`, the coverage
+  universe). A tool reaches it with
+  `sys.path.insert(0, os.path.join(<dir of __file__>, "lib"))`. Never
+  import one tool from another: move the shared code into tests/lib.
+- Data directories: functional/, int/ (and int/repl/), backtrace/ (the
+  bt_oracle programs - renamed from bt_oracle/ because a file and a
+  directory cannot share the tool's name).
+
+## Rules (maintainer-set)
+
+- **Hour-scale runs go to a MANUAL CI workflow** (workflow_dispatch:
+  int-deep.yml, mutate.yml), never the local machine for hours, never
+  per-push CI. Locally, check a long tool on a tiny input only
+  (mutate --count 2, int_enum on one program). Dispatching is the
+  maintainer's call unless he asked. Both live only on exp-work, so the
+  Actions tab has no "Run workflow" button for them: start one with
+  `gh workflow run int-deep.yml --ref exp-work -f tier3=true -f
+  select=true` or `gh workflow run mutate.yml --ref exp-work`.
+- **State the cost before starting anything multi-minute**, and pick the
+  smallest run that answers the question.
+- **Every tool that can run > 1 minute serves its progress** so
+  `tests/testctl` lists it with a percentage. A new long tool uses one
+  of: `Run` (independent ordered items, resumable), `Monitor` (phases or a
+  loop), or tests/testmon beside a shell tool. No exceptions.
+- **Every tool re-execs at idle priority** (`testjobs.ensure_idle()`
+  first in main; shell tools exec through `tests/jobs run`) and sizes
+  its pool with `testjobs.count()` / `tests/jobs count`.
+- **Per-push CI stays bounded** (Nets ~18 min). A new per-push step goes
+  into a job that is not the long pole, or gets its own parallel job.
+
+## tests/run - the runner (after Tilck's run_all_tests)
+
+- The CATALOG is `catalog()` at the top of tests/run: one `add(name,
+  type, class, build, est_seconds, cmd, ...)` per test, `cmd(c)` reading
+  the binary as `c.b` (never a hard-coded build), so the same test runs
+  on any build as NAME@BUILD; `on(test, build, est)` puts such a
+  combination in the catalog (the long run covers it). A new tool or a
+  new configuration of one gets a line there, with an HONEST class (the
+  run alone, build excluded): short <= 30 s, med <= 3 min, long <= 30
+  min, manual = hours. short + med is the default run, and a test whose
+  build is not `dbg` is `long` - building that lane is minutes on its
+  own. test-times.json keeps the measured times; trust them over `est`.
+- CI RUNS THE CATALOG (2026-10-04): every workflow builds its binary
+  itself (CMake mostly - CI is where that build system is exercised,
+  and the coverage floors were measured on those recipes) and runs
+  `tests/run -o --logs test-logs --bin LANE=PATH NAME@LANE ...`. So a
+  check CI needs is a catalog test, never a workflow shell step: a new
+  per-push check means a catalog entry plus its name in the job's
+  tests/run line. A CI build stands for a lane (Windows Debug for dbg,
+  hence `opt unknown` in dbg's expect; both Linux Release lanes for
+  rel-hard; `ship` and `lto0` are build-check lanes with no catalog
+  test of their own).
+- A test of a CONFIGURATION carries `guards=`: in-process checks run
+  before the tool that raise when the binary is not in that
+  configuration (guard_nolowmem, guard_spcheck, guard_rex). They replace
+  the workflows' old vacuity-guard steps; a new env lever whose test
+  could pass vacuously gets one.
+- `uses=[lane]` adds a build the command reads (int-vdjcmp's reference);
+  `exclusive=True` runs the test alone on its build - any tool that
+  clears and reads gcov counters (int_run --gcov, norec_coverage,
+  int_select): another run of the same binary would add to them.
+  `shard=` turns --shard I/N into the tool's own option; `-- ARGS` go to
+  the single selected test's tool (the Mutation workflow's inputs).
+- The heartbeat line carries each running test's latest output line:
+  in a CI log that is the only live view of a long tool.
+- Under GitHub Actions (`GITHUB_ACTIONS=true`) a failed test also prints
+  an `::error` annotation holding the last 30 lines of its log
+  (`gh_annotate`), and every workflow job adds
+  .github/problem-matchers.json, so compiler, sanitizer and assertion
+  lines become annotations too. They are readable through the API
+  (`check-runs/<job id>/annotations`) where the log is not. A new
+  workflow job adds the matcher step right after its checkout.
+- BUILDS are `LANES`: a make or cmake recipe plus an `expect` dict that
+  the binary's `mylang -v` must match. Add the expectation that would
+  catch the wrong binary (int_tests 1 for an INT lane, ...), never an
+  empty one. Builds go to --build-root: default build-tests/, the
+  maintainer's; Claude passes --build-root build-claude (or exports
+  MYLANG_TEST_BUILD_ROOT=build-claude), since it builds only there.
+- CASES: a test with `cases=` can list (`--list`) and run a subset
+  (`--only REGEX`) through its tool; `CASES` maps the kind to the list
+  command, the selection suffix and a FAILED-CASE PARSER that reads the
+  tool's own failure lines (rt: `[ RUN  ]` + `[ FAIL ]`; corpus_diff:
+  `DIFF [..] path`, `CRASH [..] path`, `FAIL [..] path` (a functional
+  program that does not exit 0), `MISSING [..] path` (a unit with no
+  result), `REFUSED path`; int_run: `  FAIL path`; bt_oracle: `FAIL
+  name`, `VACUOUS name:`). **Changing a tool's failure line breaks its
+  reproduce line silently: update the parser in the same change.** A
+  fuzzer's reproduce line comes from its printed seed (nested_fuzz:
+  `seed=N`).
+- --case regexes go through `rx_exact`, which escapes only what is
+  special in all three dialects the tools speak (ECMAScript for -rt,
+  Python, POSIX ERE for corpus_diff's grep -E).
+- The runner never tests a binary it did not check: every build gets a
+  `check:` step (in-process `check_build`) before its tests.
+
+## The progress API (tests/lib/testrun.py)
+
+    from testrun import Run, Monitor
+
+    # independent ordered items: heartbeat, socket, stop/pause/jobs N,
+    # resume by token; work(i, item) returns failure text or None
+    r = Run("name", items, work, fingerprint(...), jobs,
+            heartbeat=60, describe=str, phase="exploring")
+    r.execute()
+
+    # anything else: status only
+    mon = Monitor("name", total=n, phase="units")
+    with mon:
+        mon.set_current(what); ...; mon.advance(failed=bad)
+        mon.phase("census", total=m)       # restarts done at 0
+
+`percent_fn=` overrides done/total (a time-budgeted shrink); `pid=` makes
+a watcher (testmon) report the watched tool's pid. Status fields: name,
+pid, phase, percent, done, total, elapsed_s, eta_s, eta, failures,
+current (+ extras via set_extra). Sockets live in $XDG_RUNTIME_DIR/
+mylang-tests; testctl unlinks stale ones.
+
+testctl is the CLIENT a person runs (list, watch, status, failures,
+stop, pause, resume, jobs N; `tests/testctl -h`); testmon is a SERVER a
+shell tool starts beside itself - a Monitor whose `done` is a count of
+result files (`tests/testmon -h`, with corpus_diff's call as the
+example). testctl's listing sizes every column to its content, wraps
+NOW under itself (or onto its own lines below NOW_MIN free columns),
+drops PID / ELAPSED / DONE on a very narrow terminal, and colors only a
+TTY without NO_COLOR - no line may exceed the terminal width.
+
+**Kill a tool by an ANCHORED pattern** (`ps -eo pid,args | awk '$2 ==
+"python3" && $3 == "tests/x.py"'`): `pkill -f x.py` also matches the
+shell that runs the pkill (exit 144, the command dies with it).
+
+## Where each tool runs in CI
+
+Every job: its own build, then one `tests/run --bin` line naming these
+catalog tests.
+
+| workflow job             | build (lane)       | tests                     |
+|--------------------------|--------------------|---------------------------|
+| Linux build x4           | cmake (dbg, clang, | rt, myv_doc_check,        |
+|                          | rel-hard x2)       | driver_checks @lane       |
+| Linux recycle            | cmake (recycle)    | rt@recycle                |
+| Linux release-smoke x2   | cmake (release,    | system_smoke @lane        |
+|                          | ship)              |                           |
+| Linux lto0 x2            | make + cmake       | rt@lto0, driver_checks@   |
+|                          | (lto0, ship)       | lto0, system_smoke@ship   |
+| Linux dbginfo x2         | make (dbg)         | rt                        |
+| Linux debug-notests      | make (dbg-nt)      | corpus_diff@dbg-nt,       |
+|                          |                    | driver_checks@dbg-nt      |
+| macOS                    | cmake (clang)      | rt@clang                  |
+| Windows x2               | cmake MSVC (dbg,   | rt @lane                  |
+|                          | rel-hard)          |                           |
+| Coverage                 | cmake (cmake-gcov) | rt@cmake-gcov + codecov   |
+| Nets differential        | cmake (dbg)        | corpus_diff, vdjcmp,      |
+|                          |                    | bt_oracle, norec_enum,    |
+|                          |                    | norec_sweep, disasmcheck  |
+| Nets levers-fuzz         | cmake (dbg)        | corpus_diff-levers,       |
+|                          |                    | nested_fuzz               |
+| Nets disasmcheck         | cmake (rel-hard)   | disasmcheck-matrix        |
+| Nets nolowmem x2         | cmake (dbg, rna)   | rt-nolowmem, corpus_diff- |
+|                          |                    | nolowmem, driver_checks   |
+| Nets spcheck x2          | cmake (dbg, rna)   | rt-spcheck,               |
+|                          |                    | corpus_diff-spcheck       |
+| Nets int                 | cmake g++-14       | int-vdjcmp, int_run-gcov, |
+|                          | (int-gcov, dbg)    | driver_checks@int-gcov    |
+| Nets int-enum            | cmake (int-rel)    | int_enum-1, int_enum-2,   |
+|                          |                    | disasmcheck-rex           |
+| Nets myv-fuzz x2         | cmake (dbg, rna)   | myv_fuzz                  |
+| Nets repl-fuzz           | cmake (recycle)    | repl_fuzz@recycle         |
+| Nets coverage-gate       | cmake (cmake-gcov) | norec_coverage            |
+| int-deep (on demand)     | cmake, make        | int_enum-3, int_select    |
+| Mutation (on demand) x8  | its own            | mutate --shard I/8        |
+
+The CI fuzzers take `--seed ${{github.run_id}}` (a re-run keeps it): a
+fixed seed made them a regression corpus. A finding reproduces from the
+printed seed. A .myv finding does too, through tests/run on a build of
+the SAME COMMIT with TMPDIR unset (`tests/run --seed N --bin dbg=BIN
+myv_fuzz`): an image embeds its source path, but the temp directories'
+random suffixes have a fixed length, so the image's layout - and every
+mutation offset - repeats (CI seed 37801504667 was replayed that way,
+2026-10-09). The saved image (the job's artifact) is the direct
+reproducer.
+
+## Reach is not checking
+
+Coverage proves a line was REACHED, never that a wrong result there would
+fail a test (`2*x` vs `2+x` agree at x = 2). So:
+
+- never cut a fuzzer or a test on coverage alone - the evidence for a cut
+  is mutation testing (mutate: the fuzzers run as the LAST stage, so
+  "killed by fuzz" counts what no deterministic test noticed);
+- a test must print or assert VALUES. The int_select shrink oracle is
+  agreement with the tree-walker ON THE SHRUNK PROGRAM, so it accepts any
+  deletion both engines agree on: unpinned, it shrank programs to no
+  output; with print lines pinned, to `var acc = 0; print(acc)`. It now
+  pins `print(`/`assert(` lines AND ends with `observe_globals` (print
+  every top-level var). A hand-shrunk test needs the same care.
+- a self-check counter (`g_jit_*`, int_hits) proves the PATH ran; the
+  value check proves it was right. A test usually needs both.
+
+## int_run units (tests/int)
+
+- `# INT-ENGINES:` names from ENGINE_FLAGS (default tw nj vm nbi noopt
+  nc ni), `+` joins (`nbi+nj`); engines of one config must print the same
+  stdout, so include `tw` when the point is a value check, and `nc` when
+  it is what folding must not change (78_fold_after_inference.my).
+- `# INT-CONFIGS:` `;`-separated env sets.
+- `# INT-SOURCE: ../functional/NAME.my`: the unit RUNS that program (the
+  path is relative to the unit) under its own INT-ENGINES / INT-CONFIGS -
+  a tests/functional program counted as a coverage unit with no second
+  copy (int_run's census already runs tests/functional, but the coverage
+  universe counts only -rt, tests/int and the REPL sessions). The unit is
+  the stub's name, so ownership reads as usual (2026-10-05: 25-28).
+  `tests/driver_checks` COMPILES every functional program (the image
+  round trip, 2026-11-07), so such a unit owns only what RUNNING the
+  program reaches: seven that owned only compile-time elements were
+  dropped as redundant.
+- tests/int/repl/NAME.session + NAME.expected: fed to `--repl` on stdin
+  under a FRESH HOME (history file); stdout must equal NAME.expected,
+  stderr be empty, rc 0. `--update-repl` rewrites the .expected files -
+  READ the diff, it is the assertion. (Not .out: .gitignore drops *.out,
+  which is how the first push lost all 24 of them.) A session is a
+  coverage UNIT, so it must own an element (below): a front-end
+  regression check over paths other units already reach (`:quit ` with a
+  trailing space) goes in tests/driver_checks (`repl_run`) instead.
+- tests/int/tty/NAME.keys + NAME.expected: a TERMINAL session - the
+  line editor in raw mode (repaint, colour, the ghost suggestion,
+  completion, the Ctrl-R pane, bracketed paste), which no other unit
+  reaches. Each line of the .keys file is ONE input in Python
+  string-literal escapes (`\r` Enter, `\x1b[A` up, `\x12` Ctrl-R; `#`
+  lines are comments), typed on a 24x80 pseudo-terminal
+  (intcov.run_tty) once the REPL has READ the previous line
+  (/proc/PID/io's rchar) and waits in raw mode, blocked in read(0)
+  (/proc/PID/syscall). Never two inputs on one line: the editor flushes
+  typed-ahead input as it enters and leaves raw mode. What the terminal
+  shows must equal NAME.expected byte for byte (HOME fresh, TERM=xterm,
+  LC_ALL=C, colour on) - a function of the bytes typed, so it repeats
+  on every run and build; `--update-repl` rewrites it, and the file
+  holds \r, so it is opened with newline="". A `# TTY-SIZE: RxC` line
+  picks another terminal size and a `# TTY-ENV: K=V ...` line adds to
+  the environment (pane.keys: an 8x34 terminal, a UTF-8 locale for the
+  rounded borders; plain.keys: NO_COLOR). Linux only (/proc). A lone
+  ESC is the one input that is timing-dependent (the Ctrl-R pane waits
+  40 ms for a sequence): use Ctrl-G to cancel instead.
+- VALUE CLASSES (src/intsites.h, ML_INT_VCLASSES): declared operation
+  boundaries, counted at the operation (`vc <class> <hits>` lines in the
+  MYLANG_INT_OUT census). A class no run exercises fails int_run; with
+  --gcov each is a `vc:` element. 22_value_classes.my asserts every one
+  against README.md - extend it with each new class, and give the
+  README the rule first if it does not state the boundary.
+- `--gcov` needs a GCC 14 build (MC/DC conditions; an older gcov refuses
+  `--conditions`, and int_run now says so before running anything). The
+  int-gcov lane builds with the default g++; where that is older, build
+  a GCOV INT lane with CXX=g++-14 (the CI int job's compiler).
+- `--no-rt` is a SUBSET like `--only`: the whole-suite checks (the site
+  and value-class censuses, ownership, the floor) are skipped, since -rt
+  alone exercises some value classes (an out-of-range literal is a
+  compile error no tests/int program can hold). tests/mutate's `int`
+  stage runs --no-rt; with the census on, its pristine build failed and
+  every mutation run stopped before its first mutant (2026-10-05 to
+  2026-11-11).
+- `--gcov --only REGEX --report F` writes what each unit run covered:
+  compared with a whole run's uncovered list it says what a new unit
+  adds, in minutes instead of the whole run's ~50.
+- A report opens with each unit's OWNED elements (`== NAME owns N`) and
+  ends with `== uncovered N`: rank only the last section - reading the
+  whole file ranks covered code as work to do (2026-11-12).
+- Measure a tree with a coverage build OF THAT TREE. An element is named
+  by its offset from its function's first line, read from the source
+  where int_run runs, while the counts come from the source the binary
+  was built from: a worktree whose src/ differs from the binary's
+  renames every element below the change - a 30-line deletion in vm.cpp
+  read as 95 new uncovered elements and 46 vanished ones, and the floor
+  check failed on a batch that had lowered the count (2026-11-12). A
+  tests-only difference is safe.
+- Two `--gcov` runs on ONE build clear and read each other's counters
+  (`exclusive=True` keeps tests/run's own apart): a second run started
+  by hand made eleven units "redundant" and the count jump (2026-11-12).
+- A coverage build (GCOV=1) compiles ML_CHECK / ML_VM_CHECK out
+  (ML_COVERAGE, defs.h; `mylang -v`: `coverage 1`, `asserts 0`) - an
+  assertion's failure arm is an edge no correct run takes, and an inlined
+  check charged one to every call site (8,385 elements). So int_run-gcov
+  runs no assertion: the int-rel int_run is the one that does. It also
+  emits each ML_ALWAYS_INLINE helper once, out of line: inlined, every
+  caller counted the helper's branches again (~4,600 elements).
+- tests/driver_checks is a unit too (a script; its exit code is the
+  oracle): a CLI flag's code is covered by the check that tests it.
+- With --gcov every unit must OWN an element no other unit covers, and
+  uncovered must stay <= tests/int/coverage-floor.txt for the compiler.
+  Lower the floor when a change covers more (the note says by how much);
+  never raise it. CI's number comes from the `int` job log: its g++-14 is
+  gcc 14.3 since the runner image moved (2026-10-20 - the job failed
+  with "no coverage floor for `gcc 14.3`" and printed the count to
+  record); the 14.2 line is the local lane's.
+- nested_fuzz's generator has a WORK BUDGET (WORK_BUDGET: the product of
+  the enclosing loops' iteration counts; past it a level nests an `if`).
+  Without it a depth-15 program ran 1.7 million innermost iterations and
+  the debug tree-walker timed out on it (26 s alone, CPython 0.5 s) -
+  with fresh seeds in CI that would be a red run with no bug behind it.
+- 16-17_nested_*.my are GENERATED (nested_fuzz -> int_select --shrink ->
+  observe_globals -> wrapped to 80 columns, output checked identical).
+  Do not tidy them by hand; regenerate.
+
+## int_select
+
+- Coverage collection runs in worker PROCESSES (forkserver): gcov JSON
+  parsing is pure Python and the GIL made the threaded pass ~10x slower.
+  Any new coverage tool: same rule.
+- Default configs = 5 engine configs + nested_fuzz's four (-nbi, -nbi -nj,
+  --no-opt all, -tw --no-opt all); a config word with no `=` is the
+  previous flag's argument.
+- `--shrink` takes a selected test name OR a program path (kept for every
+  config it was selected under; several shrink in parallel).
+  `--shrink-budget S` bounds each; the best so far is on disk throughout.
+  Line-level ddmin on brace-structured code is slow (most deletions break
+  the parse): ~1000 trials for a 450-line program, and a trial can loop
+  forever (30 s leash on its reference run).
+
+## mutate
+
+- Mutates product .cpp only; skips ML_INT spans, INT-COV-EXEMPT lines,
+  int_*/jit_int_*/bc_int_* bodies, #ifdef TESTS / INT_TESTS regions.
+- Works in a private COPY of the tree per worker (a mutation is a
+  sabotage; never touch the checkout). Build: the INT fast lane.
+- The pristine build must pass every stage first, and sets each stage's
+  timeout (5x, min 60 s). A timeout is a kill.
+- Stages: rt, corpus, int, enum, fuzz, in that order, stop at first kill.
+
+## Adding a test - where
+
+| test of                               | goes in                      |
+|---------------------------------------|------------------------------|
+| language semantics, an error, a caret | src/tests.cpp (-rt, 5 modes) |
+| a JIT/VM shape on every engine/lever  | tests/functional/*.my        |
+| a backtrace across inlining           | tests/backtrace/*.my         |
+| a compiler decision via INT hooks     | tests/int/NN_*.my            |
+| the REPL front end                    | tests/int/repl/*.session     |
+| a CLI flag                            | tests/driver_checks          |
+
+Then: watch it fail against a sabotaged build (commit first, sabotage a
+COPY, rebuild inside the restore - root CLAUDE.md), and if it is a new
+tool, give it progress and a line in README.md and in the tables above.

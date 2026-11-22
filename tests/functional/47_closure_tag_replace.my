@@ -1,0 +1,59 @@
+# #97 closure inlining, increment 5 follow-up: a slot that may hold ONE OF
+# SEVERAL closures is scalar-replaced too - an int TAG names which one it
+# holds, every closure keeps its own capture slots, and a guard the
+# analysis cannot decide becomes a compare of the tag. Every shape must
+# print what the calls printed:
+#  - a factory returning one of two adders (bench 99's shape);
+#  - two counters, each with its OWN mutable capture, called twice per
+#    iteration (the tag must pick the right counter both times);
+#  - three closures with different capture counts (0, 1 and 2 captures) -
+#    KEPT today: a value call with three candidates is not spliced, so
+#    the call reads the object (a parity case for the day it is);
+#  - a slot whose tag is decided twice in one iteration (the slot is
+#    rebuilt between two calls).
+# MYLANG_BCINLINE_SRA=0 is the same program with the objects kept.
+func mk_add(k) {
+    if (k % 3 == 0) {
+        var base = k * 10;
+        return func [base] (int x) { return base + x; };
+    }
+    var fac = k % 7 + 1;
+    return func [fac] (int x) { return fac * x; };
+}
+func mk_cnt(k) {
+    if (k % 2 == 0) {
+        var c = k;
+        return func [c] () { c++; return c; };
+    }
+    var d = k * 3;
+    return func [d] () { d = d - 2; return d; };
+}
+func mk3(k) {
+    if (k % 3 == 0)
+        return func (int x) { return x + 1; };
+    if (k % 3 == 1) {
+        var a = k;
+        return func [a] (int x) { return a * x; };
+    }
+    var p = k + 2;
+    var q = k * 5;
+    return func [p, q] (int x) { return p + q - x; };
+}
+
+var s = 0;
+var t = 0;
+var u = 0;
+var w = 0;
+for (var i = 0; i < 60; i++) {
+    var f = mk_add(i);
+    s = (s + f(i) + f(3)) % 1000003;
+    var c = mk_cnt(i);
+    t = (t * 3 + c() * 7 + c()) % 1000003;
+    var g = mk3(i);
+    u = u + g(i) - g(1);
+    var h = mk_cnt(i);
+    w = w + h();
+    h = mk_cnt(i + 1);
+    w = w * 2 % 1000003 + h() + h();
+}
+print(s, t, u, w);

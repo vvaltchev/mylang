@@ -1,0 +1,74 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): `x % 1` and `(a + b) % 1` with the divisor a literal
+# 1. The peephole fuses `(a + b) % IMM` into one op (IntAddModRI) for any
+# immediate but 0 and -1, and the JIT reduces a constant divisor to a
+# multiply or a shift - except 1, which has no such form and takes the
+# plain idiv. The result is always 0 (README: `%` takes the sign of the
+# left operand, and |x % y| < |y|). Each shape runs with its dividend
+# a plain slot and the value an instruction just computed (the JIT
+# forwards that one in a register), negative dividends included. And
+# the shapes the fusion declines, each computing what `%` computes: a
+# modulus of -1 (INT_MIN % -1 would throw), of 0 (DivisionByZeroEx, a
+# catchable error - README), and one too wide for a 32-bit immediate.
+# The tree-walker is the oracle; every engine must print the same.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+func m1(int n) {
+    var s = 0;
+    for (var i = -n; i < n; i++)
+        s = s + (i + n) % 1 + (i + 3) % 7;
+    return s;
+}
+func m2(int n) {
+    var s = 0;
+    for (var i = -n; i < n; i++) {
+        var t = i * 3;
+        s += (t + n) % 1 + (t - 2) % 1 + t % 1;
+    }
+    return s;
+}
+func m3(int n) {
+    var s = 0;
+    for (var i = -n; i < n; i++) {
+        var t = i * 5;
+        var u = (t + 7) % 1;
+        s = s * 2 + u + (t + 1) % 4;
+    }
+    return s;
+}
+
+func m4(int n) {
+    var s = 0;
+    for (var i = -n; i < n; i++)
+        s = s + (i + n) % -1 + (i * 7 + 5000000003) % 5000000000;
+    return s;
+}
+func m5(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++)
+        s = s + (i + n) % 0;
+    return s;
+}
+
+want("(i + n) % 1 beside % 7", m1(int(runtime(10))), 15);
+want("forwarded dividends % 1", m2(int(runtime(10))), 0);
+want("% 1 into a chain", m3(int(runtime(6))), -4132);
+want("% -1 and a 64-bit modulus", m4(int(runtime(4))), 19999999996);
+var div0 = 0;
+try {
+    m5(int(runtime(3)));
+} catch (DivisionByZeroEx) {
+    div0 = 1;
+}
+want("% 0 raises DivisionByZeroEx", div0, 1);
+
+assert(bad == 0);
+print("ok");

@@ -1,0 +1,94 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> >> >> >> >> >> >> >> >> >> >> => Unit()
+>> => [Unit(), Unit()]
+>> => Big(
+     a: 1000000001,
+     b: 1000000002,
+     c: 1000000003,
+     d: 1000000004,
+     e: 1000000005,
+     f: 1000000006
+   )
+>> => W(
+     name: "a fairly long name to make the line wide",
+     vals: [1, 2, 3, 4, 5, 6, 7],
+     m: {"k": 1}
+   )
+>> => box(Big(
+     a: 1000000001,
+     b: 1000000002,
+     c: 1000000003,
+     d: 1000000004,
+     e: 1000000005,
+     f: 1
+   ))
+>> => box(P(x: 1, y: 2))
+>> .. => {
+     "outer": {
+                "middle": {
+                            "inner": [
+                                       100000001,
+                                       100000002,
+                                       100000003,
+                                       100000004
+                                     ]
+                          }
+              }
+   }
+>> => [
+     {
+       "outer": {
+                  "middle": {
+                              "inner": [
+                                         100000001,
+                                         100000002,
+                                         100000003,
+                                         100000004
+                                       ]
+                            }
+                }
+     }
+   ]
+>> .. => {
+     "first": [100000001, 100000002, 100000003],
+     "second": [200000001, 200000002, 200000003]
+   }
+>> => {}
+>> .. => [
+     "a long payload string to push this dict well past the width",
+     {"self": [...]}
+   ]
+>> => {
+     "self": [
+               "a long payload string to push this dict well past the width",
+               {...}
+             ]
+   }
+>> => [
+     {
+       "self": [
+                 "a long payload string to push this dict well past the width",
+                 {...}
+               ]
+     }
+   ]
+>> .. => CN(
+     tag: "a long tag string so that the class instance is wider than 80",
+     next: <none>
+   )
+>> => CN(
+     tag: "a long tag string so that the class instance is wider than 80",
+     next: CN(...)
+   )
+>> => CN(
+     tag: "a long tag string so that the class instance is wider than 80",
+     next: CN(...)
+   )
+>> => [
+     CN(
+       tag: "a long tag string so that the class instance is wider than 80",
+       next: CN(...)
+     )
+   ]
+>> => true
+>> >> 

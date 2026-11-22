@@ -41,6 +41,7 @@ public:
         t_ex,
         t_dict,
         t_struct,       /* a struct INSTANCE (intrusive_ptr<StructObject>) */
+        t_box,          /* a box of a scalar / str (intrusive_ptr<BoxObj>) */
 
         /* Number of types */
         t_count,
@@ -66,7 +67,7 @@ class TypeTemplate : public TypeBaseDefs, public TypeErasureOps {
 public:
 
     const TypeE t;
-    TypeTemplate(TypeE t) : t(t) { assert(t != t_count); }
+    TypeTemplate(TypeE t) : t(t) { ML_CHECK(t != t_count); }
 
     virtual void add(EvalValueT &a, const EvalValueT &b) {
         throw TypeErrorEx("The object does NOT support operator +");
@@ -144,14 +145,6 @@ public:
         throw TypeErrorEx("The object does NOT support unary operator - (negation)");
     }
 
-    virtual void land(EvalValueT &a, const EvalValueT &b) {
-        throw TypeErrorEx("The object does NOT support operator &&");
-    }
-
-    virtual void lor(EvalValueT &a, const EvalValueT &b) {
-        throw TypeErrorEx("The object does NOT support operator ||");
-    }
-
     virtual bool is_true(const EvalValueT &a) {
         throw TypeErrorEx("The object does NOT support conversion to bool");
     }
@@ -225,7 +218,7 @@ public:
 
     virtual EvalValueT intptr(const EvalValueT &a)
     {
-        assert(!a.template is<LValue *>() && !a.template is<UndefinedId>());
+        ML_CHECK(!a.template is<LValue *>() && !a.template is<UndefinedId>());
         return reinterpret_cast<int_type>(&a);
     }
 

@@ -1,0 +1,69 @@
+# A typed local copied from another local, each engine against the
+# tree-walker (corpus_diff) and against the asserts. Two codegen defects
+# until 2026-10-05:
+#  - `var x = v;` compiles `v` to its own slot and emits nothing, so the
+#    last op was the PREVIOUS statement's producer of v - and the copy
+#    RETARGETED it to write x: v was never written (`<none>` under the JIT,
+#    an assertion under -nj). Int and float alike;
+#  - a float slot copy was lowered as `dst = r + 0.0`, which turns -0.0
+#    into +0.0, so `var b = vals[k]` lost the sign the tree-walker keeps.
+# Values come from runtime(): a constant would fold.
+
+# the reproducer: v is computed, copied, copied again
+var v = float(runtime(1.5));
+var x = v;
+x = v;
+assert(str(v) == "1.500000" && str(x) == "1.500000");
+
+# a chain of copies, each source read afterwards
+var a = float(runtime(2.5));
+var b = a;
+var c = b;
+var d = c;
+assert(a == 2.5 && b == 2.5 && c == 2.5 && d == 2.5);
+
+# copy after arithmetic (the retarget that IS sound: a temp result)
+var p = float(runtime(3.0));
+var q = p * 2.0;
+var r = q;
+assert(p == 3.0 && q == 6.0 && r == 6.0);
+
+# reassign from a computed local, in a loop
+var acc = 0.0;
+var last = 0.0;
+for (var i = 0; i < int(runtime(4)); i++) {
+    var t = float(i) * 0.5;
+    last = t;
+    acc = acc + t;
+}
+assert(last == 1.5 && acc == 3.0);
+
+# the int twin
+var iv = int(runtime(7));
+var ix = iv;
+ix = iv;
+var iy = ix;
+assert(iv == 7 && ix == 7 && iy == 7);
+
+# -0.0 keeps its sign through every copy form
+var nz = -float(runtime(0.0));
+var vals = [nz, 1.5];
+var c1 = nz;                        # local <- local
+var c2 = vals[0];                   # local <- element
+var c3 = 0.0;
+c3 = nz;                            # local reassigned <- local
+struct S { float f; }
+var s = S(nz);
+var c4 = s.f;                       # local <- member
+func ret(float y) { return y; }
+var c5 = ret(nz);                   # local <- call result
+var cap = func [nz] () { var t = nz; return t; };
+var c6 = cap();                     # a copy inside a closure
+vals[1] = nz;                       # element <- local
+var dyn c7 = nz;                    # dyn <- float
+foreach (k in [c1, c2, c3, c4, c5, c6, vals[1], c7])
+    assert(str(k) == "-0.000000");
+var pz = float(runtime(0.0));
+var c8 = pz;                        # +0.0 stays +0.0
+assert(str(c8) == "0.000000");
+print(v, x, d, r, last, ix, c1, c2, c4, c8);

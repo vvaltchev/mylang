@@ -1,0 +1,54 @@
+# An in-place builtin call (pop, sort, insert, ... on a named first
+# argument) is no barrier for the reference-slot list (ref_slots) since
+# 2026-11-09: a function calling one lists only the slots that may hold a
+# reference, not every slot. Each shape here returns a reference out of
+# such a call or keeps one across it, in a function called many times,
+# so a slot the list misses is a leak or a double free the hardened
+# frame-pop audit, the INT state checker and the census report.
+
+func take(array<array<int>> rows, int n) {
+    var k = n * 3;
+    var x = pop(rows);        # a fresh reference, out of the call's dst
+    return len(x) + k;
+}
+
+func work(array<array<int>> rows, int n) {
+    var k = n * 3;
+    var t = k + 1;
+    var r = pop(rows);
+    sort(r, func (x, y) => x > y);
+    insert(r, 0, t);
+    append(rows, r);
+    return t + len(r) + k;
+}
+
+# the in-place call's result is itself returned
+func top_row(array<array<int>> rows) {
+    var x = pop(rows);
+    append(rows, x);
+    return x;
+}
+
+var total = 0;
+for (var i = 0; i < runtime(5); i++) {
+    var rows = [[3, 1], [2], [i, i + 1, i + 2]];
+    total = total + take(rows, i);
+    assert(len(rows) == 2);
+}
+assert(total == 3 * 5 + 3 * (0 + 1 + 2 + 3 + 4));
+
+var rows = [[3, 1], [2]];
+var s = 0;
+for (var i = 0; i < runtime(3); i++)
+    s = s + work(rows, i);
+assert(s == 30);
+assert(str(rows) == "[[3, 1], [7, 4, 2, 1]]");
+
+var keep = [];
+for (var i = 0; i < runtime(4); i++) {
+    var rs = [[i], [i * 10, i * 10 + 1]];
+    append(keep, top_row(rs));
+    assert(len(rs) == 2);
+}
+assert(str(keep) == "[[0, 1], [10, 11], [20, 21], [30, 31]]");
+print("ok", total, s, keep);

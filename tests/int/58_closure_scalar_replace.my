@@ -1,0 +1,11 @@
+# INT-SOURCE: ../functional/45_closure_scalar_replace.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/45_closure_scalar_replace.my:
+# #97 closure inlining, increment 5: a closure that never ESCAPES is
+# scalar-replaced - its captures become frame slots of the caller and no
+# object is built. Every shape must print what the calls printed:
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

@@ -1,0 +1,63 @@
+# Names a const scope binds, used where they are not the const:
+# a parameter, a foreach or catch variable and a capture named like an
+# outer `const` (or `pure func`) is its own binding, and reads of it are
+# not folded to the outer value; a closure capturing a const SCALAR gets
+# its own mutable copy; a const multi-declaration may bind containers, and
+# unpacks its literal as written. Each read below has a value the outer
+# const cannot produce, and runtime() keeps a twin of each call unfolded.
+
+const K = 5;
+const L = [1, 2];
+pure func a(x) => x + 1;
+struct E { int x; }
+
+# H1: parameters
+func f(K) { return K + 1; }
+func fl(L) => len(L) + L[0];
+func fa(a) { return a(2); }
+pure func p(K) => K * 2;
+const Q = p(4);
+assert(f(10) == 11 && f(runtime(10)) == 11);
+assert(fl([7]) == 8 && fl(runtime([7])) == 8);
+assert(fa(func(y) => y * 10) == 20 && a(2) == 3);
+assert(Q == 8 && p(runtime(3)) == 6);
+print(f(10), fl([7]), fa(func(y) => y * 10), Q);
+
+# H1: foreach and catch variables, a capture
+var s = 0;
+foreach (var K in [[5], [6]]) { s += K[0]; }
+foreach (var K, j in [[1, 2]]) { s += K * j; }
+foreach (var K, v in indexed [9]) { s += K * 100 + v; }
+var r = 0;
+try { throw E(7); } catch (E as L) { r = L.x; }
+var gl = func[L]() { L = [9]; return L[0]; };
+assert(s == 22 && r == 7 && gl() == 9 && L[0] == 1 && K == 5);
+print(s, r, gl());
+
+# H2: a captured const scalar is the closure's own copy
+var g = func[K]() => K;
+var h = func[K]() { K += 1; return K; };
+func outer() { var c = func[K]() { K *= 2; return K; }; return c() + c(); }
+var fs = [];
+for (var i = 0; i < 3; i++) { append(fs, func[K, i]() { K += i; return K; }); }
+var y = 0;
+if ((func[K]() => K + 1)() == 6) { y = 1; }
+if (runtime(true)) y += (func[K]() => K * 3)();
+assert(g() == 5 && h() == 6 && h() == 7 && g() == 5 && K == 5);
+assert(outer() == 30 && outer() == 30 && y == 16);
+assert(fs[0]() == 5 && fs[1]() == 6 && fs[2]() == 7 && fs[2]() == 9);
+print(g(), h(), outer(), y);
+
+# H4 + H7: a const multi-declaration
+const ma, mb = [[1], [2]];
+const mc, md, me = [3, [4], 2.5];
+func usem() { return ma[0] + mb[0] + md[0]; }
+var cm = func[mc, md]() { mc++; return mc + md[0]; };
+assert(usem() == 7 && mc + 1 == 4 && typestr(mc) == "int");
+assert(cm() == 8 && cm() == 9 && mc == 3 && me == 2.5);
+const x, z = [12, 2.5];
+assert(typestr(x) == "int" && str(x) == "12");
+var refused = 0;
+try { append(ma, 3); } catch (CannotChangeConstEx) { refused = 1; }
+assert(refused == 1 && ma == [1]);
+print(ma, mb, mc, md, me, x, z);

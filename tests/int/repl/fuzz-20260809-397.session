@@ -1,0 +1,6 @@
+:undef
+len[{"k":1}];
+:source /nonexistent
+:
+:tree var v1 = -9223372036854775808;
+:quit

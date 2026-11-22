@@ -1,0 +1,61 @@
+# FLOAT REGISTER PRESSURE, PHASED: two sequential loops, each hot on
+# 4 float accumulators plus its own float index = 5 candidates against
+# the xmm pool's 4 members PER PHASE, 10 across the run. A WHOLE-RUN
+# allocator can pin only 4 of the 10 for the entire run, so one phase
+# runs from memory; a PER-PC allocator serves 4 in EACH phase and pays
+# only the phase-boundary transitions. This is the payoff oracle the
+# F5 sweep recorded as missing.
+# ⛔ THE INT LOOP COUNTERS STAY OUT OF EVERY FLOAT EXPRESSION: one
+# usef touch would disqualify them from the INT pool (the disjoint-
+# pools rule) - fi/fj are the float-side indices, and candidates
+# themselves. All constants are dyadic; both sides run the identical
+# IEEE op order, so the result compares exactly at 4 digits.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+func work(int n) {
+    float f0 = 1.0;
+    float f1 = 2.0;
+    float f2 = 3.0;
+    float f3 = 4.0;
+    float f4 = 5.0;
+    float f5 = 6.0;
+    float f6 = 7.0;
+    float f7 = 8.0;
+    float fi = 0.0;
+    float fj = 0.0;
+    for (var i = 0; i < n; i++) {
+        fi = fi + 1.0;
+        f0 = (f0 + fi) * 0.5;
+        f1 = (f1 * 0.5) + fi;
+        f2 = (f2 + fi) * 0.625;
+        f3 = (f3 * 0.375) + fi;
+        if ((i & 1) == 0)
+            f0 = f0 + 0.125;
+    }
+    for (var j = 0; j < n; j++) {
+        fj = fj + 1.0;
+        f4 = (f4 + fj) * 0.5625;
+        f5 = (f5 * 0.4375) + fj;
+        f6 = (f6 + fj) * 0.6875;
+        f7 = (f7 * 0.3125) + fj;
+        if ((j & 1) == 0)
+            f4 = f4 + 0.125;
+    }
+    var s = 0.0;
+    s = s + f0;
+    s = s + f1;
+    s = s + f2;
+    s = s + f3;
+    s = s + f4;
+    s = s + f5;
+    s = s + f6;
+    s = s + f7;
+    s = s + fi;
+    s = s + fj;
+    return s;
+}
+
+var N = 2000000 * scale;
+print("result:", str(work(N), 4));

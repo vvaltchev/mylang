@@ -1,0 +1,38 @@
+# An inlined function that WRITES THROUGH its parameter - `p[0] = v`,
+# `p.x = v`, `p[0]++`, `append(p, v)` - needs an lvalue where the
+# parameter was. A physical call binds the argument to a slot, which is
+# one; the inliners used to substitute a LITERAL or computed argument
+# there directly, turning a legal store into a store to a temporary: the
+# tree-walker raised NotLValueEx for a compound store (`h([1, 2, 3])`
+# below) and the VM refused to COMPILE the program at all (NotLoweredEx)
+# - where `-ni` runs every line. Each shape is one inliner's path: the
+# block inliner, the expression inliner (`ap`), the tail inliner (`t`).
+
+struct S { int x; }
+func h(p) { p[1] += 9; }
+func g(p) { p[0] = 9; return p[0] + p[1]; }
+func ap(p) => append(p, 4);
+func pp(p) { pop(p); return len(p); }
+func dk(d) { d["k"] = 3; return len(d); }
+func sx(s) { s.x = 5; return s.x; }
+func inc(p) { p[0]++; return p[0]; }
+func w(p) { p[0] = 1; return p[0] + 10; }
+func t(q) { return w([q, 5]); }
+func chain(p) { p[0][1] = 4; return p[0][1]; }
+
+h([1, 2, 3]);
+assert(g([1, 2, 3]) == 11);
+print(g([1, 2, 3]));
+print(ap([1, 2]));
+assert(pp([1, 2, 3]) == 2);
+print(pp([1, 2, 3]));
+assert(dk({"a": 1}) == 2);
+print(dk({"a": 1}));
+assert(sx(S(runtime(1))) == 5);
+print(sx(S(runtime(1))));
+assert(inc([7]) == 8);
+print(inc([7]));
+assert(t(runtime(3)) == 11);
+print(t(runtime(3)));
+assert(chain([[1, 2]]) == 4);
+print(chain([[1, 2]]));

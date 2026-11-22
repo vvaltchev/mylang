@@ -15,8 +15,16 @@ using std::string;
 using std::ostream;
 
 void
-dump_line_with_caret(ostream &o, const string &ln, int from, int to)
+dump_line_with_caret(ostream &o, const string &line, int from, int to)
 {
+    /* A source run keeps a CRLF file's CRs in its lines (read_script) and
+     * an image reading its source back drops them (resolve_source): the
+     * quoted line drops a final CR, so the two print the same (RULE 2 -
+     * they did not until 2026-11-12). */
+    string ln = line;
+    if (!ln.empty() && ln.back() == '\r')
+        ln.pop_back();
+
     if (from < 1)
         from = 1;
     if (to == 0 || to > static_cast<int>(ln.length()))
@@ -34,14 +42,17 @@ dump_line_with_caret(ostream &o, const string &ln, int from, int to)
 
 void
 dump_loc_in_error(ostream &o, const Exception &e,
-                  const std::vector<string> &lines)
+                  const std::vector<string> &lines, const string &src_name)
 {
     if (!e.loc_start.col) {
         o << "\n";
         return;
     }
 
-    o << " at line " << e.loc_start.line << ", col " << e.loc_start.col;
+    o << " at ";
+    if (!src_name.empty())
+        o << src_name << ", ";
+    o << "line " << e.loc_start.line << ", col " << e.loc_start.col;
 
     /* loc_end.col is one past the last char + 1, so the last char is at
      * loc_end.col - 2 and the printed end column is loc_end.col - 1. */
@@ -58,6 +69,16 @@ dump_loc_in_error(ostream &o, const Exception &e,
               << ", col " << e.loc_end.col - 1;
     }
 
+    /* No source text (a .myv whose source is absent, changed, or was never
+     * referenced): print the located header only - the caret block needs the
+     * LINE, which a Loc cannot supply. The file name above plus the
+     * backtrace's per-frame "func(params) at line N" still locate the error
+     * exactly; only the quoted text is missing. */
+    if (lines.empty()) {
+        o << "\n";
+        return;
+    }
+
     o << "\n\n";
 
     for (int ln = e.loc_start.line;
@@ -70,14 +91,15 @@ dump_loc_in_error(ostream &o, const Exception &e,
     }
 }
 
-void
-format_exception(ostream &o, const Exception &e,
-                 const std::vector<string> &lines)
+static void
+format_exception_body(ostream &o, const Exception &e,
+                      const std::vector<string> &lines,
+                      const string &src_name, bool uncaught)
 {
     if (auto *se = dynamic_cast<const SyntaxErrorEx *>(&e)) {
 
         o << "SyntaxError";
-        dump_loc_in_error(o, e, lines);
+        dump_loc_in_error(o, e, lines, src_name);
         o << se->msg;
 
         if (se->op != Op::invalid) {
@@ -106,29 +128,88 @@ format_exception(ostream &o, const Exception &e,
         o << "Undefined variable '" << ue->name << "'";
         if (ue->in_pure_func)
             o << " while evaluating a PURE function";
-        dump_loc_in_error(o, e, lines);
+        dump_loc_in_error(o, e, lines, src_name);
         o << format_backtrace(e);
         return;
     }
 
     if (auto *xo = dynamic_cast<const ExceptionObject *>(&e)) {
 
-        o << "Uncaught exception '" << xo->get_name() << "'";
+        o << (uncaught ? "Uncaught exception '" : "Exception '")
+          << xo->get_name() << "'";
         const EvalValue &data = xo->get_data();
         if (!data.is<NoneVal>())
             o << ", data: " << data.get_type()->to_string(data);
-        dump_loc_in_error(o, e, lines);
+        dump_loc_in_error(o, e, lines, src_name);
         o << format_backtrace(e);
         return;
     }
 
     if (auto *it = dynamic_cast<const InvalidTokenEx *>(&e)) {
         o << "Invalid token: " << it->val;
-        dump_loc_in_error(o, e, lines);   /* caret when a loc is set */
+        /* a caret only when a loc is set */
+        dump_loc_in_error(o, e, lines, src_name);
         return;
     }
 
     o << e.name << ": " << (e.msg ? e.msg : "");
-    dump_loc_in_error(o, e, lines);
+    dump_loc_in_error(o, e, lines, src_name);
     o << format_backtrace(e);
+}
+
+/*
+ * Question 12: the exceptions `e` was raised while handling, OLDEST first,
+ * each followed by Python's separator - so the report ends with `e` itself.
+ * A chain node is a clone without a backtrace (exc_note_context), so each
+ * prints its header and caret only. At most EXC_CONTEXT_MAX, the youngest;
+ * a note says when older ones were left out, here or when they escaped.
+ */
+static void
+format_exception_context(ostream &o, const Exception &e,
+                         const std::vector<string> &lines,
+                         const string &src_name)
+{
+    const auto *re = dynamic_cast<const RuntimeException *>(&e);
+    if (!re || !re->context)
+        return;
+    std::vector<const RuntimeException *> chain;      /* youngest first */
+    bool cut = re->context_cut;
+    for (const RuntimeException *c = re->context.get(); c;
+         c = c->context.get()) {
+        if (chain.size() == static_cast<size_t>(EXC_CONTEXT_MAX)) {
+            cut = true;
+            break;
+        }
+        chain.push_back(c);
+        cut = cut || c->context_cut;
+    }
+    if (cut)
+        o << "(older exceptions are not shown)\n\n";
+    for (size_t i = chain.size(); i-- > 0; ) {
+        format_exception_body(o, *chain[i], lines, src_name, false);
+        o << "\nDuring handling of the above exception, another exception "
+             "occurred:\n\n";
+    }
+}
+
+void
+format_exception(ostream &o, const Exception &e,
+                 const std::vector<string> &lines, const string &src_name,
+                 bool compiling)
+{
+    format_exception_context(o, e, lines, src_name);
+    format_exception_body(o, e, lines, src_name, true);
+    format_const_eval_note(o, e, compiling);
+}
+
+void format_const_eval_note(ostream &o, const Exception &e, bool compiling)
+{
+    if (!compiling || !e.is_catchable())
+        return;
+    o << "note: a constant expression is evaluated while compiling, so its "
+         "error is a\n"
+         "compile error, which no try/catch handles; to raise it when the "
+         "program runs\n"
+         "instead, pass one of its values through runtime(), as in "
+         "10 / runtime(0)\n";
 }

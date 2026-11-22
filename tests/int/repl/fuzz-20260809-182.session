@@ -1,0 +1,9 @@
+func g(
+:trace i on
+break;
+a;
+"unterminated
+g("qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq");
+mk("%s%d");
+var i = "\n";
+:quit

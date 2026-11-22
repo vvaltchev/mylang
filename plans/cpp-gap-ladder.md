@@ -1,0 +1,320 @@
+# THE LADDER: decompose the my/cpp gap into measured rungs
+
+**Status: AGREED, NOT STARTED (2026-08-15).** Deferred in favour of the
+register allocator, which is one of the rungs it would measure. Do this
+when the next "where is the remaining gap?" question comes up, and
+BEFORE the next speculative optimization increment.
+
+## Why
+
+The overall figure is **my/cpp ~2.33x** (maintainer-measured, H1
+2026-08-12) but bench 76 was **~11x**. The gap is NOT uniform: it is a
+few outliers over a ~2.3x floor. Framing it as "10x overhead" invites
+GLOBAL mechanisms (dispatch, boxing, the value model), and that is
+exactly where this project's flat results cluster:
+
+| removed | result |
+|---|---|
+| memory traffic, allocations, a refcount RMW pair | **win, every time** |
+| a mispredicted indirect branch (CGOTO) | **win, ~10%** |
+| a PREDICTED branch (guard elision C4d/C4e/C5) | flat, -15..-32% Ir |
+| a PREDICTED call to a hot helper (#94 step 3) | flat, -3.3% Ir |
+| instructions, by ADDING emitted code (#92, 16B Instr) | **loss, 1.20x** |
+
+The rule is predictive over ~15 attempts and was never applied before
+building.
+
+**⛔ AND IT NEEDED REFINING THE FIRST TIME IT WAS USED (2026-08-15).**
+Applied to lever A's dead-store elision it predicted a win: the change
+removes **-35.84% of 07_nested_loops' data references** and -12.13% of
+03_int_arith's. Wall clock: **nothing, suite geomean 0.998x**. The D1
+MISS counts were unchanged (50,139 -> 50,164) - every removed access was
+an L1 hit to a slot nothing reads, and a dead store to an L1-resident
+line retires in the store buffer and stalls nothing.
+
+So the currency is **CACHE MISSES and DEPENDENCY STALLS**, not data
+references. The wins in the table above all removed accesses that MISSED
+(48-byte elements, freshly allocated objects, refcount RMWs on cold
+lines) or sat on a chain something waited for. Before predicting a win,
+ask which of those two the removed access was - and if the honest answer
+is "neither, it was an L1 hit nobody reads", expect zero.
+
+The reason it was never applied: callgrind counts retired
+instructions, a modern core is bound on memory traffic / dependency
+chains / mispredicts / front-end, and this box (WSL2) has **no PMU** - so
+the deterministic instrument measures the one quantity that does not
+bind, and a theory phrased in instructions survives verification while
+being wrong.
+
+The ladder replaces intuition about the gap's composition with a
+measurement of it.
+
+## The method
+
+For the 3-4 worst my/cpp benches (76_funcval_dispatch first), write C++
+variants that each add EXACTLY ONE MyLang property, and time each rung on
+this machine, wall clock, interleaved:
+
+1. **plain C++** - today's `bench/cpp` twin.
+2. **+ boxed values**: every value a 32-byte tagged union (payload +
+   `Type *`), no refcount. Isolates the size/tag cost alone.
+3. **+ refcounting** on the reference-typed ones (non-atomic, as
+   `intrusive_ptr` is). Isolates the retain/release RMW and its
+   dependency chain.
+4. **+ frame slots**: values live in 48-byte `LValue`s in a frame array
+   rather than in registers. **This is the rung the register allocator
+   attacks** - it should be the biggest single delta, and if it is not,
+   the allocator's ceiling is lower than assumed.
+5. **+ the indirect call** through a function value (76's actual shape).
+
+## What it buys
+
+Each rung's delta is a **wall-clock ceiling** for the class of
+optimization that attacks it. After the ladder, "is this increment worth
+building?" is arithmetic rather than intuition, and a proposal whose rung
+measures 3% cannot be sold as a path to 2x.
+
+## The cheap discipline that pairs with it
+
+Before building ANY perf increment, write down:
+ - bytes of memory traffic / allocations / dependency links removed
+   **per operation**;
+ - emitted bytes **added**;
+ - the predicted wall-clock delta.
+
+If the first is zero and the second is not, do not build it. #94 step 3
+removed 0 bytes and added ~40 per call site: knowable in advance, and it
+measured exactly the predicted nothing (`plans/archived/
+inline-borrow-arm.md`).
+
+## RUNG 4 IS MEASURED (2026-08-15) - and it splits into two regimes
+
+`bench/micro/slotcost.cpp` runs 03_int_arith's arithmetic three ways -
+values in registers, values round-tripped through a frame slot at
+MyLang's real 48-byte stride, and the same plus the `Type *` tag store
+MyLang also emits. Intel Core Ultra 9 285T, g++ -O2, 20M iterations:
+
+| loop shape | registers | + slot round-trip + tag | cost |
+|---|---|---|---|
+| latency-bound (serial `acc` chain) | 3.30 ns | 3.25 ns | **1.00x** |
+| throughput-bound (4 indep. accums) | 0.32 ns | 1.03 ns | **3.21x** |
+
+**A frame-slot round-trip is FREE in a loop whose own dependency chain is
+long enough to hide it, and costs 3.2x in one with real ILP.**
+
+Corroborated from the MyLang side, three ways:
+ - D1 MISSES are ~50,000 on 03_int_arith, 08_func_call AND
+   07_nested_loops - **identical**, though their data references are
+   14.5M / 6.5M / 5.4M. The count is fixed startup cost; the loops miss
+   essentially never. Miss rate 0.35% / 0.79% / 0.93%.
+ - 03_int_arith runs **63 instructions per iteration in ~3.89 ns**;
+   against the hand-written register-only C++ chain at 3.30 ns, MyLang's
+   extra ~45 instructions and 11 slot references cost **0.59 ns total**.
+ - which is why removing two of its eight stores per iteration (the
+   lever A per-site fix) measured **-35.84% data references and 0.998x
+   wall clock**.
+
+### What this means for the register allocator
+
+Its payoff is **not** "MyLang does 336x the data references of C++". It
+is `(fraction of hot loops that are THROUGHPUT-BOUND) x (up to 3.2x on
+those)`. On a latency-bound loop it is worth exactly nothing, and
+03_int_arith - the shape with the most slot traffic per iteration - is
+latency-bound.
+
+**The cheap discriminator is already in the bench table**: a benchmark
+whose my/cpp ratio is near the ~2.3x floor is latency-bound (MyLang's
+traffic hides in the same chain C++ pays), and one far above it -
+76_funcval_dispatch at ~11x - is where the traffic is NOT hidden. That
+is the same "the gap is not uniform" observation this file opens with,
+now with a mechanism behind it.
+
+**So: before building the allocator, rank the corpus by my/cpp and run
+this census on the WORST ones, not on the ones with the most slot
+references.** Those are different sets, and the whole reason the old
+plan pointed at 03_int_arith is that nobody had separated them.
+
+## THE CENSUS OF THE WORST BENCHES (2026-08-15) - it is CALLS, not slots
+
+### Step 1: rank by my/cpp, STARTUP-CORRECTED
+
+The raw bench table's my/cpp is misleading at the top: its worst entries
+have cpp times of 1-2 ms, against which MyLang's ~1 ms of parse + compile
++ JIT is a large fraction. Taking the scale-3 minus scale-1 wall time on
+BOTH sides cancels that (and needs no iteration count, since the ratio of
+deltas is the loop-only ratio). It reorders the list substantially:
+
+| bench | raw my/cpp | **loop-only** |
+|---|---|---|
+| 30_str_index_iterate | 9.44x | **27.36x** |
+| 63_closures | 11.86x | **17.57x** |
+| 76_funcval_dispatch | 10.68x | 11.40x |
+| 11_closure_counter | 7.99x | 11.11x |
+| 64_struct_create | 8.08x | 10.26x |
+| 75_indexed_unpack | 8.68x | 9.18x |
+| 35_map_filter | 7.11x | 8.74x |
+| 73_multi_unpack | 8.91x | 8.47x |
+| 03_int_arith | 1.36x | **1.18x** |
+| 09_fib_recursive | 6.41x | ~~0.09x~~ **INVALID - see below** |
+
+### ⛔ THE RAW my/cpp COLUMN FOR THESE BENCHES IS NOT A MEASUREMENT
+### (2026-08-20, after it produced a false regression report)
+
+A run printed `76_funcval_dispatch 15.26x` and read as a regression from
+the 10.68x above. It was not one. Measured the same day, same machine:
+
+    cur/base vs a pre-session baseline   1.01x   (interleaved A/B)
+    callgrind Ir, HEAD vs baseline       +0.0003%  (1,505 of 511M)
+    LOOP-ONLY my/cpp (scale 30 - 10)     10.41x  (BETTER than the 11.40x)
+
+and the RAW ratio, re-timed at four scales in one sitting:
+
+    scale  1   my 0.0197  cpp 0.0020   10.01x
+    scale  3   my 0.0534  cpp 0.0041   13.02x
+    scale 10   my 0.1751  cpp 0.0178    9.84x
+    scale 30   my 0.5761  cpp 0.0502   11.49x
+
+Same binaries, same minute: **9.84x to 13.02x**. Add the ~10% the
+machine-speed marker was already reporting (the cpp cache was written on
+a faster day, and run.py SAID so) and 15.26x is inside the noise band.
+
+**It is NOT startup.** MyLang's floor is 0.9 ms (`-e 0`), and subtracting
+it moves the scale-1 ratio 10.01x -> 9.53x. The instability is that
+**the DENOMINATOR is 2 ms**, and a 2 ms process time is not a
+measurement.
+
+**⛔ AND `bench/tune_scales.py` IS STRUCTURALLY BLIND TO IT.** The tuner
+raises a scale until *MyLang* settles inside run.py's variance gate - it
+never looks at the comparison side. 76 settles fine at scale 1, so the
+tuner is content, while the RATIO it feeds the table swings 30%. **A
+tuner for a ratio must gate the denominator too**, and it gates only the
+numerator. Same family as an oracle that shares its subject: the
+instrument is measuring one of the two things the answer depends on.
+
+Fixing that belongs to the agreed "lower bench volatility test-by-test"
+work item, which CLAUDE.md marks as done WITH the maintainer - so it is
+recorded here, not hand-patched by editing the tuner's output file.
+**Until it is fixed: quote LOOP-ONLY or `cur/base` for these benches,
+never the raw column.**
+
+03_int_arith is at PARITY once startup is removed - which independently
+confirms the rung-4 finding that its eleven slot references per iteration
+cost nothing.
+
+⛔ **THE 09_fib_recursive ROW IS WRONG AND THE REASON MATTERS
+(corrected 2026-08-16).** It read "0.09x, FASTER than C++" and that was
+an artefact of the startup correction itself. The bench is
+`for (var k = 0; k < scale; k++) r = fib(29);` - and the PER-FRAME
+PURE-CALL CACHE dedups the repeated call, so **iterations 2..scale are
+cache HITS and MyLang's work does not scale at all**:
+
+    cache on (default)   scale 1: 93,116,925 Ir   scale 3: 93,121,763
+    -npc (cache off)     scale 1: 235,623,416     scale 3: 561,517,546
+
+The scale-3-minus-scale-1 delta is **4,838 instructions of cache hits**,
+so dividing it by C++'s real delta produced a meaningless ~0. C++ and
+CPython have no such cache and do the full work every iteration.
+
+TWO consequences. **The startup-correction method is only valid for a
+bench whose work actually scales** - check that before applying it, the
+way this row failed to. And at any scale > 1 this bench compares
+different amounts of work between the two languages, so its `scale`
+knob should not be raised without addressing that (at scale 1, the
+default, both sides do one fib(29) and the entry is honest).
+
+### Step 2: classify each worst loop's emitted body
+
+| bench | instrs | calls | slot ld | slot st | dominant |
+|---|---|---|---|---|---|
+| 30_str_index_iterate | 30 | 1 | 2 | 0 | **CALL** |
+| 63_closures | 151 | 6 | 15 | 7 | **CALL** |
+| 76_funcval_dispatch | 248 | 6 | 11 | 4 | **CALL** |
+| 11_closure_counter | 259 | 15 | 18 | 6 | **CALL** |
+| 64_struct_create | 137 | **0** | 22 | 14 | **slot traffic** |
+| 75_indexed_unpack | 92 | 5 | 4 | 4 | **CALL** |
+| 73_multi_unpack | 55 | 1 | 2 | 0 | **CALL** |
+
+**SEVEN OF THE EIGHT WORST BENCHES ARE CALL-DOMINATED.** Exactly one -
+64_struct_create - is slot-traffic-dominated, and it makes no calls at
+all.
+
+30_str_index_iterate, the worst at 27x, is the clearest: its whole inner
+loop is `lea` two slot addresses, ONE helper call for the fused
+`ord(s[i])`, two `movabs` to reload the type-tag singletons the call
+clobbered, and the accumulate. **6.3 ns per character against C++'s
+0.23** - a function call where C++ does a load.
+
+### The conclusion for the register allocator
+
+It addresses slot traffic. Slot traffic dominates ONE of the eight worst
+benches. On the shape the old plan was written around (03_int_arith) the
+same measurement says the loop is already at C++ parity.
+
+**64_struct_create is the single honest candidate** - 36 slot accesses in
+137 instructions, 9.85 ns/iteration, IPC ~2.8-3.5, so partly but not
+wholly latency-bound. Worth a targeted experiment; not worth a general
+allocator on its own.
+
+**What the census actually points at is the CALL - its argument setup,
+its clobbering of the pinned type-tag registers, and the work in the
+helper body.** That is the same family as the wins already in the
+record (the nested-read fusion, the element-store inline tiers, the
+struct baked layout): replace a helper call with emitted code that does
+the work. 30_str_index_iterate is the cleanest instance left.
+
+
+## THE REGISTER-PRESSURE FAMILY (2026-08-16) - built, and it ANSWERS
+
+`bench/my/8{0..5}_regs_*` plus their C++ twins: the same loop with 8,
+14, 25 and 40 int locals, and 8 / 25 REFERENCE (array-parameter) locals.
+Designed to isolate register pressure and nothing else - each local
+carries its OWN loop-carried recurrence (N-way ILP, so the loop sits in
+the THROUGHPUT regime where a slot round-trip actually costs, and no
+compiler can vectorize a carried chain), the condition alternates with
+period 2 so nothing mispredicts, and nothing allocates or leaves L1.
+
+⛔ **THE ITERATION COUNT IS FIXED ACROSS THE FAMILY.** The first version
+held TOTAL UPDATES equal instead, which confounds it: loop overhead is
+per-ITERATION, so the small-N variants ran more iterations and paid more
+overhead per update - and the ratio curve came out non-monotonic for
+that reason alone. Fixed iterations make time(N) linear in N on both
+sides, so the SLOPE is the per-update cost with the overhead separated.
+
+### The result
+
+| N | my ns/update | cpp ns/update | my/cpp | C++ stack accesses in the loop |
+|---|---|---|---|---|
+| 8  | 0.503 | 0.147 | 3.41x | **0** (0%) |
+| 14 | 0.531 | 0.114 | 4.66x | - |
+| 25 | 0.724 | 0.123 | 5.89x | **54 of 199** (27%) |
+| 40 | 0.559 | 0.154 | 3.62x | **114 of 322** (35%) |
+
+Reference locals: 2.62x at N=8, 2.56x at N=25 - flat.
+
+### What it says, and it is not what the hypothesis predicted
+
+**C++ SPILLS 35% of its loop instructions to the stack at N=40 and its
+per-update cost does not move** (0.147 -> 0.123 -> 0.154 ns). Giving up
+the register file costs C++ essentially NOTHING at this pressure,
+because a spill slot is an L1 hit the out-of-order engine absorbs - the
+same finding as `bench/micro/slotcost.cpp`, now with the C++ compiler
+itself as the witness.
+
+So "MyLang is slower because it does not use all the registers" is not
+supported: the control that abandons the registers does not slow down.
+
+**MyLang's 3.4-5.9x is the SHAPE OF ITS SLOT, not the absence of a
+register.** C++'s spill is ONE 8-byte store or load of a raw long;
+MyLang's slot round-trip is a payload store, a TYPE-TAG store and a
+payload load - three memory operations instead of one, 48 bytes apart.
+That is the multiplier, and it is why C4a/C3's type-store elision (the
+tag) and #96's dispatch finding point at the same place a register
+allocator does, more cheaply.
+
+### What would still settle it
+
+MyLang pins only FOUR int slots (r12-r15), so even at N=8 half the
+accumulators are in memory. The family is the instrument for testing any
+fix: widen the pool, elide the tag, or allocate properly - each should
+move the my/cpp column, and the N=8 row (where C++ uses no stack at all)
+is the cleanest single number to watch.

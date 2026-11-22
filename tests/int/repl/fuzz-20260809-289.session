@@ -1,0 +1,9 @@
+struct int { int a; }
+int.int;
+:type i + 1
+:help
+int;
+var print = [
+var print = 2_;
+:tree var i = {};
+:quit

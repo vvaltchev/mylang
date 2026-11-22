@@ -1,0 +1,37 @@
+# INT-ENGINES: default
+# INT-CONFIGS: default ; MYLANG_INT_CHOOSE=press@0/spill#0=0,press@0/spill#1=0
+#
+# INT test (#107 P3): the linear scan's PRESSURE CONTEST is an enumerated
+# decision (`spill_choice`). Fifteen hot ints over a smaller register
+# pool force contests; which piece loses its register is a cost choice -
+# a wrong loser costs a reload, never a result - so the second
+# configuration makes the newcomer lose the first two contests, and the
+# answer below must not move.
+
+func press(int n) {
+    var a = 1; var b = 2; var c = 3; var d = 4; var e = 5; var f = 6;
+    var g = 7; var h = 8; var k = 9; var m = 10; var p = 11; var q = 12;
+    var r = 13; var s = 14; var t = 15;
+    for (var i = 0; i < n; i++) {
+        a += i; b += a; c += b; d += c; e += d; f += e; g += f; h += g;
+        k += h; m += k; p += m; q += p; r += q; s += r; t += s;
+        a &= 65535; b &= 65535; c &= 65535; d &= 65535; e &= 65535;
+        f &= 65535; g &= 65535; h &= 65535; k &= 65535; m &= 65535;
+        p &= 65535; q &= 65535; r &= 65535; s &= 65535; t &= 65535;
+    }
+    for (var j = 0; j < n; j++) { a += j * 3; t ^= a; }
+    return a + b + c + d + e + f + g + h + k + m + p + q + r + s + t;
+}
+var res = press(int(runtime(1000)));
+print(res);
+assert(res == 2389179);
+
+var ev = int_events("spill_choice");
+func has(arr, needle) {
+    foreach (e in arr)
+        if (find(e, needle) != none) return true;
+    return false;
+}
+assert(len(ev) >= 2);
+assert(has(ev, "key=\"press@0/spill#0\""));
+assert(has(ev, "key=\"press@0/spill#1\""));

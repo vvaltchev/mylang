@@ -1,23 +1,44 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "vm.h"
+#include "jit.h"
 #include "codegen.h"
+#include "inttest.h"
 #include "inferencer.h"
 #include "bytecode.h"
 #include "syntax.h"
 #include "eval.h"
+#include "vminvoke.h"   /* VmInvoker::bind_raw (#84) */
 #include "errors.h"
 #include "backtrace.h"   /* flush_inline_frames (Inc 4 backtrace parity) */
 #include "bitops.h"
+#include "lowmem.h"   /* the low arena: g_jit_sync_depth (see below) */
 #include "env.h"    /* env_get - the MYLANG_VM_STACK cap */
 
 #include <memory>
+#include <algorithm> /* binary_search (the C4c ref_slots audit) */
 #include <cstdlib>   /* atoll */
 #include <cmath>
 #include <unordered_map>
 
 /* The harness's engine switch (see vm.h). Default: the tree-walker. */
 ExecEngine g_exec_engine = ExecEngine::TreeWalk;
+
+/* The two 32-bit halves of a value the JIT packs into one int_type (a
+ * call-site Loc's line/column, an argument base + count). Through uint64_t:
+ * int_type is 32 bits on wasm32 (a-Shell), where `v >> 32` would not compile
+ * under -Werror (only the x86-64 JIT makes packed values, so there they are
+ * never used); on 64-bit hosts these equal `(int)(v >> 32)` and
+ * `(int)(v & 0xffffffff)` exactly. */
+static inline int32_t packed_hi(int_type v)
+{
+    return static_cast<int32_t>(static_cast<uint64_t>(v) >> 32);
+}
+
+static inline int32_t packed_lo(int_type v)
+{
+    return static_cast<int32_t>(static_cast<uint64_t>(v) & 0xffffffffu);
+}
 
 /* Read a register operand as an int: an immediate, or a frame slot's int (a
  * bool slot reads as 0/1, mirroring Identifier::eval_int). The register machine
@@ -30,9 +51,20 @@ read_int_slot(EvalContext *ctx, int_type slot)
         return lv.getval<bool>() ? 1 : 0;
     /* A th==i operand must hold an int here; anything else is an inference bug
      * or a corrupt/garbage slot (its type ptr won't match int) - caught before
-     * the raw getval misreads the union. */
-    ML_VM_CHECK(lv.is<int_type>());
-    return lv.getval<int_type>();
+     * the raw getval misreads the union.
+     *
+     * #142: the miss returns a DEFINED value, it does NOT throw. `getval`
+     * would, and this reader runs inside `noexcept` JIT helpers that have no
+     * status test - an exception leaving one calls std::terminate, which is
+     * how a corrupt `.myv` aborted the process with no message. The type test
+     * is the same one `getval` does internally, so this costs nothing; only
+     * the miss branch changes, from a throw to a value. A VALID program never
+     * reaches it (the ML_VM_CHECK above is the net, and CI runs the release
+     * lanes with VM_HARDENING on). On an IMAGE the proof is input, not a
+     * fact, so the tripwire stays silent there (the float twin below is
+     * where myv_fuzz found it, fat-845). */
+    ML_VM_CHECK(ml_untrusted_bytecode() || lv.is<int_type>());
+    return lv.is<int_type>() ? lv.getval<int_type>() : 0;
 }
 
 static ML_ALWAYS_INLINE int_type
@@ -66,9 +98,13 @@ read_float_slot(EvalContext *ctx, int_type slot)
     if (lv.is<bool>())
         return lv.getval<bool>() ? 1.0 : 0.0;
     /* Likewise a th==f operand must hold a float here (int/bool promoted
-     * above); a wrong-typed / garbage slot fails before the raw union read. */
-    ML_VM_CHECK(lv.is<float_type>());
-    return lv.getval<float_type>();
+     * above); a wrong-typed / garbage slot fails before the raw union read.
+     * The miss returns a DEFINED value rather than throwing - see the
+     * int twin above (#142). The tripwire is for bytecode WE compiled:
+     * on an image the proof is input (myv_fuzz fat-845), and the defined
+     * 0.0 is the outcome there in every build. */
+    ML_VM_CHECK(ml_untrusted_bytecode() || lv.is<float_type>());
+    return lv.is<float_type>() ? lv.getval<float_type>() : 0.0;
 }
 
 static ML_ALWAYS_INLINE float_type
@@ -87,6 +123,85 @@ write_float_slot(EvalContext *ctx, int_type slot, float_type v)
         lv.getval<float_type>() = v;
     else
         lv.put(EvalValue(v));
+}
+
+/* Write a real BOOL into a slot (the CmpIntV/CmpFloatV result - the value form
+ * of a typed compare). In-place if the slot already holds a bool. */
+static ML_ALWAYS_INLINE void
+write_bool_slot(EvalContext *ctx, int_type slot, bool v)
+{
+    LValue &lv = ctx->frame->at(slot);
+    if (lv.is<bool>())
+        lv.getval<bool>() = v;
+    else
+        lv.put(EvalValue(v));
+}
+
+/* OrdCharV body (the fused ord(s[i]) - lever 4b): TypeStr::subscript's
+ * negative-wrap + bounds check, then the raw byte as int. ML_NOINLINE off
+ * vm_dispatch's frame - the loop-body TEXT RULE, plus stack hygiene: an
+ * inline case's locals (view/Locs + sanitizer redzones) grow EVERY
+ * recursive vm_dispatch frame (the clang-ASan lane overflowed the pinned
+ * depth-200 sync-recursion test with the body inline). The base is a
+ * PROVEN non-opt string (Subscript::base_str); OOB is the only throw. */
+ML_NOINLINE static void
+vm_ord_char(const Chunk *chunk, size_t pc, const Instr *in, EvalContext *ctx)
+{
+    const EvalValue &sv = ctx->frame->at(in->target2).get();
+    if (!sv.is<SharedStr>())
+        throw InternalErrorEx();
+    const std::string_view view = sv.get_ref<SharedStr>().get_view();
+    int_type idx = read_int_operand(in->a(), ctx);
+    if (idx < 0)
+        idx += static_cast<int_type>(view.size());
+    if (idx < 0 || static_cast<size_t>(idx) >= view.size()) {
+        Loc ls, le;
+        chunk->loc_at(pc, ls, le);
+        throw OutOfBoundsEx(ls, le);
+    }
+    write_int_slot(ctx, in->target,
+                   static_cast<int_type>(
+                       static_cast<unsigned char>(view[idx])));
+}
+
+/* CmpIntV / CmpFloatV bodies (the VALUE form of a typed int/float compare ->
+ * bool). ML_NOINLINE off vm_run_chunk's frame (the loop-body TEXT RULE): the
+ * dispatch core must not grow, or an UNTOUCHED pure loop regresses via code
+ * layout (measured: inlining these cost 55_float_sum ~3% wall / +0.6% I-count
+ * with no bytecode change). One CALL per compare - still far below the boxed
+ * CmpV (num_bin_op + PMF + is_true) it replaces. Never throws. */
+ML_NOINLINE static void
+vm_cmp_int_v(const Instr &in, EvalContext *ctx)
+{
+    const int_type a = read_int_operand(in.a(), ctx);
+    const int_type b = read_int_operand(in.b(), ctx);
+    bool r;
+    switch (in.aop) {
+    case Op::lt: r = a <  b; break;
+    case Op::gt: r = a >  b; break;
+    case Op::le: r = a <= b; break;
+    case Op::ge: r = a >= b; break;
+    case Op::eq: r = a == b; break;
+    default:     r = a != b; break;   /* noteq */
+    }
+    write_bool_slot(ctx, in.target, r);
+}
+
+ML_NOINLINE static void
+vm_cmp_float_v(const Instr &in, EvalContext *ctx)
+{
+    const float_type a = read_float_operand(in.a(), ctx);
+    const float_type b = read_float_operand(in.b(), ctx);
+    bool r;
+    switch (in.aop) {
+    case Op::lt: r = a <  b; break;
+    case Op::gt: r = a >  b; break;
+    case Op::le: r = a <= b; break;
+    case Op::ge: r = a >= b; break;
+    case Op::eq: r = a == b; break;
+    default:     r = a != b; break;   /* noteq */
+    }
+    write_bool_slot(ctx, in.target, r);
 }
 
 /*
@@ -192,9 +307,17 @@ vm_store_base(EvalContext &ctx, int_type kind, int slot,
     if (kind == 1) {                            /* global */
         if (!ctx.gfuncs->defined[slot]) {
             Loc s, en;
+            /* #127: the BASE's own caret, not the whole lvalue's - the
+             * tree-walker marks the identifier (`g`), and `locs` deliberately
+             * holds the whole `g[0]` span for the OOB/type errors. `base_locs`
+             * is the store ops' second caret; `locs` remains the fallback for
+             * an op that records no base entry. */
             if (node) { s = node->start; en = node->end; }
-            else chunk.loc_at(pc, s, en);       /* AST-free op: side table */
-            throw UndefinedVariableEx(ctx.gfuncs->names[slot]->val, s, en);
+            else if (!chunk.base_loc_at(pc, s, en))
+                chunk.loc_at(pc, s, en);       /* AST-free op: side table */
+            throw UnboundSymbolEx(
+                intern_msg("'" + std::string(ctx.gfuncs->names[slot]->val)
+                           + "' is not bound yet"), s, en);
         }
         return &ctx.gfuncs->slots[slot];
     }
@@ -207,6 +330,28 @@ vm_store_base(EvalContext &ctx, int_type kind, int slot,
  * the Expr14 op vm_subscript_store expects (Op::assign / addeq / …) - the
  * StoreElem* universal fallback boxes its operands and dispatches through the
  * shared store, which uses the Expr14 op convention (like DictStore). */
+/*
+ * #97 closure inlining: capture `idx` of the closure held in frame slot
+ * `slot` - LoadCaptureOfV / StoreCaptureOfV. In bytecode WE compiled the
+ * dominating GuardCalleeV proved the slot holds a FuncObject of the def
+ * the index was taken from, so both checks are true by construction; on
+ * a loaded image neither the dominance nor the index is ours, and a miss
+ * must be a clean refusal, never a wild read (#137).
+ */
+static LValue &vm_closure_capture(EvalContext &ctx, int_type slot,
+                                  int_type idx)
+{
+    const EvalValue &v = ctx.frame->at(slot).get();
+    const bool isfo = v.is<intrusive_ptr<FuncObject>>();
+    ML_UNTRUSTED_CHECK(isfo, "a closure capture op's slot holds no function");
+    ML_VM_CHECK(ml_untrusted_bytecode() || isfo);
+    FuncObject &fo = *v.get_ref<intrusive_ptr<FuncObject>>().get();
+    ML_UNTRUSTED_CHECK(idx >= 0
+                       && static_cast<size_t>(idx) < fo.capture_slots.size(),
+                       "a closure capture index is out of range");
+    return fo.capture_slots[static_cast<size_t>(idx)];
+}
+
 static inline Op vm_base_to_expr14_op(Op base)
 {
     switch (base) {
@@ -216,28 +361,65 @@ static inline Op vm_base_to_expr14_op(Op base)
     case Op::times:   return Op::muleq;
     case Op::div:     return Op::diveq;
     case Op::mod:     return Op::modeq;
+    /* the flat tiers emit only the arith five today, but the inverse map
+     * carries the whole compound set so a future widening cannot silently
+     * turn `<<=` into a PLAIN store (the third audit-table shape) */
+    case Op::shl:     return Op::shleq;
+    case Op::shr:     return Op::shreq;
+    case Op::ushr:    return Op::ushreq;
+    case Op::band:    return Op::bandeq;
+    case Op::bor:     return Op::boreq;
+    case Op::bxor:    return Op::bxoreq;
     default:          return Op::assign;
     }
 }
 
 /* The two STRICT foreach-unpack errors (UnpackElem*), matching do_iter's
  * messages + loc (the container's, from the loc side table) BYTE-for-byte, so
- * differential agrees. Cold [[noreturn]] helpers, out of the hot loop. */
+ * differential agrees. Cold [[noreturn]] helpers, out of the hot loop. A NULL
+ * chunk (the JIT helpers, which have no chunk) throws LOC-LESS - EnterNative's
+ * re-raise stamps the same side-table caret at the op's pc. */
 [[noreturn]] static ML_COLD void
-vm_throw_unpack_nonarray(const Chunk &chunk, size_t pc, int_type nvars)
+vm_throw_unpack_nonarray(const Chunk *chunk, size_t pc, int_type nvars)
 {
     Loc s, en;
-    chunk.loc_at(pc, s, en);
+    if (chunk)
+        chunk->loc_at(pc, s, en);
     throw TypeErrorEx(intern_msg("foreach: cannot unpack a non-array element "
                                  "into " + std::to_string(nvars) +
                                  " variables"), s, en);
 }
 
+/* #53: the foreach's element is GONE (the body shrank the array) - the
+ * defined OutOfBoundsEx, loc-less for the JIT (the re-raise stamps it) */
 [[noreturn]] static ML_COLD void
-vm_throw_unpack_len(const Chunk &chunk, size_t pc, size_type m, int_type nvars)
+vm_throw_unpack_gone(const Chunk *chunk, size_t pc)
+{
+    Loc ls, le;
+    if (chunk)
+        chunk->loc_at(pc, ls, le);
+    throw OutOfBoundsEx(ls, le);
+}
+
+/* A dict entry is a key and a value - do_iter's message and caret */
+[[noreturn]] static ML_COLD void
+vm_throw_unpack_dict(const Chunk *chunk, size_t pc, size_t nvars)
 {
     Loc s, en;
-    chunk.loc_at(pc, s, en);
+    if (chunk)
+        chunk->loc_at(pc, s, en);
+    throw TypeErrorEx(intern_msg("foreach: a dict entry is a key and a "
+                                 "value, which cannot be unpacked into "
+                                 + std::to_string(nvars) + " variables"),
+                      s, en);
+}
+
+[[noreturn]] static ML_COLD void
+vm_throw_unpack_len(const Chunk *chunk, size_t pc, size_type m, int_type nvars)
+{
+    Loc s, en;
+    if (chunk)
+        chunk->loc_at(pc, s, en);
     throw TypeErrorEx(intern_msg("foreach: cannot unpack an array of length " +
                                  std::to_string(m) + " into " +
                                  std::to_string(nvars) + " variables"), s, en);
@@ -255,22 +437,205 @@ vm_throw_oob(const Chunk &chunk, size_t pc)
     throw OutOfBoundsEx(s, en);
 }
 
-[[noreturn]] static ML_COLD void
-vm_throw_div0(const Chunk &chunk, size_t pc)
+/*
+ * Stamp a LOC-LESS exception with the caret of the op at `pc` (RULE 2):
+ * the op's compound-OPERATION caret (op_locs) when the exception came
+ * out of the operation step (Exception::op_caret) and the op recorded
+ * one, else its ordinary `locs` caret. The one stamp every store
+ * handler and vm_raise share, so an operation error cannot take the
+ * lvalue's span at one site and the whole expression's at another.
+ */
+static ML_COLD void
+vm_stamp_caret(const Chunk &chunk, size_t pc, Exception &e)
 {
-    Loc s, en;
-    chunk.loc_at(pc, s, en);
-    throw DivisionByZeroEx(s, en);
+    if (e.loc_start)
+        return;
+    if (e.op_caret && chunk.op_loc_at(pc, e.loc_start, e.loc_end))
+        return;
+    chunk.loc_at(pc, e.loc_start, e.loc_end);
+}
+
+/* A flat compound store's own OPERATION error (div0, a negative shift
+ * count, the INT_MIN / -1 overflow): marked op_caret and, in the
+ * interpreter (a chunk), stamped with the op's op_locs caret; the JIT
+ * helper (null chunk) throws it loc-less for the conveyance's stamp. */
+template <class Ex>
+[[noreturn]] static ML_COLD void
+vm_store_throw_op(Ex ex, const Chunk *chunk, size_t pc)
+{
+    ex.op_caret = 1;
+    if (chunk)
+        vm_stamp_caret(*chunk, pc, ex);
+    throw ex;
+}
+
+/* The store body below is shared by the interpreter (a valid chunk -> stamp
+ * the caret from the loc table) AND the JIT helper (chunk == null -> throw
+ * LOC-LESS; EnterNative re-stamps from the LIVE chunk at the returned pc -
+ * the JIT fragment can't hold a chunk pointer, since codegen builds the
+ * chunk on the STACK and MOVES it out after jit_compile_chunk). Cold. */
+[[noreturn]] static ML_COLD void
+vm_store_throw_oob(const Chunk *chunk, size_t pc)
+{
+    if (chunk)
+        vm_throw_oob(*chunk, pc);
+    throw OutOfBoundsEx();
+}
+
+[[noreturn]] static ML_COLD void
+vm_store_throw_div0(const Chunk *chunk, size_t pc)
+{
+    vm_store_throw_op(DivisionByZeroEx(), chunk, pc);
+}
+
+/* The flat compound store's negative-shift-count throw (`a[i] <<= n`,
+ * n < 0) - checked BEFORE the COW clone, exactly like div0 above and
+ * like the tree-walker's flat_store_core (apply_compound_op throws
+ * before its clone), so a throwing store never detaches a slice
+ * (intptr-observable). Message matches bitops.h's bit_shl/shr/ushr. */
+[[noreturn]] static ML_COLD void
+vm_store_throw_negshift(const Chunk *chunk, size_t pc)
+{
+    vm_store_throw_op(InvalidValueEx("negative shift count"), chunk, pc);
+}
+
+/* The flat int store's INT_MIN / -1 check - an operation error too. */
+static ML_ALWAYS_INLINE void
+vm_store_check_div_overflow(int_type a, int_type b, const Chunk *chunk,
+                            size_t pc)
+{
+    if (b == -1 && a == INT_TYPE_MIN)
+        vm_store_throw_op(InvalidValueEx("integer overflow in division"),
+                          chunk, pc);
+}
+
+/* The StoreElemInt/StoreElemFloat store body, SHARED by the interpreter
+ * handler AND the approach-A JIT helper (jit_store_elem_int/float, below):
+ * a[i] = v / a[i] OP= v for a flat mutable int/bool/float array (COW), else
+ * the UNIVERSAL vm_subscript_store fallback (const / readonly / general /
+ * dyn / a wrong-kind base). idx/rhs are the PRE-READ scalar operands (the
+ * caller resolved them from the Instr / the native fragment); the body
+ * THROWS on OOB / div0 / not-an-lvalue / etc. - the interpreter lets it
+ * propagate, the JIT helper catches it into g_vm_jit_exc. ML_ALWAYS_INLINE
+ * so the interpreter's hot handler carries no call and the ONLY out-of-line
+ * copy is the JIT helper's. (Reading rhs up front is byte-identical: an
+ * operand read is a pure slot/lit load, no side effect - so the OOB check
+ * still fires before any store, exactly as the lazy handler did.) */
+static ML_ALWAYS_INLINE void
+vm_store_elem_int_body(LValue &alv, int_type idx, int_type rhs, Op aop,
+                       const Chunk *chunk, size_t pc)
+{
+    if (alv.is<SharedArrayObj>()) {
+        SharedArrayObj &arr = alv.getval<SharedArrayObj>();
+        /* #92: the JIT's inline store tier trusts this mirror to decide
+         * whether it may skip clone_aliased_slices, and a stale `false`
+         * would let a live slice observe a value it should have been
+         * cloned away from - silently. Re-verify it here, on the path the
+         * JIT-off modes run for every store. */
+        ML_CHECK(arr.jit_has_slices_mirror_ok());
+        const auto sk = arr.skind();
+        const bool is_bool = sk == SharedArrayObj::Storage::bools;
+        if ((sk == SharedArrayObj::Storage::ints
+             || (is_bool && aop == Op::invalid))
+            && !alv.is_const_var() && !arr.is_readonly()) {
+            if (idx < 0)
+                idx += arr.size();
+            if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+                vm_store_throw_oob(chunk, pc);
+            if ((aop == Op::div || aop == Op::mod) && rhs == 0)
+                vm_store_throw_div0(chunk, pc);
+            if ((aop == Op::shl || aop == Op::shr || aop == Op::ushr)
+                    && rhs < 0)
+                vm_store_throw_negshift(chunk, pc);
+            if (arr.is_slice())
+                arr.materialize_slice();
+            else if (arr.use_count() > 1)
+                arr.clone_aliased_slices(arr.offset() + idx);
+            if (is_bool) {
+                arr.flat_bools()[arr.offset() + idx] = rhs ? 1 : 0;
+                arr.invalidate_hash();
+                return;
+            }
+            int_type &el = arr.flat_ints()[arr.offset() + idx];
+            switch (aop) {
+            case Op::invalid: el = rhs;  break;
+            case Op::plus:    el += rhs; break;
+            case Op::minus:   el -= rhs; break;
+            case Op::times:   el *= rhs; break;
+            case Op::div:     vm_store_check_div_overflow(el, rhs,
+                                                          chunk, pc);
+                              el /= rhs; break;
+            case Op::mod:     vm_store_check_div_overflow(el, rhs,
+                                                          chunk, pc);
+                              el %= rhs; break;
+            case Op::band:    el &= rhs; break;
+            case Op::bor:     el |= rhs; break;
+            case Op::bxor:    el ^= rhs; break;
+            /* count proven >= 0 above; bit_* saturate past the width */
+            case Op::shl:     el = bit_shl(el, rhs);  break;
+            case Op::shr:     el = bit_shr(el, rhs);  break;
+            case Op::ushr:    el = bit_ushr(el, rhs); break;
+            default: throw InternalErrorEx();
+            }
+            arr.invalidate_hash();
+            return;
+        }
+    }
+    Loc ls, le;
+    if (chunk)
+        chunk->loc_at(pc, ls, le);       /* JIT (null): loc-less -> stamped */
+    vm_subscript_store(&alv, EvalValue(idx), EvalValue(rhs),
+                       vm_base_to_expr14_op(aop), ls, le);
+}
+
+static ML_ALWAYS_INLINE void
+vm_store_elem_float_body(LValue &alv, int_type idx, float_type rhs, Op aop,
+                         const Chunk *chunk, size_t pc)
+{
+    if (alv.is<SharedArrayObj>()) {
+        SharedArrayObj &arr = alv.getval<SharedArrayObj>();
+        if (arr.skind() == SharedArrayObj::Storage::floats
+            && !alv.is_const_var() && !arr.is_readonly()) {
+            if (idx < 0)
+                idx += arr.size();
+            if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+                vm_store_throw_oob(chunk, pc);
+            if ((aop == Op::div || aop == Op::mod) && rhs == 0.0)
+                vm_store_throw_div0(chunk, pc);
+            if (arr.is_slice())
+                arr.materialize_slice();
+            else if (arr.use_count() > 1)
+                arr.clone_aliased_slices(arr.offset() + idx);
+            float_type &el = arr.flat_floats()[arr.offset() + idx];
+            switch (aop) {
+            case Op::invalid: el = rhs;               break;
+            case Op::plus:    el += rhs;              break;
+            case Op::minus:   el -= rhs;              break;
+            case Op::times:   el *= rhs;              break;
+            case Op::div:     el /= rhs;              break;
+            case Op::mod:     el = std::fmod(el, rhs); break;
+            default: throw InternalErrorEx();
+            }
+            arr.invalidate_hash();
+            return;
+        }
+    }
+    Loc ls, le;
+    if (chunk)
+        chunk->loc_at(pc, ls, le);       /* JIT (null): loc-less -> stamped */
+    vm_subscript_store(&alv, EvalValue(idx), EvalValue(rhs),
+                       vm_base_to_expr14_op(aop), ls, le);
 }
 
 /* The MULTI-ASSIGN strict-unpack length error (F-1) - the same message the
  * tree-walker's handle_single_expr14 throws, WITHOUT the "foreach:" prefix. */
 [[noreturn]] static ML_COLD void
-vm_throw_multi_unpack_len(const Chunk &chunk, size_t pc, size_type m,
+vm_throw_multi_unpack_len(const Chunk *chunk, size_t pc, size_type m,
                           size_t nvars)
 {
     Loc s, en;
-    chunk.loc_at(pc, s, en);
+    if (chunk)
+        chunk->loc_at(pc, s, en);
     throw TypeErrorEx(intern_msg("cannot unpack an array of length " +
                                  std::to_string(m) + " into " +
                                  std::to_string(nvars) + " variables"), s, en);
@@ -305,10 +670,11 @@ static ML_NOINLINE EvalValue
 vm_make_array(EvalContext &ctx, int_type base, int_type n, ArrHint hint)
 {
     if (n <= 16) {
-        EvalValue stackbuf[16];
+        SmallArgs<16> stackbuf;                       /* #97 B1 */
         for (int_type i = 0; i < n; i++)
-            stackbuf[i] = ctx.frame->at(base + i).get();
-        return build_array_from_values(stackbuf, n, hint, nullptr, false);
+            stackbuf.push(ctx.frame->at(base + i).get());
+        return build_array_from_values(stackbuf.data(), n, hint, nullptr,
+                                       false);
     }
     std::vector<EvalValue> heapbuf(static_cast<size_t>(n));
     for (int_type i = 0; i < n; i++)
@@ -323,10 +689,10 @@ static ML_NOINLINE EvalValue
 vm_make_dict(EvalContext &ctx, int_type base, int_type npairs)
 {
     if (npairs <= 8) {
-        EvalValue stackbuf[16];
+        SmallArgs<16> stackbuf;                       /* #97 B1 */
         for (int_type i = 0; i < 2 * npairs; i++)
-            stackbuf[i] = ctx.frame->at(base + i).get();
-        return build_dict_from_pairs(stackbuf, npairs, false);
+            stackbuf.push(ctx.frame->at(base + i).get());
+        return build_dict_from_pairs(stackbuf.data(), npairs, false);
     }
     std::vector<EvalValue> heapbuf(static_cast<size_t>(2 * npairs));
     for (int_type i = 0; i < 2 * npairs; i++)
@@ -339,7 +705,7 @@ vm_make_dict(EvalContext &ctx, int_type base, int_type npairs)
  * the caller wraps it in the defensive loc-stamp try/catch (the throw
  * propagates out of here).
  *
- * H1 (plans/vm-performance-roadmap.md) - DST-SLOT REUSE: the hot standalone-
+ * H1 (plans/archived/vm-performance-roadmap.md) - DST-SLOT REUSE: the hot standalone-
  * construction shape is `var p = Point(...)` in a loop, where the dst slot
  * still holds LAST iteration's same-def POD instance and nothing else does
  * (`use_count() == 1` - the slot's handle is the only owner; readonly
@@ -348,9 +714,14 @@ vm_make_dict(EvalContext &ctx, int_type base, int_type npairs)
  * construction - the same overwrite-in-place + COW-guard trick the flat-
  * struct-array foreach uses (do_iter). An aliased (`var q = p;`), captured,
  * const, other-def, or non-struct dst takes the fresh-allocation path, so a
- * held instance is never mutated. The fields are coerced into a stack
+ * held instance is never mutated. Nor is a BOXED one (a box<P> has P's
+ * def): a temp that last held `box(P(..))` would come out a box<P>, and
+ * every check of the value - `==`, a fit, a print - would see a box where
+ * the program built a struct. Every constructor's reuse asks `boxed` (the
+ * planned ctor, the C4e establish, the JIT's inline guard).
+ * The fields are coerced into a stack
  * buffer BEFORE dst is touched (a defensive coerce throw leaves the old
- * value intact - construct_struct_from_values orders the same way). */
+ * value intact). */
 static ML_NOINLINE void
 vm_struct_ctor(EvalContext &ctx, StructTypeDef *def, int_type base,
                int_type nf, int_type dst)
@@ -359,9 +730,15 @@ vm_struct_ctor(EvalContext &ctx, StructTypeDef *def, int_type base,
         LValue &d = ctx.frame->at(dst);
         const EvalValue &cur = d.get();
         if (cur.is<intrusive_ptr<StructObject>>()) {
+            /* get_ref (NOT get<T>): a by-value get() would COPY the handle,
+             * bumping use_count to 2, so the reuse check below could never
+             * fire - H1 dst-reuse was silently dead, allocating a fresh
+             * StructObject every `var p = Point(..)` iteration. The sibling
+             * container-literal H1 (below) already uses get_ref. */
             const intrusive_ptr<StructObject> &so =
-                cur.get<intrusive_ptr<StructObject>>();
-            if (so->def == def && !so->readonly && so.use_count() == 1) {
+                cur.get_ref<intrusive_ptr<StructObject>>();
+            if (so->def == def && !so->readonly && !so->boxed
+                && so.use_count() == 1) {
                 char *bytes = so->bytes.data();
                 for (int_type i = 0; i < nf; i++)
                     pod_store_field(def->fields[static_cast<size_t>(i)],
@@ -370,7 +747,7 @@ vm_struct_ctor(EvalContext &ctx, StructTypeDef *def, int_type base,
             }
         }
         /* Fresh path: the values are ALREADY coerced (above), so store the
-         * bytes directly - construct_struct_from_values would coerce again. */
+         * bytes directly, with no second coercion. */
         auto obj = make_intrusive<StructObject>(def);
         char *bytes = obj->bytes.data();
         for (int_type i = 0; i < nf; i++)
@@ -396,26 +773,84 @@ vm_struct_ctor(EvalContext &ctx, StructTypeDef *def, int_type base,
     build(heapbuf.data());
 }
 
+/* THE PLANNED POD CTOR (the 64_struct_create fix, 2026-07-26). Every arg
+ * was compile-proven (the StructCtorV typed gate), so the per-field work is
+ * a STATIC plan: {byte offset, act} - act 0 = raw int store (a bool arg's
+ * payload is already 0/1; matches coerce's bool->int widen), 1 = float
+ * store with read_float_slot's exact promote ladder (float raw, int/bool
+ * cvt), 2 = bool byte store. NO coerce_struct_field calls, NO EvalValue
+ * marshal buffer; H1 dst-slot reuse kept. NEVER throws (make_intrusive's
+ * bad_alloc is terminal anyway), so the op needs no defensive catch. */
+static ML_NOINLINE void
+vm_struct_ctor_planned(EvalContext &ctx, StructTypeDef *def,
+                       const Chunk::CtorPlan &cp, int_type dst)
+{
+    LValue &d = ctx.frame->at(dst);
+    StructObject *o = nullptr;
+    const EvalValue &cur = d.get();
+    if (cur.is<intrusive_ptr<StructObject>>()) {
+        const intrusive_ptr<StructObject> &so =
+            cur.get_ref<intrusive_ptr<StructObject>>();
+        if (so->def == def && !so->readonly && !so->boxed
+            && so.use_count() == 1)
+            o = so.get();
+    }
+    intrusive_ptr<StructObject> fresh;
+    if (!o) {
+        fresh = make_intrusive<StructObject>(def);
+        o = fresh.get();
+    }
+    char *bytes = o->bytes.data();
+    for (size_t i = 0; i < cp.f.size(); i++) {
+        const Chunk::CtorPlanField &pf = cp.f[i];
+        switch (pf.act) {
+        case 0: {                                   /* int (or bool) -> int */
+            const EvalValue &v = ctx.frame->at(pf.src).get();
+            /* #142: `get<int_type>()` on a wrong-typed slot THROWS, and this
+             * whole function runs inside a noexcept JIT helper - see the
+             * contract note above. A corrupt image is the only way to get
+             * here with the wrong type, and it gets a defined value. */
+            const int_type iv = v.is<bool>() ? (v.get<bool>() ? 1 : 0)
+                              : v.is<int_type>() ? v.get<int_type>() : 0;
+            std::memcpy(bytes + pf.off, &iv, sizeof iv);
+            break;
+        }
+        case 1: {                              /* float (int/bool promote) */
+            const float_type fv = read_float_slot(&ctx, pf.src);
+            std::memcpy(bytes + pf.off, &fv, sizeof fv);
+            break;
+        }
+        default: {                                          /* bool byte */
+            const EvalValue &v = ctx.frame->at(pf.src).get();
+            bytes[pf.off] = v.is<bool>() && v.get<bool>() ? 1 : 0;
+            break;
+        }
+        }
+    }
+    if (fresh)
+        d.put(EvalValue(intrusive_ptr<StructObject>(std::move(fresh))));
+}
+
 /* Construct a BOXED struct `B(a, x)` from its field-arg run [base, base+nargs).
  * ML_NOINLINE + off vm_run_chunk's frame (recursion-stack reason). Unlike the
  * POD ctor, a field coerce CAN throw - the caller passes `locs` so the throw
  * reports the offending arg's caret (byte-identical to construct_struct). */
 static ML_NOINLINE EvalValue
 vm_struct_ctor_boxed(EvalContext &ctx, StructTypeDef *def, int_type base,
-                     int_type nargs, const ArgLoc *locs)
+                     int_type nargs, const ArgLoc *locs, bool check_fit)
 {
     if (nargs <= 16) {
         EvalValue vals[16];
         for (int_type i = 0; i < nargs; i++)
             vals[i] = ctx.frame->at(base + i).get();
         return EvalValue(construct_struct_boxed_from_values(
-            def, vals, static_cast<size_t>(nargs), locs));
+            def, vals, static_cast<size_t>(nargs), locs, check_fit));
     }
     std::vector<EvalValue> heapbuf(static_cast<size_t>(nargs));
     for (int_type i = 0; i < nargs; i++)
         heapbuf[i] = ctx.frame->at(base + i).get();
     return EvalValue(construct_struct_boxed_from_values(
-        def, heapbuf.data(), static_cast<size_t>(nargs), locs));
+        def, heapbuf.data(), static_cast<size_t>(nargs), locs, check_fit));
 }
 
 /* GENERIC N-level nested store (StoreElemChainV): gather the `nkeys` key values
@@ -425,19 +860,22 @@ vm_struct_ctor_boxed(EvalContext &ctx, StructTypeDef *def, int_type base,
 static ML_NOINLINE void
 vm_chain_store_op(EvalContext &ctx, LValue *base, int_type kbase,
                   const std::pair<Loc, Loc> *steplocs, size_t nkeys,
-                  const EvalValue &val, Op op)
+                  const EvalValue &val, Op op, bool checked)
 {
     if (nkeys <= 8) {
-        EvalValue keybuf[8];
+        SmallArgs<8> keybuf;                          /* #97 B1 */
         for (size_t k = 0; k < nkeys; k++)
-            keybuf[k] = ctx.frame->at(kbase + static_cast<int_type>(k)).get();
-        vm_subscript_chain_store(base, keybuf, nkeys, val, op, steplocs);
+            keybuf.push(
+                ctx.frame->at(kbase + static_cast<int_type>(k)).get());
+        vm_subscript_chain_store(base, keybuf.data(), nkeys, val, op,
+                                 steplocs, checked);
         return;
     }
     std::vector<EvalValue> keyheap(nkeys);
     for (size_t k = 0; k < nkeys; k++)
         keyheap[k] = ctx.frame->at(kbase + static_cast<int_type>(k)).get();
-    vm_subscript_chain_store(base, keyheap.data(), nkeys, val, op, steplocs);
+    vm_subscript_chain_store(base, keyheap.data(), nkeys, val, op, steplocs,
+                             checked);
 }
 
 /* GENERAL nested lvalue-chain store (StoreLValueChainV): walk the mixed
@@ -455,31 +893,71 @@ vm_chain_store_op(EvalContext &ctx, LValue *base, int_type kbase,
  * failing NotLValue at the FINAL step. A throw AT a step (OOB / KeyNotFound /
  * TypeError) carries THAT step's node loc - byte-identical to the
  * tree-walker's per-node stamp (an internal throw is loc-less). */
+/* `mkeys` = chunk.member_keys.data() (the buffer, not the whole chunk) - so the
+ * JIT can bake it (a stable pool address) instead of a &chunk that dangles. */
+/* `place` (a store's walk): where a step's struct lives in bytes no LValue
+ * covers - a writable flat struct array's element, an inline POD field of a
+ * rooted POD struct - the walk enters them (POD places, eval.h) and keeps
+ * stepping through inline POD members there; a step the bytes cannot take
+ * reads the struct as a value from there on, as the walk always did. */
 static void
-vm_chain_walk(EvalContext &ctx, const Chunk &chunk, EvalValue &cur,
-              const std::vector<Chunk::ChainStep> &steps, size_t upto)
+vm_chain_walk(EvalContext &ctx, const Chunk::MemberKey *mkeys, EvalValue &cur,
+              const std::vector<Chunk::ChainStep> &steps, size_t upto,
+              PodPlace &place)
 {
     for (size_t i = 0; i < upto; i++) {
         const Chunk::ChainStep &step = steps[i];
         try {
+            if (place.bytes) {
+                if (step.is_member &&
+                    pod_place_step(place, mkeys[step.operand].memUid))
+                    continue;
+                cur = pod_place_value(place);
+                place = PodPlace();
+            }
             if (step.is_member) {
-                const Chunk::MemberKey &mk = chunk.member_keys[step.operand];
-                const EvalValue cval =
-                    cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
+                const Chunk::MemberKey &mk = mkeys[step.operand];
+                if (cur.is<LValue *>()) {
+                    /* the store writes into the struct this step enters:
+                     * the slot's own first (struct_own, the tree-walker's
+                     * member_store_step) */
+                    LValue *h = cur.get<LValue *>();
+                    struct_own_if(h);
+                    cur = EvalValue(h);
+                    if (pod_place_rooted_field(h, mk.memUid, place))
+                        continue;
+                } else {
+                    /* a box<P> of a POD struct read as a value: its inline
+                     * POD field is a place in the shared bytes (`cur`
+                     * keeps the object alive) */
+                    PodPlace rp;
+                    if (pod_place_ref(cur, rp)
+                            && pod_place_step(rp, mk.memUid)) {
+                        place = rp;
+                        continue;
+                    }
+                }
                 /* for_write=false: an intermediate member is READ to walk into.
-                 * A mutable boxed field / dict value -> an lvalue REF; else the
-                 * tree-walker reads a VALUE (member_read: a POD/readonly copy,
-                 * or a TypeError for a non-struct/dict base) and continues. */
-                LValue *next = vm_member_lvalue_ref(cval, mk.memId, mk.memUid,
+                 * A slot's boxed field / a dict value -> an lvalue REF; else
+                 * the tree-walker reads a VALUE (member_read: a POD copy, a
+                 * value's field, or a TypeError for a non-struct/dict base)
+                 * and continues. */
+                LValue *next = vm_member_lvalue_ref(cur, mk.memId, mk.memUid,
                     /*for_write=*/false, step.lstart, step.lend);
-                if (next)
+                if (next) {
                     cur = EvalValue(next);
-                else
+                } else {
+                    const EvalValue cval =
+                        cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
                     cur = member_read_core(cval, mk.memId, mk.memUid,
                         mk.optional, step.lstart, step.lend,
-                        step.lstart, step.lend);
+                        mk.bstart, mk.bend);
+                }
             } else {
                 const EvalValue &key = ctx.frame->at(step.operand).get();
+                if (cur.is<LValue *>() &&
+                    pod_place_elem(cur.get<LValue *>(), key, place))
+                    continue;
                 Type *ct = cur.is<LValue *>()
                     ? cur.get<LValue *>()->get().get_type() : cur.get_type();
                 cur = ct->subscript(cur, key, /*for_write=*/false);
@@ -492,25 +970,60 @@ vm_chain_walk(EvalContext &ctx, const Chunk &chunk, EvalValue &cur,
     }
 }
 
+/* Takes the steps vector + the member_keys buffer directly (not chunk +
+ * steps_idx), so the JIT can bake both pool addresses (a &chunk would dangle). */
 static ML_NOINLINE void
-vm_chain_lvalue_store_op(EvalContext &ctx, const Chunk &chunk, LValue *base,
-                         int_type steps_idx, const EvalValue &value, Op op)
+vm_chain_lvalue_store_op(EvalContext &ctx,
+                         const std::vector<Chunk::ChainStep> &steps,
+                         const Chunk::MemberKey *mkeys, LValue *base,
+                         const EvalValue &value, Op op, bool checked)
 {
-    const std::vector<Chunk::ChainStep> &steps = chunk.chain_steps[steps_idx];
     const size_t n = steps.size();
     EvalValue cur = EvalValue(base);
-    vm_chain_walk(ctx, chunk, cur, steps, n - 1);
+    PodPlace place;
+    vm_chain_walk(ctx, mkeys, cur, steps, n - 1, place);
 
     const Chunk::ChainStep &last = steps[n - 1];   /* node = the whole lvalue */
     try {
+        /* a field in bytes no LValue covers: stored in place */
+        if (place.bytes) {
+            const int slot = last.is_member
+                ? place.def->slot_of(mkeys[last.operand].memUid) : -1;
+            if (slot >= 0) {
+                pod_place_store(place, slot, op, value,
+                                last.lstart, last.lend);
+                return;
+            }
+            cur = pod_place_value(place);
+        }
         /* The final store needs a live lvalue; a VALUE-walked chain (a POD /
          * readonly intermediate) can't be stored into -> NotLValueEx at the
-         * whole-lvalue loc, exactly as the tree-walker's handle_single_expr14. */
-        if (!cur.is<LValue *>())
-            throw NotLValueEx(last.lstart, last.lend);
-        LValue *curlv = cur.get<LValue *>();
+         * whole-lvalue loc, exactly as the tree-walker's member_store /
+         * subscript_store - which first ACCESS the value's member or
+         * element, so a missing member, a base that has none or a bad key
+         * raises its own error (VM and tree-walker disagreed there until
+         * 2026-10-05). A plain `=` reads no dict member: a readonly dict's
+         * missing key is `none` there (MemberExpr::access). */
         if (last.is_member) {
-            const Chunk::MemberKey &mk = chunk.member_keys[last.operand];
+            const Chunk::MemberKey &mk = mkeys[last.operand];
+            if (!cur.is<LValue *>() && is_class_instance(cur)) {
+                /* a CLASS instance read as a value (an element of a flat
+                 * class array) is a reference: its field is the shared
+                 * object's - stored through a holder, as the tree-walker's
+                 * store_rooted lets member_store do */
+                LValue holder(cur, false);
+                vm_member_store(&holder, mk.memUid, op, value,
+                                last.lstart, last.lend, last.lstart, last.lend);
+                return;
+            }
+            if (!cur.is<LValue *>()) {
+                if (op != Op::assign || !cur.is<intrusive_ptr<DictObject>>())
+                    member_read_core(cur, mk.memId, mk.memUid, false,
+                                     last.lstart, last.lend,
+                                     mk.bstart, mk.bend);
+                throw NotLValueEx(last.lstart, last.lend);
+            }
+            LValue *curlv = cur.get<LValue *>();
             /* A DICT member store `d.f = v` IS `d["f"] = v` (auto-vivify on a
              * plain assign; KeyNotFound on a compound of a missing key) - route
              * it through vm_subscript_store with the member name as the key, as
@@ -518,64 +1031,106 @@ vm_chain_lvalue_store_op(EvalContext &ctx, const Chunk &chunk, LValue *base,
              * boxed field) goes through vm_member_store. */
             if (curlv->get().is<intrusive_ptr<DictObject>>())
                 vm_subscript_store(curlv, mk.memId, value, op,
-                                   last.lstart, last.lend);
+                                   last.lstart, last.lend, checked);
             else
                 vm_member_store(curlv, mk.memUid, op, value,
                                 last.lstart, last.lend, last.lstart, last.lend);
         } else {
             const EvalValue &key = ctx.frame->at(last.operand).get();
-            vm_subscript_store(curlv, key, value, op, last.lstart, last.lend);
+            if (!cur.is<LValue *>()) {
+                cur.get_type()->subscript(cur, key, op == Op::assign);
+                throw NotLValueEx(last.lstart, last.lend);
+            }
+            vm_subscript_store(cur.get<LValue *>(), key, value, op,
+                               last.lstart, last.lend, checked);
         }
     } catch (Exception &ex) {
-        if (!ex.loc_start) { ex.loc_start = last.lstart; ex.loc_end = last.lend; }
+        /* an OPERATION error (op_caret) keeps no lvalue caret: the op's
+         * op_locs entry is stamped by the handler / the conveyance */
+        if (!ex.loc_start && !ex.op_caret) {
+            ex.loc_start = last.lstart;
+            ex.loc_end = last.lend;
+        }
         throw;
     }
 }
 
+/* The final step of an inc-dec chain over the walked-to ref, value or
+ * place: IncDecExpr::do_eval's exact tier semantics (vm_incdec_final,
+ * eval.cpp) - old for postfix, new for prefix. */
+static EvalValue
+vm_incdec_last(EvalContext &ctx, const Chunk::IncDecChain &site,
+               const Chunk::MemberKey *mkeys, EvalValue &cur,
+               const PodPlace &place, bool is_inc)
+{
+    const Chunk::ChainStep &last = site.steps.back();
+
+    /* a field in bytes no LValue covers: the read-modify-write in place */
+    if (place.bytes) {
+        const int slot = last.is_member
+            ? place.def->slot_of(mkeys[last.operand].memUid) : -1;
+        if (slot >= 0)
+            return pod_place_incdec(place, slot, is_inc, site.is_prefix,
+                                    last.lstart, last.lend,
+                                    site.id_start, site.id_end);
+        cur = pod_place_value(place);
+    }
+    EvalValue memId;
+    const UniqueId *memUid = nullptr;
+    EvalValue key;
+    Loc bstart = last.lstart, bend = last.lend;
+    if (last.is_member) {
+        const Chunk::MemberKey &mk = mkeys[last.operand];
+        memId = mk.memId;
+        memUid = mk.memUid;
+        bstart = mk.bstart;
+        bend = mk.bend;
+    } else {
+        key = ctx.frame->at(last.operand).get();
+    }
+
+    return vm_incdec_final(cur, last.is_member, memId, memUid, key,
+                           site.tier2, is_inc,
+                           site.is_prefix,
+                           last.lstart, last.lend,
+                           site.kstart, site.kend,
+                           bstart, bend,
+                           site.id_start, site.id_end);
+}
+
 /* IncDecChainV (the R4 value form): root -> intermediate walk -> the final
- * step's exact IncDecExpr tier semantics (vm_incdec_final, eval.cpp). A kind-3
- * root seeds the walk with a VALUE (a compiled rvalue base keeps its
- * rvalue-ness); the result (old for postfix / new for prefix) lands in `dst`
- * (-1 = statement, discarded). ML_NOINLINE: off vm_run_chunk's recursive
- * frame (the recursion-stack hygiene rule). */
+ * step (vm_incdec_last). A kind-3 root seeds the walk with a VALUE (a
+ * compiled rvalue base keeps its rvalue-ness); the result (old for postfix
+ * / new for prefix) lands in `dst`, a frame slot (codegen allocates one
+ * for the statement form too; verify_chunk bounds it). ML_NOINLINE (the
+ * op below): off vm_run_chunk's recursive frame (the recursion-stack
+ * hygiene rule). */
+/* The chain walk + final step over an already-formed root - the SHARED core
+ * for the interpreter op below AND jit_incdec_chain (the root forming
+ * differs: the interpreter throws UndefinedVariableEx for an undefined
+ * global root, the JIT helper BAILS). `mkeys` is the member_keys BUFFER. */
+static void
+vm_incdec_chain_core(EvalContext &ctx, const Chunk::IncDecChain &site,
+                     const Chunk::MemberKey *mkeys, EvalValue cur,
+                     int_type dst, bool is_inc)
+{
+    PodPlace place;
+    vm_chain_walk(ctx, mkeys, cur, site.steps, site.steps.size() - 1, place);
+    EvalValue r = vm_incdec_last(ctx, site, mkeys, cur, place, is_inc);
+    ctx.frame->at(dst).put(std::move(r));
+}
+
 static ML_NOINLINE void
 vm_incdec_chain_op(EvalContext &ctx, const Chunk &chunk, const Instr &in,
                    size_t pc)
 {
     const Chunk::IncDecChain &site = chunk.incdec_chains[in.b_lit()];
-    const std::vector<Chunk::ChainStep> &steps = site.steps;
-    const size_t n = steps.size();
 
-    EvalValue cur;
-    if (in.a_lit() == 3)
-        cur = ctx.frame->at(in.target2).get();      /* rvalue root: a VALUE */
-    else
-        cur = EvalValue(
-            vm_store_base(ctx, in.a_lit(), in.target2, chunk, pc, nullptr));
+    EvalValue cur = EvalValue(
+        vm_store_base(ctx, in.a_lit(), in.target2, chunk, pc, nullptr));
 
-    vm_chain_walk(ctx, chunk, cur, steps, n - 1);
-
-    const Chunk::ChainStep &last = steps[n - 1];
-    EvalValue memId;
-    const UniqueId *memUid = nullptr;
-    EvalValue key;
-    if (last.is_member) {
-        const Chunk::MemberKey &mk = chunk.member_keys[last.operand];
-        memId = mk.memId;
-        memUid = mk.memUid;
-    } else {
-        key = ctx.frame->at(last.operand).get();
-    }
-
-    EvalValue r = vm_incdec_final(cur, last.is_member, memId, memUid, key,
-                                  site.tier2, in.aop == Op::plus,
-                                  site.is_prefix,
-                                  site.allow_flat, site.allow_pod,
-                                  last.lstart, last.lend,
-                                  site.kstart, site.kend,
-                                  site.id_start, site.id_end);
-    if (in.target >= 0)
-        ctx.frame->at(in.target).put(std::move(r));
+    vm_incdec_chain_core(ctx, site, chunk.member_keys.data(), std::move(cur),
+                         in.target, in.aop == Op::plus);
 }
 
 /* Build a FLAT array<PodStruct> literal from the N structs' interleaved
@@ -610,6 +1165,7 @@ vm_make_struct_array_op(EvalContext &ctx, StructTypeDef *def, int_type base,
                 && arr.use_count() == 1
                 && !arr.is_readonly()
                 && arr.flat_structs().def == def
+                && arr.ctype() == annot_array_of_struct(def)
                 && arr.size() == static_cast<size_type>(n)) {
                 const size_t M = def->fields.size();
                 const int stride = def->size;
@@ -617,23 +1173,35 @@ vm_make_struct_array_op(EvalContext &ctx, StructTypeDef *def, int_type base,
                 char *out = ma.flat_structs().buf.data();
                 for (size_t i = 0; i < static_cast<size_t>(n); i++) {
                     char *b = out + i * static_cast<size_t>(stride);
-                    for (size_t j = 0; j < M; j++)
-                        pod_store_field(def->fields[j], b,
-                            coerce_struct_field(def->fields[j],
-                                                vals[i * M + j],
-                                                Loc(), Loc()));
+                    for (size_t j = 0; j < M; j++) {
+                        const FieldDef &fd = def->fields[j];
+                        const EvalValue &fv = vals[i * M + j];
+                        /* G3: skip the IDENTITY coercion (see
+                         * field_exact_scalar, structtype.h) - it copies a
+                         * 32-byte EvalValue in and out for nothing. Every
+                         * real widening still takes the call below. */
+                        if (field_exact_scalar(fd, fv))
+                            pod_store_field(fd, b, fv);
+                        else
+                            pod_store_field(fd, b,
+                                coerce_struct_field(fd, fv, Loc(), Loc()));
+                    }
                 }
                 return;
             }
         }
         d.put(vm_make_struct_array(def, static_cast<size_t>(n), vals));
+        /* Q2: a flat struct literal is an array<P> (its fused op is
+         * emitted for that destination type only) */
+        stamp_ctype_top(d.get(), annot_array_of_struct(def));
     };
 
     if (total <= 32) {
-        EvalValue stackbuf[32];
+        SmallArgs<32> stackbuf;                       /* #97 B1 */
         for (size_t k = 0; k < total; k++)
-            stackbuf[k] = ctx.frame->at(base + static_cast<int_type>(k)).get();
-        build(stackbuf);
+            stackbuf.push(
+                ctx.frame->at(base + static_cast<int_type>(k)).get());
+        build(stackbuf.data());
         return;
     }
     std::vector<EvalValue> heapbuf(total);
@@ -648,18 +1216,26 @@ vm_make_struct_array_op(EvalContext &ctx, StructTypeDef *def, int_type base,
  * func_lv with `target` + `rest`, zero node->eval. ML_NOINLINE keeps the (cold)
  * CallBuiltinLV case out of vm_run_chunk's hot body. n_rest is small for a valid
  * call (insert 2, erase 1); >8 (a wrong-arity call) heaps. */
+/* Takes the BuiltinCall pool ENTRY directly (not chunk + idx), so the JIT can
+ * bake `&chunk.builtin_calls[idx]` (a stable pool address) - a &chunk dangles. */
 static ML_COLD EvalValue
-vm_call_builtin_lv_rest(EvalContext &ctx, const Chunk &chunk, int bc_idx,
+vm_call_builtin_lv_rest(EvalContext &ctx, const Chunk::BuiltinCall &bc,
                         LValue *target, int_type base)
 {
-    const Chunk::BuiltinCall &bc = chunk.builtin_calls[bc_idx];
     const int_type n_rest = static_cast<int_type>(bc.args.size()) - 1;
-    ArgLocs al = chunk.arglocs_at(bc_idx);
+    ArgLocs al;
+    al.start = bc.start;
+    al.end = bc.end;
+    al.args = bc.args.data();
+    al.nargs = bc.args.size();
+    al.arr_hint = bc.arr_hint;
+    al.ctype = bc.ctype;
+    al.ct_store = bc.ct_store;
     if (n_rest <= 8) {
-        EvalValue stackbuf[8];
+        SmallArgs<8> stackbuf;                        /* #97 B1 */
         for (int_type i = 0; i < n_rest; i++)
-            stackbuf[i] = ctx.frame->at(base + i).get();
-        return bc.builtin.func_lv(&ctx, &al, target, stackbuf,
+            stackbuf.push(ctx.frame->at(base + i).get());
+        return bc.builtin.func_lv(&ctx, &al, target, stackbuf.data(),
                                   static_cast<size_t>(n_rest));
     }
     std::vector<EvalValue> heapbuf(static_cast<size_t>(n_rest));
@@ -680,19 +1256,19 @@ vm_do_emplace(EvalContext &ctx, const Chunk::EmplaceSite &site,
 {
     const size_t nf = site.field_locs.size();
     if (nf <= 8) {
-        EvalValue stackbuf[8];
+        SmallArgs<8> stackbuf;                        /* #97 B1 */
         for (size_t i = 0; i < nf; i++)
-            stackbuf[i] = ctx.frame->at(base + i).get();
+            stackbuf.push(ctx.frame->at(base + i).get());
         return vm_emplace_struct(&ctx, target, site.a0_start, site.a0_end,
                                  site.def, site.field_locs.data(),
-                                 stackbuf, nf);
+                                 stackbuf.data(), nf, site.ct_store);
     }
     std::vector<EvalValue> heapbuf(nf);
     for (size_t i = 0; i < nf; i++)
         heapbuf[i] = ctx.frame->at(base + i).get();
     return vm_emplace_struct(&ctx, target, site.a0_start, site.a0_end,
                              site.def, site.field_locs.data(),
-                             heapbuf.data(), nf);
+                             heapbuf.data(), nf, site.ct_store);
 }
 
 /* Map an arith/bitwise Op to its num_bin_op Type method, for the boxed BinOpV
@@ -727,6 +1303,70 @@ static NumBinOp cmp_pmf(Op op)
         case Op::noteq: return &Type::noteq;
         default:        return nullptr;
     }
+}
+
+/* Declared in vm.h (#137 tier 1) - the load-time verifier's question, asked
+ * of the same two tables the dispatch below uses. */
+bool vm_aop_dispatchable(Op aop)
+{
+    return binop_pmf(aop) != nullptr || cmp_pmf(aop) != nullptr;
+}
+
+/*
+ * #60 lever 2: the boxed arith/compare handlers' (BinOpV / CompoundV / CmpV,
+ * plus the compound global/capture stores and the dyn inc-dec) num_bin_op
+ * front end. M8 lowers a PROVEN int/float node to a native IntBin/FloatBin, but
+ * a DYN/general operand - or a comparison used as a VALUE (`x % 3 == 0` as a
+ * return value has no native typed-VALUE compare) - still boxes here and paid
+ * num_bin_op's promotion-check chain + an indirect PMF call + TypeInt's own
+ * dispatch (~7% of 35_map_filter: num_bin_op 4.5% + TypeInt::eq 2.3%).
+ *
+ * For the overwhelmingly common case where BOTH runtime operands are plain int,
+ * compute the result inline via a switch on the Op ENUM (the VM has it; the PMF
+ * hid it), writing the int result (a comparison yields int 0/1, which the CmpV
+ * caller wraps with is_true() exactly as TypeInt::lt + num_bin_op does). Any
+ * other operand shape (float / bool / string / mixed / dyn-non-int) falls back
+ * to the EXACT num_bin_op PMF path - byte-identical, including div/mod-by-zero
+ * (thrown here too) and the bad-shift-count / type errors, whose loc the
+ * caller's catch stamps. ML_NOINLINE: ONE out-of-line copy (num_bin_op no
+ * longer inlines at each of the ~7 call sites) - a DIRECT call, not the removed
+ * indirect PMF, and it keeps vm_dispatch's hot code layout unperturbed (the
+ * loop-body text rule).
+ */
+static ML_NOINLINE void
+vm_num_binop(EvalValue &a, const EvalValue &b, Op aop)
+{
+    if (a.is<int_type>() && b.is<int_type>()) {
+        const int_type y = b.get<int_type>();
+        int_type &x = a.get<int_type>();
+        switch (aop) {
+        case Op::plus:  x += y; return;
+        case Op::minus: x -= y; return;
+        case Op::times: x *= y; return;
+        case Op::div:   if (y == 0) throw DivisionByZeroEx();
+                        check_int_div_overflow(x, y); x /= y; return;
+        case Op::mod:   if (y == 0) throw DivisionByZeroEx();
+                        check_int_div_overflow(x, y); x %= y; return;
+        case Op::band:  x &= y; return;
+        case Op::bor:   x |= y; return;
+        case Op::bxor:  x ^= y; return;
+        case Op::shl:   x = bit_shl(x, y);  return;
+        case Op::shr:   x = bit_shr(x, y);  return;
+        case Op::ushr:  x = bit_ushr(x, y); return;
+        case Op::lt:    x = (x <  y); return;
+        case Op::gt:    x = (x >  y); return;
+        case Op::le:    x = (x <= y); return;
+        case Op::ge:    x = (x >= y); return;
+        case Op::eq:    x = (x == y); return;
+        case Op::noteq: x = (x != y); return;
+        default:        break;   /* unreachable: aop is one of the above */
+        }
+    }
+    NumBinOp pmf = binop_pmf(aop);
+    if (!pmf)
+        pmf = cmp_pmf(aop);
+    ML_VM_CHECK(pmf != nullptr);
+    num_bin_op(a, b, pmf);
 }
 
 /*
@@ -769,10 +1409,33 @@ static NumBinOp cmp_pmf(Op op)
 #  define ML_CGOTO 1
 #endif
 
+#ifdef INT_TESTS
+/*
+ * #107 P4 - THE VM STATE CHECKER (every INT build, every op - no switch:
+ * a runtime switch would put a never-taken branch at every dispatch, and
+ * the plan's bar is every op of every INT run).
+ * At EVERY op boundary of interpreted execution, the frame is checked
+ * against what the compiler proved: a slot NOT in the chunk's ref_slots
+ * holds no reference (the release scans skip such a slot, and a scalar
+ * store into it overwrites without releasing - so a reference there is a
+ * leak the moment it happens, found here at the op that put it there, not
+ * at the frame pop the VM_HARDENING audit looks at), and a `borrowed` slot
+ * holds a non-slice reference (#94's two runtime declines). A violation
+ * aborts naming the function, the pc and the slot.
+ */
+
+static void int_vm_state_check(const Chunk &ck, const EvalContext &ctx,
+                               size_t pc) noexcept;
+#define VM_INT_STATE() int_vm_state_check(*chunk, ctx, pc)
+#else
+#define VM_INT_STATE() ((void)0)
+#endif
+
 #ifdef ML_CGOTO
 #  define VM_CASE(N)  lbl_##N
-#  define VM_NEXT     goto *vm_optbl[static_cast<size_t>(                    \
-                          (in = &code[pc])->op)]
+#  define VM_NEXT     do { VM_INT_STATE();                                   \
+                           goto *vm_optbl[static_cast<size_t>(               \
+                               (in = &code[pc])->op)]; } while (0)
    /* A VM_NEXT that must EXIT a scope holding live non-trivially-
     * destructible locals (the call ops' cross-frame exception dispatch).
     * clang forbids an INDIRECT goto from exiting such a scope (it cannot
@@ -803,7 +1466,269 @@ static bool g_vm_executing = false;
  */
 static std::unordered_map<const FuncDescriptor *, Chunk> g_func_chunks;
 
-static void vm_precompile_all(const Block *root);   /* AOT: defined below */
+#ifdef INT_TESTS
+static void int_vm_state_fail(const Chunk &ck, size_t pc, int slot,
+                              const char *what) noexcept
+{
+    const char *fn = "main";
+    for (const auto &kv : g_func_chunks)
+        if (&kv.second == &ck && kv.first->name)
+            fn = kv.first->name->val.c_str();
+    std::fprintf(stderr, "INT-VMSTATE: %s, pc %zu, slot %d: %s\n", fn, pc,
+                 slot, what);
+    std::abort();
+}
+
+/* The kind a value is, in int_param_kinds' / int_op_result_kind's
+ * encoding: 1 int, 2 float, 3 bool, 0 anything else. */
+static int int_value_kind(const EvalValue &v) noexcept
+{
+    switch (v.get_type()->t) {
+    case Type::t_int:   return 1;
+    case Type::t_float: return 2;
+    case Type::t_bool:  return 3;
+    default:            return 0;
+    }
+}
+
+/* What an op's dst holds once it has run, for the ops whose handler
+ * writes ONE kind unconditionally (0: not checked). A deliberately small
+ * list - an op not here is simply not checked; one here that writes
+ * another kind is a bug in the op or in the codegen that chose it. */
+static int int_op_result_kind(const Instr &in) noexcept
+{
+    switch (in.op) {
+    case OpCode::IntAddRR: case OpCode::IntAddRI:
+    case OpCode::IntSubRR: case OpCode::IntSubRI:
+    case OpCode::IntMulRR: case OpCode::IntMulRI:
+    case OpCode::IntAndRR: case OpCode::IntAndRI:
+    case OpCode::IntOrRR:  case OpCode::IntOrRI:
+    case OpCode::IntXorRR: case OpCode::IntXorRI:
+    case OpCode::IntShlRR: case OpCode::IntShlRI:
+    case OpCode::IntShrRR: case OpCode::IntShrRI:
+    case OpCode::IntModRI: case OpCode::IntBin:
+    case OpCode::LoadImmInt: case OpCode::StrLen:
+        return 1;
+    case OpCode::FloatAddRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRR: case OpCode::FloatSubRI:
+    case OpCode::FloatMulRR: case OpCode::FloatMulRI:
+    case OpCode::FloatBin: case OpCode::LoadImmFloat:
+        return 2;
+    case OpCode::CmpIntV: case OpCode::CmpFloatV:
+        return 3;
+    default:
+        return 0;
+    }
+}
+
+/* A slot's reference as (the refcounted object, its count); false for a
+ * value that holds no count. Reads through get_ref: get<T>() copies the
+ * handle, and the copy's own count would be part of the answer. */
+static bool int_ref_count(const EvalValue &v, const void *&id,
+                          long &cnt) noexcept
+{
+    switch (v.get_type()->t) {
+    case Type::t_str: {
+        const SharedStr &h = v.get_ref<SharedStr>();
+        id = &h.get_ref();
+        cnt = h.use_count();
+        return true;
+    }
+    case Type::t_arr: {
+        const SharedArrayObj &h = v.get_ref<SharedArrayObj>();
+        id = h.int_storage();
+        cnt = h.use_count();
+        return true;
+    }
+    case Type::t_dict: {
+        const auto &h = v.get_ref<intrusive_ptr<DictObject>>();
+        id = h.get();
+        cnt = h.use_count();
+        return true;
+    }
+    case Type::t_struct: {
+        const auto &h = v.get_ref<intrusive_ptr<StructObject>>();
+        id = h.get();
+        cnt = h.use_count();
+        return true;
+    }
+    case Type::t_func: {
+        const auto &h = v.get_ref<intrusive_ptr<FuncObject>>();
+        id = h.get();
+        cnt = h.use_count();
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+/* (object, count, slot) per owning reference slot - reused, so the check
+ * allocates only while the largest frame seen grows */
+struct IntRefSlot {
+    const void *id;
+    long cnt;
+    int slot;
+};
+static std::vector<IntRefSlot> g_int_refs;
+
+/* The op this frame ran last, so the next check can read its dst. */
+static const Chunk *g_int_vms_ck = nullptr;
+static const Frame *g_int_vms_fr = nullptr;
+static size_t g_int_vms_pc = 0;
+
+/* Declared in vm.h: the frame-slot half of the state checker, shared by
+ * the dispatch loop and the JIT's probe (jit.cpp). */
+const char *int_slots_fault(const std::vector<int32_t> &ref_slots,
+                            const std::vector<unsigned char> &param_kinds,
+                            const LValue *slots, int n,
+                            const std::vector<char> *skip,
+                            int &bad) noexcept
+{
+    const void *poison = jit_poison_type();
+    const auto skipped = [&](int i) {
+        return (skip && i < static_cast<int>(skip->size()) && (*skip)[i])
+               || static_cast<const void *>(slots[i].get().get_type())
+                      == poison;
+    };
+    const char *fault = nullptr;
+    size_t ri = 0;                       /* ref_slots is sorted */
+    for (int i = 0; i < n && !fault; i++) {
+        while (ri < ref_slots.size() && ref_slots[ri] < i)
+            ri++;
+        if (skipped(i))
+            continue;
+        const bool listed = ri < ref_slots.size() && ref_slots[ri] == i;
+        const LValue &lv = slots[i];
+        const EvalValue &v = lv.get();
+        const bool ref = v.get_type()->t >= Type::t_str;
+        bad = i;
+        /* the borrowed byte is read only by the release scans, which
+         * visit listed slots only - an unlisted slot's tail may be stale
+         * (a frameless window leaves a scalar parameter's tail unwritten,
+         * W5), and an unlisted slot holding a reference fails the first
+         * rule anyway */
+        const bool borrowed = listed && lv.jit_borrowed_probe();
+        if (ref && !listed)
+            fault = "holds a reference but is not in ref_slots";
+        else if (borrowed && !ref)
+            fault = "is borrowed but holds no reference";
+        else if (borrowed && v.is<SharedArrayObj>()
+                 && v.get_ref<SharedArrayObj>().is_slice())
+            fault = "is borrowed but holds a slice";
+        else if (v.is<SharedArrayObj>())
+            fault = v.get_ref<SharedArrayObj>().int_slice_fault();
+        IntRefSlot r;
+        if (!fault && ref && !borrowed
+                && int_ref_count(v, r.id, r.cnt)) {
+            r.slot = i;
+            g_int_refs.push_back(r);
+        }
+    }
+    /*
+     * REFCOUNT SANITY: every slot that owns a reference (not borrowed)
+     * holds one count of it, so no object may count fewer handles than
+     * the slots of this frame holding it - a missing retain shows here,
+     * at the op that made it, rather than as a use-after-free later.
+     */
+    std::sort(g_int_refs.begin(), g_int_refs.end(),
+              [](const IntRefSlot &a, const IntRefSlot &b) {
+                  return a.id < b.id;
+              });
+    for (size_t i = 0; i < g_int_refs.size() && !fault;) {
+        size_t j = i;
+        while (j < g_int_refs.size()
+               && g_int_refs[j].id == g_int_refs[i].id)
+            j++;
+        if (g_int_refs[i].cnt < static_cast<long>(j - i)) {
+            bad = g_int_refs[i].slot;
+            fault = "an object counts fewer handles than the slots of "
+                    "this frame holding it";
+        }
+        i = j;
+    }
+    g_int_refs.clear();
+    /*
+     * THE PROVEN TYPES. A loaded image's proofs are input, not facts
+     * (the audits' rule, CLAUDE.md #142), so only our own bytecode: a
+     * typed or inference-proven PARAMETER holds that scalar (or none,
+     * when it is opt) at every op of its body.
+     */
+    if (fault || g_untrusted_bytecode)
+        return fault;
+    const size_t np = std::min(param_kinds.size(), static_cast<size_t>(n));
+    for (size_t i = 0; i < np; i++) {
+        const unsigned char want = param_kinds[i];
+        if (!want || skipped(static_cast<int>(i)))
+            continue;
+        const EvalValue &v = slots[i].get();
+        if (int_value_kind(v) == (want & 3))
+            continue;
+        if ((want & 4) && v.get_type()->t == Type::t_none)
+            continue;
+        bad = static_cast<int>(i);
+        return (want & 3) == 1 ? "a proven-int parameter holds a non-int"
+                               : "a proven-float parameter holds a "
+                                 "non-float";
+    }
+    return nullptr;
+}
+
+static void int_vm_state_check(const Chunk &ck, const EvalContext &ctx,
+                               size_t pc) noexcept
+{
+    const Frame *fr = ctx.frame;
+    if (!fr)
+        return;
+    const int n = std::min(fr->size, ck.slot_count + ck.n_temps);
+    int bad = -1;
+    if (const char *f = int_slots_fault(ck.ref_slots, ck.int_param_kinds,
+                                        fr->slots, n, nullptr, bad))
+        int_vm_state_fail(ck, pc, bad, f);
+    /*
+     * The dst of the op just run, when that op writes one kind, holds it
+     * - read at the FALL-THROUGH successor in the same frame only: an op
+     * that raised skipped its write, and the next op dispatched in that
+     * frame is then a handler elsewhere.
+     */
+    if (!g_untrusted_bytecode && g_int_vms_ck == &ck && g_int_vms_fr == fr
+            && pc == g_int_vms_pc + 1) {
+        const Instr &prev = ck.code[g_int_vms_pc];
+        const int want = int_op_result_kind(prev);
+        if (want && prev.target >= 0 && prev.target < n
+                && int_value_kind(fr->slots[prev.target].get()) != want)
+            int_vm_state_fail(ck, pc, prev.target,
+                              want == 1 ? "the previous op writes an int, "
+                                          "the slot holds another kind"
+                              : want == 2 ? "the previous op writes a float"
+                                            ", the slot holds another kind"
+                              : "the previous op writes a bool, the slot "
+                                "holds another kind");
+    }
+    g_int_vms_ck = &ck;
+    g_int_vms_fr = fr;
+    g_int_vms_pc = pc;
+}
+
+/* int_param_kinds, from the descriptor keying the chunk (bytecode.h). */
+static void int_stamp_param_kinds(Chunk &ck, const FuncDescriptor *d)
+{
+    ck.int_param_kinds.assign(d->params.size(), 0);
+    for (size_t i = 0; i < d->params.size(); i++) {
+        const FuncDescriptor::ParamDesc &pd = d->params[i];
+        const DeclType t = pd.decl_type != DeclType::none ? pd.decl_type
+                                                          : pd.proven_type;
+        const unsigned char k = t == DeclType::i ? 1
+                              : t == DeclType::f ? 2 : 0;
+        ck.int_param_kinds[i] = k ? static_cast<unsigned char>(
+                                        k | (pd.opt ? 4 : 0))
+                                  : 0;
+    }
+}
+#endif
+
+static void vm_precompile_all(const Block *root, bool jit = true,
+                              Chunk *main_chunk = nullptr);
 
 /*
  * Execute the optimized program via the bytecode VM. It builds the program's
@@ -830,7 +1755,9 @@ struct ExecGuard {
  * / exception mid-loop releases it when the frame unwinds - no cleanup op. */
 struct DictIterState {
     intrusive_ptr<DictObject> dict;
-    DictObject::inner_type::iterator it;
+    /* #53: a walk the body may restructure (DictObject::Cursor) - movable,
+     * so the activation's state vector may grow under it */
+    DictObject::Cursor cur;
 };
 /* Per-loop LIVE state for a native `foreach (<ids> in [indexed] <dyn>)`: the
  * array-vs-dict choice is made ONCE at ForeachDynInit and recorded here (the
@@ -841,21 +1768,412 @@ struct DictIterState {
 struct DynIterState {
     EvalValue container;   /* pins the array OR dict for the loop */
     bool is_dict = false;
+    bool is_str = false;   /* a string: its characters, as do_iter's */
     bool indexed = false;  /* ids[0] is the iteration counter */
     int nvars = 1;         /* TOTAL loop vars (incl. the indexed counter) */
     const std::vector<int32_t> *targets = nullptr;   /* per-var slots */
     size_type idx = 0, size = 0;               /* array cursor + snapshot */
+    int_type mark = -1;                        /* #53 option 1: the array's
+                                                * shift epoch at Init
+                                                * (fe_mark) */
     int_type counter = 0;                      /* dict `indexed` counter */
-    DictObject::inner_type::iterator it;       /* dict cursor (iff is_dict) */
+    DictObject::Cursor cur;                    /* dict cursor (iff is_dict,
+                                                * #53 - see DictObject) */
+    /* Lever 4 (shape specialization): the per-element Next body, RESOLVED
+     * ONCE at Init - a flat int/float/bool single-var array binds the raw
+     * scalar, a 1/2-var dict binds through the baked slot0/slot1, anything
+     * else keeps the generic body. Kind-stable by construction: a flat
+     * int/float/bool array can never change storage kind at runtime (no
+     * promotion; a wrong-type mutation throws), and every fast body still
+     * re-derefs the container per element, so growth/realloc during the
+     * loop behaves exactly as the generic body did. */
+    bool (*next)(DynIterState &, Frame &, const Chunk *, size_t) = nullptr;
+    int32_t slot0 = -1, slot1 = -1;            /* baked target slots */
+    /* #53: an ARRAY body found the element gone (the loop body shrank the
+     * array): it returns false with this set, and the op raises the
+     * foreach's OutOfBoundsEx - so the specialized bodies stay throw-free
+     * (the JIT helper keeps no EH state on their hot path). */
+    bool oob = false;
+    /* #56: only the GENERIC body can throw (the strict N-var unpack /
+     * the InternalErrorEx net); the five specialized bodies never do -
+     * the JIT helper skips its try/catch for them (the extra catch
+     * clause measured +7 Ir PER ELEMENT on the hot path's codegen). */
+    bool next_throws = true;
 };
-/* P8 Inc 0: an active `try` region on the VM handler stack. `catch_pc` is where
- * the boundary jumps on a caught exception (the CatchTest chain). */
+
+static bool vm_foreach_dyn_next_body(DynIterState &, Frame &,
+                                     const Chunk *, size_t);
+static bool vm_dyn_next_arr_int(DynIterState &, Frame &,
+                                const Chunk *, size_t);
+static bool vm_dyn_next_arr_float(DynIterState &, Frame &,
+                                  const Chunk *, size_t);
+static bool vm_dyn_next_arr_bool(DynIterState &, Frame &,
+                                 const Chunk *, size_t);
+static bool vm_dyn_next_arr_gen(DynIterState &, Frame &,
+                                const Chunk *, size_t);
+static bool vm_dyn_next_dict(DynIterState &, Frame &,
+                             const Chunk *, size_t);
+#ifdef TESTS
+/* lever 4 execution proof: per-element runs of EACH specialized body
+ * (0 int / 1 float / 2 bool / 3 gen / 4 dict) - one aggregate counter
+ * could not tell the flat bodies from the gen fallback (a `var dyn a =
+ * range(N)` DESTINATION is general storage by the ArrHint rule; only a
+ * dyn ALIAS of a typed array reaches the flat bodies). */
+unsigned long g_dyn_foreach_fast[5] = {0};
+#  define ML_DYN_FAST_RAN(k) (g_dyn_foreach_fast[k]++)
+#else
+#  define ML_DYN_FAST_RAN(k) ((void)0)
+#endif
+
+/* The SHARED iterator-op bodies (model-flip nativize-ops): ONE implementation
+ * each for the interpreter handler AND its jit_* twin, so the two cannot
+ * drift (the emit_elem_int_read lesson). A NULL `chunk` (the JIT helpers)
+ * makes a throw LOC-LESS - EnterNative's re-raise stamps the caret from the
+ * loc side table at the op's pc, byte-identical to the interpreted throw. */
+
+/* DictIterInit: pin the dict + set the live iterator to begin(). The
+ * inferencer proved a Dict static type; the ML_VM_CHECK is the hardening
+ * net (shared by both engines). Never throws.
+ *
+ * ⛔ AND "NEVER THROWS" IS A CONTRACT IT MUST KEEP EVEN ON A CORRUPT
+ * IMAGE (#118, the #142 rule). `jit_dict_iter_init` is `noexcept` and
+ * the emitter takes NO status from it, so a type miss here has to take a
+ * DEFINED FALLBACK - it cannot report. Whether the slot really holds a
+ * dict is VALUE-dependent, so `verify_chunk` structurally cannot decide
+ * it at load either (#137 tier 1 ends before this question); and under
+ * ASSERTS=0 the ML_VM_CHECK above is compiled away, so `get<>()` threw
+ * TypeErrorEx straight through a noexcept frame and the process died
+ * with no message, no caret and no backtrace - in exactly the
+ * configuration a shipped image runs in.
+ *
+ * The fallback is an EMPTY dict, chosen so the loop simply runs zero
+ * times: `begin() == end()` for it, so `vm_dict_iter_next_body`'s
+ * EXISTING exhaustion test returns false on the first call and no new
+ * branch appears on the per-iteration path. The good path pays one
+ * type-tag compare, ONCE per loop rather than per iteration.
+ *
+ * Both twins are fixed by this one edit because the body is shared -
+ * which is the reason it is shared (the emit_elem_int_read lesson). */
+static ML_ALWAYS_INLINE void
+vm_dict_iter_init_body(DictIterState &st, const EvalValue &base)
+{
+    /* the tripwire stays for bytecode WE compiled - there a non-dict IS
+     * an interpreter bug - and stands down for an image, where it is
+     * input the fallback below handles */
+    ML_VM_CHECK(ml_untrusted_bytecode()
+                || base.is<intrusive_ptr<DictObject>>());
+    if (base.is<intrusive_ptr<DictObject>>())
+        st.dict = base.get<intrusive_ptr<DictObject>>();
+    else
+        st.dict = intrusive_ptr<DictObject>(new DictObject());
+    st.cur.start(*st.dict);
+}
+
+/* DictIterNext: false on exhaustion; else bind the key (and value) box-free -
+ * a plain EvalValue copy, matching the tree-walker's `{p.first,
+ * p.second.get()}` - and advance. A slot of -1 is a `_` placeholder / the
+ * keys-only 1-var form. Never throws (frame-slot puts have no COW path). */
+static ML_ALWAYS_INLINE bool
+vm_dict_iter_next_body(DictIterState &st, Frame &frame,
+                       int_type k_slot, int_type v_slot)
+{
+    /* #53: the next key present at the loop's start and still present
+     * (DictObject::Cursor); the binds COPY before the body can erase it */
+    const auto *p = st.cur.next_entry(*st.dict);
+    if (!p)
+        return false;
+    if (k_slot >= 0)
+        frame.at(k_slot).put(p->first);
+    if (v_slot >= 0)
+        frame.at(v_slot).put(p->second.get());
+    return true;
+}
+
+/* ForeachDynInit: dispatch the DYN container once - pin it, record the loop
+ * shape (`shape` = nvars | indexed << 8, `targets` = the unpack_targets pool
+ * entry), and set up an array or dict cursor. An unsupported runtime value
+ * throws TypeErrorEx (loc from `chunk`, or loc-less when null). */
+static void
+vm_foreach_dyn_init_body(DynIterState &st, const EvalValue &cont,
+                         int_type shape, const std::vector<int32_t> *targets,
+                         const Chunk *chunk, size_t pc)
+{
+    st.container = cont;
+    st.nvars = static_cast<int>(shape & 0xff);
+    st.indexed = (shape >> 8) != 0;
+    st.targets = targets;
+    st.counter = 0;
+    st.next = &vm_foreach_dyn_next_body;     /* the generic default */
+    st.next_throws = true;
+    st.slot0 = st.slot1 = -1;
+    st.oob = false;
+    st.is_str = false;
+    const std::vector<int32_t> &tg = *targets;
+    const size_t tb = st.indexed ? 1 : 0;
+    const size_t nv = static_cast<size_t>(st.nvars) - tb;
+    if (st.container.is<SharedArrayObj>()) {
+        st.is_dict = false;
+        st.idx = 0;
+        st.size = st.container.get<SharedArrayObj>().size();
+        st.mark = st.container.get_ref<SharedArrayObj>().fe_mark();
+        /* lever 4: the single-var, non-indexed array loop binds per-skind
+         * (a `_` var / indexed / N-var unpack keeps the generic body). */
+        if (!st.indexed && nv == 1 && tg[0] >= 0) {
+            st.slot0 = tg[0];
+            st.next_throws = false;
+            switch (st.container.get_ref<SharedArrayObj>().skind()) {
+            case SharedArrayObj::Storage::ints:
+                st.next = &vm_dyn_next_arr_int; break;
+            case SharedArrayObj::Storage::floats:
+                st.next = &vm_dyn_next_arr_float; break;
+            case SharedArrayObj::Storage::bools:
+                st.next = &vm_dyn_next_arr_bool; break;
+            default:      /* general/strs/structs: strs may PROMOTE mid-
+                           * loop, so the per-element arr_elem_at dispatch
+                           * is kept (still shape-specialized). */
+                st.next = &vm_dyn_next_arr_gen; break;
+            }
+        }
+    } else if (st.container.is<SharedStr>()) {
+        /* README: a foreach walks an array, a STRING or a dict - each
+         * character a one-character string, as do_iter's. It raised
+         * "Unsupported container type" here, so a `dyn` string - and a
+         * typed one whose loop var is `_`, which takes this path - ran
+         * only in the tree-walker. A string is immutable: no shift, no
+         * shrink; the generic body walks it. */
+        st.is_dict = false;
+        st.is_str = true;
+        st.idx = 0;
+        st.size = static_cast<size_type>(
+            st.container.get_ref<SharedStr>().size());
+        st.mark = -1;
+    } else if (st.container.is<intrusive_ptr<DictObject>>()) {
+        st.is_dict = true;
+        st.cur.start(*st.container.get_ref<intrusive_ptr<DictObject>>());
+        /* lever 4: the non-indexed 1/2-var dict loop binds key/value
+         * through the baked slots (more vars: the generic body, which
+         * throws). */
+        if (!st.indexed && nv >= 1 && nv <= 2) {
+            st.slot0 = tg[0];
+            st.slot1 = nv == 2 ? tg[1] : -1;
+            st.next = &vm_dyn_next_dict;
+            st.next_throws = false;
+        }
+    } else {
+        Loc s, en;
+        if (chunk)
+            chunk->loc_at(pc, s, en);
+        /* the tree-walker's exact wording (do_iter) - byte parity (#56) */
+        throw TypeErrorEx("Unsupported container type by foreach()", s, en);
+    }
+}
+
+/* ForeachDynNext: false on exhaustion; else bind the loop vars from the state
+ * (target slots, -1 == `_` skipped) exactly as do_iter - `indexed` binds
+ * targets[0] = the counter; an ARRAY element binds the single remaining var
+ * box-free (vm_arr_elem) or STRICT-unpacks an array element into the N
+ * remaining vars (the two TypeErrorEx throws; loc-less when `chunk` null); a
+ * DICT binds key [, value] (a third variable is do_iter's TypeErrorEx). Then
+ * advance. */
+static bool
+vm_foreach_dyn_next_body(DynIterState &st, Frame &frame,
+                         const Chunk *chunk, size_t pc)
+{
+    const std::vector<int32_t> &tg = *st.targets;
+    const size_t tb = st.indexed ? 1 : 0;    /* first value var */
+    const size_t nv = static_cast<size_t>(st.nvars) - tb;
+    const auto bind = [&](size_t i, const EvalValue &v) {
+        if (tg[i] >= 0)
+            frame.at(tg[i]).put(v);
+    };
+    if (st.is_str) {
+        if (st.idx >= st.size)
+            return false;
+        const std::string_view view =
+            st.container.get_ref<SharedStr>().get_view();
+        if (st.indexed)
+            bind(0, EvalValue(static_cast<int_type>(st.idx)));
+        if (nv == 1)
+            bind(tb, EvalValue(SharedStr(std::string(&view[st.idx], 1))));
+        else if (nv >= 2)       /* a character is not an array to unpack */
+            vm_throw_unpack_nonarray(chunk, pc, static_cast<int>(nv));
+        st.idx++;
+        return true;
+    }
+    if (!st.is_dict) {
+        if (st.idx >= st.size)
+            return false;
+        const SharedArrayObj &ca = st.container.get_ref<SharedArrayObj>();
+        if (ca.fe_shifted(st.mark) || st.idx >= ca.size()) {
+            st.oob = true;                              /* #53 */
+            return false;
+        }
+        if (st.indexed)
+            bind(0, EvalValue(static_cast<int_type>(st.idx)));
+        if (nv == 1) {
+            bind(tb, vm_arr_elem(st.container, st.idx));
+        } else if (nv >= 2) {
+            /* N-var over an ARRAY: the element must be an array of EXACTLY
+             * nv, unpacked into the vars - do_iter's STRICT destructure. */
+            const EvalValue elem = vm_arr_elem(st.container, st.idx);
+            if (!elem.is<SharedArrayObj>())
+                vm_throw_unpack_nonarray(chunk, pc, static_cast<int>(nv));
+            const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
+            if (sub.size() != static_cast<size_type>(nv))
+                vm_throw_unpack_len(chunk, pc, sub.size(),
+                                    static_cast<int>(nv));
+            for (size_t i = 0; i < nv; i++)
+                bind(tb + i, vm_arr_elem(sub, static_cast<size_type>(i)));
+        }
+        st.idx++;
+    } else {
+        DictObject &d = *st.container.get_ref<intrusive_ptr<DictObject>>();
+        const auto *p = st.cur.next_entry(d);       /* #53 */
+        if (!p)
+            return false;
+        /* do_iter's count==2 else-branch: key, then value; a third
+         * variable is the strict unpack's error */
+        if (nv > 2)
+            vm_throw_unpack_dict(chunk, pc, nv);
+        if (st.indexed)
+            bind(0, EvalValue(st.counter++));
+        if (nv >= 1)
+            bind(tb, p->first);
+        if (nv >= 2)
+            bind(tb + 1, p->second.get());
+    }
+    return true;
+}
+
+/* Lever 4 - the SPECIALIZED Next bodies (selected once at Init; see
+ * DynIterState::next). Each mirrors the generic body's semantics for its
+ * shape EXACTLY: the size snapshot bounds the loop, the container is
+ * re-derefed per element (growth/realloc during the loop behaves as
+ * before), and a flat scalar binds as the same boxed value arr_elem_at
+ * produces (a flat bool binds a REAL bool). None of them throw. */
+static bool
+vm_dyn_next_arr_int(DynIterState &st, Frame &frame, const Chunk *, size_t)
+{
+    if (st.idx >= st.size)
+        return false;
+    ML_DYN_FAST_RAN(0);
+    const SharedArrayObj &a = st.container.get_ref<SharedArrayObj>();
+    if (a.fe_shifted(st.mark) || st.idx >= a.size()) {  /* #53 */
+        st.oob = true;
+        return false;
+    }
+    frame.at(st.slot0).put(EvalValue(a.flat_ints()[a.offset() + st.idx]));
+    st.idx++;
+    return true;
+}
+
+static bool
+vm_dyn_next_arr_float(DynIterState &st, Frame &frame, const Chunk *, size_t)
+{
+    if (st.idx >= st.size)
+        return false;
+    ML_DYN_FAST_RAN(1);
+    const SharedArrayObj &a = st.container.get_ref<SharedArrayObj>();
+    if (a.fe_shifted(st.mark) || st.idx >= a.size()) {  /* #53 */
+        st.oob = true;
+        return false;
+    }
+    frame.at(st.slot0).put(EvalValue(a.flat_floats()[a.offset() + st.idx]));
+    st.idx++;
+    return true;
+}
+
+static bool
+vm_dyn_next_arr_bool(DynIterState &st, Frame &frame, const Chunk *, size_t)
+{
+    if (st.idx >= st.size)
+        return false;
+    ML_DYN_FAST_RAN(2);
+    const SharedArrayObj &a = st.container.get_ref<SharedArrayObj>();
+    if (a.fe_shifted(st.mark) || st.idx >= a.size()) {  /* #53 */
+        st.oob = true;
+        return false;
+    }
+    frame.at(st.slot0).put(EvalValue(
+        static_cast<bool>(a.flat_bools()[a.offset() + st.idx])));
+    st.idx++;
+    return true;
+}
+
+static bool
+vm_dyn_next_arr_gen(DynIterState &st, Frame &frame, const Chunk *, size_t)
+{
+    if (st.idx >= st.size)
+        return false;
+    ML_DYN_FAST_RAN(3);
+    const SharedArrayObj &a = st.container.get_ref<SharedArrayObj>();
+    if (a.fe_shifted(st.mark) || st.idx >= a.size()) {  /* #53 */
+        st.oob = true;
+        return false;
+    }
+    frame.at(st.slot0).put(vm_arr_elem(st.container, st.idx));
+    st.idx++;
+    return true;
+}
+
+static bool
+vm_dyn_next_dict(DynIterState &st, Frame &frame, const Chunk *, size_t)
+{
+    DictObject &d = *st.container.get_ref<intrusive_ptr<DictObject>>();
+    const auto *p = st.cur.next_entry(d);           /* #53 */
+    if (!p)
+        return false;
+    ML_DYN_FAST_RAN(4);
+    if (st.slot0 >= 0)
+        frame.at(st.slot0).put(p->first);
+    if (st.slot1 >= 0)
+        frame.at(st.slot1).put(p->second.get());
+    return true;
+}
+
+/*
+ * P8 Inc 0: an active `try` region on the VM handler stack. It used to carry
+ * the pc the raise path jumps to (the head of the interpreted CatchTest
+ * chain); #78 step D deleted that chain, so a live handler is now JUST its
+ * chunk-static REGION ID - the index of both its Chunk::handler_sites entry
+ * (the clause list the dispatch matches against) and its per-frame
+ * pend/exc slot. Back to 4 bytes, which the emitted inline push/pop and the
+ * handler_base bake all depend on (static_assert below).
+ */
 struct VmHandler {
-    uint32_t catch_pc;
+    uint32_t region;
 };
 
 /*
- * The VM's SLOT STACK (plans/vm-native-call-stack.md): every VM frame is a
+ * Per-TRY-REGION exception state (task #78 step 2). The caught exception a
+ * catch body's `rethrow` re-raises, and the pending action + exception a
+ * `finally` resumes, used to be ONE {exc, pend} pair on the call record -
+ * which the tree-walker never needed because ITS state lives in
+ * TryCatchStmt::do_eval C++ locals, nested for free by recursion. The single
+ * slot CLOBBERED under same-frame nesting (all found by the #78 battery,
+ * tree-walker = the oracle):
+ *   - try/catch inside a FINALLY body overwrote the pending exception (the
+ *     outer catch then missed it - it escaped);
+ *   - try/FINALLY inside a finally overwrote the pending ACTION - the
+ *     exception was silently LOST;
+ *   - a caught try/catch inside a CATCH body overwrote the exception a
+ *     later `rethrow` re-raises (the wrong one was rethrown).
+ * The fix: one {exc, pend} slot PER TRY REGION, keyed by a chunk-static
+ * monotonic region id the codegen bakes into the exception ops (the
+ * dict-iterator pattern: `Chunk::n_trys` sizes a per-frame slice of the
+ * activation's shared `pends` stack, watermarked by VmCallRec::pend_base).
+ * Distinct regions cannot clobber; a loop re-entering the SAME region reuses
+ * its slot (each cycle completes or is abandoned before the next); an
+ * abandoned slot (flow out of a catch body) is dead until the region reruns
+ * (overwrite) or the frame pops (trim) - bounded, no leak.
+ */
+struct VmPendState {
+    std::unique_ptr<RuntimeException> exc;
+    Pend pend = Pend::normal;
+};
+
+/*
+ * The VM's SLOT STACK (plans/archived/vm-native-call-stack.md): every VM frame is a
  * WINDOW of a segment. SEGMENTED, not relocating, because C++ builtins hold
  * frame LValue* / EvalValue& ACROSS user-code callbacks (sort's arg0 over
  * its comparator calls, map/filter's container reference over per-element
@@ -868,8 +2186,41 @@ struct VmHandler {
  */
 struct VmStackSeg {
     std::vector<LValue> slots;
-    int_type top = 0;                 /* allocation watermark */
-    explicit VmStackSeg(size_t cap) : slots(cap) { }
+    /*
+     * THE ALLOCATION WATERMARK IS A POINTER, not a slot index. It used
+     * to be an index, and every emitted call then paid to convert: the
+     * window is `slots.data() + top * sizeof(LValue)`, i.e. a load, a
+     * move and an imul by 48 on the push, plus a saved index per record
+     * to restore on the pop. As a pointer the window IS the watermark -
+     * the push reads it, the pop writes the record's own `window` back,
+     * and no multiply happens at all.
+     *
+     * `end` is the one-past-last slot; the fit test is a pointer
+     * compare. Both are stable for the segment's whole life (segments
+     * never move and `slots` is never resized - see below).
+     */
+    LValue *cur = nullptr;            /* allocation watermark */
+    LValue *end = nullptr;            /* one past the last slot */
+    /*
+     * `slots` is sized ONCE at construction and never resized - live windows
+     * hold raw pointers into it ("segments never move"), so its capacity is a
+     * constant of the segment. Precomputed because the EMITTED push's fit test
+     * rebuilt it every call from the vector's two pointers plus an imul by 48
+     * (it compared byte extents); against this field the same test is one
+     * compare in slot units. ML_VM_CHECKed against slots.size() at each C++
+     * push.
+     */
+    int_type cap_slots;
+    explicit VmStackSeg(size_t cap)
+        : slots(cap), cap_slots(static_cast<int_type>(cap))
+    {
+        cur = slots.data();
+        end = slots.data() + cap;
+    }
+    /* the slot INDEX of the watermark - the form the reconstruction
+     * oracle and the -vd-facing diagnostics still speak in */
+    int_type top_index() const
+    { return static_cast<int_type>(cur - slots.data()); }
 };
 
 /*
@@ -883,7 +2234,10 @@ struct VmCallRec {
     LValue *window;                   /* stable - segments never move */
     int_type nslots;
     int seg;                          /* owning segment index */
-    int_type seg_top_before;          /* watermark to restore on pop */
+    /* No saved watermark: the pop restores `cur = window`, which is the
+     * same value and is already in the record. The reconstruction
+     * oracle's cumulative chain now reads `window + nslots == the frame
+     * above's window` - the identical invariant in addresses. */
 
     const Chunk *run_chunk = nullptr; /* the chunk THIS frame executes */
 
@@ -893,7 +2247,7 @@ struct VmCallRec {
     int_type dst = -1;                /* parent slot for the return value */
     const FuncDescriptor *desc = nullptr;   /* callee (backtrace); null for
                                              * the root/main frame */
-    std::vector<LValue> *caller_captures = nullptr;  /* ctx.captures to
+    CaptureSlots *caller_captures = nullptr;  /* ctx.captures to
                                                       * restore on pop */
 
     /* Per-FRAME exception/iterator state (was vm_run_chunk locals - one
@@ -901,14 +2255,44 @@ struct VmCallRec {
      * stacks now). */
     uint32_t handler_base = 0;
     uint32_t diter_base = 0, dyiter_base = 0;
-    std::unique_ptr<RuntimeException> exc;  /* in-flight caught exception */
-    Pend pend = Pend::normal;               /* finally resume action */
+    /* The frame's slice of the activation's per-try-region pend/exc stack
+     * (VmPendState above). VALID ONLY when run_chunk->n_trys != 0: the
+     * emitted M5b inline push does not set it (such chunks decline the
+     * inline push), so on a try-free chunk's record it may be STALE - every
+     * reader is gated on n_trys, including pop_window's trim. */
+    uint32_t pend_base = 0;
 
     /* CachedCallV: the {func, args} key to store the (scalar) result under
      * in the CALLER's cache when this frame pops. */
     std::unique_ptr<PureCacheKey> cache_key;
 
+    /* #56 step 3: the BAKED call-site loc (line<<32|col) for a SWITCH-pushed
+     * record - in a DELETED run every pc collapsed onto the head EnterNative,
+     * so vm_capture_rec_frame's loc_at(ret_pc - 1) would caret the wrong op.
+     * 0 = derive from ret_chunk/ret_pc as before. Zeroed by the interpreted
+     * setups; only the switch push sets it (the emitted M5b push is excluded
+     * by the !sync_stop gate at the reader). */
+    int_type call_site_packed = 0;
+
+    /* #38 repro B: the caret's twin for the call site's INLINED-AT
+     * chain - an index into ret_chunk->inline_frames (-1 = the call is
+     * not inlined code), baked where call_site_packed is and read under
+     * the same gate. The walk's pc lookup at ret_pc - 1 has the same
+     * collapse problem the caret had: every op of a deleted run maps to
+     * the head EnterNative, so the lookup named the FIRST inlined op's
+     * chain - a phantom `step(n)` frame for a call that sat next to an
+     * inlined `step` in a mutual recursion. */
+    int32_t call_site_chain = -1;
+
     unsigned char boundary = 0;
+
+    /* M5 LEAN SYNC ENTER (plans/archived/model-flip.md): this frame was pushed by a
+     * native caller's jit_call_sync* helper - its ret_chunk is the SENTINEL
+     * stop chunk, so a normal return dispatches the sentinel's ExitBlock
+     * (vm_dispatch returns to the helper), and the unwind walk STOPS here
+     * like a boundary (capture this frame, pop, convert to g_vm_exc_pending)
+     * instead of walking into the native caller's record. */
+    unsigned char sync_stop = 0;
 
     /* The CALLER's per-frame pure-call cache, stashed while a callee runs:
      * eval.cpp reaches the cache as `ctx->frame->pure_cache`, and the view
@@ -916,10 +2300,45 @@ struct VmCallRec {
      * cache would outlive its frame and become global memoization, which
      * the per-frame design explicitly forbids (see PureCache, eval.h). */
     std::unique_ptr<PureCache> caller_cache;
+
+    /* G1 no-record tier, STEP 1 (plans/archived/g1-no-record-tier.md): the emitted
+     * sync-call SITE that pushed this record (a NorecSite*), stored by the
+     * M5b inline push UNDER TESTS so the shadow verification and the
+     * full-stack audit can associate a live record with its side-table
+     * entry. push_window nulls it for every C++-pushed record, so in a
+     * non-TESTS build (where the emitted store is not compiled) it is
+     * always null - and nothing reads it there. */
+    const void *norec_site = nullptr;
+    /* STEP 3: the pushing FRAGMENT's frame pointer (rbp) at push time -
+     * the native anchor by which the mixed walk orders record-ful and
+     * record-less frames. Written UNCONDITIONALLY by the emitted push
+     * (the step-4 walk needs it in every build); null on C++ pushes. */
+    const void *native_rbp = nullptr;
+
+    /* G1 step 4-v (plans/archived/g1-no-record-tier.md 4c): the PARENT frame's
+     * view - window/nslots/seg of the frame this record's pop returns
+     * to, captured AT PUSH TIME (the view frame + cur_seg, which still
+     * describe the caller there). These replace every "the record below
+     * is my parent" read - pop_window's vframe repoint and the C4c
+     * inline arm's parent-window loads: with record-less frames
+     * interleaved, records[rec_n-2] can be an ANCESTOR, but the
+     * push-time capture is always the true parent. Byte-identical in
+     * the all-record world (records[rec_n-2] IS the parent there -
+     * pinned per push by jit_norec_push_verify). Filled by push_window
+     * (every C++ push) and the emitted M5b inline push. */
+    LValue *parent_window = nullptr;
+    int32_t parent_nslots = 0;
+    int32_t parent_seg = -1;
+    /* H8 inc 1: the parent's SEGMENT, beside its index. cur_sg has to be
+     * restored on pop exactly as cur_seg is, and the emitted pop cannot
+     * afford to re-derive segs[parent_seg] - that indexed load is what
+     * this increment removed. Captured at the same moment parent_seg is,
+     * so the two can never disagree (ML_VM_CHECKed at every pop). */
+    VmStackSeg *parent_sg = nullptr;
 };
 
 /*
- * A VM ACTIVATION (plans/vm-native-call-stack.md): one run of VM frames
+ * A VM ACTIVATION (plans/archived/vm-native-call-stack.md): one run of VM frames
  * entered from C++ (vm_run). It owns the segmented slot stack, the call
  * records, and the VIEW Frame the dispatch loop + builtins access slots
  * through (Frame::point_at - a non-owning window; repointing per frame is
@@ -932,7 +2351,37 @@ struct VmActivation {
 
     std::vector<std::unique_ptr<VmStackSeg>> segs;
     int cur_seg = -1;
+    /* The call-record stack. `records` is PHYSICAL storage that grows only to
+     * the high-water mark; `rec_n` is the LIVE count. A push REUSES the
+     * already-constructed record at rec_n (growing by one only at a new peak),
+     * a pop resets its owning fields + decrements - so the ~140-byte record's
+     * 3 unique_ptrs are NOT default-constructed/destructed per call (the
+     * emplace_back construct was ~6% of a deep-recursion profile). RAII is
+     * kept (the unique_ptrs live in the reused objects, null between uses;
+     * pop_window frees any the exceptional/cache path left set). */
     std::vector<VmCallRec> records;
+    size_t rec_n = 0;                 /* live records; records[rec_n..] reused */
+    /* Lever 1 push/pop micro (the callgrind vector-size split): back_rec's
+     * records[rec_n - 1] is an IMUL by the 136-byte stride at EVERY use
+     * (~23 sites, several per call) - cache the top record's address,
+     * updated at push/pop (records only reallocates in push_window's grow
+     * branch; NATIVE code reads rec_n but never writes it, so the pointer
+     * cannot go stale under a fragment). recs_high mirrors records.size()
+     * (another per-push IMUL); diters_n/dyiters_n mirror the two iter
+     * stacks' sizes (dyn's 72-byte stride divided per push AND pop) -
+     * both vectors are mutated ONLY in push/pop below. handlers is NOT
+     * mirrored: fragments push/pop it natively (inline PushHandler), and
+     * its 4-byte stride is a plain shift anyway. ML_VM_CHECK re-verifies
+     * every mirror (the CI-release hardening net). */
+    VmCallRec *top_rec = nullptr;
+    uint32_t recs_high = 0;           /* == records.size() */
+    uint32_t diters_n = 0;            /* == dict_iters.size() */
+    uint32_t dyiters_n = 0;           /* == dyn_iters.size() */
+    ML_ALWAYS_INLINE VmCallRec &back_rec() {
+        ML_VM_CHECK(top_rec == &records[rec_n - 1]);
+        return *top_rec;
+    }
+    ML_ALWAYS_INLINE bool no_recs() const { return rec_n == 0; }
     /*
      * The REUSABLE context for builtin->callback invocations (vm_invoke,
      * Phase D): constructed ONCE per activation (vm_run parents it to the
@@ -948,11 +2397,49 @@ struct VmActivation {
     std::vector<VmHandler> handlers;
     std::vector<DictIterState> dict_iters;
     std::vector<DynIterState> dyn_iters;
-    Frame view_frame;                 /* the loop's window into the stack */
-    int_type used = 0;                /* live slots, for the depth cap */
-    int_type cap;                     /* MYLANG_VM_STACK (slots) */
+    std::vector<VmPendState> pends;   /* per-try-region exc/pend (#78) */
+    uint32_t pends_n = 0;             /* == pends.size() (mirror) */
 
-    VmActivation() : cap(stack_cap()) { records.reserve(32); }
+    /* The region's pend/exc slot for `rec`'s frame. Callers are all ops of
+     * a chunk WITH trys (n_trys > 0), so pend_base is valid (see the field's
+     * comment). */
+    ML_ALWAYS_INLINE VmPendState &pend_at(const VmCallRec &rec,
+                                          int_type region)
+    {
+        ML_VM_CHECK(pends_n == pends.size());
+        ML_VM_CHECK(rec.run_chunk && rec.run_chunk->n_trys > 0);
+        ML_VM_CHECK(region >= 0
+                    && region < static_cast<int_type>(
+                           rec.run_chunk->n_trys));
+        ML_VM_CHECK(rec.pend_base + static_cast<uint32_t>(region) < pends_n);
+        return pends[rec.pend_base + static_cast<uint32_t>(region)];
+    }
+    Frame view_frame;                 /* the loop's window into the stack */
+    /*
+     * H8 inc 1: THE DEPTH CAP IS THE SEGMENT BUDGET, so there is no live-
+     * slot counter. `used` was a second running total maintained beside
+     * every segment's own `top` - one add per push, one sub per pop, plus
+     * a compare against `cap` - and the emitted call protocol carried all
+     * three. It is redundant: a frame can only exceed the cap by needing
+     * a segment that `room` cannot pay for, and WITHIN a segment the fit
+     * test (top + n <= cap_slots) already bounds it.
+     *
+     * EXACT, not approximate: a new segment is sized min(max(n,
+     * SEG_SLOTS), room), so the last one is exactly the remaining budget
+     * and the total ever allocated is exactly the cap. `room` is spent
+     * only when a segment is CREATED - walking back into an already
+     * allocated successor after a pop does not re-charge it, which is
+     * what keeps a deep-recurse/return/deep-recurse program from
+     * exhausting the budget on the second pass.
+     */
+    int_type room;                    /* MYLANG_VM_STACK, minus allocated */
+    /* The current segment, held DIRECTLY. push and pop both used to
+     * re-derive it from (cur_seg, segs._M_start) - a load, a sign-extend
+     * and an indexed load each, in EMITTED code. cur_seg stays: it is the
+     * index the records store and the parent-view restore needs. */
+    VmStackSeg *cur_sg = nullptr;
+
+    VmActivation() : room(stack_cap()) { records.reserve(32); }
 
     /* The configurable depth cap (slots). One env read per process. */
     static int_type stack_cap()
@@ -976,45 +2463,123 @@ struct VmActivation {
     ML_ALWAYS_INLINE Frame *push_window(int_type n, const Chunk *ck,
                                         bool boundary)
     {
-        if (used + n > cap)
-            throw StackOverflowEx();
+        /* 4-v: capture the PARENT view BEFORE the segment logic below can
+         * advance cur_seg - the view frame + cur_seg still describe the
+         * caller here (a record-less caller included: the vframe is
+         * repointed by every push/pop, so it is correct even when the
+         * caller has no record of its own). Stored into the record after
+         * it is (re)acquired. */
+        LValue *const par_win = view_frame.slots;
+        const int32_t par_nslots = static_cast<int32_t>(view_frame.size);
+        const int32_t par_seg = static_cast<int32_t>(cur_seg);
+        VmStackSeg *const par_sg = cur_sg;
 
-        VmStackSeg *sg = cur_seg >= 0 ? segs[cur_seg].get() : nullptr;
-        if (!sg || sg->top + n > static_cast<int_type>(sg->slots.size())) {
+        VmStackSeg *sg = cur_sg;
+        ML_VM_CHECK(!sg || sg == segs[cur_seg].get());
+        /* the emitted push's fit test compares `cur + n` against `end` -
+         * keep both provably the extent of `slots` */
+        ML_VM_CHECK(!sg || (sg->cap_slots
+                                == static_cast<int_type>(sg->slots.size())
+                            && sg->end == sg->slots.data() + sg->cap_slots));
+        if (!sg || sg->cur + n > sg->end) {
+#ifdef TESTS
+            /* Net 3's SEGMENT-BOUNDARY case: an emitted push DECLINES
+             * across a boundary (the fit test sends it to C++), so this
+             * is exactly where record-ful and record-less frames must
+             * interleave. Counted so a test can PROVE it got here -
+             * crossing needs ~16384/frame-size levels of recursion, far
+             * more than any corpus program had. `sg` non-null means a
+             * REAL advance; the null case is just the first segment. */
+            if (sg)
+                g_vm_seg_advance++;
+#endif
             /* Advance to (or create) a segment with room. Reuse an already-
              * allocated successor when its capacity fits (the common pop/
              * push cycle at a segment edge); else append a fresh one. */
-            const size_t need = static_cast<size_t>(
-                n > SEG_SLOTS ? n : SEG_SLOTS);
+            const int_type want = n > SEG_SLOTS ? n : SEG_SLOTS;
+            /* An already-allocated successor is REUSED whenever the frame
+             * fits it - the test used to demand a full SEG_SLOTS, which
+             * would now insert (and CHARGE `room` for) a fresh segment on
+             * a deep/shallow/deep program until the budget ran out. */
             if (cur_seg + 1 < static_cast<int>(segs.size())
-                    && segs[cur_seg + 1]->slots.size() >= need) {
-                cur_seg++;
+                    && segs[cur_seg + 1]->slots.size()
+                           >= static_cast<size_t>(n)) {
+                cur_seg++;                /* already paid for */
             } else {
+                /* THE CAP: a fresh segment is capped by the remaining
+                 * budget, so the last one is exactly `room` and a frame
+                 * the budget cannot pay for is the overflow. */
+                const int_type give = want < room ? want : room;
+                if (give < n)
+                    throw StackOverflowEx();
                 segs.insert(segs.begin() + (cur_seg + 1),
-                            std::make_unique<VmStackSeg>(need));
+                            std::make_unique<VmStackSeg>(
+                                static_cast<size_t>(give)));
+                room -= give;
                 cur_seg++;
             }
             sg = segs[cur_seg].get();
-            ML_CHECK(sg->top == 0);
+            cur_sg = sg;
+            ML_CHECK(sg->cur == sg->slots.data());
         }
 
-        records.emplace_back();          /* fill IN PLACE - no struct move */
-        VmCallRec &rec = records.back();
-        rec.window = sg->slots.data() + sg->top;
+        /* REUSE the constructed record at rec_n; grow only at a new peak. */
+        ML_VM_CHECK(recs_high == records.size());
+        if (rec_n == recs_high) {
+            records.emplace_back();      /* one-time construct at high-water */
+            recs_high++;
+        }
+        VmCallRec &rec = records[rec_n++];   /* fill IN PLACE - no move */
+        top_rec = &rec;                  /* stays valid: grow is above */
+        rec.window = sg->cur;
         rec.nslots = n;
         rec.seg = cur_seg;
-        rec.seg_top_before = sg->top;
+        rec.parent_window = par_win;          /* 4-v: the parent view */
+        rec.parent_nslots = par_nslots;
+        rec.parent_seg = par_seg;
+        rec.parent_sg = par_sg;
         rec.boundary = boundary;
+        rec.sync_stop = 0;               /* a REUSED record must not carry a
+                                          * stale lean-sync stop mark */
+        rec.norec_site = nullptr;        /* every C++ push nulls the G1 site
+                                          * (only the M5b emitted push, which
+                                          * bypasses this function, sets it) */
+        rec.native_rbp = nullptr;        /* likewise the step-3 anchor */
         rec.run_chunk = ck;
         rec.handler_base = static_cast<uint32_t>(handlers.size());
-        rec.diter_base = static_cast<uint32_t>(dict_iters.size());
-        rec.dyiter_base = static_cast<uint32_t>(dyn_iters.size());
-        if (ck->n_dict_iters)
-            dict_iters.resize(dict_iters.size() + ck->n_dict_iters);
-        if (ck->n_dyn_iters)
-            dyn_iters.resize(dyn_iters.size() + ck->n_dyn_iters);
-        sg->top += n;
-        used += n;
+        ML_VM_CHECK(diters_n == dict_iters.size());
+        ML_VM_CHECK(dyiters_n == dyn_iters.size());
+        rec.diter_base = diters_n;
+        rec.dyiter_base = dyiters_n;
+        /* An IN-VM push (boundary=false) is followed by vm_enter_call setting
+         * every resume field; a BOUNDARY push has no such follow-up, so on a
+         * REUSED record its resume fields would be stale - clear them (they
+         * are provably unused for a boundary frame, but staleness is a
+         * future-change hazard, and a boundary push is rare/off the hot
+         * recursion path). */
+        if (boundary) {
+            rec.ret_chunk = nullptr;
+            rec.ret_pc = 0;
+            rec.dst = -1;
+            rec.desc = nullptr;
+            rec.caller_captures = nullptr;
+        }
+        if (ck->n_dict_iters) {
+            diters_n += static_cast<uint32_t>(ck->n_dict_iters);
+            dict_iters.resize(diters_n);
+        }
+        if (ck->n_dyn_iters) {
+            dyiters_n += static_cast<uint32_t>(ck->n_dyn_iters);
+            dyn_iters.resize(dyiters_n);
+        }
+        if (ck->n_trys) {
+            ML_VM_CHECK(pends_n == pends.size());
+            rec.pend_base = pends_n;
+            pends_n += static_cast<uint32_t>(ck->n_trys);
+            pends.resize(pends_n);
+        }
+        sg->cur += n;
+
         /* Stash the CALLER's pure cache; the callee's frame starts with
          * none (per-frame scoping - see VmCallRec::caller_cache). */
         if (view_frame.pure_cache)
@@ -1028,12 +2593,13 @@ struct VmActivation {
      * at the new top (if any). */
     /* Pop the top record WITHOUT moving the (unique_ptr-bearing) struct
      * out: the caller reads any resume fields it needs BEFORE calling (they
-     * are stable), we clean by reference, then pop_back (a cheap dtor - the
-     * rare owning fields are null on the hot path). */
+     * are stable), we clean by reference, then decrement rec_n (the record
+     * object is REUSED by the next push - we free its owning fields here, the
+     * equivalent of the old pop_back dtor, but keep the object). */
     ML_ALWAYS_INLINE void pop_window()
     {
-        ML_CHECK(!records.empty());
-        VmCallRec &rec = records.back();
+        ML_CHECK(rec_n != 0);
+        VmCallRec &rec = back_rec();
 
         /* Release the window's REFERENCES (the old Frame-dtor point). A
          * slot holding a trivial value (int/float/bool/none - no refcount,
@@ -1050,7 +2616,7 @@ struct VmActivation {
                     break;               /* sorted */
                 LValue &lv = rec.window[s];
                 if (lv.get().get_type()->t >= Type::t_str)
-                    lv = LValue();
+                    lv.frame_release();
             }
 #if ML_VM_HARDENING
             for (int_type i = 0; i < rec.nslots; i++)
@@ -1061,36 +2627,88 @@ struct VmActivation {
             for (int_type i = 0; i < rec.nslots; i++) {
                 LValue &lv = rec.window[i];
                 if (lv.get().get_type()->t >= Type::t_str)
-                    lv = LValue();
+                    lv.frame_release();
             }
         }
 
-        /* Per-frame state dies with the frame. A normal return has already
+        /*
+         * Per-frame state dies with the frame. A normal return has already
          * popped its handlers (the codegen emits the crossed-try pops); the
-         * exceptional walk truncates whatever is left. */
-        if (handlers.size() != rec.handler_base)
-            handlers.resize(rec.handler_base);
-        if (dict_iters.size() != rec.diter_base)
-            dict_iters.resize(rec.diter_base);
-        if (dyn_iters.size() != rec.dyiter_base)
-            dyn_iters.resize(rec.dyiter_base);
+         * exceptional walk truncates whatever is left.
+         *
+         * A PLAIN frame (no trys, no iterators - see Chunk::plain_frame) can
+         * provably have moved none of the four watermarks, so one flag test
+         * replaces four comparisons. A hardened build re-checks all four, so
+         * an op that starts pushing per-frame state without a chunk count
+         * fails loudly rather than leaking it into the caller.
+         */
+        if (!rec.run_chunk || !rec.run_chunk->plain_frame) {
+            if (handlers.size() != rec.handler_base)
+                handlers.resize(rec.handler_base);
+            if (diters_n != rec.diter_base) {
+                dict_iters.resize(rec.diter_base);
+                diters_n = rec.diter_base;
+            }
+            if (dyiters_n != rec.dyiter_base) {
+                dyn_iters.resize(rec.dyiter_base);
+                dyiters_n = rec.dyiter_base;
+            }
+            /* The per-region exc/pend slice (#78) - gated on n_trys because an
+             * M5b-inline-pushed record's pend_base is stale (see the field). */
+            if (rec.run_chunk && rec.run_chunk->n_trys
+                    && pends_n != rec.pend_base) {
+                pends.resize(rec.pend_base);
+                pends_n = rec.pend_base;
+            }
+        } else {
+            ML_VM_CHECK(handlers.size() == rec.handler_base);
+            ML_VM_CHECK(diters_n == rec.diter_base);
+            ML_VM_CHECK(dyiters_n == rec.dyiter_base);
+        }
 
-        segs[rec.seg]->top = rec.seg_top_before;
-        used -= rec.nslots;
-        cur_seg = rec.seg;
+        ML_VM_CHECK(cur_sg == segs[rec.seg].get());
+        cur_sg->cur = rec.window;      /* the window IS the watermark */
 
         /* The popped frame's cache dies HERE (per-frame scoping); the
          * caller's stashed cache comes back into the view. */
         if (rec.caller_cache || view_frame.pure_cache)
             view_frame.pure_cache = std::move(rec.caller_cache);
 
-        records.pop_back();
+        /* Free any owning state the frame still holds - the reuse-equivalent
+         * of the old pop_back dtor. On the HOT path both are already null
+         * (cache_key moved out by vm_leave_call, caller_cache moved out
+         * above); the cached-call path may leave one set, and freeing it
+         * here matches the old dtor exactly. */
+        rec.cache_key.reset();
+        rec_n--;
 
-        if (!records.empty()) {
-            const VmCallRec &tp = records.back();
-            view_frame.point_at(tp.window, static_cast<int>(tp.nslots));
-            cur_seg = tp.seg;
+        /* `cur_seg` is set from the popped record's PARENT VIEW (4-v) -
+         * captured at push time, so it names the true parent even when
+         * record-less frames interleave (records[rec_n-1] can then be an
+         * ANCESTOR). In the all-record world the two are identical
+         * (records[rec_n-1] IS the parent - pinned per push by
+         * jit_norec_push_verify); only an empty stack keeps the dead
+         * frame's segment. */
+        if (rec_n) {
+            top_rec = &records[rec_n - 1];
+            view_frame.point_at(rec.parent_window,
+                                static_cast<int>(rec.parent_nslots));
+            cur_seg = rec.parent_seg;
+            cur_sg = rec.parent_sg;
+        } else {
+            top_rec = nullptr;
+            cur_seg = rec.seg;
+            cur_sg = cur_seg >= 0 ? segs[cur_seg].get() : nullptr;
         }
+        /* cur_sg tracks cur_seg (it IS segs[cur_seg]); a pop that walks
+         * back a segment must move BOTH, or the next push allocates from
+         * the dead frame's segment. The EMITTED pop restores them from
+         * the record's parent pair for the same reason - forgetting the
+         * pointer half is what the rel-hard lane's M5a deep-recursion
+         * test caught, and only that lane: it needs a real segment
+         * ADVANCE, which no sanitizer-lane depth reaches. */
+        ML_VM_CHECK(cur_sg == (cur_seg >= 0 ? segs[cur_seg].get()
+                                            : nullptr));
     }
 };
 
@@ -1098,7 +2716,7 @@ struct VmActivation {
  * Null outside VM execution - do_func_call's window push falls back to a
  * plain per-call Frame then (e.g. a harness helper calling eval_func with
  * the engine flag set but no VM run active). */
-static VmActivation *g_vm_act = nullptr;
+static VmActivation *&g_vm_act = *ml_lowmem_new<VmActivation *>(nullptr);
 
 Frame *vm_window_push(int_type nslots, const Chunk *ck)
 {
@@ -1115,8 +2733,257 @@ void vm_window_pop()
     g_vm_act->pop_window();
 }
 
+/* .myv LOAD: re-resolve a builtin by NAME against the singleton table (a
+ * stored image names its builtins, never their addresses). False = the file
+ * names a builtin this binary does not have -> the loader refuses it. */
+bool vm_lookup_builtin(const UniqueId *name, Builtin &out)
+{
+    if (!name)
+        return false;
+    auto it = EvalContext::const_builtins.find(name);
+    if (it == EvalContext::const_builtins.end()) {
+        it = EvalContext::builtins.find(name);
+        if (it == EvalContext::builtins.end())
+            return false;
+    }
+    if (!it->second.get().is<Builtin>())
+        return false;
+    out = it->second.get().get<Builtin>();
+    return true;
+}
+
+/* .myv LOAD (plans/archived/myv-serializer.md): own a deserialized chunk and stamp
+ * it on its descriptor - the loader's equivalent of vm_precompile_all's end
+ * state for a fresh compile. The AOT NATIVE tier re-runs here: only the VM
+ * image is stored, so machine code is (re-)generated per load. */
+void vm_install_func_chunk(const FuncDescriptor *fdesc, Chunk &&ck)
+{
+    /*
+     * insert_or_ASSIGN, not emplace: `g_func_chunks` is keyed by a RAW
+     * DESCRIPTOR POINTER, which is a stable identity only while the program
+     * that owns it is alive. A second `.myv` loaded into the same process
+     * gets fresh descriptors from the allocator, and it happily hands back
+     * an address the previous program's descriptor had - at which point
+     * `emplace` finds the key PRESENT, keeps the OLD chunk, and returns it,
+     * so the new function would run the previous image's bytecode.
+     *
+     * Exactly the stale-identity hazard CLAUDE.md warns about, and silent:
+     * one image per process (the CLI) never sees it. It surfaced loading
+     * several images in one process, which the #137 corruption test does.
+     */
+    Chunk &owned =
+        g_func_chunks.insert_or_assign(fdesc, std::move(ck)).first->second;
+    jit_norec_rebind(owned);
+    /* NOT jit'd here: the tier runs once over the WHOLE image
+     * (vm_jit_loaded_image), because a caller's native-call gate needs
+     * every callee's flag set first - vm_precompile_all's two passes. */
+    (void)owned;
+    fdesc->vm_chunk = &owned;
+    fdesc->vm_chunk_tried = true;
+    compute_bind_flags(fdesc);             /* fast_bind + bind_req */
+}
+
+/* .myv LOAD: the AOT native tier over a loaded image - the two-pass shape
+ * of vm_precompile_all. Pass A recomputes each chunk's native_leaf flag
+ * (codegen sets it on a fresh compile; it is derived from the ops, so it is
+ * recomputed rather than stored - no drift surface). Pass B jits every body
+ * with a JitCtx rebuilt from the image (global slot -> descriptor by NAME,
+ * plus the stored reassigned flags), then main. */
+void vm_jit_loaded_image(VmProgram &prog)
+{
+    /*
+     * Over THIS PROGRAM's chunks, not over `g_func_chunks`.
+     *
+     * That map is process-global and keyed by descriptor pointer, and
+     * nothing removes a program's entries when it is destroyed - only
+     * `vm_compile` clears it, and a `.myv` load does not go through
+     * vm_compile. Iterating it therefore re-JITs chunks belonging to
+     * previously loaded, already-freed programs, handing them a dangling
+     * `caller_desc` and THIS program's global-slot tables. One image per
+     * process (the CLI) never notices; loading several in one process
+     * crashed inside emit_op on a foreign chunk's pools.
+     */
+    const auto for_each_chunk = [&](const std::function<void (Chunk &,
+                                    const FuncDescriptor *)> &fn) {
+        for (const auto &d : prog.funcs)
+            if (d->vm_chunk)
+                fn(*static_cast<Chunk *>(
+                       const_cast<void *>(d->vm_chunk)), d.get());
+    };
+
+    for_each_chunk([](Chunk &ck, const FuncDescriptor *d) {
+        ML_INT_ONLY(int_stamp_param_kinds(ck, d);)
+        ck.native_leaf = jit_chunk_is_native_leaf(ck);
+        /* #97 increment 2: derived from the ops exactly like native_leaf,
+         * never stored - and read by the CALLER's site (frameless_site),
+         * so it must exist before main is jitted. Left at its loaded
+         * default (false) it made a loaded image's main 649 bytes bigger
+         * than the fresh compile's, which myv_round_trip caught. */
+        jit_chunk_frameless_derive(ck);          /* W3, small-60 */
+    });
+
+    const std::vector<const FuncDescriptor *> slot_desc =
+        vm_image_slot_desc(prog);
+    std::vector<std::pair<Chunk *, const FuncDescriptor *>> bodies;
+    for_each_chunk([&](Chunk &ck, const FuncDescriptor *desc) {
+        bodies.push_back({ &ck, desc });
+    });
+    /* the ONE driver (vm.h): a loaded image's main must emit the native
+     * code a fresh compile's does - that is the whole point of re-running
+     * the tier here, and it holds by construction only while both run
+     * the same function. */
+    vm_jit_program(&prog.root, bodies, slot_desc,
+                   prog.global_slot_reassigned);
+}
+
+/* Declared in vm.h: a loaded image's global slot -> the function a slot
+ * names, by NAME (an image stores no pointer). The load's JIT and the
+ * image's -vd dump both read it, so the dump's container plan asks the
+ * question the JIT asked. */
+std::vector<const FuncDescriptor *> vm_image_slot_desc(const VmProgram &prog)
+{
+    std::vector<const FuncDescriptor *> slot_desc(
+        prog.global_func_names.size(), nullptr);
+    for (size_t s = 0; s < prog.global_func_names.size(); s++) {
+        const UniqueId *nm = prog.global_func_names[s];
+        if (!nm)
+            continue;
+        for (const auto &d : prog.funcs)
+            if (d->name == nm && d->vm_chunk) {
+                slot_desc[s] = d.get();
+                break;
+            }
+    }
+    return slot_desc;
+}
+
+/* Declared in vm.h - see the contract there. */
+void vm_jit_program(Chunk *main,
+                    const std::vector<std::pair<Chunk *,
+                                                const FuncDescriptor *>>
+                        &bodies,
+                    const std::vector<const FuncDescriptor *> &slot_desc,
+                    const std::vector<char> &slot_reassigned)
+{
+    /* #97 inc 2 (F6): which callees will MAIN call framelessly - decided
+     * from main's code before any body is jitted, so a body knows whether
+     * to emit its frameless entry and return arm (bytecode.h) */
+    if (main) {
+        JitCtx jc;
+        jc.slot_desc = &slot_desc;
+        jc.slot_reassigned = &slot_reassigned;
+        jit_mark_frameless_wanted(*main, &jc);
+    }
+    /* #97 F1: ...and from every body - any caller may call a LEAF
+     * framelessly now */
+    for (const auto &b : bodies) {
+        JitCtx jc;
+        jc.slot_desc = &slot_desc;
+        jc.slot_reassigned = &slot_reassigned;
+        jc.caller_desc = b.second;
+        jit_mark_frameless_wanted(*b.first, &jc);
+    }
+    /*
+     * Pass B: every body with its own JitCtx (caller_desc = the
+     * descriptor keying its chunk). A frameless site's entry is an
+     * IMMEDIATE, so its callee must be placed before the caller is
+     * emitted - and placement is made by the callee's own JIT pass,
+     * whose position in `bodies` is a pointer-keyed map's order. So the
+     * frameless LEAF bodies go FIRST (#97 F1): a leaf names no callee,
+     * so it needs no placement of its own, and every leaf a site can
+     * name is placed before any site is emitted - in every run. The
+     * partition is STABLE, so the relative order within each half is
+     * what it always was. (main, compiled last, was the only caller
+     * this used to hold for.)
+     */
+    std::vector<std::pair<Chunk *, const FuncDescriptor *>> order(bodies);
+    std::stable_partition(
+        order.begin(), order.end(),
+        [](const std::pair<Chunk *, const FuncDescriptor *> &b) {
+            return b.first->frameless_ok && !b.first->frameless_calls;
+        });
+    for (const auto &b : order) {
+        JitCtx jc;
+        jc.slot_desc = &slot_desc;
+        jc.slot_reassigned = &slot_reassigned;
+        jc.caller_desc = b.second;
+        jit_compile_chunk(*b.first, &jc);
+    }
+    /*
+     * ...AND MAIN, LAST, WITH THE SAME MAP (#97 step 4). It used to be
+     * jitted by the caller with NO JitCtx at all, on the #55 reasoning
+     * that main has no stable descriptor and so cannot make a native
+     * DIRECT call. True, and `callv_native_ok` still declines on
+     * `!jc->caller_desc` - but the map itself is what lets the inline
+     * push BAKE its callee, and main is where most call loops live
+     * (every headline bench's outer loop). Handing main a context with
+     * a null caller_desc gives it the bake and changes nothing else.
+     */
+    if (main) {
+        JitCtx jc;
+        jc.slot_desc = &slot_desc;
+        jc.slot_reassigned = &slot_reassigned;
+        jit_compile_chunk(*main, &jc);
+    }
+}
+
+/* Declared in vm.h - see the contract there. */
+void
+vm_verify_program(const VmProgram &prog)
+{
+    ChunkLimits lim;
+    lim.nglobals = prog.global_func_names.size();
+    lim.nbuiltins = builtin_slot_count();
+    for (const auto &sd : prog.structs)
+        lim.max_fields = std::max(lim.max_fields, sd->fields.size());
+
+    /*
+     * main: no captures, and its frame is the ROOT slot count + temps.
+     * `root_slot_count` is the root chunk's `slot_count` stored a second
+     * time (section 10 of the format), and the two must AGREE - the same
+     * cross-record rule the function chunks get below, for the same
+     * reason: `slot_count` partitions the frame into locals and temps, and
+     * every load-time analysis and the JIT's pin gate classify a slot by
+     * it. A mutated copy (myv_fuzz fat-316: 26 -> 145; fat-311: 22 -> 101,
+     * which made the register cache pin a TEMP as a local and leak the
+     * reference it also held) is a refusal, not a run.
+     */
+    if (prog.root_slot_count != prog.root.slot_count)
+        throw Exception("MyvError",
+                        intern_msg("corrupt .myv (the root chunk's "
+                                   "slot_count disagrees with the stored "
+                                   "root slot count)"));
+    lim.nslots = prog.root_slot_count + prog.root.n_temps;
+    lim.ncaptures = 0;
+    verify_chunk(prog.root, lim);
+
+    for (const auto &d : prog.funcs) {
+        if (!d->vm_chunk)
+            continue;
+        const Chunk &ck = *static_cast<const Chunk *>(d->vm_chunk);
+        /*
+         * A CROSS-RECORD fact the per-chunk verifier cannot see: the
+         * chunk's `slot_count` IS its descriptor's `frame_size`
+         * (codegen_func_body passes it as such). The push sizes the
+         * window from the DESCRIPTOR and the JIT's return arms from the
+         * CHUNK, so a mutated slot_count (myv_fuzz, 2026-09-20: 0 -> 1024
+         * and 0 -> 66 on the fat image) makes the two disagree on how
+         * many slots a frame has - an oracle abort in the debug build,
+         * and a release scan past the window in the assert-free one.
+         */
+        if (ck.slot_count != d->frame_size)
+            throw Exception("MyvError",
+                            intern_msg("corrupt .myv (a function chunk's "
+                                       "slot_count disagrees with its "
+                                       "descriptor's frame_size)"));
+        lim.nslots = d->frame_size + ck.n_temps;
+        lim.ncaptures = d->captures.size();
+        verify_chunk(ck, lim);
+    }
+}
+
 VmProgram
-vm_compile(const Construct *root_c)
+vm_compile(const Construct *root_c, bool jit)
 {
     const Block *root = static_cast<const Block *>(root_c);
     ExecGuard exec_guard;
@@ -1126,25 +2993,60 @@ vm_compile(const Construct *root_c)
     g_func_chunks.clear();
 
     VmProgram prog;
-    prog.root = codegen_program(root);
 
-    /* AOT: compile every function body upfront (no lazy per-call compile) - the
-     * maintainer's no-lazy rule + a `.myv`-serialization prerequisite. After
-     * this, do_func_call reads a precomputed vm_chunk and never compiles. */
-    vm_precompile_all(root);
-
-    /* Root-context data the run needs, copied OUT of the root Block. */
-    prog.root_slot_count = root->slot_count;
-    prog.global_func_names = root->global_func_names;
-
-    /* OWNERSHIP TRANSFER (plans/vm-ast-free-runtime.md): move every function
-     * descriptor and struct type def out of the AST into the program image,
-     * so the tree is droppable. The decls keep their raw aliases (desc/def),
-     * which stay valid - a unique_ptr move does not relocate the pointee. The
-     * walks use the COMPLETE child visitor, so no decl is missed. */
+    /*
+     * #97 E1 - THE LIVE-DESCRIPTOR SET, installed before ANY codegen runs.
+     *
+     * `CallExpr::callee_desc` names the callee a value-call site reaches,
+     * but the optimizer stack can free the decl that owns that descriptor
+     * (an inline lambda dies with the call expression that held it), so
+     * codegen must never DEREFERENCE a stamp it has not first found here.
+     * Built from `collect_funcs` over the FINAL tree - the same walk that
+     * decides which bodies to compile and which descriptors the program
+     * image takes ownership of, so the three cannot drift.
+     *
+     * ⛔ IT MUST WRAP BOTH `codegen_program` (MAIN, right below - where
+     * every headline bench's call loop lives) AND `vm_precompile_all` (the
+     * function bodies). Installing it inside the latter left main's chunk
+     * compiled with a NULL set, so every stamp declined and the tier was
+     * silently inert - and the reach counter read exactly like "the
+     * liveness gate is too strict" rather than "the gate never ran".
+     */
     std::vector<const FuncDeclStmt *> funcs;
     for (const auto &e : root->elems)
         collect_funcs(e.get(), funcs);
+    CodegenLiveDescs live_guard(funcs);
+
+    /* #55 STEP 2: codegen main WITHOUT jit - its native_leaf flag is still set;
+     * jit is deferred to below, after Pass A has set every function's flag (a
+     * top-level native call to a function needs the callee's flag). */
+    prog.root = codegen_program(root, /*jit=*/false);
+
+    /* AOT: compile every function body upfront (no lazy per-call compile) - the
+     * maintainer's no-lazy rule + a `.myv`-serialization prerequisite. After
+     * this, do_func_call reads a precomputed vm_chunk and never compiles.
+     * Pass A codegens all bodies (flags set), Pass B jits them. */
+    /* Pass B jits every body and then MAIN, last - main needs the same
+     * global slot -> descriptor map to bake its callees (#97 step 4), and
+     * it must come after every body so their `native_leaf` flags and
+     * fragments exist (#55 STEP 2). */
+    vm_precompile_all(root, jit, &prog.root);
+
+    /* Root-context data the run needs, copied OUT of the root Block. */
+    prog.root_slot_count = root->slot_count;
+    prog.typed = g_ctype_adopt;
+    prog.global_func_names = root->global_func_names;
+    prog.global_slot_reassigned = root->global_slot_reassigned;
+
+    /* OWNERSHIP TRANSFER (plans/archived/vm-ast-free-runtime.md): move every function
+     * descriptor and struct type def out of the AST into the program image,
+     * so the tree is droppable. The decls keep their raw aliases (desc/def),
+     * which stay valid - a unique_ptr move does not relocate the pointee. The
+     * walks use the COMPLETE child visitor, so no decl is missed.
+     * `funcs` is the SAME collection the live-descriptor set was built from
+     * above - one walk, so the set and the ownership transfer cannot
+     * disagree about which functions exist. */
+
     for (const FuncDeclStmt *fn : funcs)
         if (fn->desc_owner)
             prog.funcs.push_back(
@@ -1153,7 +3055,7 @@ vm_compile(const Construct *root_c)
     std::function<void (Construct *)> take_structs = [&](Construct *c) {
         if (!c)
             return;
-        if (auto *sd = dynamic_cast<StructDeclStmt *>(c)) {
+        if (auto *sd = node_cast<StructDeclStmt>(c)) {
             if (sd->def_owner)
                 prog.structs.push_back(std::move(sd->def_owner));
             return;
@@ -1163,6 +3065,20 @@ vm_compile(const Construct *root_c)
     for (const auto &e : root->elems)
         take_structs(e.get());
 
+    /*
+     * #137: the CODEGEN self-check. The verifier's per-opcode table is the
+     * audit-table stage trap in its most dangerous form (a stale entry means
+     * silent acceptance), so it is run here too - against everything codegen
+     * and the JIT actually emit. A mis-classified operand then fails the
+     * whole test suite and the sample corpus, not a hostile image in the
+     * field. ASSERTS-only: on a loaded image the check is what stands
+     * between corruption and a wild index, but here the input is our own
+     * output. Runs LAST, once the structs are in `prog` (max_fields).
+     */
+#ifndef NDEBUG
+    vm_verify_program(prog);
+#endif
+
     return prog;
 }
 
@@ -1170,7 +3086,11 @@ void
 vm_run(VmProgram &prog)
 {
     ExecGuard exec_guard;
+    g_ctype_adopt = prog.typed;
     EvalContext ctx(nullptr, /*const_ctx=*/false);
+    /* a run numbers its class instances from one base, in every engine
+     * (g_class_ident: the hash of a class instance) */
+    class_ident_reset(CLASS_IDENT_RUN_BASE);
 
     /* Main's frame - the resolved locals plus the register machine's scratch
      * temps [slot_count, slot_count + n_temps) - is the activation's FIRST
@@ -1196,7 +3116,7 @@ vm_run(VmProgram &prog)
         ctx.gfuncs = gtable.get();
     }
 
-    /* The reusable callback-invoke context (vm_try_invoke): parented to the
+    /* The reusable callback-invoke context (VmInvoker): parented to the
      * ROOT (a callback body must not see its caller - lexical scoping; it
      * inherits gfuncs/frame from the root, func_ctx gives it its own
      * FlowState). Built once, after the root ctx is complete. */
@@ -1232,7 +3152,48 @@ vm_execute(const Construct *root_c)
      */
     static std::vector<VmProgram> retained;
     retained.push_back(vm_compile(root_c));
+    /* G1: the program (and its root Chunk) just MOVED - twice, in fact:
+     * out of vm_compile's frame and into the retained vector, which may
+     * also REALLOCATE and move every EARLIER program's root. Every one of
+     * those moves goes through VmProgram's move operations, which REBIND
+     * the root's baked addresses (vm.h) - this used to be an explicit
+     * rebind loop here, which the script driver's load path then lacked. */
     vm_run(retained.back());
+}
+
+VmProgram::~VmProgram()
+{
+    for (const auto &f : funcs)
+        g_func_chunks.erase(f.get());
+}
+
+/* The move operations rebind the root chunk's baked addresses - see the
+ * contract on the struct (vm.h). Out of line: vm.h does not see jit.h. */
+VmProgram::VmProgram(VmProgram &&o) noexcept
+    : root(std::move(o.root)),
+      root_slot_count(o.root_slot_count),
+      typed(o.typed),
+      global_func_names(std::move(o.global_func_names)),
+      global_slot_reassigned(std::move(o.global_slot_reassigned)),
+      funcs(std::move(o.funcs)),
+      structs(std::move(o.structs))
+{
+    jit_norec_rebind(root);
+}
+
+VmProgram &VmProgram::operator=(VmProgram &&o) noexcept
+{
+    if (this != &o) {
+        root = std::move(o.root);
+        root_slot_count = o.root_slot_count;
+        typed = o.typed;
+        global_func_names = std::move(o.global_func_names);
+        global_slot_reassigned = std::move(o.global_slot_reassigned);
+        funcs = std::move(o.funcs);
+        structs = std::move(o.structs);
+        jit_norec_rebind(root);
+    }
+    return *this;
 }
 
 void
@@ -1264,7 +3225,7 @@ vm_ast_teardown(std::unique_ptr<Construct> &root, VmProgram &prog)
  * Block::do_eval with no offsetting win.
  */
 const Chunk *
-vm_func_chunk(const FuncDescriptor *fdesc)
+vm_func_chunk(const FuncDescriptor *fdesc, bool jit)
 {
     /*
      * A chunk may be compiled ONLY while executing the final AST. If we are
@@ -1289,9 +3250,12 @@ vm_func_chunk(const FuncDescriptor *fdesc)
      * the precompile walk didn't reach (there should be none). */
     Chunk ck;
     ML_CHECK_MSG(fdesc->decl, "vm_func_chunk on a descriptor with no decl");
-    if (!codegen_func_body(fdesc->decl, ck))
+    if (!codegen_func_body(fdesc->decl, ck, jit))
         return nullptr;
-    return &g_func_chunks.emplace(fdesc, std::move(ck)).first->second;
+    Chunk &placed = g_func_chunks.emplace(fdesc,
+                                          std::move(ck)).first->second;
+    jit_norec_rebind(placed);   /* the lazy net jitted a STACK local */
+    return &placed;
 }
 
 /*
@@ -1306,42 +3270,124 @@ vm_func_chunk(const FuncDescriptor *fdesc)
  * (g_vm_executing true, the AST final), so vm_func_chunk's guard is satisfied.
  */
 static void
-vm_precompile_all(const Block *root)
+vm_precompile_all(const Block *root, bool jit, Chunk *main_chunk)
 {
     std::vector<const FuncDeclStmt *> funcs;
     for (const auto &e : root->elems)
         collect_funcs(e.get(), funcs);
 
+    /* #55 STEP 2 - Pass A: CODEGEN every body (jit deferred), so every
+     * `native_leaf` flag is set (codegen_chunk sets it from the ops) BEFORE any
+     * jit. A caller's native-call gate needs EVERY callee's flag, and a caller
+     * may be declared before its callee, so all flags must exist first. */
     for (const FuncDeclStmt *fn : funcs) {
         /* compiles + caches (or null); stamped on the DESCRIPTOR */
-        fn->desc->vm_chunk = vm_func_chunk(fn->desc);
+        fn->desc->vm_chunk = vm_func_chunk(fn->desc, /*jit=*/false);
         fn->desc->vm_chunk_tried = true;
-        bool fast = true;
-        for (const auto &p : fn->desc->params)
-            if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
-                fast = false;
-        fn->desc->fast_bind = fast;
+        compute_bind_flags(fn->desc);
     }
+
+    /* #55 STEP 2.1: the global slot -> callee FuncDescriptor* map, so a
+     * caller's native-call gate can resolve + bake a callee. Only a function
+     * bound to a global slot is a native-call target; every other slot stays
+     * null (not native-callable). Sized like the global table. */
+    std::vector<const FuncDescriptor *> slot_desc(
+        root->global_func_names.size(), nullptr);
+    for (const FuncDeclStmt *fn : funcs)
+        if (fn->id && fn->id->sym.kind == SymKind::global) {
+            const int slot = fn->id->sym.slot;
+            if (slot >= 0 && static_cast<size_t>(slot) < slot_desc.size())
+                slot_desc[slot] = fn->desc;
+        }
+
+    ML_INT_ONLY(for (auto &kv : g_func_chunks)
+                    int_stamp_param_kinds(kv.second, kv.first);)
+
+    /* THE BYTECODE INLINER's corpus audit (env MYLANG_INLAUDIT=1): with
+     * every chunk codegen'd and the slot->descriptor map built, report what
+     * a splice would reach. See plans/bytecode-inliner.md - the measured
+     * reach is what decides the gate, and the DELAUDIT precedent is to put
+     * the audit surface in before the transform. Dev-only. */
+    for (auto &kv : g_func_chunks)
+        bc_inline_audit(kv.second,
+                        kv.first->name ? kv.first->name->val.c_str() : "?",
+                        slot_desc);
+
+    /* #107 P6: a test's chunk hook edits codegen's output here, before
+     * the splice snapshots any callee (inttest.h) */
+    ML_INT_ONLY(for (auto &kv : g_func_chunks)
+                    int_stage(IntStage::pre_splice,
+                              kv.first->name ? kv.first->name->val
+                                             : std::string("<lambda>"),
+                              kv.second);
+                if (main_chunk)
+                    int_stage(IntStage::pre_splice, "main", *main_chunk);)
+
+    /* THE SPLICE, before any jit: it produces bytecode, so the JIT (and a
+     * `.myv` writer, which stores this same pre-jit code) sees the inlined
+     * form. One pass, one level - the snapshot rule keeps a self-recursive
+     * body from compounding. */
+    BcInlineSnapshots bc_snaps;
+    for (const auto &kv : g_func_chunks)
+        bc_inline_snapshot(kv.second, bc_snaps);
+    const std::vector<const FuncDescriptor *> bc_slots =
+        bc_inline_slot_map(slot_desc, root->global_slot_reassigned);
+    for (auto &kv : g_func_chunks) {
+        ML_INT_ONLY(g_bc_int_caller = bc_int_key_fn(kv.first, kv.second);)
+        bc_inline_chunk(kv.second, bc_slots, bc_snaps);
+    }
+    /* #97 closure inlining: MAIN too, where every hot value call of the
+     * call cluster lives - VALUE sites only, so main's CallV sites keep
+     * the bytecode they always had (admitting those is its own step).
+     * Unconditional: a `.myv` writer (jit=false) stores this form. */
+    ML_INT_ONLY(g_bc_int_caller = "main";)
+    if (main_chunk)
+        bc_inline_chunk(*main_chunk, bc_slots, bc_snaps,
+                        /*value_only=*/true);
+
+    ML_INT_ONLY(for (auto &kv : g_func_chunks)
+                    int_stage(IntStage::post_splice,
+                              kv.first->name ? kv.first->name->val
+                                             : std::string("<lambda>"),
+                              kv.second);
+                if (main_chunk)
+                    int_stage(IntStage::post_splice, "main", *main_chunk);)
+
+    /* Pass B: the native tier, through the ONE driver (vm.h) - the
+     * frameless pre-pass over main, every body with its own JitCtx, then
+     * main last with the same map. */
+    if (!jit)
+        return;                 /* the .myv writer stores PRE-jit bytecode */
+    std::vector<std::pair<Chunk *, const FuncDescriptor *>> bodies;
+    for (auto &kv : g_func_chunks)
+        bodies.push_back({ &kv.second, kv.first });
+    vm_jit_program(main_chunk, bodies, slot_desc,
+                   root->global_slot_reassigned);
 }
 
 /* The in-flight exception's type NAME for catch-matching (a user struct
  * exception's type name, else the built-in name). Mirrors do_catch's ex_name. */
 static std::string_view vm_exc_name(const RuntimeException *ex)
 {
-    if (auto *eo = dynamic_cast<const ExceptionObject *>(ex))
-        return eo->get_name();
-    return ex->name;
+    return ex->match_name();     /* virtual, no RTTI (see errors.h, #74) */
 }
 
 /* The value `catch (T as e)` binds: a thrown struct's instance (so `e.field`
  * works), else a fresh ExceptionObject. Mirrors do_catch's bind_val. */
 static EvalValue vm_catch_bind_val(RuntimeException *ex)
 {
-    auto *eo = dynamic_cast<ExceptionObject *>(ex);
+    auto *eo = ex->is_exception_object()
+        ? static_cast<ExceptionObject *>(ex) : nullptr;
     if (eo && eo->get_data().is<intrusive_ptr<StructObject>>())
         return eo->get_data();
-    return EvalValue(make_intrusive<ExceptionObject>(
-        eo ? *eo : ExceptionObject(ex->name)));
+    /* a FRESH object, the caught exception's value: no caret, frames or
+     * chain of its raise (do_catch's twin says why); the serial says it
+     * IS the caught exception */
+    auto xo = make_intrusive<ExceptionObject>(
+        eo ? std::string(eo->get_name()) : std::string(ex->name),
+        eo ? eo->get_data() : EvalValue());
+    xo->serial = ex->serial;
+    return EvalValue(std::move(xo));
 }
 
 /* P8 Inc 1: build (WITHOUT C++-throwing) the RuntimeException a native `Throw`
@@ -1354,26 +3400,306 @@ vm_make_thrown_exc(const EvalValue &v, Loc estart, Loc eend)
     if (v.is<intrusive_ptr<StructObject>>())
         return std::unique_ptr<RuntimeException>(new ExceptionObject(
             std::string(v.get<intrusive_ptr<StructObject>>()->def->name->val),
-            v));
+            v, v.get<intrusive_ptr<StructObject>>()->def->name));
     if (v.is<intrusive_ptr<ExceptionObject>>())
         return std::unique_ptr<RuntimeException>(
             v.get<intrusive_ptr<ExceptionObject>>()->clone());
     throw TypeErrorEx("Can only throw a struct instance", estart, eend);
 }
 
-/* P8: pop the innermost handler OF THE CURRENT FRAME (entries below the
- * record's watermark belong to outer frames - those are reached by the
- * boundary catch's frame walk, never here) and set `pc` to its
- * catch-dispatch; false (pc unchanged) if this frame has none. */
-static bool vm_dispatch_exc(VmActivation &act, const VmCallRec &cur,
-                            size_t &pc)
+/*
+ * #78 step A: the CLAUSE MATCHER - does this clause (a catch_types index, or
+ * -1 = the parenless catch-all) match the in-flight exception? ONE shared
+ * implementation for the interpreted CatchTest and (step C) the handler-table
+ * dispatch, so the two can never drift. A name compares by its interned
+ * pointer (#74 inc 3: catch_keys' uid is derived from catch_types by the
+ * same canonical interning, so pointer equality == string equality); a
+ * subclass without match_uid takes the string fallback.
+ */
+static ML_ALWAYS_INLINE bool vm_catch_match(const Chunk &chunk,
+                                           int_type types_idx,
+                                           const RuntimeException *exc)
+{
+    /* An UNCATCHABLE runtime exception travels the conveyance (so it gets
+     * frames + a caret instead of a std::terminate) but a script may NEVER
+     * handle it - not even with the parenless catch-all. Checked FIRST, so
+     * the catch-all below cannot swallow it. */
+    if (!exc->is_catchable())
+        return false;
+
+    if (types_idx < 0)
+        return true;                              /* catch-all */
+
+    /* question 25: a struct by identity; a built-in exception's name
+     * matches no struct, boxed or not; an unresolved name (an open world)
+     * by name */
+    bool x_struct = false;
+    const StructTypeDef *xd = exc_struct_def(exc, x_struct);
+    const UniqueId *eu = exc->match_uid();
+    const auto &keys = chunk.catch_keys[types_idx];
+    for (size_t k = 0; k < keys.size(); k++) {
+        const Chunk::CatchKey &key = keys[k];
+        if (key.def) {
+            if (key.def == xd)
+                return true;
+            continue;
+        }
+        if (key.builtin && x_struct)
+            continue;
+        if (eu ? key.uid == eu
+               : chunk.catch_types[types_idx][k] == vm_exc_name(exc))
+            return true;
+    }
+    return false;
+}
+
+/*
+ * #78 step C: THE CATCH DISPATCH. Pop the innermost handler OF THE CURRENT
+ * FRAME (entries below the record's watermark belong to outer frames - those
+ * are reached by the frame walk, never here), MATCH the in-flight exception
+ * against that try region's clauses from the HANDLER TABLE, bind
+ * `catch (T as e)`, and set `pc` to the catch BODY - ordinary, entry-mapped
+ * code. False (pc and `ex` untouched) when this frame handles nothing.
+ *
+ * This is the redesign's point. The matcher used to be INTERPRETED ops: the
+ * dispatch jumped to a CatchTest chain, each op decoding operands, re-reading
+ * the region slot and re-dispatching, with a Reraise at the end whose whole
+ * job was to re-enter this function for the next handler out. All of that is
+ * now one C++ loop, and - once step D stops emitting those ops - the chain's
+ * un-deletable "matcher pc" disappears with them, which is what frees a
+ * try/catch run to delete its interpreted originals.
+ *
+ * Three exits per handler (a CHAIN MARKER region, question 12, first
+ * hands its handled exception to the in-flight one as its context):
+ *   - a clause MATCHES: bind + jump to its body. The exception is PARKED in
+ *     the region's slot, for a `rethrow` and for the chain.
+ *   - NO clause matches but the try has a FINALLY: park + pend=reraise and
+ *     jump to it; its EndFinally re-raises (that is what the SetPend+Jump
+ *     tail of the old chain did).
+ *   - NO clause, NO finally: fall to the NEXT handler out in this frame -
+ *     the loop below, which is exactly what the old Reraise round trip
+ *     achieved, minus the round trip.
+ */
+#ifdef TESTS
+extern unsigned long g_vm_table_dispatch;
+#endif
+
+/*
+ * #78 step C: dispatch a raised exception against THIS frame's live handler
+ * stack using the HANDLER TABLE (Chunk::handler_sites) - the region each
+ * PushHandler recorded names its clause list directly, so a catch is a
+ * TABLE LOOKUP instead of a jump to an interpreted CatchTest chain.
+ *
+ * Returns true (and sets `pc` to the resume point - a catch body, or a
+ * finally that will re-raise) iff this frame handles it; false when the
+ * frame's handlers are exhausted and the walk must pop to the caller.
+ *
+ * SHAPE (measured; see the inline wrapper below): the LOOP is one
+ * out-of-line function. Inlining the whole thing at the call sites cost
+ * +3.6M Ir on 42_exceptions (it grows vm_dispatch's text - the loop-body
+ * text rule), and splitting a cold tail out of it +2.7M (a second call and
+ * its argument marshalling, for a frame it barely shrinks).
+ */
+/*
+ * Question 12: `ex` is leaving the body of a CHAIN MARKER region (see
+ * Chunk::HandlerSite::chain) - remember the exception that body handled,
+ * then free it: the body that handled it is over (a catch body), or the
+ * new exception supersedes it (a finally), exactly when the tree-walker
+ * frees its copy. Out of line: only a marker pays for it.
+ */
+static ML_NOINLINE void vm_note_context(VmActivation &act,
+                                        const VmCallRec &cur,
+                                        const Chunk::HandlerSite &site,
+                                        RuntimeException &ex)
+{
+    VmPendState &ps = act.pend_at(cur, site.chain);
+    if (ps.exc) {
+        exc_note_context(ex, *ps.exc);
+        ps.exc.reset();
+    }
+}
+
+static ML_ALWAYS_INLINE bool vm_dispatch_exc_body(
+        VmActivation &act, const VmCallRec &cur, EvalContext &ctx,
+        size_t &pc, std::unique_ptr<RuntimeException> &ex)
+{
+    const Chunk *ck = cur.run_chunk;
+
+    /* PRECONDITION: the inline wrapper below already proved this frame has
+     * at least one live handler - hence do/while, not while: repeating that
+     * test here measured +6 Ir per throw on the same-frame benches. */
+    ML_VM_CHECK(act.handlers.size() > cur.handler_base);
+    do {
+
+        const VmHandler h = act.handlers.back();
+        act.handlers.pop_back();
+
+        ML_VM_CHECK(ck && h.region < ck->handler_sites.size());
+        const Chunk::HandlerSite &site = ck->handler_sites[h.region];
+
+        if (site.chain >= 0)
+            vm_note_context(act, cur, site, *ex);
+
+        for (const Chunk::HandlerClause &cl : site.clauses) {
+
+            if (!vm_catch_match(*ck, cl.types_idx, ex.get()))
+                continue;
+
+            if (cl.bind_slot >= 0)
+                ctx.frame->at(cl.bind_slot).put(vm_catch_bind_val(ex.get()));
+
+            /*
+             * Park the exception for as long as its catch body runs: a
+             * `rethrow` there raises a copy of it, and an exception
+             * leaving the body remembers it (question 12 - the body's
+             * guard region chains here). The body's exits free it (a
+             * flagged SetPend), and so does an exception leaving it
+             * (vm_note_context) - when the tree-walker frees its copy.
+             */
+            act.pend_at(cur, static_cast<int_type>(h.region)).exc =
+                std::move(ex);
+
+#ifdef TESTS
+            g_vm_table_dispatch++;
+#endif
+            pc = static_cast<size_t>(cl.body_pc);
+            return true;
+        }
+
+        if (site.fin_pc >= 0) {
+            /*
+             * No clause matched, but this try has a finally: run it, then
+             * re-raise (EndFinally reads both fields back).
+             */
+            VmPendState &ps = act.pend_at(cur, static_cast<int_type>(h.region));
+            ps.pend = Pend::reraise;
+            ps.exc = std::move(ex);
+#ifdef TESTS
+            g_vm_table_dispatch++;
+#endif
+            pc = static_cast<size_t>(site.fin_pc);
+            return true;
+        }
+        /* neither: keep walking OUT to the next enclosing handler */
+    } while (act.handlers.size() > cur.handler_base);
+
+    return false;
+}
+
+/*
+ * The OUT-OF-LINE form, for the boxed-throw sites INSIDE vm_dispatch. Those
+ * must not inline the body: growing the dispatch loop's text measured +3.6M
+ * Ir on 42_exceptions (the loop-body text rule). vm_raise takes the inlined
+ * form instead - see vm_dispatch_exc_hot.
+ */
+static ML_NOINLINE bool vm_dispatch_exc_frame(
+        VmActivation &act, const VmCallRec &cur, EvalContext &ctx,
+        size_t &pc, std::unique_ptr<RuntimeException> &ex)
+{
+    return vm_dispatch_exc_body(act, cur, ctx, pc, ex);
+}
+
+/*
+ * THE FAST REJECT, inline at every call site: "does this frame have a live
+ * try at all?" - two loads and a compare.
+ *
+ * It is load-bearing for the FRAME WALK, which calls this once per POPPED
+ * frame, and the overwhelming majority of those frames have no handler. The
+ * pre-#78 dispatch was small enough to inline whole, so the reject was free;
+ * the table version is not, and paying a full call frame per walked frame
+ * cost 162 Ir per frame - measured as +6.4% on 69_exc_crossframe (a throw 16
+ * frames deep) before this wrapper went back in.
+ */
+static ML_ALWAYS_INLINE bool vm_dispatch_exc(
+        VmActivation &act, const VmCallRec &cur, EvalContext &ctx,
+        size_t &pc, std::unique_ptr<RuntimeException> &ex)
+{
+    if (act.handlers.size() <= cur.handler_base)
+        return false;                 /* no try here - no call, no frame */
+    return vm_dispatch_exc_frame(act, cur, ctx, pc, ex);
+}
+
+/*
+ * The HOT form, used ONLY by vm_raise - the same body, INLINED.
+ *
+ * Measured: the out-of-line call cost 28 Ir per throw in prologue+epilogue
+ * alone (17 in `{`, 11 in `}` on 70_exc_runtime_error), against a body whose
+ * real work is ~15 - the frame was nearly twice the function. vm_raise is
+ * reached from the throw HELPERS, not from the dispatch loop, so inlining
+ * here grows a cold-ish function rather than the loop text; the
+ * vm_dispatch-internal sites keep the out-of-line form above. One shared
+ * body either way, so the two cannot drift.
+ */
+static ML_ALWAYS_INLINE bool vm_dispatch_exc_hot(
+        VmActivation &act, const VmCallRec &cur, EvalContext &ctx,
+        size_t &pc, std::unique_ptr<RuntimeException> &ex)
 {
     if (act.handlers.size() <= cur.handler_base)
         return false;
-    pc = act.handlers.back().catch_pc;
-    act.handlers.pop_back();
-    return true;
+    return vm_dispatch_exc_body(act, cur, ctx, pc, ex);
 }
+
+/* G1 no-record tier - the step-2 counters, the walk stash, and the
+ * shared mismatch abort. Defined HERE (above the capture path that uses
+ * them); the push-side verification further down uses them too. */
+unsigned long g_jit_norec_frame_verify = 0;
+unsigned long g_jit_norec_stamp_verify = 0;
+unsigned long g_jit_norec_walk_frames = 0;
+unsigned long g_jit_norec_desc_chain = 0;
+unsigned long g_jit_norec_win_chain = 0;
+unsigned long g_jit_norec_gate_ok = 0;
+unsigned long g_jit_norec_gate_cached = 0;
+unsigned long g_jit_norec_gate_plain = 0;
+unsigned long g_jit_norec_gate_body = 0;
+unsigned long g_jit_norec_raise_walk = 0;
+unsigned long g_jit_norec_raise_frames = 0;
+unsigned long g_jit_norec_ret_arm = 0;
+unsigned long g_jit_norec_retarm_verify = 0;
+unsigned long g_jit_norec_mat_walk = 0;
+unsigned long g_jit_norec_mat_frames = 0;
+unsigned long g_jit_norec_mat_residue = 0;
+unsigned long g_jit_norec_pushes = 0;
+unsigned long g_jit_norec_mat_insert = 0;
+/* G1 step 4-iv (design 4d): the MATERIALIZER ANCHOR relay - see jit.h.
+ * Written by the emitted slow tail just before each jit_call_sync*
+ * helper call; read (and consumed) by the depth-cap SWITCH. Defined
+ * unconditionally so the non-JIT platforms link without stubs. */
+const void *g_norec_switch_site = nullptr;
+const void *g_norec_switch_rbp = nullptr;
+/* 4-v: the EXIT RELAY (see jit.h) - the fragment epilogue's last store. */
+const void *g_norec_exit_desc = nullptr;
+/* 4-iii: the residue-captures relay (see jit.h; was jit.cpp-static). */
+const void *&g_jit_residue_caps = *ml_lowmem_new<const void *>(nullptr);
+#ifdef TESTS
+std::vector<NorecReconFrame> g_norec_recon;
+#endif
+#ifdef TESTS
+/* the shared chain walk (defined beside jit_norec_push_verify below);
+ * vm_raise runs it from the raise site since step 4-ii */
+static size_t norec_walk_chain(VmActivation *act, const char *fp,
+                               size_t idx, const void *ns);
+/* step 4-iv: the -3/SWITCH materializer's shadow (defined there too);
+ * jit_call_sync_switch runs it at every depth-cap switch */
+static void norec_materialize_shadow(VmActivation &act, EvalContext &ctx,
+                                     int_type resume_pc, int_type dst,
+                                     int_type site_packed,
+                                     const char *entry_rbp);
+#endif
+#ifdef TESTS
+[[noreturn]] static void norec_fail(const char *what, const void *a,
+                                    const void *b)
+{
+    fprintf(stderr, "NOREC SHADOW MISMATCH: %s (%p vs %p)\n", what, a, b);
+    abort();
+}
+
+/* G1 step 2: the sync record the unwind walk just popped, so the NEXT
+ * postexit's baked site stamp can be compared against the TABLE's loc
+ * for that same frame. Reset at each walk start; only the walk's
+ * sync_stop pop sets it; only the first pending tail after it compares
+ * (upper -2 conveyance levels see null and skip). */
+static const NorecSite *g_norec_stash = nullptr;
+#endif
 
 /*
  * Append the frame a WALK is popping to the exception's backtrace - the
@@ -1387,14 +3713,3809 @@ static void vm_capture_rec_frame(RuntimeException &e, const VmCallRec &rec)
         if (auto *undefEx = dynamic_cast<UndefinedVariableEx *>(&e))
             undefEx->in_pure_func = true;
 
-    /* profile #3: the LAZY frame - no strings at capture time */
+    /* profile #3: the LAZY frame - no strings at capture time. #56: a
+     * SWITCH-pushed record carries its BAKED call-site (a deleted run's
+     * loc table collapsed, so loc_at(ret_pc - 1) would be wrong); gated
+     * on !sync_stop so a reused record filled by the emitted M5b push
+     * (which doesn't know the field) can never leak a stale value. */
     Loc cs, end_ignored;
-    rec.ret_chunk->loc_at(rec.ret_pc - 1, cs, end_ignored);
-    e.backtrace.emplace_back(rec.desc, cs);
+    if (rec.call_site_packed && !rec.sync_stop)
+        cs = Loc(packed_hi(rec.call_site_packed),
+                 packed_lo(rec.call_site_packed));
+    else
+        rec.ret_chunk->loc_at(rec.ret_pc - 1, cs, end_ignored);
+#ifdef TESTS
+    /* G1 STEP 2 - backtraces from the TABLE, verified while the record
+     * still exists. For an M5b-pushed frame the record path captures
+     * LOC-LESS (the sentinel has no locs; the postexit stamp supplies the
+     * site later) - the table already HAS both halves of the frame:
+     *   desc: the descriptor whose vm_chunk is the chunk the return
+     *         address (in the child) lands in - checked here as
+     *         desc->vm_chunk == run_chunk plus the range lookup;
+     *   loc:  ns->site_loc, compared against the actual STAMP by the
+     *         postexit (via g_norec_stash below).
+     * Each claim the record-less renderer will rely on is asserted at
+     * the moment the record-based renderer runs. */
+    if (rec.norec_site) {
+        const auto *ns = static_cast<const NorecSite *>(rec.norec_site);
+        if (!rec.sync_stop) {
+            /* 4-iv (task #148): a RETARGETED record - its sentinel resume
+             * was rewritten to the real one at a switch, and its capture
+             * must have come from the site's baked loc (the packed-loc
+             * branch above), not the collapsed loc table. */
+            if (rec.call_site_packed
+                    != static_cast<int_type>(ns->site_loc))
+                norec_fail("a retargeted frame's packed loc != its site",
+                           ns, nullptr);
+            if (static_cast<uint64_t>(
+                        (static_cast<int_type>(cs.line) << 32)
+                        | static_cast<uint32_t>(cs.col))
+                    != ns->site_loc)
+                norec_fail("a retargeted frame captured off-site", ns,
+                           nullptr);
+            e.push_frame(rec.desc, cs);
+            return;
+        }
+        if (cs.line != 0 || cs.col != 0)
+            norec_fail("an M5b frame captured WITH a loc", ns, nullptr);
+        if (!ns->site_loc)
+            norec_fail("a site with no baked loc", ns, nullptr);
+        if (rec.desc
+                && static_cast<const Chunk *>(rec.desc->vm_chunk)
+                       != rec.run_chunk)
+            norec_fail("desc->vm_chunk != run_chunk", rec.desc,
+                       rec.run_chunk);
+        if (rec.run_chunk && rec.run_chunk->native.base
+                && jit_norec_frag_for(rec.run_chunk->native.base)
+                       != rec.run_chunk)
+            norec_fail("frame range lookup at capture",
+                       rec.run_chunk->native.base, rec.run_chunk);
+        g_norec_stash = ns;
+        g_jit_norec_frame_verify++;
+    }
+#endif
+    e.push_frame(rec.desc, cs);
 }
 
 /* Inc v2: the in-flight cross-frame exception signal (see vm.h). */
 std::unique_ptr<RuntimeException> g_vm_exc_pending;
+
+/* Approach A: a native fragment sets this (a JitRaiseKind) instead of
+ * re-interpreting an op that hit a proven exception; EnterNative raises. */
+int g_vm_jit_raise = 0;
+
+/* #55 native calls: jit_frame_leave (the return-side leave core, shared by the
+ * interpreter's ReturnV and - later - the native ReturnV) stashes the PARENT's
+ * resume point here (a machine-code caller can't take C++ refs to the loop's
+ * chunk/pc locals). The interpreter's vm_leave_call reads them into its refs;
+ * EnterNative will read them when a native ReturnV rets the resume SENTINEL. */
+static const Chunk *g_vm_resume_chunk = nullptr;
+static size_t g_vm_resume_pc = 0;
+
+/* model-flip M2 (plans/archived/model-flip.md): the ISLAND fall-through resume pc. An
+ * ExitBlock sets it (the container's next-block pc) and returns from
+ * vm_dispatch; vm_exec_block reads it to distinguish a fall-through exit
+ * (g_vm_block_resume != NONE) from a ReturnV/Halt (flow) or a raise. NONE
+ * (SIZE_MAX) between islands - cleared by vm_exec_block before each run. */
+static const size_t VM_BLOCK_NONE = static_cast<size_t>(-1);
+static size_t g_vm_block_resume = VM_BLOCK_NONE;
+
+/* model-flip M3: jit_exec_block returns this (high bit set, so a container
+ * fragment's `test rax; jns` distinguishes it from a small fall-through resume
+ * pc) when an island RAISED - the pending exception is bridged into
+ * g_vm_jit_exc and the fragment exits so EnterNative re-raises. */
+static const size_t JIT_BLOCK_RAISED = static_cast<size_t>(-3);
+
+/* #55 native calls: the EvalContext of the CURRENTLY EXECUTING vm_run_chunk
+ * (set + restored at each entry - a builtin callback re-enters with the invoke
+ * ctx), so the native ReturnV helper (jit_ret) reaches the right frame / flow /
+ * captures; the fragment holds no ctx handle. The matching activation is the
+ * existing g_vm_act. */
+/* in the LOW ARENA: the emitter reads it with an absolute disp32 (one
+ * instruction, no scratch). A reference, so every C++ use is unchanged.
+ * ⛔ This one is a TRADE, not a free win - C++ reads it in every helper
+ * and now pays an extra load - so it is MEASURED, not assumed. */
+static EvalContext *&g_current_ctx = *ml_lowmem_new<EvalContext *>(nullptr);
+
+/* #55: jit_ret's return values - a resume PC no real chunk pc can equal (a
+ * remapped pc is always small). IN-VM: EnterNative switches to the parent
+ * (g_vm_resume_chunk/pc). BOUNDARY: EnterNative stops the invocation. */
+static const size_t JIT_RET_SENTINEL = static_cast<size_t>(-1);
+static const size_t JIT_RET_BOUNDARY = static_cast<size_t>(-2);
+/* #56 calls step 3: "the call was PUSHED interpreted-flat - switch to
+ * g_vm_resume_chunk/pc (the callee, pc 0) and drive it in THIS dispatch
+ * loop". Returned by a sync slow helper past the depth cap (status 3 ->
+ * the emitted site translates + propagates); the pushed record's ret_pc
+ * is the call's POST-CALL ENTRY-STUB pc, so the eventual pop resumes the
+ * caller fragment natively. Zero new C frames at an EnterNative consumer. */
+static const size_t JIT_RET_SWITCH = static_cast<size_t>(-3);
+
+/* #55: native ReturnVs executed process-wide (a coverage counter - see jit.h). */
+unsigned long g_jit_native_returns = 0;
+
+/* Approach A (container-store helper ops): a noexcept JIT helper that CAUGHT
+ * an arbitrary RuntimeException stashes a CLONE here (loc intact) and returns
+ * non-0; EnterNative raises it. Complements g_vm_jit_raise (a KIND a fragment
+ * can signal by itself) - this carries the exact object a C++ helper threw
+ * (OOB / div0 / NotLValue / CannotChangeConst / KeyNotFound / TypeError),
+ * whose type + message + caret can't be reconstructed from a kind. */
+static std::unique_ptr<RuntimeException> g_vm_jit_exc;
+
+/* M5: a PLAIN (non-Runtime) exception crossing a fragment - e.g. a callee's
+ * UndefinedVariableEx surfacing from a native sync call. It has no clone()
+ * (only RuntimeException does), so it rides a std::exception_ptr; EnterNative
+ * rethrows it, after which it propagates out of vm_dispatch exactly like the
+ * interpreted in-VM call's own throw (non-catchable, top-level render). */
+static std::exception_ptr g_vm_jit_eptr;
+
+/* The approach-A container-store JIT helpers (declared in jit.h). A native
+ * a[i]=v fragment marshals the base LValue*, index and value and CALLS one of
+ * these instead of splitting the run at the store - keeping the surrounding
+ * matrix/sieve loop native. They run vm_store_elem_*_body (the interpreter's
+ * EXACT store) with a NULL chunk, noexcept: a raise is thrown LOC-LESS,
+ * caught into g_vm_jit_exc, and reported by the return value; EnterNative
+ * re-stamps the caret from the LIVE chunk at the returned pc (a fragment
+ * can't hold a chunk pointer - the chunk is stack-built + moved out after
+ * jit_compile_chunk). aop is an int to keep the Op enum out of jit.h. */
+extern "C" int jit_store_elem_int(LValue *base, int_type idx, int_type rhs,
+                                  int aop) noexcept
+{
+#ifdef TESTS
+    g_jit_op_run[static_cast<size_t>(OpCode::StoreElemInt)]++;
+#endif
+    try {
+        vm_store_elem_int_body(*base, idx, rhs, static_cast<Op>(aop),
+                               nullptr, 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * #92 prep - the COW work as its OWN slow path, so the store can RESUME
+ * natively (maintainer's design, 2026-08-02). The inline tier used to
+ * DECLINE to the full helper whenever a live slice existed - every store,
+ * forever, 85 Ir each - although the interpreter itself pays the clone
+ * exactly ONCE and then stores raw. Prep is that clone alone: the emitted
+ * guards detect slice/has_slices, call here, and jump BACK to re-run the
+ * fast path, which now passes.
+ *
+ * SEMANTICS ARE THE INTERPRETER'S, BIT FOR BIT, and each rule is
+ * load-bearing:
+ *   - called only AFTER the const + readonly guards passed: the
+ *     interpreter throws on those WITHOUT cloning, and a clone changes
+ *     observable identity (`intptr`, which the COW tests pin as spec);
+ *   - a negative or out-of-range index returns 1 UNCLONED: the
+ *     interpreter bounds-checks BEFORE it clones, so a store that only
+ *     throws OOB must not detach anything - the full helper then wraps /
+ *     raises with the exact caret;
+ *   - clones ONLY the slices overlapping the written index
+ *     (clone_aliased_slices(offset+idx)), never all of them: detaching a
+ *     non-overlapping slice early is observable via `intptr`;
+ *   - the return value re-checks jit_cow_clean(), so the native retry
+ *     loop CANNOT spin: prep either normalized the array or the store
+ *     goes to the full helper. A non-overlapping slice therefore keeps
+ *     THAT store on the slow path - exactly the interpreter's per-store
+ *     behaviour - and the fast path resumes once the loop reaches the
+ *     slice's range and detaches it.
+ */
+extern "C" int jit_store_elem_prep(LValue *base, int_type idx) noexcept
+{
+    if (!base->is<SharedArrayObj>())
+        return 1;
+    SharedArrayObj &arr = base->getval<SharedArrayObj>();
+    if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+        return 1;
+    try {
+        if (arr.is_slice())
+            arr.materialize_slice();
+        else
+            arr.clone_aliased_slices(
+                arr.offset() + static_cast<size_type>(idx));
+    } catch (...) {
+        return 1;
+    }
+#ifdef TESTS
+    g_jit_store_prep++;
+#endif
+    return arr.jit_cow_clean() ? 0 : 1;
+}
+
+extern "C" int jit_store_elem_float(LValue *base, int_type idx, double rhs,
+                                    int aop) noexcept
+{
+#ifdef TESTS
+    g_jit_op_run[static_cast<size_t>(OpCode::StoreElemFloat)]++;
+#endif
+    try {
+        vm_store_elem_float_body(*base, idx, rhs, static_cast<Op>(aop),
+                                 nullptr, 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* Approach A - the DICT-STORE JIT helper (d[k] = v / d[k] OP= v): the native
+ * fragment passes the base dict LValue* and the key/value slot EvalValue*s
+ * (the frame slots hold the BOXED values, so no marshaling - the fragment
+ * just leas their addresses; EvalValue is the first LValue member) plus the
+ * Expr14 op. Runs the SAME vm_subscript_store the interpreter's DictStore
+ * handler calls (auto-vivify / COW / key-freeze / any base type), so a dict
+ * loop no longer splits the run at the store. LOC-LESS throw -> g_vm_jit_exc
+ * -> EnterNative stamps the caret (see jit_store_elem_int). `op` is the Expr14
+ * op (Op) as an int. Measured ~6.5% wall / 12% fewer instructions on the
+ * dict-insert loop (23_dict_insert) - dispatch IS a real chunk of the dict
+ * tier; the bigger headroom is still the boxed-value/alloc model (N7). */
+extern "C" int jit_dict_store(LValue *base, const EvalValue *key,
+                              const EvalValue *val, int op) noexcept
+{
+    try {
+        vm_subscript_store(base, *key, *val, store_word_op(op),
+                           Loc(), Loc(), store_word_checked(op));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): the native StoreElemValue - the UNIVERSAL subscript
+ * store `a[i] = v` / `a[i] OP= v` for ANY base (flat / general / dict), the
+ * interpreter's exact vm_subscript_store (bounds + COW + slot_rmw, type-
+ * dispatched). Unlike jit_dict_store (a frame-slot base lea'd in the emit), the
+ * base may be a GLOBAL or CAPTURE container, so the emit passes `kind` (0 local
+ * / 1 global / 2 capture) + the base SLOT and the helper forms the LValue* (like
+ * vm_store_base). `idx`/`val` are frame slots (the computed index + value);
+ * `aop` is the Expr14 op (assign / addeq / ...). TWO throw sources: (1) an
+ * UNDEFINED GLOBAL base (kind==1, use-before-def) - BAILS (return 1 with NO
+ * g_vm_jit_exc set, so EnterNative resumes the INTERPRETER, which re-runs
+ * StoreElemValue + throws UndefinedVariableEx, a plain Exception; the N4 pattern,
+ * like LoadGlobalV); (2) vm_subscript_store's OOB/KeyNotFound/TypeError/NotLValue
+ * (all RuntimeException) -> caught loc-less into g_vm_jit_exc + return 1, so
+ * EnterNative re-raises (caret from the loc side table). Both exits are `return
+ * 1`; EnterNative distinguishes by whether g_vm_jit_exc is set. NOT
+ * op_fully_native (side-table caret / the bail keeps the original).
+ */
+extern "C" int jit_store_elem_value(int_type kind, int_type base_slot,
+                                    int_type idx_slot, int_type val_slot,
+                                    int_type aop) noexcept
+{
+    ML_JIT_OP_RAN(StoreElemValue);
+    EvalContext *ctx = g_current_ctx;
+    if (kind == 1 && !ctx->gfuncs->defined[base_slot])
+        return 1;                            /* bail (no exc): re-run -> throw */
+    LValue *alv = kind == 1 ? &ctx->gfuncs->slots[base_slot]
+                : kind == 2 ? &(*ctx->captures)[base_slot]
+                            : &ctx->frame->at(base_slot);
+    const EvalValue &idx = ctx->frame->at(idx_slot).get();
+    const EvalValue &val = ctx->frame->at(val_slot).get();
+    try {
+        vm_subscript_store(alv, idx, val, store_word_op(aop), Loc(), Loc(),
+                           store_word_checked(aop));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): the native StoreMemberV - a struct field store
+ * `s.f = v` / `s.f OP= v` (a dict member store uses DictStore), the
+ * interpreter's exact vm_member_store (POD byte / boxed-field store). Like
+ * jit_store_elem_value but the "key" is a MEMBER: the emit bakes
+ * `&chunk.member_keys[idx]` (the pool BUFFER addr, stable across the chunk move)
+ * and the helper reads memUid + the 4 carets from it. The base may be a
+ * GLOBAL/CAPTURE struct (`kind`). Throws: an UNDEFINED GLOBAL base BAILS (return
+ * 1, no exc -> interpreter re-runs + throws UndefinedVariableEx); vm_member_store
+ * throws only RuntimeExceptions (a non-struct base / a bad POD field type ->
+ * TypeErrorEx already carrying its caret; a readonly instance -> NotLValueEx
+ * (mstart); a compound `s.f += v` div/mod -> a LOC-LESS DivisionByZeroEx, stamped
+ * with the MEMBER caret here exactly as the interpreted StoreMemberV catch does)
+ * -> g_vm_jit_exc -> EnterNative re-raises. NOT op_fully_native.
+ */
+extern "C" int jit_store_member(int_type kind, int_type base_slot,
+                                int_type val_slot, int_type aop,
+                                const void *mkv) noexcept
+{
+    ML_JIT_OP_RAN(StoreMemberV);
+    const Chunk::MemberKey *mk = static_cast<const Chunk::MemberKey *>(mkv);
+    EvalContext *ctx = g_current_ctx;
+    if (kind == 1 && !ctx->gfuncs->defined[base_slot])
+        return 1;                            /* bail (no exc): re-run -> throw */
+    LValue *blv = kind == 1 ? &ctx->gfuncs->slots[base_slot]
+                : kind == 2 ? &(*ctx->captures)[base_slot]
+                            : &ctx->frame->at(base_slot);
+    const EvalValue &val = ctx->frame->at(val_slot).get();
+    try {
+        vm_member_store(blv, mk->memUid, static_cast<Op>(aop), val,
+                        mk->mstart, mk->mend, mk->bstart, mk->bend,
+                        mk->bake_def, mk->bake_slot);
+    } catch (RuntimeException &e) {
+        /* a compound's OPERATION error stays loc-less: the conveyance
+         * stamps the whole expression (op_locs, RULE 2) */
+        if (!e.loc_start && !e.op_caret) {
+            e.loc_start = mk->mstart;
+            e.loc_end = mk->mend;
+        }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): the native StoreElem2V - a 2-level nested store
+ * `a[i][j] = v` / `a[i][j] OP= v` (read a[i] as a ref, store [j] into it), the
+ * interpreter's exact vm_nested_subscript_store. The base `a` is a LOCAL frame
+ * slot (no kind); k1/k2/val are frame slots; `locs` = chunk.chain_locs[idx].data()
+ * (the per-step carets, baked - so an intermediate a[i] OOB and the final store
+ * carry their OWN subscript loc). vm_nested_subscript_store throws only
+ * RuntimeExceptions (OOB/KeyNotFound/TypeError/NotLValue), already carrying their
+ * per-step caret -> caught into g_vm_jit_exc + re-raised. NOT op_fully_native.
+ */
+extern "C" int jit_store_elem2(int_type base_slot, int_type k1_slot,
+                               int_type k2_slot, int_type val_slot,
+                               int_type aop, const void *locsv) noexcept
+{
+    ML_JIT_OP_RAN(StoreElem2V);
+    const std::pair<Loc, Loc> *locs =
+        static_cast<const std::pair<Loc, Loc> *>(locsv);
+    EvalContext *ctx = g_current_ctx;
+    LValue &alv = ctx->frame->at(base_slot);
+    const EvalValue &k1 = ctx->frame->at(k1_slot).get();
+    const EvalValue &k2 = ctx->frame->at(k2_slot).get();
+    const EvalValue &val = ctx->frame->at(val_slot).get();
+    try {
+        vm_nested_subscript_store(&alv, k1, k2, val, store_word_op(aop), locs,
+                                  store_word_checked(aop));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): the native StoreElemChainV - a GENERIC N-level
+ * nested store `a[k0][k1]...[kn] = v`, the interpreter's exact vm_chain_store_op
+ * (walk the `nkeys` key values from the run [kbase, +nkeys) + store). The base
+ * may be GLOBAL/CAPTURE (`kind`); `cl` = &chunk.chain_locs[idx] (baked - the
+ * helper reads cl->data()/size() = the per-step carets + nkeys). An undefined-
+ * global base BAILS; vm_chain_store_op throws only RuntimeExceptions (each
+ * carrying its per-step caret) -> g_vm_jit_exc -> re-raise. NOT op_fully_native.
+ */
+extern "C" int jit_store_elem_chain(int_type kind, int_type base_slot,
+                                    int_type kbase, int_type val_slot,
+                                    int_type aop, const void *clv) noexcept
+{
+    ML_JIT_OP_RAN(StoreElemChainV);
+    const std::vector<std::pair<Loc, Loc>> *cl =
+        static_cast<const std::vector<std::pair<Loc, Loc>> *>(clv);
+    EvalContext *ctx = g_current_ctx;
+    if (kind == 1 && !ctx->gfuncs->defined[base_slot])
+        return 1;                            /* bail (no exc): re-run -> throw */
+    LValue *base = kind == 1 ? &ctx->gfuncs->slots[base_slot]
+                 : kind == 2 ? &(*ctx->captures)[base_slot]
+                             : &ctx->frame->at(base_slot);
+    const EvalValue &val = ctx->frame->at(val_slot).get();
+    try {
+        vm_chain_store_op(*ctx, base, kbase, cl->data(), cl->size(), val,
+                          store_word_op(aop), store_word_checked(aop));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): the native StoreLValueChainV - a GENERAL nested
+ * lvalue-chain store `base.step1.step2... = v` mixing MEMBER + SUBSCRIPT steps,
+ * the interpreter's exact vm_chain_lvalue_store_op (walk the steps as lvalue
+ * refs, store the final). The base may be GLOBAL/CAPTURE (`kind`); `steps` =
+ * &chunk.chain_steps[idx] and `mkeys` = chunk.member_keys.data() are baked (the
+ * refactored vm_chain_lvalue_store_op takes both pool pointers, not the &chunk
+ * that would dangle). An undefined-global base BAILS; the chain walk throws only
+ * RuntimeExceptions (each step stamps its own caret; a still-loc-less throw is
+ * re-stamped by EnterNative from the loc side table, matching the interpreted
+ * outer catch) -> g_vm_jit_exc -> re-raise. NOT op_fully_native.
+ */
+extern "C" int jit_store_lvalue_chain(int_type kind, int_type base_slot,
+                                      int_type val_slot, int_type aop,
+                                      const void *stepsv,
+                                      const void *mkeysv) noexcept
+{
+    ML_JIT_OP_RAN(StoreLValueChainV);
+    const std::vector<Chunk::ChainStep> *steps =
+        static_cast<const std::vector<Chunk::ChainStep> *>(stepsv);
+    const Chunk::MemberKey *mkeys =
+        static_cast<const Chunk::MemberKey *>(mkeysv);
+    EvalContext *ctx = g_current_ctx;
+    if (kind == 1 && !ctx->gfuncs->defined[base_slot])
+        return 1;                            /* bail (no exc): re-run -> throw */
+    LValue *base = kind == 1 ? &ctx->gfuncs->slots[base_slot]
+                 : kind == 2 ? &(*ctx->captures)[base_slot]
+                             : &ctx->frame->at(base_slot);
+    const EvalValue &val = ctx->frame->at(val_slot).get();
+    try {
+        vm_chain_lvalue_store_op(*ctx, *steps, mkeys, base, val,
+                                 store_word_op(aop), store_word_checked(aop));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* model-flip (nativize-ops): PER-OP runtime coverage (see jit.h). Sized by
+ * the opcode count; g_jit_op_run[op] proves that op's native helper RAN. */
+unsigned long g_jit_op_run[static_cast<size_t>(OpCode::OpCount_)] = {0};
+
+/* model-flip (nativize-ops): the native MoveV body - the interpreter's exact
+ * `frame->at(dst).put(frame->at(src).get())` (an alias-copy, ref-aware; never
+ * throws). `slots` is the frame slot base (rdi). */
+extern "C" void jit_move(LValue *slots, int_type dst, int_type src) noexcept
+{
+    ML_JIT_OP_RAN(MoveV);
+    slots[dst].put(slots[src].get());
+}
+
+/* Reference ARGUMENTS bound by the emitted inline push (coverage - see
+ * jit_bind_ref_arg; the counter proves the native path served a call whose
+ * argument is an array/string/dict/struct, which used to decline entirely). */
+unsigned long g_jit_ref_arg_binds = 0;
+
+/*
+ * #94 execution proof, and the reason there are TWO counters: a single
+ * "borrow" total cannot tell "the tier ran" from "the tier was reachable but
+ * every value declined", which is the exact shape the project's vacuous-test
+ * trap takes. `g_arg_borrow` is bumped ONLY where the retain was skipped;
+ * `g_arg_borrow_slice` counts a parameter the analysis cleared whose value
+ * turned out to be a slice, so a decline is attributable rather than silent.
+ */
+unsigned long g_arg_borrow = 0;
+unsigned long g_arg_borrow_slice = 0;
+unsigned long g_arg_borrow_scalar = 0;
+
+/* THE IN-PLACE ARGUMENT (#162): bumped by the EMITTED copy loop, once per
+ * fused argument bound from its caller slot. */
+unsigned long g_jit_arg_inplace = 0;
+
+/* #97 step 4: an EMIT-time count (see jit.h) - the scalar argument binds
+ * that dropped their source-type test because the slot is not ref-listed. */
+unsigned long g_jit_cap_scalar = 0;        /* #111 (emitted) */
+unsigned long g_jit_frameless_chunks = 0;  /* #97 reach probe (TESTS) */
+unsigned long g_jit_frameless_calls = 0;   /* #97 reach probe (TESTS) */
+unsigned long g_jit_frameless_entries = 0; /* #97 inc 2: entries EMITTED */
+unsigned long g_jit_frameless_sites = 0;   /* #97 inc 2: sites EMITTED
+                                            * frameless (the dump driver's
+                                            * net reads it) */
+unsigned long g_jit_frameless_self_sites = 0; /* #97 E2: emit-time */
+unsigned long g_jit_frameless_self_id = 0;    /* #97 E2c: emit-time */
+unsigned long g_jit_frameless_self_floor = 0; /* #97 E2d: emit-time */
+unsigned long g_jit_vframe_publish = 0;      /* #97 E2e: emit-time */
+unsigned long g_jit_frameless_nonmain = 0;   /* #97 F1: emit-time */
+unsigned long g_jit_frameless_mutual = 0;    /* #97 G1: emit-time */
+unsigned long g_jit_frameless_fixed = 0;     /* #97 G2: emit-time */
+unsigned long g_jit_frameless_boundary = 0;   /* #97 E2: run-time */
+unsigned long g_jit_frameless_pushes = 0;  /* #97 inc 2: frameless CALLS
+                                            * (emitted code) */
+unsigned long g_jit_regcall_args = 0;      /* REGCALL 1A: a frameless call
+                                            * with register args (emitted) */
+unsigned long g_jit_regcall_pinned = 0;    /* REGCALL 1A: an entry move
+                                            * into a pin (emit-time) */
+unsigned long g_jit_frameless_ret_regs = 0; /* REGCALL 1B: a frameless
+                                            * return in RDX/RCX (emitted) */
+unsigned long g_jit_frameless_rets = 0;    /* #97 inc 2: frameless RETURN
+                                            * arm taken (emitted code) */
+unsigned long g_jit_frameless_init_free = 0; /* #97 inc 3 W3: window slots
+                                              * a site left uninitialised
+                                              * (emit-time) */
+unsigned long g_jit_vframe_quiet_sites = 0;
+unsigned long g_jit_vframe_quiet_lost = 0;
+unsigned long g_jit_frameless_capbase = 0;   /* #97 inc 3 W4: sites that
+                                              * skip the captures repoint
+                                              * (emit-time) */
+unsigned long g_jit_borrow_inline = 0;       /* #97 inc 3 W5: borrows the
+                                              * frameless site bound inline
+                                              * (emitted code) */
+unsigned long g_jit_arg_scalar = 0;
+
+#ifdef TESTS
+/*
+ * #97 INCREMENT 3 (W3): THE POISON TYPE - see jit.h. Every lifecycle op
+ * is an abort, because reaching one means emitted code or a helper read
+ * the OLD state of a window slot the frameless site proved nothing
+ * reads: the site's raw-only classification (jit_instr_stores_dst_raw)
+ * admitted an op whose helper tier writes its dst through LValue::put.
+ * That is the failure this object exists to make deterministic and
+ * named; without it the same read is a garbage Type* dereference that
+ * may or may not fault. `t_dict` is any non-trivial kind: every scan
+ * that asks `t >= t_str` then takes the releasing path and lands here.
+ */
+namespace {
+struct JitPoisonType final : Type {
+    JitPoisonType() : Type(Type::t_dict) {}
+    [[noreturn]] static void hit(const char *op)
+    {
+        fprintf(stderr,
+                "\n*** POISON HIT (%s): a helper read a value the frameless "
+                "site poisoned - W3: the old state of a window slot the site "
+                "left uninitialised (jit_instr_stores_dst_raw admits an op "
+                "whose helper tier writes its dst through LValue::put); or "
+                "W4: ctx->captures inside a W4 callee (jit_op_w4_safe admits "
+                "an op whose helper reads it, and jit_w4_unsafe_helpers "
+                "does not list that helper) ***\n", op);
+        fflush(stderr);
+        abort();
+    }
+    void default_ctor(void *) override { hit("default_ctor"); }
+    void dtor(void *) override { hit("dtor"); }
+    void copy_ctor(void *, const void *) override { hit("copy_ctor"); }
+    void move_ctor(void *, void *) override { hit("move_ctor"); }
+    void copy_assign(void *, const void *) override { hit("copy_assign"); }
+    void move_assign(void *, void *) override { hit("move_assign"); }
+};
+JitPoisonType g_jit_poison_type;
+}   /* namespace */
+
+const void *jit_poison_type()
+{
+    return &g_jit_poison_type;
+}
+#endif
+
+/*
+ * The fused site's COLD arm: replay the staging MoveVs the emit skipped.
+ * See jit.h. This is the interpreter's own MoveV (jit_move's body) run
+ * over the site's baked pair list, so a materialised run is byte-identical
+ * to the one the unfused emit would have built.
+ */
+unsigned long g_jit_arg_stage = 0;
+
+extern "C" void jit_stage_args(const int32_t *pairs, int_type n) noexcept
+{
+#ifdef TESTS
+    g_jit_arg_stage++;
+#endif
+    EvalContext *ctx = g_current_ctx;
+    if (!ctx || !ctx->frame)
+        return;
+    for (int_type i = 0; i < n; i++)
+        ctx->frame->at(pairs[2 * i]).put(ctx->frame->at(pairs[2 * i + 1])
+                                             .get());
+}
+
+/*
+ * Bind ONE reference argument for the fragment-inline sync push (M5b).
+ *
+ * The inline push copies a scalar argument as raw bytes - 24 bytes of payload
+ * plus the type word - and used to DECLINE the whole push when any argument
+ * held a reference, sending the call to the C++ slow tier. That decline was
+ * not a micro-cost: it is 100% of the calls in any code that passes an array,
+ * string, dict or struct, i.e. most real code (measured: 76_funcval_dispatch
+ * took the slow tier on all 1,000,000 of its calls, 55% of the benchmark's
+ * instructions, while the same shape with an int argument took it ONCE).
+ *
+ * The copy cannot be inlined as a refcount bump, which is why it is a call: a
+ * SLICE registers itself in its parent's `slices` set on copy
+ * (SharedArrayObjTempl's copy ctor), so a raw payload copy plus a retain would
+ * corrupt that set. Deferring to the real C++ copy is correct by construction
+ * for every reference type, present and future.
+ *
+ * This is `fast_bind`'s per-argument step verbatim (vm_frame_setup_lean's
+ * `w->at(i).rebind(argrun[i].get())`), so the two paths cannot drift.
+ * noexcept: a copy-assign of an EvalValue does not throw.
+ */
+/*
+ * #94 THE BORROW BIND - the consumer of the parameter escape analysis
+ * (resolver.cpp, FuncDescriptor::noescape_params).
+ *
+ * When the analysis proves the reference bound to a parameter cannot still be
+ * reachable after the call returns, the callee slot does not need a reference
+ * of its own: the CALLER's slot holds one for the whole of the synchronous
+ * call. So bind it as a raw bit-copy and skip the retain here and the release
+ * at the frame pop - the pair this whole path exists to pay.
+ *
+ * ⛔ ONE runtime exclusion, and dropping it is a use-after-free, not a leak:
+ * a SLICE registers itself in its parent's live-slices set when it is COPIED,
+ * and an element write to the parent then DETACHES every registered slice in
+ * place (clone_aliased_slices), as a write through any handle of the slice
+ * moves all of them (materialize_slice, question 3). A borrowed slice is not
+ * in that set, so such a write would leave it pointing at storage that has
+ * just been handed to somebody else - and freed outright, if the caller's
+ * slot held the last reference. Every OTHER reference type's copy is a plain
+ * retain with no registration, which is exactly what makes the bit-copy
+ * symmetric with LValue::frame_release()'s abandon.
+ *
+ * `can_borrow` is the callee descriptor's bit for THIS parameter. It is read
+ * at run time on both paths, not baked at emit time, because the emitted push
+ * reaches its callee through an inline CACHE - the descriptor is a register
+ * there, not a compile-time constant.
+ */
+static ML_ALWAYS_INLINE bool vm_value_is_slice(const EvalValue &v)
+{
+    return v.get_type()->t == Type::t_arr
+           && v.get_ref<SharedArrayObj>().is_slice();
+}
+
+static ML_ALWAYS_INLINE void
+vm_bind_arg(LValue &dst, const EvalValue &v, bool can_borrow)
+{
+    /*
+     * ⛔ ONLY A REFERENCE IS EVER BORROWED, and the `t >= t_str` test is
+     * load-bearing rather than an optimization. The release scan skips a
+     * slot holding a TRIVIAL value - correctly, there is nothing to release
+     * - so a borrowed int would keep its flag set forever, and the next call
+     * to reuse that window slot would rebind over a slot still marked
+     * borrowed. Caught by rebind's ML_CHECK on the first run, in a template
+     * whose un-annotated parameter is not `binds_scalar` (so the analysis
+     * claims it) but holds an int at run time - ackermann.
+     *
+     * It costs nothing: a trivial value's rebind is already a bit-copy with
+     * no refcount, which is exactly what the borrow would have done.
+     */
+    if (can_borrow && v.get_type()->t >= Type::t_str
+            && !vm_value_is_slice(v)) {
+#ifdef TESTS
+        g_arg_borrow++;
+#endif
+        dst.borrow_from(v);
+        return;
+    }
+#ifdef TESTS
+    if (can_borrow) {
+        if (v.get_type()->t < Type::t_str)
+            g_arg_borrow_scalar++;
+        else
+            g_arg_borrow_slice++;
+    }
+#endif
+    dst.rebind(v);
+}
+
+/*
+ * Bind ONE reference argument for the fragment-inline sync push (M5b).
+ *
+ * The inline push copies a scalar argument as raw bytes - 24 bytes of payload
+ * plus the type word - and used to DECLINE the whole push when any argument
+ * held a reference, sending the call to the C++ slow tier. That decline was
+ * not a micro-cost: it is 100% of the calls in any code that passes an array,
+ * string, dict or struct, i.e. most real code (measured: 76_funcval_dispatch
+ * took the slow tier on all 1,000,000 of its calls, 55% of the benchmark's
+ * instructions, while the same shape with an int argument took it ONCE).
+ *
+ * The retaining copy cannot be inlined as a refcount bump, which is why it is
+ * a call: a SLICE registers itself in its parent's `slices` set on copy, so a
+ * raw payload copy plus a retain would corrupt that set. Deferring to the real
+ * C++ copy is correct by construction for every reference type.
+ *
+ * This is `fast_bind`'s per-argument step verbatim (vm_frame_setup_lean's own
+ * vm_bind_arg call), so the two paths cannot drift.
+ * noexcept: neither a copy-assign nor a bit-copy of an EvalValue throws.
+ */
+extern "C" void jit_bind_ref_arg(LValue *dst, const LValue *src,
+                                 int_type can_borrow) noexcept
+{
+#ifdef TESTS
+    g_jit_ref_arg_binds++;
+#endif
+    vm_bind_arg(*dst, src->get(), can_borrow != 0);
+}
+
+/*
+ * Re-raise DELETABILITY (plans/archived/model-flip.md): a conveying op's caret must
+ * be pc-INDEPENDENT (a DELETED run collapses every pc onto its EnterNative,
+ * where a loc-table lookup would be wrong). Two zero-hot-cost carriers:
+ * the BoxedOp-family helpers stamp from their pool entry's start/end (the
+ * pool pointer is hot-live anyway), and the pointer-arg helpers
+ * (subscript/slice/dict-load/coerce, the stores) stay LOC-LESS - their
+ * EMIT stamps the op's baked caret DIRECTLY INTO the conveyed exception
+ * object on the COLD failure branch: load g_vm_jit_exc's pointer, and only
+ * if it is non-null (a BAIL conveys nothing - the null check makes a
+ * stale-state bug structurally impossible, where an earlier side-global
+ * design left a value a later unrelated raise could mis-consume) and the
+ * exception is still loc-less (a nested throw keeps its own caret), store
+ * the start/end Locs into it. A helper ARG was measured to cost +4 Ir per
+ * CALL on the hot path (the value stays live across the try -> an extra
+ * callee-saved spill; 62_dict_word_count +0.6%); the cold-side stores
+ * cost nothing on success. The accessors below give the emitter the
+ * unique_ptr's storage address + the Loc offsets inside the object.
+ */
+void **jit_addr_exc()
+{
+    static_assert(sizeof(g_vm_jit_exc) == sizeof(void *),
+                  "unique_ptr<RuntimeException> must be one raw pointer "
+                  "for the native null-check + stamp");
+    return reinterpret_cast<void **>(&g_vm_jit_exc);
+}
+
+ptrdiff_t jit_off_exc_loc_start()
+{
+    DivisionByZeroEx e;              /* any concrete subclass; loc_start
+                                      * lives in the Exception base, same
+                                      * offset for all (single inheritance) */
+    RuntimeException *b = &e;
+    return reinterpret_cast<char *>(&b->loc_start)
+         - reinterpret_cast<char *>(b);
+}
+
+ptrdiff_t jit_off_exc_loc_end()
+{
+    DivisionByZeroEx e;
+    RuntimeException *b = &e;
+    return reinterpret_cast<char *>(&b->loc_end)
+         - reinterpret_cast<char *>(b);
+}
+
+/* #56: the baked INLINED-AT chain index a conveying fragment stamps (see
+ * Exception::jit_inline_frame) - probed like the Locs above, never assumed. */
+ptrdiff_t jit_off_exc_inline_frame()
+{
+    DivisionByZeroEx e;
+    RuntimeException *b = &e;
+    return reinterpret_cast<char *>(&b->jit_inline_frame)
+         - reinterpret_cast<char *>(b);
+}
+
+/* RULE 2 (2026-09-20): the FAILING ARGUMENT index a bind coercion recorded
+ * (Exception::bind_arg), which a call site's emitted stamp reads to pick
+ * that argument's caret over the list's - probed like the fields above. */
+ptrdiff_t jit_off_exc_bind_arg()
+{
+    DivisionByZeroEx e;
+    RuntimeException *b = &e;
+    return reinterpret_cast<char *>(&b->bind_arg)
+         - reinterpret_cast<char *>(b);
+}
+
+/* RULE 2: the compound-OPERATION flag (Exception::op_caret) a store op's
+ * emitted stamp tests to pick its op_locs caret over its locs one. */
+ptrdiff_t jit_off_exc_op_caret()
+{
+    DivisionByZeroEx e;
+    RuntimeException *b = &e;
+    return reinterpret_cast<char *>(&b->op_caret)
+         - reinterpret_cast<char *>(b);
+}
+
+/* model-flip (nativize-ops): the native SubscriptV body - the interpreter's
+ * exact `dst = RValue(base.subscript(idx, for_write=false))`. base_lv is passed
+ * as an LValue* (like Subscript::do_eval, for COW identity). Throws -> conveyed
+ * WITH the op's own (baked) caret -> op_fully_native (deletable). */
+extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
+                             LValue *dst) noexcept
+{
+    ML_JIT_OP_RAN(SubscriptV);
+    try {
+        Type *t = base_lv->get().get_type();
+        dst->put(RValue(t->subscript(EvalValue(base_lv), *idx, false)));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* #56 delete-originals: the SHARED LoadElemInt/LoadElemFloat scalar-read
+ * cores - ONE implementation for the interpreter case and the JIT slow
+ * tier, so the two cannot drift. `chunk` null (the helpers) makes the OOB
+ * LOC-LESS - the fragment's exc-stamp conveys the op's caret. Returns the
+ * scalar; the CALLER writes its slot (the interpreter via write_*_slot,
+ * the helper via the dst LValue). A non-array base is the InternalErrorEx
+ * net (base_array is proven; rides g_vm_jit_eptr from the helper). */
+/* A GENERAL element a typed op reads as an int / a float holds no
+ * number - a string a `dyn` alias stored into an array<int> (#49 leaves a
+ * container reached through a dyn NAME unchecked). That is a TypeErrorEx
+ * at the READ's caret, the span its OutOfBoundsEx takes, which is where
+ * the tree-walker (Subscript::eval_int) and the JIT's exc-stamp put it:
+ * the interpreter threw getval's loc-less error, so a run without the JIT
+ * located it nowhere ("line 0"). `chunk` null - the JIT's helpers - stays
+ * loc-less for the fragment's stamp to convey, as OOB does. */
+[[noreturn]] static ML_NOINLINE void
+vm_elem_type_error(const Chunk *chunk, size_t pc,
+                   const std::pair<Loc, Loc> *lp)
+{
+    Loc ls, le;
+    if (lp) {
+        ls = lp->first;
+        le = lp->second;
+    } else if (chunk) {
+        chunk->loc_at(pc, ls, le);
+    }
+    throw TypeErrorEx(ls, le);
+}
+
+static ML_ALWAYS_INLINE int_type
+vm_general_elem_int(const LValue &e, const Chunk *chunk, size_t pc,
+                    const std::pair<Loc, Loc> *lp = nullptr)
+{
+    if (!e.is<int_type>() && !e.is<bool>())
+        vm_elem_type_error(chunk, pc, lp);
+    return general_elem_int(e);
+}
+
+static ML_ALWAYS_INLINE float_type
+vm_general_elem_float(const LValue &e, const Chunk *chunk, size_t pc,
+                      const std::pair<Loc, Loc> *lp)
+{
+    if (!e.is<float_type>() && !e.is<int_type>() && !e.is<bool>())
+        vm_elem_type_error(chunk, pc, lp);
+    return general_elem_float(e);
+}
+
+static ML_ALWAYS_INLINE int_type
+vm_load_elem_int_core(const EvalValue &base, int_type idx,
+                      const Chunk *chunk, size_t pc,
+                      const std::pair<Loc, Loc> *lp = nullptr)
+{
+    if (!base.is<SharedArrayObj>())
+        throw InternalErrorEx();
+    const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
+    if (idx < 0)
+        idx += arr.size();
+    if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
+        Loc ls, le;
+        if (lp) {
+            ls = lp->first;
+            le = lp->second;
+        } else if (chunk) {
+            chunk->loc_at(pc, ls, le);
+        }
+        throw OutOfBoundsEx(ls, le);
+    }
+    const size_type at = arr.offset() + idx;
+    if (arr.skind() == SharedArrayObj::Storage::ints)
+        return arr.flat_ints()[at];
+    if (arr.skind() == SharedArrayObj::Storage::bools)
+        return arr.flat_bools()[at] ? 1 : 0;
+    return vm_general_elem_int(arr.get_vec()[at], chunk, pc, lp);
+}
+
+static ML_ALWAYS_INLINE float_type
+vm_load_elem_float_core(const EvalValue &base, int_type idx,
+                        const Chunk *chunk, size_t pc,
+                        const std::pair<Loc, Loc> *lp = nullptr)
+{
+    if (!base.is<SharedArrayObj>())
+        throw InternalErrorEx();
+    const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
+    if (idx < 0)
+        idx += arr.size();
+    if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
+        Loc ls, le;
+        if (lp) {
+            ls = lp->first;
+            le = lp->second;
+        } else if (chunk) {
+            chunk->loc_at(pc, ls, le);
+        }
+        throw OutOfBoundsEx(ls, le);
+    }
+    const size_type at = arr.offset() + idx;
+    if (arr.skind() == SharedArrayObj::Storage::floats)
+        return arr.flat_floats()[at];
+    if (arr.skind() == SharedArrayObj::Storage::ints)
+        return static_cast<float_type>(arr.flat_ints()[at]);
+    return vm_general_elem_float(arr.get_vec()[at], chunk, pc, lp);
+}
+
+/*
+ * The NESTED-READ FUSION's level 1 (plans/archived/unboxing.md option A): resolve
+ * `base[oidx]` to a BORROWED row - a raw `const EvalValue &` into the outer
+ * array's storage - instead of the LoadElemValue pair's boxed temp slot
+ * (a helper call + retain + 32-byte copy + live-slices registration + a
+ * release next iteration, for a value alive one instruction).
+ *
+ * The borrow never leaves this call: the caller reads ONE scalar out of it
+ * and returns. Nothing can invalidate it in between - no user code, no
+ * allocation, no mutation, no unwinding - and the outer array holds the
+ * row's reference throughout.
+ *
+ * Behaviour is the unfused pair's, exactly: `locs[0]` is the INNER
+ * subscript's caret (LoadElemValue's), and a non-array / non-general outer
+ * is the same InternalErrorEx the pair raises (LoadElemValue rejects a
+ * non-general kind; a `strs` row would then fail the scalar core's
+ * is<SharedArrayObj> test - same exception, so it is short-circuited here
+ * rather than paying a SharedStr copy on the way to it).
+ */
+static ML_ALWAYS_INLINE const EvalValue &
+vm_elem2_borrow_row(const EvalValue &base, int_type oidx,
+                    const std::pair<Loc, Loc> *locs)
+{
+    if (!base.is<SharedArrayObj>())
+        throw InternalErrorEx();
+    const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
+    if (arr.skind() != SharedArrayObj::Storage::general)
+        throw InternalErrorEx();
+    if (oidx < 0)
+        oidx += arr.size();
+    if (oidx < 0 || static_cast<size_t>(oidx) >= arr.size())
+        throw OutOfBoundsEx(locs[0].first, locs[0].second);
+    return arr.get_vec()[arr.offset() + oidx].get();
+}
+
+/* `dst = base[i][j]`, int/float element. `locs[0]` carets an OOB on the
+ * OUTER index (the `base[i]` span), `locs[1]` one on the INNER (the whole
+ * `base[i][j]` span) - the two the unfused pair produced, which is why the
+ * op carries a chain_locs entry rather than a single loc-table caret. The
+ * scalar read is the SHARED single-level core, so the levels cannot
+ * drift. */
+static ML_ALWAYS_INLINE int_type
+vm_load_elem2_int_core(const EvalValue &base, int_type oidx, int_type iidx,
+                       const std::pair<Loc, Loc> *locs)
+{
+    return vm_load_elem_int_core(vm_elem2_borrow_row(base, oidx, locs),
+                                 iidx, nullptr, 0, &locs[1]);
+}
+
+static ML_ALWAYS_INLINE float_type
+vm_load_elem2_float_core(const EvalValue &base, int_type oidx, int_type iidx,
+                         const std::pair<Loc, Loc> *locs)
+{
+    return vm_load_elem_float_core(vm_elem2_borrow_row(base, oidx, locs),
+                                   iidx, nullptr, 0, &locs[1]);
+}
+
+/* The JIT slow tiers (#56): every shape the inline fast path declines - a
+ * slice, general/strs storage, a wrong flat kind, negative wrap, OOB - runs
+ * the interpreter's exact core; a RuntimeException (OOB) conveys via
+ * g_vm_jit_exc, anything else (the InternalErrorEx net) via g_vm_jit_eptr.
+ * With these, LoadElemInt/LoadElemFloat never re-interpret - their runs'
+ * originals are deletable. */
+/* #56: the native `throw` - the interpreted op's exact body, so its
+ * original can be DELETED. Builds the exception from the value slot
+ * (vm_make_thrown_exc; a non-struct value's TypeErrorEx is CONVEYED, as
+ * the interpreted op's C++ throw would be by the landing pad), then runs
+ * the SHARED vm_raise:
+ *   0 = dispatched to a SAME-FRAME handler - the handler pc is parked in
+ *       g_vm_resume_pc and the fragment returns it as an ordinary
+ *       external exit (control resumes interpreted AT THE HANDLER; the
+ *       op already ran, so this is a resume, not a re-run);
+ *   1 = the raise reached the activation BOUNDARY (g_vm_exc_pending set)
+ *       - the fragment returns JIT_RET_BOUNDARY, stopping the invocation
+ *       exactly as the interpreted `if (!vm_raise(...)) return;`;
+ *   2 = the BUILDER threw - conveyed (the emit's exc-stamp is a no-op
+ *       here: the TypeErrorEx already carries the throw-site caret).
+ * `pc` is the op's RUNTIME pc, used only for vm_flush_inline's lookup;
+ * a DELETED run has no inline_ctxs entries by the deletability guard, so
+ * the collapse cannot mis-key it. */
+/* #56: the ELEMENT-VALUE slow tier shared by the two #9 fusions - every
+ * shape their inline fast paths decline (a non-array/slice/general or
+ * wrong-kind base, a negative index needing the wrap, OOB) runs the
+ * interpreter's exact core and hands the scalar back; a throw CONVEYS
+ * (the fragment exc-stamps the op's caret), so neither fusion bails and
+ * their runs' originals delete. */
+/* #56: the fusions' slow-tier scratch (single-threaded; written by the
+ * helper, read by the emitted code immediately after - no lifetime span). */
+int_type g_jit_elem_tmp = 0;
+
+extern "C" int jit_elem_int_value(LValue *base_lv, int_type idx,
+                                  int_type *out) noexcept
+{
+    try {
+        *out = vm_load_elem_int_core(base_lv->get(), idx, nullptr, 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_load_elem_int(LValue *base_lv, int_type idx,
+                                 LValue *dst) noexcept
+{
+    ML_JIT_OP_RAN(LoadElemInt);
+    try {
+        dst->put(EvalValue(vm_load_elem_int_core(base_lv->get(), idx,
+                                                 nullptr, 0)));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+/* The fused nested read's helper tier. Unlike its single-level siblings it
+ * does NOT throw loc-less: the two levels need DIFFERENT carets, so the
+ * baked `locs` pair supplies them and the emit-side exc-stamp (first
+ * conveyor wins) leaves them alone. No bail -> op_fully_native. */
+extern "C" int jit_load_elem2_int(LValue *base_lv, int_type oidx,
+                                  int_type iidx, LValue *dst,
+                                  const void *locs) noexcept
+{
+    ML_JIT_OP_RAN(LoadElem2Int);
+    try {
+        dst->put(EvalValue(vm_load_elem2_int_core(
+            base_lv->get(), oidx, iidx,
+            static_cast<const std::pair<Loc, Loc> *>(locs))));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_load_elem2_float(LValue *base_lv, int_type oidx,
+                                    int_type iidx, LValue *dst,
+                                    const void *locs) noexcept
+{
+    ML_JIT_OP_RAN(LoadElem2Float);
+    try {
+        dst->put(EvalValue(vm_load_elem2_float_core(
+            base_lv->get(), oidx, iidx,
+            static_cast<const std::pair<Loc, Loc> *>(locs))));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_load_elem_float(LValue *base_lv, int_type idx,
+                                   LValue *dst) noexcept
+{
+    ML_JIT_OP_RAN(LoadElemFloat);
+    try {
+        dst->put(EvalValue(vm_load_elem_float_core(base_lv->get(), idx,
+                                                   nullptr, 0)));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_ord_char(LValue *base_lv, int_type idx,
+                            LValue *dst) noexcept
+{
+    ML_JIT_OP_RAN(OrdCharV);
+    try {
+        /* the base is compile-proven a non-opt string (Subscript::base_str),
+         * so the raw proven-type read is the N0 contract */
+        const std::string_view view =
+            base_lv->get().get_ref<SharedStr>().get_view();
+        if (idx < 0)
+            idx += static_cast<int_type>(view.size());
+        if (idx < 0 || static_cast<size_t>(idx) >= view.size())
+            throw OutOfBoundsEx();   /* loc-less; the fragment exc-stamps */
+        dst->put(EvalValue(static_cast<int_type>(
+                     static_cast<unsigned char>(view[idx]))));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): the native SliceV body - the interpreter's exact
+ * `dst = base.slice(start, end)` (the runtime Type::slice: the COW-registered
+ * sub-view, absent bounds passed as none). base/start/end/dst are frame slots
+ * (start/end == -1 -> none, a[:j] / a[i:]); read via g_current_ctx->frame. The
+ * RHS (slice) is evaluated fully before dst is written, so `dst == base` (a
+ * self-slice a=a[i:j]) reads the old base first - matching the tree-walker. Only
+ * TypeErrorEx (a non-int bound / non-sliceable base) is thrown (slices CLAMP
+ * out-of-range indices, no OOB), and it is a RuntimeException -> caught loc-less
+ * into g_vm_jit_exc + return 1 - conveyed WITH the op's own baked caret
+ * (`lep`, the fifth register arg) -> op_fully_native (deletable).
+ */
+extern "C" int jit_slice(int_type base_slot, int_type start_slot,
+                         int_type end_slot, int_type dst_slot) noexcept
+{
+    ML_JIT_OP_RAN(SliceV);
+    EvalContext *ctx = g_current_ctx;
+    const EvalValue &base = ctx->frame->at(base_slot).get();
+    const EvalValue start = start_slot >= 0
+        ? ctx->frame->at(start_slot).get() : EvalValue();
+    const EvalValue end = end_slot >= 0
+        ? ctx->frame->at(end_slot).get() : EvalValue();
+    try {
+        ctx->frame->at(dst_slot).put(base.get_type()->slice(base, start, end));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native LoadBuiltinV body - the interpreter's
+ * exact `slots[dst] = builtin_slot[idx].get()`. A builtin is a trivial value
+ * (< t_str), never throws. */
+extern "C" void jit_load_builtin(LValue *slots, int_type dst,
+                                 int_type idx) noexcept
+{
+    ML_JIT_OP_RAN(LoadBuiltinV);
+    slots[dst].put(builtin_slot(static_cast<int>(idx)).get());
+}
+
+/* model-flip (nativize-ops): the native LoadCaptureV body - the interpreter's
+ * exact `frame[dst] = (*ctx->captures)[idx]`. A capture is snapshot into the
+ * closure's capture_slots at creation, so it is always defined and the read
+ * never throws. Uses g_current_ctx (the running closure's ctx - captures +
+ * frame), like jit_make_closure. */
+extern "C" void jit_load_capture(int_type dst, int_type idx) noexcept
+{
+    ML_JIT_OP_RAN(LoadCaptureV);
+    g_current_ctx->frame->at(dst).put(
+        (*g_current_ctx->captures)[idx].get());
+}
+
+/* model-flip (nativize-ops): the native LoadConstV body - the interpreter's
+ * exact `slots[dst] = chunk->consts[idx]` (a value copy; never throws). `src`
+ * points into the const-pool buffer (baked by the emitter). */
+extern "C" void jit_load_const(LValue *slots, int_type dst,
+                               const EvalValue *src) noexcept
+{
+    ML_JIT_OP_RAN(LoadConstV);
+    slots[dst].put(*src);
+}
+
+/* model-flip (nativize-ops): the native LoadLiteralObjV body - the exact
+ * `slots[dst] = eval_literal_obj(...)` (immutable share vs a fresh mutable
+ * clone; never throws). `lov` is a baked `&chunk.literal_objs[idx]` (void*
+ * because Chunk::LiteralObjEntry is nested; the pool buffer addr is stable
+ * across the chunk's std::move). */
+extern "C" void jit_load_literal_obj(LValue *slots, int_type dst,
+                                     const void *lov) noexcept
+{
+    ML_JIT_OP_RAN(LoadLiteralObjV);
+    const Chunk::LiteralObjEntry *lo =
+        static_cast<const Chunk::LiteralObjEntry *>(lov);
+    slots[dst].put(eval_literal_obj(lo->value, lo->immutable));
+}
+
+extern "C" void jit_store_global(int_type gslot,
+                                 const EvalValue *src) noexcept
+{
+    ML_JIT_OP_RAN(StoreGlobalV);
+    g_current_ctx->gfuncs->put_defined(gslot, RValue(*src));
+}
+
+/* model-flip (nativize-ops): the native StoreCaptureV PLAIN `cap = <expr>` - the
+ * capture-slot twin of jit_store_global. Writes the running closure's
+ * per-instance capture slot `(*ctx->captures)[cap_slot] = RValue(*src)`; a
+ * capture is ALWAYS defined (snapshot at closure creation), so - unlike a global
+ * - there is no defined check and no throw (op_fully_native). Only the PLAIN
+ * case is JIT-eligible (like StoreGlobalV); a COMPOUND `cap OP= v` runs
+ * num_bin_op and stays interpreted. */
+extern "C" void jit_store_capture(int_type cap_slot,
+                                  const EvalValue *src) noexcept
+{
+    ML_JIT_OP_RAN(StoreCaptureV);
+    (*g_current_ctx->captures)[cap_slot].put(RValue(*src));
+}
+
+/*
+ * #97 INCREMENT 3 (W4): THE BASE-RELATIVE TWINS. A run that holds the
+ * capture base in a register (#112's capbase) hands it to its helper
+ * arms as an ARGUMENT, so the helper reads the same array the inline
+ * path does - and never `ctx->captures`. That is what lets a frameless
+ * site skip repointing ctx.captures for the callee (W4): under it the
+ * running closure's captures are reachable ONLY through the register
+ * the entry loaded from the FuncObject, and ctx->captures still names
+ * the CALLER's (a TESTS build points it at the poison below, so a read
+ * of it aborts by name instead of returning the caller's values).
+ */
+extern "C" void jit_load_capture_at(int_type dst, const LValue *base,
+                                    int_type idx) noexcept
+{
+    ML_JIT_OP_RAN(LoadCaptureV);
+    g_current_ctx->frame->at(dst).put(base[idx].get());
+}
+
+extern "C" void jit_store_capture_at(LValue *base, int_type cap_slot,
+                                     const EvalValue *src) noexcept
+{
+    ML_JIT_OP_RAN(StoreCaptureV);
+    base[cap_slot].put(RValue(*src));
+}
+
+#ifdef TESTS
+/*
+ * W4's net (see jit_poison_type for the W3 twin): the CaptureSlots a
+ * W4 site installs as ctx.captures for the callee's duration in a TESTS
+ * build. Every slot's type word names the poison type, so a helper that
+ * reads `ctx->captures` inside a W4 callee - one the emitter's
+ * classification wrongly admitted, or one missing from its unsafe
+ * list - aborts by name on its first lifecycle op. Built once, never
+ * destroyed (its destructor would run the poison's), reachable through
+ * the global so it is no leak; 64 slots, more than any closure captures.
+ */
+static CaptureSlots *g_jit_poison_caps = nullptr;
+
+const void *jit_poison_captures()
+{
+    if (!g_jit_poison_caps) {
+        CaptureSlots *cs = new CaptureSlots;
+        cs->reserve(64);
+        for (int i = 0; i < 64; i++)
+            cs->emplace_back(EvalValue(), false);
+        /* the type word's offset, probed the way jit_layout() probes
+         * it (LValue::val is private; its payload is at +0 of val) */
+        const ptrdiff_t ty_off =
+            reinterpret_cast<const char *>(&(*cs)[0].get())
+            - reinterpret_cast<const char *>(&(*cs)[0])
+            + static_cast<ptrdiff_t>(EvalValue::jit_type_off());
+        const void *poison = jit_poison_type();
+        for (int i = 0; i < 64; i++) {
+            char *slot = reinterpret_cast<char *>(&(*cs)[i]);
+            std::memcpy(slot + ty_off, &poison, sizeof poison);
+        }
+        g_jit_poison_caps = cs;
+    }
+    return g_jit_poison_caps;
+}
+
+extern "C" [[noreturn]] void jit_vframe_published()
+{
+    fprintf(stderr, "R4: a frameless callee claimed a quiet vframe, but "
+                    "the cell was written during the call (the release "
+                    "site does not restore it)\n");
+    abort();
+}
+
+extern "C" [[noreturn]] void jit_w4_captures_replaced()
+{
+    fprintf(stderr, "W4: a frameless callee whose site leaves "
+                    "ctx.captures alone returned with it REPLACED (the "
+                    "release arm does not restore it)\n");
+    abort();
+}
+
+/* #97 E2e's net: the WINDOW a TESTS build leaves in act.view_frame where
+ * the lazy scheme leaves a stale one (after a self call returns, at a
+ * frameless entry) - the poison captures' slots, so a C++ reader that
+ * ran without a publish aborts by name on its first lifecycle op */
+const void *jit_poison_window()
+{
+    const CaptureSlots &cs =
+        *static_cast<const CaptureSlots *>(jit_poison_captures());
+    return &cs[0];
+}
+#endif
+
+/*
+ * model-flip (nativize-ops): the native LoadGlobalV body - `frame[dst] =
+ * gfuncs->slots[gslot]`. The COMMON case (the global is defined) runs native.
+ * The RARE undefined case (a use-before-def read of a global) CONVEYS the
+ * exact interpreted throw - UndefinedVariableEx(names[gslot], caret) - via
+ * g_vm_jit_eptr (it is a PLAIN Exception with no clone(), so it can't ride
+ * g_vm_jit_exc; the M5 eptr channel rethrows it from EnterNative, and it
+ * propagates out of vm_dispatch exactly like the interpreted throw does:
+ * a non-catchable hard error either way). The caret comes from the op's
+ * baked LocEntry (`lep`) - pc-independent, so the op is op_fully_native
+ * (deletable); the pre-eptr version BAILED to a re-interpret instead,
+ * which kept the original alive. noexcept: the throw is caught and
+ * converted here; the defined-slot write can't throw.
+ */
+extern "C" int jit_load_global(int_type dst_gslot,
+                               const void *lep) noexcept
+{
+    /* dst_gslot = dst (lo32) | gslot (hi32) - the same two movabs as the
+     * pre-deletability emit, so the lep costs nothing per call site. */
+    ML_JIT_OP_RAN(LoadGlobalV);
+    const int_type dst = dst_gslot & 0xffffffff;
+    const int_type gslot = static_cast<int_type>(
+        static_cast<uint64_t>(dst_gslot) >> 32);
+    GlobalFuncTable *g = g_current_ctx->gfuncs;
+    if (!g->defined[gslot]) {
+        Loc s, en;
+        if (lep) {
+            const Chunk::LocEntry *le =
+                static_cast<const Chunk::LocEntry *>(lep);
+            s = le->start;
+            en = le->end;
+        }
+        g_vm_jit_exc = std::make_unique<UnboundSymbolEx>(
+            intern_msg("'" + std::string(g->names[gslot]->val)
+                       + "' is not bound yet"), s, en);
+        return 1;
+    }
+    g_current_ctx->frame->at(dst).put(g->slots[gslot].get());
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native ArrLen body - the interpreter's exact
+ * `frame[dst] = size(frame[base])`. `base` is a proven flat array, so size()
+ * never throws (op_fully_native). */
+extern "C" void jit_arr_len(LValue *slots, int_type dst, int_type base) noexcept
+{
+    ML_JIT_OP_RAN(ArrLen);
+    /* #142: `noexcept` with NO status test at the call site, so a throw here
+     * calls std::terminate. get_ref would throw on a non-array base, which
+     * only a corrupt image can produce - it gets `none`. The type test is
+     * the one get_ref does anyway, so the hit path is unchanged. */
+    const EvalValue &b = slots[base].get();
+    if (!b.is<SharedArrayObj>()) {
+        slots[dst].put(EvalValue());
+        return;
+    }
+    slots[dst].put(EvalValue(static_cast<int_type>(
+        b.get_ref<SharedArrayObj>().size())));
+}
+
+/*
+ * #53 option 1 - THE FOREACH SHIFT GUARD's two bodies (bytecode.h,
+ * ArrEpochMark), ONE implementation each for the interpreter handler and
+ * the JIT helper. Both are total over a corrupt image's operands: a
+ * non-array container marks -1 (never checked) and a non-int mark never
+ * raises - the loads that follow keep their own bounds checks, so memory
+ * safety never rests on the guard.
+ */
+static ML_ALWAYS_INLINE int_type vm_epoch_mark(const EvalValue &c)
+{
+    return c.is<SharedArrayObj>() ? c.get_ref<SharedArrayObj>().fe_mark()
+                                  : static_cast<int_type>(-1);
+}
+
+static ML_ALWAYS_INLINE bool
+vm_epoch_shifted(const EvalValue &c, const EvalValue &m)
+{
+    return c.is<SharedArrayObj>() && m.is<int_type>()
+        && c.get_ref<SharedArrayObj>().fe_shifted(m.get<int_type>());
+}
+
+extern "C" void jit_arr_epoch_mark(LValue *slots, int_type dst,
+                                   int_type base) noexcept
+{
+    ML_JIT_OP_RAN(ArrEpochMark);
+    slots[dst].put(EvalValue(vm_epoch_mark(slots[base].get())));
+}
+
+/* UnpackLenCheck's shared test: the size of a destructure's proven-
+ * array rvalue when it is NOT the target count (the op then raises),
+ * else -1. A non-array base (an image's corrupt operand) answers -1 -
+ * the loads after the check keep their own checks. */
+static ML_ALWAYS_INLINE int64_t vm_unpack_len_bad(const EvalValue &v,
+                                                   int_type n)
+{
+    if (!v.is<SharedArrayObj>())
+        return -1;
+    const size_type m = v.get_ref<SharedArrayObj>().size();
+    return static_cast<int_type>(m) == n ? -1 : static_cast<int64_t>(m);
+}
+
+/* UnpackLenCheck's flag: the storage IS the proven flat kind (b bit 1
+ * ints, bit 2 floats) - the only case the typed element reads take. */
+static ML_ALWAYS_INLINE bool vm_unpack_flat_ok(const EvalValue &v,
+                                               int_type flags)
+{
+    if (!v.is<SharedArrayObj>())
+        return false;
+    const auto sk = v.get_ref<SharedArrayObj>().skind();
+    return (flags & 2) ? sk == SharedArrayObj::Storage::ints
+                       : sk == SharedArrayObj::Storage::floats;
+}
+
+/* UnpackLenCheck's cold tier (the emitted inline compare saw a mismatch,
+ * or a storage kind it does not read): 1 = conveyed the TypeErrorEx
+ * LOC-LESS (the emitter's exc-stamp gives it the caret), 0 = the length
+ * is right - and then the flag slot, if any, is written. */
+extern "C" int jit_unpack_len_check(LValue *slots, int_type base,
+                                    int_type n, int_type flags,
+                                    int_type dst) noexcept
+{
+    ML_JIT_OP_RAN(UnpackLenCheck);
+    const EvalValue &v = slots[base].get();
+    const int64_t m = vm_unpack_len_bad(v, n);
+    if (m < 0) {
+        if (dst >= 0)
+            slots[dst].put(EvalValue(static_cast<int_type>(
+                vm_unpack_flat_ok(v, flags) ? 1 : 0)));
+        return 0;
+    }
+    try {
+        if (flags & 1)
+            vm_throw_unpack_len(nullptr, 0, static_cast<size_type>(m), n);
+        vm_throw_multi_unpack_len(nullptr, 0, static_cast<size_type>(m),
+                                  static_cast<size_t>(n));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+    }
+    return 1;
+}
+
+/* The cold tier of the emitted check (its inline compare saw a mismatch,
+ * or a base it cannot navigate): 1 = conveyed the OutOfBoundsEx LOC-LESS
+ * (the emitter's exc-stamp gives it the container caret), 0 = no raise -
+ * a slice's -1 mark, or an image's non-array base. */
+extern "C" int jit_arr_epoch_check(LValue *slots, int_type base,
+                                   int_type m) noexcept
+{
+    /* (the execution proof is bumped by the EMITTED inline compare) */
+    if (!vm_epoch_shifted(slots[base].get(), slots[m].get()))
+        return 0;
+    g_vm_jit_exc.reset(new OutOfBoundsEx());
+    return 1;
+}
+
+/* model-flip (nativize-ops): the native DictLoadInt/Float body - the typed
+ * scalar dict read d.k / d[k]. The KEY is baked by the emitter: a member's key
+ * is `&chunk.consts[idx]` (a const-pool value), a subscript's is `&slot[k]`
+ * (the key temp - EvalValue is the first LValue member), passed either way as
+ * `key`. A PRESENT key reads via dict_present_value (hot); a MISSING key /
+ * non-dict base runs the shared Type::subscript (the tree-walker's exact
+ * default-dict insert / KeyNotFoundEx / not-subscriptable) LOC-LESS -> caught
+ * into g_vm_jit_exc + return 1, so EnterNative re-raises stamping DictLoad's
+ * caret from the loc side table (recorded by extract_locs). `is_int` selects
+ * DictLoadInt vs Float; g_current_ctx->frame is the running callee frame. */
+/* model-flip (nativize-ops): the native MakeClosureV body - the interpreter's
+ * exact `frame[dst] = FuncObject(def, ctx)` (create the closure + snapshot the
+ * captures from the running ctx), byte-identical to FuncDeclStmt::do_eval for a
+ * lambda. `defv` is the closure's program-lifetime FuncDescriptor* (baked by the
+ * emitter as a value - the descriptor address is stable, like CallV's callee).
+ * A resolved closure's captures are defined, so the ctor never throws. */
+/*
+ * #97 step 3: THE CLOSURE'S POINTER, HANDED TO EMITTED CODE.
+ *
+ * The storing form below writes the fresh closure with
+ * `frame->at(dst).put(EvalValue(...))`, and that store - not the
+ * construction - was the expensive half: `put` reaches
+ * EvalValue::operator=(EvalValue&&), which destroys the old value and
+ * move-constructs the new one through the TYPE-ERASED ops table, i.e.
+ * TWO INDIRECT CALLS plus their machinery. Measured on 63_closures
+ * that pair is ~125 Ir per closure, against ~110 for building the
+ * object itself.
+ *
+ * Emitted code can do the same store in about ten instructions,
+ * because it knows two things C++ does not: the new value's type is
+ * t_func, and the pointer arrives with the count ALREADY at 1. So this
+ * variant CONSTRUCTS ONLY and transfers ownership to the caller - the
+ * count is set to 1 by hand rather than by an intrusive_ptr that would
+ * release it on the way out. Returns null after conveying a throw (the
+ * capture snapshot can raise UnboundSymbolEx - see the storing form).
+ */
+extern "C" void *jit_make_closure_ptr(const void *defv) noexcept
+{
+    ML_JIT_OP_RAN(MakeClosureV);
+    const FuncDescriptor *def = static_cast<const FuncDescriptor *>(defv);
+    try {
+        FuncObject *fo = new FuncObject(def, g_current_ctx);
+        fo->intr_refcount = 1;      /* the destination slot owns it */
+        return fo;
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return nullptr;
+    }
+}
+
+/* #97 R2: every capture is a frame local (the emitter checked), so the
+ * construction cannot throw and reads the slots straight from `frame` */
+extern "C" void *jit_make_closure_locals(const void *defv,
+                                         const LValue *frame) noexcept
+{
+    ML_JIT_OP_RAN(MakeClosureV);
+    const FuncDescriptor *def = static_cast<const FuncDescriptor *>(defv);
+    /* (R4: `frame` is not checked against ctx->frame - a lazy frameless
+     * leaf calls this without publishing it; the emitter hands rbx) */
+    ML_CHECK(!g_current_ctx->const_ctx && frame != nullptr);
+    FuncObject *fo = new FuncObject(def, get_root_ctx(g_current_ctx),
+                                    frame, FuncObject::LocalCaptures());
+    fo->intr_refcount = 1;          /* the destination slot owns it */
+    return fo;
+}
+
+/* #97 R2c: exactly one local capture, `src` its source slot */
+extern "C" void *jit_make_closure_1(const void *defv,
+                                    const LValue *src) noexcept
+{
+    ML_JIT_OP_RAN(MakeClosureV);
+    const FuncDescriptor *def = static_cast<const FuncDescriptor *>(defv);
+    ML_CHECK(!g_current_ctx->const_ctx);
+    FuncObject *fo = new FuncObject(def, get_root_ctx(g_current_ctx), *src,
+                                    FuncObject::OneLocal());
+    fo->intr_refcount = 1;          /* the destination slot owns it */
+    return fo;
+}
+
+/* #97 R3: the all-local form for a site with no scratch register -
+ * stores through the frame like jit_make_closure, and like the other
+ * all-local forms reads no ctx->captures and cannot throw */
+extern "C" void jit_make_closure_locals_st(int_type dst,
+                                           const void *defv,
+                                           int_type off) noexcept
+{
+    ML_JIT_OP_RAN(MakeClosureV);
+    const FuncDescriptor *def = static_cast<const FuncDescriptor *>(defv);
+    ML_CHECK(!g_current_ctx->const_ctx);
+    Frame *fr = g_current_ctx->frame;
+    /* `off`: #97 increment 3's capture shift (0 unless spliced) */
+    fr->at(dst).put(EvalValue(intrusive_ptr<FuncObject>(
+        make_intrusive<FuncObject>(def, get_root_ctx(g_current_ctx),
+                                   fr->slots + off,
+                                   FuncObject::LocalCaptures()))));
+}
+
+extern "C" int jit_make_closure(int_type dst, const void *defv) noexcept
+{
+    ML_JIT_OP_RAN(MakeClosureV);
+    const FuncDescriptor *def = static_cast<const FuncDescriptor *>(defv);
+
+    /* The capture SNAPSHOT reads each captured name, and a captured GLOBAL
+     * whose declaration has not run yet raises UnboundSymbolEx (#131) - so
+     * this CAN throw, contrary to what it assumed while it was `void` and
+     * unguarded. That assumption is what made
+     * `var c = func[zz]() => zz;` a std::terminate: a throw escaping a
+     * `noexcept` helper aborts outright. Convey it like every other tier. */
+    try {
+        g_current_ctx->frame->at(dst).put(EvalValue(intrusive_ptr<FuncObject>(
+            make_intrusive<FuncObject>(def, g_current_ctx))));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native MakeArrayV body - the interpreter's
+ * exact `frame[dst] = vm_make_array(ctx, base, n, hint)`: build an array LITERAL
+ * from the element run [base, base+n) via the shared build_array_from_values
+ * (flat int/float/bool/struct or general per the ArrHint). It NEVER THROWS (the
+ * build has no error path - a mixed literal just goes general), so the helper
+ * returns void and MakeArrayV is op_fully_native (deletable). The element buffer
+ * lives in vm_make_array's frame ON PURPOSE (see that helper) - never inline it
+ * into a fragment or vm_run_chunk's recursion-multiplied frame. */
+extern "C" void jit_make_array(int_type dst, int_type base, int_type n,
+                               int_type hint, const TypeAnnot *ct) noexcept
+{
+    ML_JIT_OP_RAN(MakeArrayV);
+    EvalContext *ctx = g_current_ctx;
+    EvalValue v = vm_make_array(*ctx, base, n, static_cast<ArrHint>(hint));
+    stamp_ctype_top(v, ct);             /* Q2: the type it is made with */
+    ctx->frame->at(dst).put(std::move(v));
+}
+
+/* model-flip (nativize-ops): the native MakeDictV body - the interpreter's exact
+ * `frame[dst] = vm_make_dict(ctx, base, npairs)`: build a dict LITERAL from the
+ * INTERLEAVED key/value run [base, base + 2*npairs) via the shared
+ * build_dict_from_pairs (which FREEZES each key with make_const_clone, so the
+ * VM and the tree-walker share one builder). Unlike MakeArrayV this CAN throw:
+ * freezing/inserting a key HASHES it, and an UNHASHABLE key (a function value
+ * laundered through `dyn`) raises TypeErrorEx - a RuntimeException, so it rides
+ * g_vm_jit_exc LOC-LESS and EnterNative re-raises stamping the `{...}` literal's
+ * caret from the loc side table (recorded by extract_locs). Hence NOT
+ * op_fully_native. The pair buffer lives in vm_make_dict's frame ON PURPOSE
+ * (the recursion-depth reason - see vm_make_array). */
+extern "C" int jit_make_dict(int_type dst, int_type base,
+                             int_type npairs, const TypeAnnot *ct) noexcept
+{
+    ML_JIT_OP_RAN(MakeDictV);
+    EvalContext *ctx = g_current_ctx;
+    try {
+        EvalValue v = vm_make_dict(*ctx, base, npairs);
+        stamp_ctype_top(v, ct);         /* Q2: the type it is made with */
+        ctx->frame->at(dst).put(std::move(v));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        /* a plain Exception: the eptr channel (#56 - the noexcept would
+         * std::terminate otherwise) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native ITERATOR ops. The per-loop state lives
+ * on the ACTIVATION as a watermarked slice (act.dict_iters / act.dyn_iters,
+ * indexed by the current record's diter_base/dyiter_base + the codegen-assigned
+ * iter_id) - the helpers reach it via g_vm_act exactly like jit_ret reaches the
+ * frame, computing the address FRESH per call (the vectors can realloc when a
+ * nested call pushes more iterator slices). Each runs the SHARED body its
+ * interpreter handler runs, so the two cannot drift. */
+static ML_ALWAYS_INLINE DictIterState &jit_diter(int_type i)
+{
+    VmActivation &act = *g_vm_act;
+    ML_VM_CHECK(i >= 0 && act.back_rec().diter_base + static_cast<size_t>(i)
+                              < act.dict_iters.size());
+    return act.dict_iters[act.back_rec().diter_base + i];
+}
+static ML_ALWAYS_INLINE DynIterState &jit_dyiter(int_type i)
+{
+    VmActivation &act = *g_vm_act;
+    ML_VM_CHECK(i >= 0 && act.back_rec().dyiter_base + static_cast<size_t>(i)
+                              < act.dyn_iters.size());
+    return act.dyn_iters[act.back_rec().dyiter_base + i];
+}
+
+/* DictIterInit: pin the dict + iterator = begin(). The dict is PROVEN (a Dict
+ * static type), so it never throws -> void + op_fully_native. */
+extern "C" void jit_dict_iter_init(int_type iter_id,
+                                   int_type dict_slot) noexcept
+{
+    ML_JIT_OP_RAN(DictIterInit);
+    vm_dict_iter_init_body(jit_diter(iter_id),
+                           g_current_ctx->frame->at(dict_slot).get());
+}
+
+/* DictIterNext: 1 = bound (fall through into the body), 0 = exhausted (the
+ * fragment jumps to end_pc). Never throws -> op_fully_native. */
+extern "C" int jit_dict_iter_next(int_type iter_id, int_type k_slot,
+                                  int_type v_slot) noexcept
+{
+    ML_JIT_OP_RAN(DictIterNext);
+    return vm_dict_iter_next_body(jit_diter(iter_id), *g_current_ctx->frame,
+                                  k_slot, v_slot) ? 1 : 0;
+}
+
+/* ForeachDynInit: dispatch the dyn container once. `targets` is the baked
+ * `&chunk.unpack_targets[idx]` (a pool-element address, stable across the
+ * chunk's std::move). A non-container throws TypeErrorEx LOC-LESS ->
+ * g_vm_jit_exc + return 1 (EnterNative re-raises with the container's caret
+ * from the loc side table); 0 otherwise. */
+extern "C" int jit_foreach_dyn_init(int_type iter_id, int_type cont_slot,
+                                    int_type shape,
+                                    const void *targets) noexcept
+{
+    ML_JIT_OP_RAN(ForeachDynInit);
+    try {
+        vm_foreach_dyn_init_body(
+            jit_dyiter(iter_id), g_current_ctx->frame->at(cont_slot).get(),
+            shape, static_cast<const std::vector<int32_t> *>(targets),
+            nullptr, 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        /* a plain Exception: the eptr channel (the noexcept would
+         * std::terminate otherwise - #56) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+/* ForeachDynNext: 1 = bound, 0 = exhausted (jump to end_pc), -1 = THREW (the
+ * strict N-var unpack's TypeErrorEx rides g_vm_jit_exc LOC-LESS; EnterNative
+ * stamps the container's caret from the loc side table). */
+/* The GENERIC-body tier of jit_foreach_dyn_next: the only body that can
+ * throw (the strict N-var unpack / the InternalErrorEx net). Out-of-line
+ * so the hot helper carries no EH state (see its comment). */
+static ML_NOINLINE int
+jit_foreach_dyn_next_slow(DynIterState &st) noexcept
+{
+    try {
+        if (st.next(st, *g_current_ctx->frame, nullptr, 0))
+            return 1;
+        if (st.oob)                             /* #53: the element is gone */
+            throw OutOfBoundsEx();
+        return 0;
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return -1;
+    } catch (...) {
+        /* a plain Exception: the eptr channel (the noexcept would
+         * std::terminate otherwise - #56) */
+        g_vm_jit_eptr = std::current_exception();
+        return -1;
+    }
+}
+
+extern "C" int jit_foreach_dyn_next(int_type iter_id) noexcept
+{
+    ML_JIT_OP_RAN(ForeachDynNext);
+    DynIterState &st = jit_dyiter(iter_id);
+    if (!st.next_throws)
+        /* a SPECIALIZED body: never throws - and keeping ALL EH state out
+         * of THIS function matters: the catch-all's exception_ptr temp
+         * made -fstack-protector-strong add a canary, +7 Ir per element
+         * on the hot path (#56, callgrind-diagnosed). */
+        if (st.next(st, *g_current_ctx->frame, nullptr, 0))
+            return 1;
+    /* exhausted - or (#53) the element is gone, which only the EH-carrying
+     * slow tier conveys; checked here, OFF the per-element path */
+    if (!st.next_throws && !st.oob)
+        return 0;
+    return jit_foreach_dyn_next_slow(st);
+}
+
+/* model-flip (nativize-ops): the native StructCtorV body - a standalone POD
+ * struct construction `P(x, y)` from its field-arg run, via vm_struct_ctor (the
+ * interpreter's exact call, incl. the H1 DST-SLOT REUSE that overwrites last
+ * iteration's same-def instance in place). `defv` is the program-lifetime
+ * StructTypeDef* from the struct_defs pool, baked by the emitter as a VALUE
+ * (like MakeClosureV's FuncDescriptor*). The codegen's typed-scalar arg gate
+ * means coerce_struct_field cannot throw here, but the field buffer is coerced
+ * DEFENSIVELY, so a throw is caught LOC-LESS -> g_vm_jit_exc; the emit's
+ * cold-side exc-stamp gives it the construction's caret (vm_raise stamps only
+ * when the exception has no loc). Every reachable throw is a TypeErrorEx (a
+ * RuntimeException). Convey-only -> op_fully_native (deletable; #98 - the
+ * census audit found it left out of the #56 batch its emit twin
+ * MakeStructArrayV joined). */
+extern "C" int jit_struct_ctor(const void *defv, int_type base, int_type nf,
+                               int_type dst) noexcept
+{
+    ML_JIT_OP_RAN(StructCtorV);
+    StructTypeDef *def =
+        const_cast<StructTypeDef *>(static_cast<const StructTypeDef *>(defv));
+    try {
+        vm_struct_ctor(*g_current_ctx, def, base, nf, dst);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* The planned StructCtorV's SLOW branch (fresh alloc / aliased dst /
+ * layout-probe-off): the interpreter's planned body - lean raw-slot
+ * reads + direct byte stores, NEVER throws, so the fragment emits no
+ * status test. The FAST inline path bumps g_jit_ctor_fast instead. */
+extern "C" void jit_struct_ctor_planned(const void *defv, const void *planv,
+                                        int_type dst) noexcept
+{
+    ML_JIT_OP_RAN(StructCtorV);
+    vm_struct_ctor_planned(
+        *g_current_ctx,
+        const_cast<StructTypeDef *>(static_cast<const StructTypeDef *>(defv)),
+        *static_cast<const Chunk::CtorPlan *>(planv), dst);
+}
+
+/*
+ * C4e: make the H1 reuse invariant TRUE, once, in a loop's preheader, so
+ * the ctors inside it need no guards at all. Idempotent and deliberately
+ * NON-destructive when the slot is already reusable: that is what keeps a
+ * re-entered loop (an inner loop of a nest) at exactly ONE allocation for
+ * the whole program, and what makes running it before the first iteration
+ * indistinguishable from what that iteration's own slow tier would do.
+ * The emitter only calls this where entering the preheader PROVES the
+ * ctor executes (see jit_pick_ctor_establish).
+ */
+extern "C" void jit_struct_ctor_establish(const void *defv,
+                                          int_type dst) noexcept
+{
+    StructTypeDef *const def =
+        const_cast<StructTypeDef *>(static_cast<const StructTypeDef *>(defv));
+    LValue &d = g_current_ctx->frame->at(dst);
+    const EvalValue &cur = d.get();
+    if (cur.is<intrusive_ptr<StructObject>>()) {
+        const intrusive_ptr<StructObject> &so =
+            cur.get_ref<intrusive_ptr<StructObject>>();
+        if (so->def == def && !so->readonly && !so->boxed
+            && so.use_count() == 1)
+            return;                          /* already reusable */
+    }
+    d.put(EvalValue(make_intrusive<StructObject>(def)));
+}
+
+/* model-flip (nativize-ops): the native StructCtorBoxedV body - a BOXED (non-POD)
+ * struct construction `B(a, x)` with runtime args, via vm_struct_ctor_boxed (it
+ * also doubles as the CHECKED POD ctor). `bcv` is a baked
+ * `&chunk.boxed_ctors[idx]` (the pool BUFFER address, stable across the chunk's
+ * std::move) holding the def + the PER-ARG carets. Here a field coerce genuinely
+ * CAN throw (a dyn-laundered wrong value), and the exception already carries the
+ * offending arg's caret from the pool - vm_raise's stamp is conditional on an
+ * EMPTY loc, so that pooled caret survives the re-raise untouched (byte-identical
+ * to the tree-walker's construct_struct). Convey-only -> op_fully_native
+ * (deletable; #98 - the emit's cold-side exc-stamp covers a loc-less throw,
+ * and the stamp's own non-empty-loc guard keeps the pooled caret intact). */
+extern "C" int jit_struct_ctor_boxed(int_type dst, int_type base,
+                                     const void *bcv) noexcept
+{
+    ML_JIT_OP_RAN(StructCtorBoxedV);
+    const Chunk::BoxedCtor *bc = static_cast<const Chunk::BoxedCtor *>(bcv);
+    EvalContext *ctx = g_current_ctx;
+    StructTypeDef *def = const_cast<StructTypeDef *>(bc->def);
+    try {
+        EvalValue v = vm_struct_ctor_boxed(
+            *ctx, def, base, static_cast<int_type>(bc->arg_locs.size()),
+            bc->arg_locs.data(), bc->fit);
+        ctx->frame->at(dst).put(std::move(v));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        /* a plain Exception: the eptr channel (#56's net, missing here
+         * alone - its emit twin jit_make_struct_array had it; without it
+         * the noexcept would std::terminate) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native MakeStructArrayV body - the FUSED flat
+ * `array<PodStruct>` literal `[P(..), P(..)]`, via vm_make_struct_array_op (which
+ * coerces the interleaved field values STRAIGHT into a contiguous byte buffer -
+ * no per-element StructObject - and reuses the dst slot's same-def, same-count
+ * buffer when it owns it). `defv` is the baked program-lifetime StructTypeDef*;
+ * `n` is the ELEMENT count (the run holds n * nfields values). The all-scalar
+ * field gate means the coerce can't throw; a defensive throw is caught LOC-LESS
+ * -> g_vm_jit_exc, stamped by the emit's cold-side exc-stamp. Convey-only ->
+ * op_fully_native (deletable, the #56 batch; this comment used to deny that -
+ * it predated the batch and went stale, #98). */
+extern "C" int jit_make_struct_array(const void *defv, int_type base,
+                                     int_type n, int_type dst) noexcept
+{
+    ML_JIT_OP_RAN(MakeStructArrayV);
+    StructTypeDef *def =
+        const_cast<StructTypeDef *>(static_cast<const StructTypeDef *>(defv));
+    try {
+        vm_make_struct_array_op(*g_current_ctx, def, base, n, dst);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        /* a plain Exception: the eptr channel (#56 - the noexcept would
+         * std::terminate otherwise) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): THE FOREACH ELEMENT/FIELD LOADS. Each is the
+ * interpreter's exact handler body; the INDEX arrives as a VALUE (the emitter
+ * materializes the op's slot-or-literal operand with the cache-aware
+ * load_operand BEFORE the call prologue), so a foreach counter pinned in an N5
+ * register is read from the REGISTER, not from a stale memory slot.
+ *
+ * All of these are NON-THROWING (the index is loop-bounded by the ArrLen/StrLen
+ * that produced it, and the base kind is proven by the inferencer), hence void
+ * + op_fully_native - EXCEPT jit_load_elem_value, whose interpreter body does
+ * bounds-check (it also serves 2-D `a[i][k]` reads where the index is NOT the
+ * loop counter) and can raise OutOfBoundsEx.
+ */
+
+/* model-flip (nativize-ops): the native JumpUnlessTrueV CONDITION - the BOXED
+ * truthiness test behind `if (dynvalue)`, `while (flag)`, a `&&`/`||` conjunct
+ * and the boxed ternary. Unlike every other nativized op this is a BRANCH: the
+ * helper only evaluates the condition and the FRAGMENT does the jump (a
+ * fragment-local jcc for an in-run target, an exit_pc otherwise) - which is what
+ * lets a loop whose body holds a boxed condition iterate entirely in machine
+ * code instead of splitting the run at the branch and leaving the back edge
+ * interpreted.
+ *
+ * Returns 1 = true, 0 = false, -1 = THREW. `is_true` is a virtual Type op whose
+ * BASE implementation throws TypeErrorEx ("does NOT support conversion to
+ * bool") - reachable from a script with a builtin value as a condition
+ * (`var dyn f = print; if (f)`), so the status is a tri-state, not a bool. The
+ * throw rides g_vm_jit_exc LOC-LESS and EnterNative stamps the CONDITION's caret
+ * from the loc side table. */
+extern "C" int jit_is_true(int_type cond_slot) noexcept
+{
+    /* NO ML_JIT_OP_RAN here: the EMITTER bumps the counter for both paths (the
+     * inline int/bool fast path calls no helper), so bumping again would
+     * double-count the slow path. */
+    try {
+        return g_current_ctx->frame->at(cond_slot).get().is_true() ? 1 : 0;
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return -1;
+    }
+}
+
+/* LoadStrChar: bind a FRESH 1-char string for the container's i-th char -
+ * matches the tree-walker's SharedStr(string(&view[i], 1)). */
+extern "C" void jit_load_str_char(int_type dst, int_type base,
+                                  int_type idx) noexcept
+{
+    ML_JIT_OP_RAN(LoadStrChar);
+    Frame *f = g_current_ctx->frame;
+    /* #142: `noexcept`, no status test - see jit_arr_len. This one had BOTH
+     * hazards: get_ref throws on a non-string base, and `&view[idx]` was
+     * indexed with no bound at all (the tree-walker's `s[i]` does check). */
+    const EvalValue &bv = f->at(base).get();
+    if (!bv.is<SharedStr>()) {
+        f->at(dst).put(EvalValue());
+        return;
+    }
+    const std::string_view view = bv.get_ref<SharedStr>().get_view();
+    if (idx < 0 || static_cast<size_t>(idx) >= view.size()) {
+        f->at(dst).put(EvalValue());
+        return;
+    }
+    f->at(dst).put(EvalValue(SharedStr(std::string(&view[idx], 1))));
+}
+
+/*
+ * G4: the CHECKED `a[i].f` helper - the subscript form. Returns non-zero when
+ * it raised, conveying a LOC-LESS OutOfBoundsEx exactly as jit_load_elem_value
+ * does, so EnterNative re-raises it with this op's caret from the loc side
+ * table (the SUBSCRIPT's span).
+ */
+extern "C" int jit_load_struct_elem_field(int_type dst, int_type base,
+                                          int_type idx, int_type fidx,
+                                          int is_float) noexcept
+{
+#ifdef TESTS
+    g_jit_op_run[static_cast<size_t>(is_float ? OpCode::LoadStructFieldFloat
+                                              : OpCode::LoadStructFieldInt)]++;
+    g_jit_sfield_checked++;
+#endif
+    Frame *f = g_current_ctx->frame;
+    try {
+        const EvalValue &av = f->at(base).get();
+        if (is_float)
+            write_float_slot(g_current_ctx, dst,
+                             vm_struct_elem_field_float(av, idx, fidx));
+        else
+            write_int_slot(g_current_ctx, dst,
+                           vm_struct_elem_field_int(av, idx, fidx));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(static_cast<RuntimeException *>(e.clone()));
+        return 1;
+    }
+    return 0;
+}
+
+/* LoadStructFieldInt/Float: `pts[i].f` read STRAIGHT from the flat struct-array
+ * bytes into a scalar slot (no StructObject) - `is_float` picks the pair. */
+extern "C" void jit_load_struct_field(int_type dst, int_type base, int_type idx,
+                                      int_type fidx, int is_float) noexcept
+{
+#ifdef TESTS
+    g_jit_op_run[static_cast<size_t>(is_float ? OpCode::LoadStructFieldFloat
+                                              : OpCode::LoadStructFieldInt)]++;
+#endif
+    EvalContext *ctx = g_current_ctx;
+    const EvalValue &arrv = ctx->frame->at(base).get();
+    if (is_float)
+        write_float_slot(ctx, dst, vm_struct_field_float(arrv, idx, fidx));
+    else
+        write_int_slot(ctx, dst, vm_struct_field_int(arrv, idx, fidx));
+}
+
+/* LoadStructElemV: the whole-`p` foreach bind - materialize a fresh
+ * StructObject from the flat struct-array element into the loop var.
+ * A STATUS helper (#142, myv_fuzz fat-676): for bytecode WE compiled the
+ * base is a proven flat struct array and nothing here can throw, but on an
+ * IMAGE the proof is input - `flat_structs()`'s ML_UNTRUSTED_CHECK throws
+ * InternalErrorEx (and a non-array base a TypeErrorEx) - and a throw
+ * through a `void noexcept` helper is std::terminate: no message, no
+ * caret. Both are RuntimeExceptions, so the return conveys them exactly
+ * as jit_load_struct_elem_field does and EnterNative re-raises with this
+ * op's caret. */
+extern "C" int jit_load_struct_elem(int_type dst, int_type base,
+                                    int_type idx) noexcept
+{
+    ML_JIT_OP_RAN(LoadStructElemV);
+    Frame *f = g_current_ctx->frame;
+    try {
+        vm_struct_elem_into(f->at(dst), f->at(base).get(), idx);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(static_cast<RuntimeException *>(e.clone()));
+        return 1;
+    }
+    return 0;
+}
+
+/* LoadElemValue: a GENERAL (or flat-str) array element into a slot, box-free.
+ * Unlike its siblings this BOUNDS-CHECKS (it also serves a 2-D `a[i][k]` read,
+ * whose index is not the loop counter) - an OOB raises OutOfBoundsEx LOC-LESS
+ * -> g_vm_jit_exc, and EnterNative re-raises with the loc side table's caret.
+ * The interpreter's unreachable non-general tail is an InternalErrorEx there;
+ * here the SAME InternalErrorEx is conveyed via g_vm_jit_eptr (no clone() -
+ * a plain exception) so the op has NO bail and is deletable. */
+extern "C" int jit_load_elem_value(int_type dst, int_type base,
+                                   int_type idx) noexcept
+{
+    ML_JIT_OP_RAN(LoadElemValue);
+    Frame *f = g_current_ctx->frame;
+    const EvalValue &basev = f->at(base).get();
+    if (!basev.is<SharedArrayObj>()) {
+        /* the interpreted handler's unreachable tail (base_array proven):
+         * CONVEY the same InternalErrorEx via eptr (a DECL_SIMPLE
+         * exception, no clone()) instead of the old bail - deletability
+         * forbids a re-run exit, and the propagation is identical (a
+         * non-catchable hard error either way). */
+        g_vm_jit_eptr = std::make_exception_ptr(InternalErrorEx());
+        return 1;
+    }
+    const SharedArrayObj &arr = basev.get_ref<SharedArrayObj>();
+    int_type i = idx;
+    if (i < 0)
+        i += arr.size();
+    if (i < 0 || static_cast<size_t>(i) >= arr.size()) {
+        g_vm_jit_exc.reset(new OutOfBoundsEx());   /* loc-less: side table */
+        return 1;
+    }
+    /* every storage kind, through the interpreter's own boxing function
+     * (H2) - see the interpreted twin's comment. */
+    f->at(dst).put(vm_arr_elem(arr, static_cast<size_type>(i)));
+    return 0;
+}
+
+/*
+ * The bool foreach loop variable's element (LoadElemBool): 0 = a bool, in
+ * `out`; 1 = past the end - the loop is bounded by the length at its
+ * START and the body may have shrunk the array, the foreach's defined
+ * OutOfBoundsEx (#53); 2 = not a bool. A GENERAL array<bool> (an inline
+ * keys() of a dict<bool, _>) holds whatever a `dyn` alias
+ * stored into it, and the loop variable is typed bool: such an element
+ * is a TypeErrorEx at the container, as LoadElemInt's misfit is. Until
+ * 2026-11-14 the VM read it as `false`, the JIT bound the string and
+ * the tree-walker bound it and failed at its first use. ONE answer for
+ * the interpreted handler and its JIT decline tier (jit_load_elem_bool).
+ */
+static ML_ALWAYS_INLINE int
+vm_bool_elem(const SharedArrayObj &arr, int_type idx, bool &out)
+{
+    if (idx < 0 || static_cast<size_type>(idx) >= arr.size())
+        return 1;
+    if (arr.skind() == SharedArrayObj::Storage::bools) {
+        out = arr.flat_bools()[arr.offset() + idx] != 0;
+        return 0;
+    }
+    if (arr.skind() != SharedArrayObj::Storage::general)
+        return 2;
+    const EvalValue &e = arr.get_view()[idx].get();
+    if (!e.is<bool>())
+        return 2;
+    out = e.get<bool>();
+    return 0;
+}
+
+/* LoadElemBool's decline tier: a slice, a general array, an element the
+ * body removed or one that is no bool - each through vm_bool_elem,
+ * conveying its exception LOC-LESS for the fragment's stamp (the
+ * container's caret), as jit_load_elem_value conveys its OOB. */
+extern "C" int jit_load_elem_bool(int_type dst, int_type base,
+                                  int_type idx) noexcept
+{
+    ML_JIT_OP_RAN(LoadElemBool);
+    Frame *f = g_current_ctx->frame;
+    const EvalValue &basev = f->at(base).get();
+    if (!basev.is<SharedArrayObj>()) {
+        /* the proven base's net, as jit_load_elem_value's */
+        g_vm_jit_eptr = std::make_exception_ptr(InternalErrorEx());
+        return 1;
+    }
+    bool b = false;
+    switch (vm_bool_elem(basev.get_ref<SharedArrayObj>(), idx, b)) {
+    case 0:
+        f->at(dst).put(EvalValue(b));
+        return 0;
+    case 1:
+        g_vm_jit_exc.reset(new OutOfBoundsEx());
+        return 1;
+    default:
+        g_vm_jit_exc.reset(new TypeErrorEx());
+        return 1;
+    }
+}
+
+/* TWO ENTRY POINTS (int/float) so the scalar kind is a compile-time
+ * constant: the single-entry is_int ARG cost a movabs per call site, and
+ * folding it into lep's low bit cost an unpack per CALL (+4M Ir on
+ * 25_dict_member - measured; this form is back to the pre-deletability
+ * instruction count, the lep movabs simply replacing the is_int movabs). */
+static ML_ALWAYS_INLINE int
+jit_dict_load_body(int_type dst, int_type base_slot, const EvalValue *key,
+                   bool is_int) noexcept
+{
+    EvalContext *ctx = g_current_ctx;
+    /* The PRESENT-key write sits inside the try too: write_scalar_slot's
+     * get<> throws TypeErrorEx for a dyn-laundered WRONG-typed value (the
+     * inference safety net) - previously an unguarded throw in a noexcept
+     * helper == std::terminate, a latent JIT crash; now conveyed with a
+     * caret. The try is the zero-cost-EH shape (a TYPE PRE-CHECK variant
+     * measured WORSE: +2.0% Ir on 25_dict_member vs this form's +0.0%). */
+    try {
+        const EvalValue &base = ctx->frame->at(base_slot).get();
+        if (base.is<intrusive_ptr<DictObject>>())
+            if (const EvalValue *v = dict_present_value(
+                    base.get_ref<intrusive_ptr<DictObject>>(), *key)) {
+                write_scalar_slot(ctx, dst, is_int, *v);
+                return 0;
+            }
+        LValue &dlv = ctx->frame->at(base_slot);
+        EvalValue r = base.get_type()->subscript(EvalValue(&dlv), *key, false);
+        write_scalar_slot(ctx, dst, is_int,
+                          r.is<LValue *>() ? r.get<LValue *>()->get() : r);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_dict_load_int(int_type dst, int_type base_slot,
+                                 const EvalValue *key) noexcept
+{
+    ML_JIT_OP_RAN(DictLoadInt);
+    return jit_dict_load_body(dst, base_slot, key, true);
+}
+
+extern "C" int jit_dict_load_float(int_type dst, int_type base_slot,
+                                   const EvalValue *key) noexcept
+{
+    ML_JIT_OP_RAN(DictLoadFloat);
+    return jit_dict_load_body(dst, base_slot, key, false);
+}
+
+#ifdef TESTS
+unsigned long g_unpack_fast_binds = 0;   /* H3 (#159) execution proof */
+#endif
+
+/* H3 (#159): bind an unpacked STRING into a plain frame slot. put() is
+ * correct here but pays the type-erased dispatch (EvalValue::operator= is
+ * an indirect call through type->copy/move_assign, plus destroy/create
+ * function-pointer hops when the slot's current type differs) - measured
+ * at ~93% of 75_indexed_unpack's wall time. When BOTH sides are strings
+ * and the slot is a plain one (no container back-pointer - the COW path
+ * keeps put()), the bind is a plain SharedStr copy-assign: an
+ * intrusive_ptr release+retain plus three POD fields, fully inline, with
+ * a self-assign guard in the pointer. Observably identical to put(): the
+ * slot shares the same StrObj either way (the window model gives value
+ * semantics with shared buffers), and put() does not test is_const
+ * either (const-ness is enforced by the callers). The steady state
+ * (iteration 2+ of an unpack loop) always hits this: the slot still
+ * holds the previous iteration's string. */
+static inline void
+vm_slot_bind_str(LValue &dst, const SharedStr &src)
+{
+    if (!dst.container && dst.is<SharedStr>()) {
+#ifdef TESTS
+        g_unpack_fast_binds++;
+#endif
+        dst.getval<SharedStr>() = src;   /* release + retain, no dispatch */
+        return;
+    }
+    dst.put(EvalValue(SharedStr(src)));  /* first bind / type change */
+}
+
+/* The GENERAL-storage twin: the element is already a boxed EvalValue, so
+ * a non-string bind is put(const &) - ONE copy_assign - instead of
+ * materializing a temp via vm_arr_elem (copy_ctor + move_assign + dtor).
+ * Safe to pass a reference INTO the array's storage: the base frame slot
+ * owns the outer array for the whole op and this writes only frame
+ * slots, so the source cannot be freed mid-assign (the same argument
+ * today's temp-then-put relies on for its `sub` reference). */
+static inline void
+vm_slot_bind_value(LValue &dst, const EvalValue &src)
+{
+    if (!dst.container && src.is<SharedStr>() && dst.is<SharedStr>()) {
+#ifdef TESTS
+        g_unpack_fast_binds++;
+#endif
+        dst.getval<SharedStr>() = src.get_ref<SharedStr>();
+        return;
+    }
+    dst.put(src);
+}
+
+#ifdef TESTS
+unsigned long g_ref_bind_fast = 0;   /* #121 execution proof */
+#endif
+
+/*
+ * #121: the DISPATCH-FREE same-kind REFERENCE bind - H3's shape (the two
+ * helpers above), one type family over.
+ *
+ * `dst.put(std::move(src))` is correct and costs THREE nested out-of-line
+ * frames to perform a release plus two pointer stores: put() itself, then
+ * EvalValue::operator=(EvalValue &&), then the type-erased
+ * TypeImpl<T>::move_assign reached through the Type ops table. Measured on
+ * 63_closures (callgrind, DEBUG_INFO=1, OPT=1 ASSERTS=0, 400,000
+ * reference-returning returns): 69 Ir per return, of which the release and
+ * the destroy are 24 - the other 45, i.e. 7.0% of the whole program, is
+ * frame and dispatch to reach a handle assign whose concrete type was known
+ * all along.
+ *
+ * When both sides carry the SAME reference tag and the slot is a plain one,
+ * that type IS known here, so the bind is the handle's own operator=, fully
+ * inline. Observably identical to put(): it is the very operator= the type
+ * table would have dispatched to, without asking the table which one.
+ *
+ * THREE DECLINE CONDITIONS, each load-bearing:
+ *  - a CONTAINER-backed slot (an array element) must take put()'s
+ *    copy-on-write path. A frame slot never sets `container`, so the caller
+ *    below always passes this - it is kept because the helper is written to
+ *    be reusable, and a future caller with an element destination must not
+ *    silently skip COW;
+ *  - a BORROWED slot (#94) holds a raw bit-copy whose reference the caller
+ *    owns; assigning over it would release a count this slot never took.
+ *    put() ML_CHECKs that this never happens, so declining here preserves
+ *    that abort instead of racing past it in an ASSERTS=0 build;
+ *  - DIFFERENT tags: the destination must be destroyed and re-constructed as
+ *    another type, which is exactly what operator= exists for.
+ *
+ * t_arr IS DELIBERATELY ABSENT, and the reason is COST, not safety - say it
+ * accurately, because a false safety claim in a comment is worse than none.
+ * SharedArrayObj::operator=(&&) would be correct here: it is the same
+ * operator the type table dispatches to, and it already erases `this` from
+ * its old SharedObject's live-slices set before taking the new one (see
+ * *Copy-on-write containers* in CLAUDE.md - the missing erase there was a
+ * real use-after-free). But it is NOT a handle move: for a slice it is two
+ * std::set operations plus four field copies, so the dispatch this helper
+ * removes is a small fraction of what the op costs, and inlining it at every
+ * return site buys little for real text growth. Admitting t_arr is a
+ * measurable follow-up, not a correctness question.
+ *
+ * The switch FAILS CLOSED: an unlisted tag returns false and the caller does
+ * the ordinary put(), so a reference type added later costs this
+ * optimization and can never cost correctness.
+ */
+static inline bool
+vm_slot_bind_ref(LValue &dst, EvalValue &src)
+{
+    if (dst.container || dst.is_borrowed()
+            || dst.get().get_type() != src.get_type())
+        return false;
+
+    switch (src.get_type()->t) {
+
+    case Type::t_str:
+        dst.getval<SharedStr>() = std::move(src.get<SharedStr>());
+        break;
+
+    case Type::t_func:
+        dst.getval<intrusive_ptr<FuncObject>>() =
+            std::move(src.get<intrusive_ptr<FuncObject>>());
+        break;
+
+    case Type::t_ex:
+        dst.getval<intrusive_ptr<ExceptionObject>>() =
+            std::move(src.get<intrusive_ptr<ExceptionObject>>());
+        break;
+
+    case Type::t_dict:
+        dst.getval<intrusive_ptr<DictObject>>() =
+            std::move(src.get<intrusive_ptr<DictObject>>());
+        break;
+
+    case Type::t_struct:
+        dst.getval<intrusive_ptr<StructObject>>() =
+            std::move(src.get<intrusive_ptr<StructObject>>());
+        break;
+
+    default:
+        return false;       /* t_arr and every trivial tag */
+    }
+
+    /* The payload is moved-from (a null handle), so the tag is all that is
+     * left to drop - and dropping it is what spares the caller's EvalValue
+     * one more indirect dtor call when it goes out of scope. */
+    src.drop_moved_from_tag();
+#ifdef TESTS
+    g_ref_bind_fast++;
+#endif
+    return true;
+}
+
+/* The SHARED UnpackElem* body (the STRICT foreach-unpack of pairs[i] into N
+ * loop vars): ONE implementation for the four interpreter handlers AND
+ * jit_unpack_elem. `kind` 0 = int (flat-ints fast path), 1 = float, 2 =
+ * value; `targets` non-null = the per-position slot list (UnpackElemTargets,
+ * -1 == `_`), else the consecutive run dst_base..dst_base+N-1. The two
+ * strict errors throw loc-less when `chunk` is null (the JIT; the re-raise
+ * stamps the same side-table caret). */
+static void
+vm_unpack_elem_body(EvalContext &ctx, const EvalValue &base_v, int_type idx,
+                    int_type N, int kind, int_type dst_base,
+                    const std::vector<int32_t> *targets,
+                    const Chunk *chunk, size_t pc)
+{
+    /* a codegen-PROVEN array base - for bytecode WE compiled. On an
+     * image the proof is input, not a fact (myv_fuzz fat-260): the
+     * tripwire stays silent there and get_ref's TypeErrorEx is the
+     * defined outcome (defs.h, the ml_untrusted_bytecode() idiom). */
+    ML_VM_CHECK(ml_untrusted_bytecode() || base_v.is<SharedArrayObj>());
+    const SharedArrayObj &outer = base_v.get_ref<SharedArrayObj>();
+    /* #53: the index is bounded by the length at the loop's START; the
+     * body may have shrunk the array since - the foreach's defined
+     * OutOfBoundsEx (loc-less for the JIT: the re-raise stamps it). */
+    /* The row is BORROWED from a general array's storage, as it was
+     * before #53: copying it (vm_arr_elem returns by value) cost a
+     * SharedArrayObj retain + live-slices registration + release per
+     * element - +49% Ir on 75_indexed_unpack. Only a flat storage kind,
+     * which holds no EvalValue to point at, needs the materialized
+     * copy. Safe: nothing runs between here and the last read of `sub`
+     * that could mutate `outer` (the binds below write loop slots).
+     * Both lengths are read INLINE for the general case: the kind-
+     * dispatching size() is an out-of-line call, and it was two per
+     * element. */
+    EvalValue elem_copy;
+    const EvalValue *elem_p;
+    if (outer.skind() == SharedArrayObj::Storage::general) {
+        const auto &ov = outer.get_vec();
+        /* a BYTE bound, not a count: vector::size() over 48-byte
+         * LValues is a subtract and a divide-by-48 per element (and no
+         * pointer is formed before the index is known to be in range) */
+        const LValue *const base = ov.data() + outer.offset();
+        const std::ptrdiff_t avail = outer.is_slice()
+            ? static_cast<std::ptrdiff_t>(outer.size() * sizeof(LValue))
+            : reinterpret_cast<const char *>(ov.data() + ov.size())
+                  - reinterpret_cast<const char *>(base);
+        if (idx < 0 || static_cast<std::ptrdiff_t>(idx * sizeof(LValue))
+                           >= avail)
+            vm_throw_unpack_gone(chunk, pc);
+        elem_p = &base[idx].get();
+    } else {
+        if (idx < 0 || static_cast<size_type>(idx) >= outer.size())
+            vm_throw_unpack_gone(chunk, pc);
+        elem_copy = vm_arr_elem(outer, static_cast<size_type>(idx));
+        elem_p = &elem_copy;
+    }
+    const EvalValue &elem = *elem_p;
+    if (!elem.is<SharedArrayObj>())
+        vm_throw_unpack_nonarray(chunk, pc, N);
+    const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
+    if (sub.skind() == SharedArrayObj::Storage::general
+            && !sub.is_slice()) {
+        /* (bytes, not a count - see the pointer bound above) */
+        const auto &sv = sub.get_vec();
+        if (reinterpret_cast<const char *>(sv.data() + sv.size())
+                - reinterpret_cast<const char *>(sv.data())
+                != static_cast<std::ptrdiff_t>(N * sizeof(LValue)))
+            vm_throw_unpack_len(chunk, pc, sub.size(), N);
+    } else if (sub.size() != static_cast<size_type>(N)) {
+        vm_throw_unpack_len(chunk, pc, sub.size(), N);
+    }
+    const size_type off = sub.offset();
+    const auto sk = sub.skind();
+    /*
+     * H7 inc 1: THE STORAGE DISPATCH IS HOISTED OUT OF THE ELEMENT LOOP.
+     * It used to sit in a per-element helper, so every element re-read
+     * `sub.skind()` and `sub.offset()`, re-derived the element vector, and
+     * paid a non-inlined call - N times for a sub-array whose storage
+     * cannot change between them (nothing here runs user code; the only
+     * writes are to frame slots). Dispatching ONCE and running a
+     * kind-specialized loop over a hoisted base pointer leaves the binds
+     * themselves untouched - the refcount work in vm_slot_bind_str is the
+     * irreducible half and is not what this removes.
+     */
+    const auto each = [&](auto &&bind) {
+        if (targets) {
+            for (int_type k = 0; k < N; k++)
+                if ((*targets)[k] >= 0)
+                    bind(ctx.frame->at((*targets)[k]), k);
+        } else {
+            for (int_type k = 0; k < N; k++)
+                bind(ctx.frame->at(dst_base + k), k);
+        }
+    };
+    if (!targets && kind == 0 && sk == SharedArrayObj::Storage::ints) {
+        const int_type *iv = sub.flat_ints().data() + off;
+        for (int_type k = 0; k < N; k++)
+            write_int_slot(&ctx, dst_base + k, iv[k]);
+        return;
+    }
+    if (!targets && kind == 1 && sk == SharedArrayObj::Storage::floats) {
+        const float_type *fv = sub.flat_floats().data() + off;
+        for (int_type k = 0; k < N; k++)
+            write_float_slot(&ctx, dst_base + k, fv[k]);
+        return;
+    }
+    /* UnpackElemValue, the Targets variant, OR a flat op whose sub-array's
+     * storage is NOT the expected kind (a mixed-numeric literal built
+     * GENERAL, or the other scalar kind): bind each element's ACTUAL boxed
+     * value - identical to do_iter's bind_loop_var. */
+    switch (sk) {
+    case SharedArrayObj::Storage::strs: {
+        const SharedStr *sv = sub.flat_strs().data() + off;
+        each([&](LValue &d, int_type k) { vm_slot_bind_str(d, sv[k]); });
+        return;
+    }
+    case SharedArrayObj::Storage::general: {
+        const LValue *gv = sub.get_vec().data() + off;
+        each([&](LValue &d, int_type k) {
+            vm_slot_bind_value(d, gv[k].get());
+        });
+        return;
+    }
+    default:
+        /* the flat SCALAR kinds keep the vm_arr_elem temp: it is trivial
+         * there (a POD copy, t < t_str), and a struct element must
+         * materialize anyway */
+        each([&](LValue &d, int_type k) {
+            d.put(vm_arr_elem(sub, static_cast<size_type>(k)));
+        });
+        return;
+    }
+}
+
+/* The SHARED MultiUnpackV body (the multi-assign strict destructure /
+ * spread): ONE implementation for the interpreter handler AND
+ * jit_multi_unpack. A null `chunk` makes the throws loc-less (the JIT; the
+ * re-raise stamps the same side-table caret vm_stamp_loc would). */
+static void
+vm_multi_unpack_body(EvalContext &ctx, const EvalValue &rval,
+                     const std::vector<int32_t> &targets,
+                     const std::vector<unsigned char> *coerce, Op aop,
+                     const Chunk *chunk, size_t pc)
+{
+    const bool compound = aop != Op::invalid;
+    size_t ti = 0;
+    const auto store = [&](int32_t t, const EvalValue &v) {
+        if (!compound) {
+            if (coerce && (*coerce)[ti]) {
+                try {
+                    ctx.frame->at(t).put(vm_coerce_decl_num(
+                        v, (*coerce)[ti] == 2));
+                } catch (Exception &e) {
+                    if (chunk)
+                        vm_stamp_loc(*chunk, pc, e);
+                    throw;
+                }
+                return;
+            }
+            ctx.frame->at(t).put(v);
+            return;
+        }
+        EvalValue nv = ctx.frame->at(t).get();
+        try {
+            vm_num_binop(nv, v, aop);
+        } catch (Exception &e) {
+            if (chunk)
+                vm_stamp_loc(*chunk, pc, e);
+            throw;
+        }
+        ctx.frame->at(t).put(std::move(nv));
+    };
+    if (rval.is<SharedArrayObj>()) {
+        const SharedArrayObj &ra = rval.get_ref<SharedArrayObj>();
+        const size_type m = ra.size();
+        if (m != static_cast<size_type>(targets.size()))
+            vm_throw_multi_unpack_len(chunk, pc, m, targets.size());
+        /* H7 inc 1's SIBLING: the storage dispatch is hoisted here too.
+         * `sk`/`off`/the element base are loop-invariant for the same
+         * reason as in vm_unpack_elem_body - nothing in the loop runs
+         * user code or touches `ra`. A COMPOUND or COERCING position
+         * still goes through store(), which needs the boxed element, so
+         * the fast arm is chosen per element and the hoisting only pays
+         * for the plain ones. */
+        const size_type roff = ra.offset();
+        const auto rsk = ra.skind();
+        const SharedStr *rsv =
+            rsk == SharedArrayObj::Storage::strs
+                ? ra.flat_strs().data() + roff : nullptr;
+        const LValue *rgv =
+            rsk == SharedArrayObj::Storage::general
+                ? ra.get_vec().data() + roff : nullptr;
+        for (size_t i = 0; i < targets.size(); i++) {
+            ti = i;
+            if (targets[i] < 0)
+                continue;
+            if (!compound && !(coerce && (*coerce)[i])) {
+                /* the plain bind (H3): identical to store()'s put arm,
+                 * minus the vm_arr_elem temp + type-erased dispatch */
+                LValue &d = ctx.frame->at(targets[i]);
+                if (rsv)
+                    vm_slot_bind_str(d, rsv[i]);
+                else if (rgv)
+                    vm_slot_bind_value(d, rgv[i].get());
+                else
+                    d.put(vm_arr_elem(ra, static_cast<size_type>(i)));
+                continue;
+            }
+            store(targets[i], vm_arr_elem(ra, static_cast<size_type>(i)));
+        }
+    } else {
+        for (size_t i = 0; i < targets.size(); i++) {
+            ti = i;
+            if (targets[i] < 0)
+                continue;
+            if (!compound && !(coerce && (*coerce)[i])) {
+                vm_slot_bind_value(ctx.frame->at(targets[i]), rval);
+                continue;
+            }
+            store(targets[i], rval);
+        }
+    }
+}
+
+/* model-flip (nativize-ops): the native UnpackElem* / MultiUnpackV bodies -
+ * the shared strict-unpack cores above. `targets` / `coerce` are baked pool
+ * BUFFER addresses. Throws -> g_vm_jit_exc + return 1 (the loc-less throw
+ * gets the side-table caret at the re-raise); 0 on success. */
+extern "C" int jit_unpack_elem(int_type dst_base, int_type base_slot,
+                               int_type idx, int_type n_kind,
+                               const void *targets) noexcept
+{
+#ifdef TESTS
+    {
+        const int k = static_cast<int>(n_kind >> 8);
+        g_jit_op_run[static_cast<size_t>(
+            targets ? OpCode::UnpackElemTargets
+                    : k == 0 ? OpCode::UnpackElemInt
+                    : k == 1 ? OpCode::UnpackElemFloat
+                             : OpCode::UnpackElemValue)]++;
+    }
+#endif
+    EvalContext *ctx = g_current_ctx;
+    try {
+        vm_unpack_elem_body(
+            *ctx, ctx->frame->at(base_slot).get(), idx,
+            n_kind & 0xff, static_cast<int>(n_kind >> 8), dst_base,
+            static_cast<const std::vector<int32_t> *>(targets), nullptr, 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_multi_unpack(int_type rval_slot, const void *targets,
+                                const void *coerce, int_type aop) noexcept
+{
+    ML_JIT_OP_RAN(MultiUnpackV);
+    EvalContext *ctx = g_current_ctx;
+    try {
+        vm_multi_unpack_body(
+            *ctx, ctx->frame->at(rval_slot).get(),
+            *static_cast<const std::vector<int32_t> *>(targets),
+            static_cast<const std::vector<unsigned char> *>(coerce),
+            static_cast<Op>(aop), nullptr, 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        /* a plain Exception: the eptr channel (the noexcept would
+         * std::terminate otherwise - #56) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+/* The SHARED IncDecCheckedV body (the dyn scalar ++/--): int/float-only
+ * (a TypeErrorEx otherwise - loc-less when `chunk` is null, the JIT; the
+ * re-raise stamps the same side-table caret), then +-1 in place. ONE
+ * implementation for the interpreter handler AND jit_incdec_checked. */
+static void
+vm_incdec_scalar_body(LValue &lv, bool is_inc, const Chunk *chunk, size_t pc)
+{
+    EvalValue nv = lv.get();
+    if (!nv.is<int_type>() && !nv.is<float_type>()) {
+        Loc s, en;
+        if (chunk)
+            chunk->loc_at(pc, s, en);
+        throw TypeErrorEx("'++'/'--' requires an int or float", s, en);
+    }
+    vm_num_binop(nv, EvalValue(static_cast<int_type>(1)),
+                 is_inc ? Op::plus : Op::minus);
+    lv.put(std::move(nv));
+}
+
+/* model-flip (nativize-ops): the native CHECKED INC-DEC bodies. Each forms
+ * its base/root like the interpreter, EXCEPT an undefined GLOBAL, which
+ * BAILS (return 1 with NO exception set - UndefinedVariableEx is not
+ * conveyable via g_vm_jit_exc; the interpreter re-runs the op and throws
+ * with the side-table caret, the LoadGlobalV pattern). Every other throw is
+ * a RuntimeException -> g_vm_jit_exc + return 1; the Elem/Member/Chain
+ * throws carry their POOLED carets (which survive the re-raise), the scalar
+ * TypeErrorEx is loc-less -> the side-table caret. */
+extern "C" int jit_incdec_checked(int_type slot, int_type kind,
+                                  int_type is_inc) noexcept
+{
+    ML_JIT_OP_RAN(IncDecCheckedV);
+    EvalContext *ctx = g_current_ctx;
+    LValue *lvp;
+    if (kind == 1) {
+        if (!ctx->gfuncs->defined[slot])
+            return 1;                       /* bail: interpreter re-runs */
+        lvp = &ctx->gfuncs->slots[slot];
+    } else if (kind == 2) {
+        lvp = &(*ctx->captures)[slot];
+    } else {
+        lvp = &ctx->frame->at(slot);
+    }
+    try {
+        vm_incdec_scalar_body(*lvp, is_inc != 0, nullptr, 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_incdec_elem(int_type kind, int_type base_slot,
+                               int_type key_slot, int_type is_inc,
+                               const void *sitev) noexcept
+{
+    ML_JIT_OP_RAN(IncDecElemCheckedV);
+    EvalContext *ctx = g_current_ctx;
+    const Chunk::IncDecSite &site =
+        *static_cast<const Chunk::IncDecSite *>(sitev);
+    LValue *blv;
+    if (kind == 1) {
+        if (!ctx->gfuncs->defined[base_slot])
+            return 1;                       /* bail */
+        blv = &ctx->gfuncs->slots[base_slot];
+    } else if (kind == 2) {
+        blv = &(*ctx->captures)[base_slot];
+    } else {
+        blv = &ctx->frame->at(base_slot);
+    }
+    try {
+        vm_incdec_elem(blv, ctx->frame->at(key_slot).get(), is_inc != 0,
+                       site.lstart, site.lend, site.istart, site.iend);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_incdec_member(int_type kind, int_type base_slot,
+                                 int_type is_inc, const void *sitev) noexcept
+{
+    ML_JIT_OP_RAN(IncDecMemberCheckedV);
+    EvalContext *ctx = g_current_ctx;
+    const Chunk::IncDecSite &site =
+        *static_cast<const Chunk::IncDecSite *>(sitev);
+    LValue *blv;
+    if (kind == 1) {
+        if (!ctx->gfuncs->defined[base_slot])
+            return 1;                       /* bail */
+        blv = &ctx->gfuncs->slots[base_slot];
+    } else if (kind == 2) {
+        blv = &(*ctx->captures)[base_slot];
+    } else {
+        blv = &ctx->frame->at(base_slot);
+    }
+    try {
+        vm_incdec_member(blv, site.memId, site.memUid, is_inc != 0,
+                         site.lstart, site.lend, site.bstart, site.bend,
+                         site.istart, site.iend);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_incdec_chain(int_type root_kind, int_type root_slot,
+                                int_type dst, int_type is_inc,
+                                const void *chainv,
+                                const void *mkeys) noexcept
+{
+    ML_JIT_OP_RAN(IncDecChainV);
+    EvalContext *ctx = g_current_ctx;
+    const Chunk::IncDecChain &site =
+        *static_cast<const Chunk::IncDecChain *>(chainv);
+    EvalValue cur;
+    if (root_kind == 1) {
+        if (!ctx->gfuncs->defined[root_slot])
+            return 1;                       /* bail */
+        cur = EvalValue(&ctx->gfuncs->slots[root_slot]);
+    } else if (root_kind == 2) {
+        cur = EvalValue(&(*ctx->captures)[root_slot]);
+    } else {
+        cur = EvalValue(&ctx->frame->at(root_slot));
+    }
+    try {
+        vm_incdec_chain_core(*ctx, site,
+                             static_cast<const Chunk::MemberKey *>(mkeys),
+                             std::move(cur), dst, is_inc != 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* The BAKED member read (the 64_struct_create fix): try_member_scalar
+ * resolved the field at COMPILE time (b dual: lo = byte offset or -1,
+ * hi = struct_defs idx << 2 | form) - so the hot path is a def-identity
+ * check + one byte read, NO name scan (slot_of compared interned names
+ * over the fields vector on EVERY read before). Forms: 0 int, 1 float,
+ * 2 bool->0/1, 3 int promoted to float. Returns false (untouched dst) on
+ * any mismatch -> the generic vm_load_member_scalar below. */
+static ML_ALWAYS_INLINE bool
+vm_load_member_baked(EvalContext &ctx, const Instr *in, const Chunk *chunk)
+{
+    const int32_t off = in->b_dual_lo();
+    if (off < 0)
+        return false;
+    const EvalValue &b = ctx.frame->at(in->target2).get();
+    if (!b.is<intrusive_ptr<StructObject>>())
+        return false;
+    const int32_t hi = in->b_dual_hi();
+    const StructObject &o = *b.get_ref<intrusive_ptr<StructObject>>().get();
+    if (o.def != chunk->struct_defs[hi >> 2])
+        return false;
+    const char *p = o.bytes.data() + off;
+    switch (hi & 3) {
+    case 0: {
+        int_type v;
+        std::memcpy(&v, p, sizeof v);
+        write_int_slot(&ctx, in->target, v);
+        break;
+    }
+    case 1: {
+        float_type v;
+        std::memcpy(&v, p, sizeof v);
+        write_float_slot(&ctx, in->target, v);
+        break;
+    }
+    case 2:
+        write_int_slot(&ctx, in->target,
+                       static_cast<unsigned char>(*p) != 0 ? 1 : 0);
+        break;
+    default: {                                  /* int field read as float */
+        int_type v;
+        std::memcpy(&v, p, sizeof v);
+        write_float_slot(&ctx, in->target, static_cast<float_type>(v));
+        break;
+    }
+    }
+    return true;
+}
+
+/* The SHARED LoadMemberInt/Float body (H1 - the typed standalone struct-member
+ * read `p.x`, th==i/f) for what the BAKED read (vm_load_member_baked,
+ * jit's inline twin) does not serve: a boxed struct, a dict, a const
+ * member, a `dyn` base. member_read_core + write_scalar_slot, whose
+ * loc-less get<> throw is stamped with the member's caret. A POD field is
+ * never left here by our own bytecode - try_member_scalar bakes every one
+ * it can, and the baked def is the def every instance of the type holds -
+ * and member_read_core reads one correctly anyway (it had a byte-reading
+ * arm of its own here, which no program reached). ONE implementation for
+ * the interpreter handlers AND jit_load_member, so they cannot drift. */
+static void
+vm_load_member_scalar(EvalContext &ctx, const Chunk::MemberKey &mk,
+                      int_type base_slot, int_type dst, bool is_int)
+{
+    const EvalValue &b = ctx.frame->at(base_slot).get();
+    try {
+        write_scalar_slot(&ctx, dst, is_int,
+            member_read_core(b, mk.memId, mk.memUid, mk.optional,
+                             mk.mstart, mk.mend, mk.bstart, mk.bend));
+    } catch (Exception &e) {
+        /* write_scalar_slot's get<> throw is loc-less - give it the member's
+         * caret (member_read_core's own throws carry it) */
+        if (!e.loc_start) {
+            e.loc_start = mk.mstart;
+            e.loc_end = mk.mend;
+        }
+        throw;
+    }
+}
+
+/* model-flip (nativize-ops): the native LoadMemberInt/Float body - the shared
+ * H1 typed member read above. `mkv` is a baked `&chunk.member_keys[idx]`. The
+ * fallback path throws WITH the member caret -> g_vm_jit_exc + return 1
+ * (vm_raise's empty-loc-only stamp keeps it); 0 on success. */
+extern "C" int jit_load_member(int_type dst, int_type base_slot,
+                               const void *mkv, int is_int) noexcept
+{
+#ifdef TESTS
+    g_jit_op_run[static_cast<size_t>(
+        is_int ? OpCode::LoadMemberInt : OpCode::LoadMemberFloat)]++;
+#endif
+    EvalContext *ctx = g_current_ctx;
+    const Chunk::MemberKey *mk = static_cast<const Chunk::MemberKey *>(mkv);
+    try {
+        vm_load_member_scalar(*ctx, *mk, base_slot, dst, is_int != 0);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        /* a plain Exception: the eptr channel (the noexcept would
+         * std::terminate otherwise - #56) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native DeclConstV body - bind a const
+ * arr/dict/func decl's slot as a CONST LValue (so a later rebind still
+ * throws), local or global. The rvalue is already materialized in `src`.
+ * Never throws. */
+extern "C" void jit_decl_const(int_type dst, int_type is_global,
+                               int_type src) noexcept
+{
+    ML_JIT_OP_RAN(DeclConstV);
+    EvalContext *ctx = g_current_ctx;
+    EvalValue v = ctx->frame->at(src).get();
+    if (!is_global) {
+        ctx->frame->at(dst) = LValue(std::move(v), true);
+    } else {
+        ctx->gfuncs->define(dst, LValue(std::move(v), true));
+    }
+}
+
+/* model-flip (nativize-ops): the native DefinedGlobalV body - `defined(g)`
+ * is the global slot's defined-flag as a bool. Never throws. */
+extern "C" void jit_defined_global(int_type dst, int_type gslot) noexcept
+{
+    ML_JIT_OP_RAN(DefinedGlobalV);
+    EvalContext *ctx = g_current_ctx;
+    ctx->frame->at(dst).put(EvalValue(ctx->gfuncs->defined[gslot] != 0));
+}
+
+/* model-flip (nativize-ops): the native StructFieldAddInt READ half - the #9
+ * fusion `dst = other + a[i].f`'s proven no-fault field read (the exact
+ * vm_struct_field_int the interpreter calls). The ADD and the dst write run
+ * in the FRAGMENT (cache-aware - the dst is the reduction's hot accumulator,
+ * which must stay N5-pinnable), so the helper only reads. Never throws. */
+extern "C" int_type jit_struct_field_add_int(int_type base_slot, int_type idx,
+                                             int_type fidx) noexcept
+{
+    ML_JIT_OP_RAN(StructFieldAddInt);
+    Frame *f = g_current_ctx->frame;
+    return vm_struct_field_int(f->at(base_slot).get(), idx, fidx);
+}
+
+/* #32: an in-place builtin's base, for its JIT helper - the interpreted
+ * op's vm_store_base, CONVEYED: an unbound global sets a loc-less
+ * UnboundSymbolEx and gives null, and the helper returns status 2, on
+ * which the emitted code stamps the BASE's caret (base_locs) - the
+ * tree-walker reads arg0's root identifier and raises there. */
+static ML_COLD void
+jit_lv_unbound(EvalContext *ctx, int_type slot)
+{
+    g_vm_jit_exc = std::make_unique<UnboundSymbolEx>(
+        intern_msg("'" + std::string(ctx->gfuncs->names[slot]->val)
+                   + "' is not bound yet"), Loc(), Loc());
+}
+
+/* the bound path inlines into each helper: the message building lives
+ * out of line (it cost 58_structs +3.4% Ir as one function) */
+static inline LValue *
+jit_lv_base(EvalContext *ctx, int_type kind, int_type slot)
+{
+    if (kind == 1) {
+        if (!ctx->gfuncs->defined[slot]) {
+            jit_lv_unbound(ctx, slot);
+            return nullptr;
+        }
+        return &ctx->gfuncs->slots[slot];
+    }
+    if (kind == 2)
+        return &(*ctx->captures)[slot];
+    return &ctx->frame->at(slot);
+}
+
+/* model-flip (nativize-ops): the native EmplaceStruct body - append(struct_arr,
+ * Ctor(args)) with the ctor's field VALUES in the run at run_base. Forms
+ * arg0's LValue* by kind EXACTLY like the interpreter handler (an unbound
+ * GLOBAL returns status 2 - jit_lv_base), runs the shared
+ * vm_do_emplace, writes dst. A throw (coerce / const / non-lvalue) rides
+ * g_vm_jit_exc; a LOC-LESS one gets this pc's side-table caret at the
+ * re-raise == the interpreted handler's vm_stamp_loc; one carrying a pooled
+ * per-field caret keeps it (vm_raise stamps only empty locs). `sitev` = a
+ * baked &chunk.emplace_sites[idx]. */
+extern "C" int jit_emplace_struct(int_type dst, int_type base_slot,
+                                  int_type kind, const void *sitev,
+                                  int_type run_base) noexcept
+{
+    ML_JIT_OP_RAN(EmplaceStruct);
+    EvalContext *ctx = g_current_ctx;
+    const Chunk::EmplaceSite &site =
+        *static_cast<const Chunk::EmplaceSite *>(sitev);
+    LValue *target = jit_lv_base(ctx, kind, base_slot);
+    if (!target)
+        return 2;
+    try {
+        ctx->frame->at(dst).put(vm_do_emplace(*ctx, site, target, run_base));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        /* a plain Exception: the eptr channel (#56 - the noexcept would
+         * std::terminate otherwise) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native MemberV body - the interpreter's exact
+ * `dst = member_read_core(base, key...)`. `mkv` is a `&chunk.member_keys[idx]`
+ * (baked; void* because Chunk::MemberKey is nested). A missing field/key throws
+ * WITH the member caret already set, so EnterNative's re-raise preserves it. */
+extern "C" int jit_member(const EvalValue *base, LValue *dst,
+                          const void *mkv) noexcept
+{
+    const Chunk::MemberKey *mk = static_cast<const Chunk::MemberKey *>(mkv);
+    ML_JIT_OP_RAN(MemberV);
+    try {
+        dst->put(member_read_core(*base, mk->memId, mk->memUid, mk->optional,
+                                  mk->mstart, mk->mend, mk->bstart, mk->bend));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native BOXED-ARITH bodies (BinOpV / CmpV /
+ * CompoundV) - the interpreter's EXACT bodies (boxed_operand + vm_num_binop,
+ * int/float promotion, string `+`, bitwise). `bop` is a `&chunk.boxed_ops[idx]`
+ * (baked pool-buffer address, stable across the chunk move); it holds the FINAL
+ * operand data (target/a/b/aop) so the JIT never bakes an unstable &code[pc].
+ * g_current_ctx->frame is the running callee frame. A num_bin_op throw (div0 /
+ * type) is caught LOC-LESS into g_vm_jit_exc + returns 1, so EnterNative
+ * re-raises stamping the op's caret from the loc side table (extract_locs
+ * records these ops) - byte-identical to the interpreted stamp_operand_loc. */
+#ifdef TESTS
+/* WHICH SHAPE declines the inline fast tier? The tier is int-int (#60)
+ * and float-float (H6); everything else pays the exact-helper path here.
+ * Bumped from the SLOW helpers only, so this is a complete classification
+ * of the residue: `_f` should now be ~0 (a float-float decline is a
+ * div-by-zero or a shape the emit gate refused), `_m` sizes the one
+ * enumerated-but-unbuilt arm (the MIXED int/float promotion), and
+ * everything left is strings/arrays/dicts, which have no inline shape. */
+static void boxed_slow_classify(const EvalValue &a, const EvalValue &b)
+{
+    const bool af = a.is<float_type>(), bf = b.is<float_type>();
+    const bool ai = a.is<int_type>(),   bi = b.is<int_type>();
+    g_jit_boxed_slow++;
+    if (af && bf)
+        g_jit_boxed_slow_f++;
+    else if ((af && bi) || (ai && bf))
+        g_jit_boxed_slow_m++;
+}
+#define ML_BOXED_SLOW(a, b) boxed_slow_classify((a), (b))
+#else
+#define ML_BOXED_SLOW(a, b) ((void)0)
+#endif
+
+extern "C" int jit_boxed_binop(const void *bop) noexcept
+{
+    ML_JIT_OP_RAN(BinOpV);
+    const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
+    EvalContext *ctx = g_current_ctx;
+    EvalValue sa, sb;
+    ML_BOXED_SLOW(boxed_operand(bo->a, ctx, sa),
+                  boxed_operand(bo->b, ctx, sb));
+    EvalValue val = boxed_operand(bo->a, ctx, sa).clone();
+    ctype_sum_copy(val);       /* Q2: as the BinOpV handler */
+    try {
+        const ArrSumScope g(val);
+        vm_num_binop(val, boxed_operand(bo->b, ctx, sb), bo->aop);
+    } catch (RuntimeException &e) {
+        /* deletability: the op's own caret from the pool entry */
+        if (!e.loc_start) { e.loc_start = bo->start; e.loc_end = bo->end; }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    ctx->frame->at(bo->target).put(std::move(val));
+    return 0;
+}
+
+extern "C" int jit_boxed_cmp(const void *bop) noexcept
+{
+    ML_JIT_OP_RAN(CmpV);
+    const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
+    EvalContext *ctx = g_current_ctx;
+    EvalValue sa, sb;
+    ML_BOXED_SLOW(boxed_operand(bo->a, ctx, sa),
+                  boxed_operand(bo->b, ctx, sb));
+    EvalValue val = boxed_operand(bo->a, ctx, sa);
+    try {
+        vm_num_binop(val, boxed_operand(bo->b, ctx, sb), bo->aop);
+    } catch (RuntimeException &e) {
+        /* deletability: the op's own caret from the pool entry */
+        if (!e.loc_start) { e.loc_start = bo->start; e.loc_end = bo->end; }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    ctx->frame->at(bo->target).put(EvalValue(val.is_true()));
+    return 0;
+}
+
+extern "C" int jit_boxed_compound(const void *bop) noexcept
+{
+    ML_JIT_OP_RAN(CompoundV);
+    const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
+    EvalContext *ctx = g_current_ctx;
+    EvalValue sb;
+    EvalValue nv = ctx->frame->at(bo->target).get();
+    ML_BOXED_SLOW(nv, boxed_operand(bo->b, ctx, sb));
+    try {
+        vm_num_binop(nv, boxed_operand(bo->b, ctx, sb), bo->aop);
+    } catch (RuntimeException &e) {
+        /* deletability: the op's own caret from the pool entry */
+        if (!e.loc_start) { e.loc_start = bo->start; e.loc_end = bo->end; }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    ctx->frame->at(bo->target).put(std::move(nv));
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): the native COMPOUND global store `g OP= rhs` /
+ * `g++` - the interpreter's compound StoreGlobalV branch. Reuses the boxed_ops
+ * pool (bo->target = the GLOBAL slot, bo->a = the rhs operand, bo->aop = the
+ * op). An UNDEFINED global BAILS (return 1, no g_vm_jit_exc -> the interpreter
+ * re-runs + throws UndefinedVariableEx, like jit_load_global). A num_bin_op
+ * throw (div0/type, loc-less) -> g_vm_jit_exc + return 1, so EnterNative
+ * re-raises with the caret from the loc side table (like the interpreted
+ * vm_stamp_loc). Both exits return 1; EnterNative distinguishes by whether
+ * g_vm_jit_exc is set. NOT op_fully_native.
+ */
+extern "C" int jit_store_global_compound(const void *bop) noexcept
+{
+    ML_JIT_OP_RAN(StoreGlobalV);
+    const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
+    EvalContext *ctx = g_current_ctx;
+    GlobalFuncTable *g = ctx->gfuncs;
+    if (!g->defined[bo->target]) {
+        /* re-raise deletability: CONVEY the exact interpreted throw (the
+         * eptr channel - UndefinedVariableEx has no clone()) with the
+         * name + the op's own pool caret, instead of the old bail-to-
+         * re-run; the pool entry is already loaded, so this costs nothing
+         * on the defined path. */
+        g_vm_jit_exc = std::make_unique<UnboundSymbolEx>(
+            intern_msg("'" + std::string(g->names[bo->target]->val)
+                       + "' is not bound yet"), bo->start, bo->end);
+        return 1;
+    }
+    LValue &lv = g->slots[bo->target];
+    EvalValue sb;
+    EvalValue nv = lv.get();
+    try {
+        vm_num_binop(nv, boxed_operand(bo->a, ctx, sb), bo->aop);
+    } catch (RuntimeException &e) {
+        /* deletability: the op's own caret from the pool entry */
+        if (!e.loc_start) { e.loc_start = bo->start; e.loc_end = bo->end; }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    lv.put(std::move(nv));
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native COMPOUND capture store `cap OP= rhs` /
+ * `cap++` - the interpreter's compound StoreCaptureV branch. Like
+ * jit_store_global_compound but the slot is a CAPTURE (bo->target) - a capture
+ * is always defined, so NO bail (only the num_bin_op re-raise). NOT
+ * op_fully_native. */
+extern "C" int jit_store_capture_compound(const void *bop) noexcept
+{
+    ML_JIT_OP_RAN(StoreCaptureV);
+    const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
+    EvalContext *ctx = g_current_ctx;
+    LValue &lv = (*ctx->captures)[bo->target];
+    EvalValue sb;
+    EvalValue nv = lv.get();
+    try {
+        vm_num_binop(nv, boxed_operand(bo->a, ctx, sb), bo->aop);
+    } catch (RuntimeException &e) {
+        /* deletability: the op's own caret from the pool entry */
+        if (!e.loc_start) { e.loc_start = bo->start; e.loc_end = bo->end; }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    lv.put(std::move(nv));
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native LogV body - EAGER logical `a && b` /
+ * `a || b` (MyLang's don't short-circuit at runtime; both operands are already
+ * computed). is_true() never throws, so LogV is op_fully_native (no eax check).
+ * `bop` is a `&chunk.boxed_ops[idx]` (the same pool as the arith ops). */
+extern "C" int jit_boxed_log(const void *bop) noexcept
+{
+    ML_JIT_OP_RAN(LogV);
+    const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
+    EvalContext *ctx = g_current_ctx;
+    try {
+        EvalValue sa, sb;
+        const bool a = boxed_operand(bo->a, ctx, sa).is_true();
+        const bool b = boxed_operand(bo->b, ctx, sb).is_true();
+        ctx->frame->at(bo->target).put(
+            EvalValue(bo->aop == Op::land ? (a && b) : (a || b)));
+    } catch (RuntimeException &e) {
+        /* is_true's BASE Type op throws for an operand with no bool conversion
+         * (a builtin value laundered through `dyn`). This helper is noexcept, so
+         * before this catch existed the exception ESCAPED -> std::terminate: a
+         * real JIT crash, from the "is_true never throws" assumption LogV was
+         * nativized under. Re-raise like every other throwing op. */
+        /* deletability: the op's own caret from the pool entry */
+        if (!e.loc_start) { e.loc_start = bo->start; e.loc_end = bo->end; }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native UnaryV body - boxed unary over a
+ * dyn/general operand (Expr02::do_eval: clone the operand, apply). `-str`/`~str`
+ * throw a type error via the Type vtable -> caught into g_vm_jit_exc + return 1
+ * (EnterNative re-raises with the operand caret from the loc side table).
+ * Reuses the boxed_ops pool (1-operand: target/a/aop, b unused). */
+extern "C" int jit_unary(const void *bop) noexcept
+{
+    ML_JIT_OP_RAN(UnaryV);
+    const Chunk::BoxedOp *bo = static_cast<const Chunk::BoxedOp *>(bop);
+    EvalContext *ctx = g_current_ctx;
+    EvalValue s;
+    EvalValue v = boxed_operand(bo->a, ctx, s).clone();
+    try {
+        switch (bo->aop) {
+        case Op::plus:
+            if (v.is<bool>())
+                v = static_cast<int_type>(v.get<bool>() ? 1 : 0);
+            break;
+        case Op::minus:
+            if (v.is<bool>())
+                v = static_cast<int_type>(v.get<bool>() ? 1 : 0);
+            v.get_type()->opneg(v);
+            break;
+        case Op::lnot:
+            v = EvalValue(!v.is_true());
+            break;
+        case Op::bnot:
+            if (v.is<bool>())
+                v = static_cast<int_type>(v.get<bool>() ? 1 : 0);
+            v.get_type()->bnot(v);
+            break;
+        default:
+            break;                     /* unreachable: codegen emits a valid
+                                        * unary aop only (the interpreter's
+                                        * InternalErrorEx default is dead) */
+        }
+    } catch (RuntimeException &e) {
+        /* deletability: the op's own caret from the pool entry */
+        if (!e.loc_start) { e.loc_start = bo->start; e.loc_end = bo->end; }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    ctx->frame->at(bo->target).put(std::move(v));
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native CoerceNumV body - the typed-store
+ * numeric coerce (the coerces_dyn accumulator's plain assign): widen
+ * float<-int/bool, int<-bool, pass none, THROW TypeError on a non-fitting dyn
+ * value. `src_slot` holds the dyn value, `dst` the typed int/float slot,
+ * `is_float` the target kind. A throw catches LOC-LESS into g_vm_jit_exc +
+ * returns 1 -> EnterNative re-raises with the Expr14 caret from the loc side
+ * table (extract_locs records it), byte-identical to the interpreted stamp. */
+extern "C" int jit_coerce_num(int_type dst, int_type src_slot,
+                              int is_float) noexcept
+{
+    ML_JIT_OP_RAN(CoerceNumV);
+    EvalContext *ctx = g_current_ctx;
+    try {
+        ctx->frame->at(dst).put(vm_coerce_decl_num(
+            ctx->frame->at(src_slot).get(), is_float != 0));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* #97 closure inlining: the explicit-closure capture ops' helper arm -
+ * every shape the emitted inline copy does not take (a boxed capture, a
+ * reference-listed dst, any loaded image). vm_closure_capture is the
+ * interpreter's own accessor, so the two tiers cannot disagree; its
+ * provenance refusal (an image's corrupt operand) conveys like any
+ * RuntimeException - the op is exc-stamped, never noexcept-terminated. */
+extern "C" int jit_load_capture_of(int_type dst, int_type fn_slot,
+                                   int_type idx) noexcept
+{
+    ML_JIT_OP_RAN(LoadCaptureOfV);
+    EvalContext *ctx = g_current_ctx;
+    try {
+        ctx->frame->at(dst).put(
+            vm_closure_capture(*ctx, fn_slot, idx).get());
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_store_capture_of(int_type fn_slot, int_type idx,
+                                    int_type src) noexcept
+{
+    ML_JIT_OP_RAN(StoreCaptureOfV);
+    EvalContext *ctx = g_current_ctx;
+    try {
+        vm_closure_capture(*ctx, fn_slot, idx).put(
+            RValue(ctx->frame->at(src).get()));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native CallBuiltinV body - a value-ABI
+ * read-only builtin call. `bcv` is a baked `&chunk.builtin_calls[idx]` (the pool
+ * entry: the func_v pointer, the args-list caret start/end, per-arg carets,
+ * arr_hint). The ArgLocs is built from it (no chunk needed - exactly
+ * arglocs_at's fields). Args are copied from frame slots [base, base+n) into a
+ * stack buffer (n<=8) or a heap one, then func_v runs the interpreter's EXACT
+ * body - a builtin with a callback (make_array/make_dict/find) re-enters
+ * vm_dispatch, which saves/restores g_current_ctx, so `ctx` is valid for the dst
+ * write after. Every REACHABLE builtin throw is now a RuntimeException (arity +
+ * bad-argument are DECL_RUNTIME_EX; the only DECL_SIMPLE one, InternalErrorEx in
+ * str() on snprintf<0, is a can't-happen defensive check) - caught, the loc
+ * stamped from the pool (bc->start/end, exactly the interpreter's stamp), cloned
+ * into g_vm_jit_exc + return 1 -> EnterNative re-raises with that (already-set)
+ * loc. */
+extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
+                                const void *bcv) noexcept
+{
+    ML_JIT_OP_RAN(CallBuiltinV);
+    const Chunk::BuiltinCall *bc =
+        static_cast<const Chunk::BuiltinCall *>(bcv);
+    EvalContext *ctx = g_current_ctx;
+    ArgLocs al;
+    al.start = bc->start;
+    al.end = bc->end;
+    al.args = bc->args.data();
+    al.nargs = bc->args.size();
+    al.arr_hint = bc->arr_hint;
+    al.ctype = bc->ctype;
+    al.ct_store = bc->ct_store;
+    try {
+        EvalValue r;
+        if (n <= 8) {
+            SmallArgs<8> stackbuf;                    /* #97 B1 */
+            for (int_type i = 0; i < n; i++)
+                stackbuf.push(ctx->frame->at(base + i).get());
+            r = bc->builtin.func_v(ctx, &al, stackbuf.data(), n);
+        } else {
+            std::vector<EvalValue> heapbuf(static_cast<size_t>(n));
+            for (int_type i = 0; i < n; i++)
+                heapbuf[i] = ctx->frame->at(base + i).get();
+            r = bc->builtin.func_v(ctx, &al, heapbuf.data(), n);
+        }
+        ctx->frame->at(dst).put(std::move(r));
+    } catch (RuntimeException &e) {
+        if (!e.loc_start) { e.loc_start = bc->start; e.loc_end = bc->end; }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* Re-raise deletability (ThrowRuntimeV): build the POOLED exception
+ * natively - `tv` is a baked &chunk.throws[idx] (kind + the exact caret +
+ * the name). Every kind is a RuntimeException (UndefinedVariableEx an
+ * uncatchable one) and rides g_vm_jit_exc, so the walk records the frames
+ * it unwinds. Every kind carries its pooled loc at CONSTRUCTION,
+ * so the caret is pc-independent and the op is deletable. */
+extern "C" int jit_throw_runtime(const void *tv) noexcept
+{
+    ML_JIT_OP_RAN(ThrowRuntimeV);
+    const Chunk::ThrowSite &t = *static_cast<const Chunk::ThrowSite *>(tv);
+    switch (t.kind) {
+    case Chunk::ThrowKind::not_lvalue:
+        g_vm_jit_exc = std::make_unique<NotLValueEx>(t.start, t.end);
+        break;
+    case Chunk::ThrowKind::bad_args:
+        g_vm_jit_exc =
+            std::make_unique<InvalidNumberOfArgsEx>(t.start, t.end);
+        break;
+    case Chunk::ThrowKind::undefined_var:
+        /* UNDEFINED (no slot anywhere), not unbound - see the interpreted
+         * twin. Still the eptr channel: UndefinedVariableEx is an
+         * UncatchableRuntimeException, conveyed but never handled. */
+        g_vm_jit_exc = std::make_unique<UndefinedVariableEx>(
+            t.name->val, t.start, t.end);
+        break;
+    }
+    return 1;
+}
+
+/* Re-raise deletability (the raise-kind ops): build the JR-kind exception
+ * LOC-LESS into g_vm_jit_exc from the fragment's cold raise branch; the
+ * emit's exc-stamp then adds the op's own caret, so the op CONVEYS like
+ * the rest of the family instead of signalling g_vm_jit_raise (whose
+ * exception EnterNative builds with a loc_at(pc) caret - wrong at a
+ * deleted run's collapsed pc). The construction mirrors EnterNative's
+ * exactly. Cold - called only when the div/shift actually faults. */
+/* The ONE kind->exception mapping (four consumers used to carry copies
+ * of a ternary chain - a new kind would have had to be added to each). */
+static std::unique_ptr<RuntimeException> vm_jit_raise_kind_new(int kind)
+{
+    switch (kind) {
+    case JR_OOB:     return std::make_unique<OutOfBoundsEx>();
+    case JR_DIV0:    return std::make_unique<DivisionByZeroEx>();
+    case JR_DIV_OVF: return std::make_unique<InvalidValueEx>(
+                                "integer overflow in division");
+    default:         return std::make_unique<InvalidValueEx>(
+                                "negative shift count");
+    }
+}
+
+extern "C" void jit_raise_kind_exc(int kind) noexcept
+{
+    g_vm_jit_exc = vm_jit_raise_kind_new(kind);
+}
+
+/* model-flip (nativize-ops): the native CheckCallableV - an indirect
+ * call's callable guard (FuncObject / Builtin / struct type descriptor),
+ * run BEFORE the arg run evaluates (the tree-walker's dispatch order). A
+ * non-callable conveys a LOC-LESS NotCallableEx; the emit's cold-side
+ * exc-stamp gives it the callee caret -> op_fully_native (deletable). */
+extern "C" int jit_check_callable(int_type slot) noexcept
+{
+    ML_JIT_OP_RAN(CheckCallableV);
+    const EvalValue &cv = g_current_ctx->frame->at(slot).get();
+    if (cv.is<intrusive_ptr<FuncObject>>() || cv.is<Builtin>()
+            || cv.is<StructTypeDef *>())
+        return 0;
+    g_vm_jit_exc = std::make_unique<NotCallableEx>();
+    return 1;
+}
+
+
+/* model-flip (nativize-ops): the native CheckFuncV - map/filter's arg0
+ * guard. A non-function conveys a LOC-LESS TypeErrorEx; EnterNative's
+ * re-raise (vm_raise) stamps arg0's caret from the loc table at the op's
+ * pc - exactly the loc_at(pc) the interpreted throw uses. */
+extern "C" int jit_check_func(int_type slot) noexcept
+{
+    ML_JIT_OP_RAN(CheckFuncV);
+    EvalContext *ctx = g_current_ctx;
+    if (ctx->frame->at(slot).get().is<intrusive_ptr<FuncObject>>())
+        return 0;
+    g_vm_jit_exc = std::make_unique<TypeErrorEx>("Expected function");
+    return 1;
+}
+
+/*
+ * RULE 1: CheckNoneArgsV's check, shared by the interpreted op
+ * (vm_check_none_args) and the JIT's helper: the index of the first
+ * argument that is a none bound to a parameter not declared `opt` of the
+ * RUNTIME callee - that parameter's name in `param` - or -1 when the bind
+ * accepts. `kind` 0 = the callee is in frame slot `callee`, 1 = global slot
+ * `callee` (an unbound one holds none); anything but a function there is
+ * the call's own error to raise. Each caller builds the refusal
+ * (none_bind_error) and gives it its caret.
+ */
+static BindFault
+vm_none_args_fault(EvalContext &ctx, int_type kind, int_type callee,
+                   int_type argbase, int_type nargs,
+                   const FuncDescriptor *&desc)
+{
+    /* (the lines marked INT-COV-EXEMPT hold one Frame::at each, whose
+     * bounds assert cannot fail: verify_chunk bounds both operands) */
+    const EvalValue &cv = kind == 0
+        ? ctx.frame->at(callee).get()           /* INT-COV-EXEMPT: at() */
+        : ctx.gfuncs->slots[callee].get();
+    /* INT-COV-EXEMPT: a valid program's call op names a FUNCTION (its
+     * static type is one, and a named function is bound at scope entry) -
+     * only a crafted image reaches the early return */
+    if (!cv.is<intrusive_ptr<FuncObject>>())    /* INT-COV-EXEMPT */
+        return BindFault();
+    const FuncDescriptor *d = cv.get_ref<intrusive_ptr<FuncObject>>()->func;
+    desc = d;
+    /* the op stands before a CallV or a CallValueV, whose callee's arity
+     * the check pass proved against this call (a dyn callee takes the
+     * generic op, which checks the count first) - so the count is in
+     * range, and std::min only keeps a crafted image's mismatch in bounds
+     * (it then refuses the none where the call would refuse the count) */
+    const size_t n = std::min(static_cast<size_t>(nargs), d->params.size());
+    return bind_fault_in_range(d, n,
+        [&](size_t i) -> const EvalValue & {
+            const int_type s = argbase + static_cast<int_type>(i);
+            return ctx.frame->at(s).get();      /* INT-COV-EXEMPT: at() */
+        });
+}
+
+/* RULE 1: the native CheckNoneArgsV - a refusal conveys, and the op's
+ * exc-stamp selects the argument's span from arg_locs at run time */
+extern "C" int jit_check_none_args(int_type kind, int_type callee,
+                                   int_type argbase, int_type nargs) noexcept
+{
+    ML_JIT_OP_RAN(CheckNoneArgsV);
+    const FuncDescriptor *d = nullptr;
+    const BindFault f = vm_none_args_fault(*g_current_ctx, kind, callee,
+                                           argbase, nargs, d);
+    if (f.idx < 0)
+        return 0;
+    g_vm_jit_exc = std::make_unique<TypeErrorEx>(
+        bind_fault_error(d, f, f.idx));
+    return 1;
+}
+
+/* class step 4: the native LoadBoxV / StoreBoxV (jit.h) - the shared
+ * box_load_want / box_store every engine calls; every raise is a
+ * RuntimeException built loc-less, stamped with the `*b` caret by the
+ * op's exc-stamp, as the interpreted op stamps it from the loc table */
+extern "C" int jit_load_box(int_type box_slot, int_type dst, int_type want,
+                            const void *def) noexcept
+{
+    ML_JIT_OP_RAN(LoadBoxV);
+    Frame *f = g_current_ctx->frame;
+    try {
+        EvalValue v = box_load_want(
+            f->at(box_slot).get(), static_cast<int>(want),
+            static_cast<const StructTypeDef *>(def));
+        f->at(dst).put(std::move(v));
+    } catch (RuntimeException &e) {   /* INT-COV-EXEMPT: its type test */
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* #49: the native CheckFitV - a misfit conveys a loc-less TypeErrorEx,
+ * stamped with the value's caret by the op's exc-stamp */
+extern "C" int jit_check_fit(int_type slot, const void *spec) noexcept
+{
+    ML_JIT_OP_RAN(CheckFitV);
+    try {
+        check_fit(g_current_ctx->frame->at(slot).get(),
+                  *static_cast<const FitSpec *>(spec));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* the native CastV (plans/cast.md) - cast_value; a refusal conveys
+ * loc-less, stamped with the argument's caret by the op's exc-stamp */
+extern "C" int jit_cast(int_type src, int_type dst, const void *t) noexcept
+{
+    ML_JIT_OP_RAN(CastV);
+    Frame *f = g_current_ctx->frame;
+    try {
+        EvalValue v = cast_value(f->at(src).get(),
+                                 *static_cast<const TypeAnnot *>(t), false);
+        f->at(dst).put(std::move(v));
+    } catch (RuntimeException &e) {   /* INT-COV-EXEMPT: its type test */
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_store_box(int_type box_slot, int_type val_slot) noexcept
+{
+    ML_JIT_OP_RAN(StoreBoxV);
+    Frame *f = g_current_ctx->frame;
+    try {
+        box_store(f->at(box_slot).get(), f->at(val_slot).get());
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* model-flip (nativize-ops): the native MapFilterV - map/filter over the
+ * pre-validated function + container via the SHARED vm_map_filter (the
+ * interpreter's exact body; a callback re-enters vm_dispatch through
+ * VmInvoker, which owns g_current_ctx for its loop, so `ctx` stays valid
+ * for the dst write). The unsupported-container TypeErrorEx is built
+ * LOC-LESS (empty locs passed) and stamped at the op's pc by EnterNative's
+ * re-raise - the same loc_at(pc) caret the interpreted op passes in; a
+ * callback's own throw already carries its loc. A PLAIN exception (a
+ * callback's UndefinedVariableEx - no clone()) rides g_vm_jit_eptr. */
+/* Q2: give the container MapFilterV just made in `dst` the type it is
+ * made with - a separate call after jit_map_filter, whose six argument
+ * registers are taken. Never throws. */
+extern "C" void jit_stamp_ctype(int_type dst, const TypeAnnot *ct) noexcept
+{
+    stamp_ctype(g_current_ctx->frame->at(dst).get(), ct);
+}
+
+extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
+                              int_type dst, int_type is_map,
+                              int_type site, int_type cend) noexcept
+{
+    ML_JIT_OP_RAN(MapFilterV);
+    EvalContext *ctx = g_current_ctx;
+    /* the container caret (`site` is its start): carried explicitly, as
+     * the interpreted op passes it, so the only loc-less escape is a
+     * callback's bind - stamped with the argument list at the site */
+    const Loc cs(packed_hi(site), packed_lo(site));
+    const Loc ce(packed_hi(cend), packed_lo(cend));
+    try {
+        ctx->frame->at(dst).put(
+            vm_map_filter(ctx, ctx->frame->at(fn_slot).get(),
+                          ctx->frame->at(cont_slot).get(),
+                          (is_map & 1) != 0, cs, ce, cs,
+                          static_cast<int>((is_map >> 1) & 3)));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): the native AppendV `append(a, x)` / `push(a, x)` -
+ * the interpreter's D1 fast op. Forms arg0's LValue* from `kind` (0 local / 1
+ * global / 2 capture) + `arg0_slot` (an unbound global -> status 2,
+ * jit_lv_base), then runs arr_append_fast (the shared
+ * NEVER-THROWING append core - flat/general, hash upkeep) inline. Any decline
+ * (const/readonly/non-array/slice/flat-mismatch/null) falls back to the FULL
+ * vm_call_builtin_lv_rest (builtin_append), which CAN throw - all
+ * RuntimeExceptions now (NotLValueEx / TypeErrorEx / CannotChangeConstEx, the
+ * last just made a RuntimeException) already carrying the arg caret -> caught
+ * into g_vm_jit_exc + re-raised, byte-identical to the interpreted AppendV.
+ * `dst_slot` = the result dst (-1 = a discarded `append(a,x);` statement).
+ * `bc` = &chunk.builtin_calls[idx] (the pool entry, baked). NOT op_fully_native.
+ */
+extern "C" int jit_append(int_type kind, int_type arg0_slot, int_type val_slot,
+                          int_type dst_slot, const void *bcv) noexcept
+{
+    ML_JIT_OP_RAN(AppendV);
+    const Chunk::BuiltinCall *bc =
+        static_cast<const Chunk::BuiltinCall *>(bcv);
+    EvalContext *ctx = g_current_ctx;
+    LValue *target = jit_lv_base(ctx, kind, arg0_slot);
+    if (!target)
+        return 2;
+    const EvalValue &elem = ctx->frame->at(val_slot).get();
+    /* Q2: a checked append takes the full builtin (AppendV's handler) */
+    if (!bc->ct_store && arr_append_fast(target, elem, false)) {
+        if (dst_slot >= 0)
+            ctx->frame->at(dst_slot).put(target->get());
+        return 0;
+    }
+    try {
+        EvalValue res = vm_call_builtin_lv_rest(*ctx, *bc, target, val_slot);
+        if (dst_slot >= 0)
+            ctx->frame->at(dst_slot).put(std::move(res));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        /* a plain (non-Runtime) Exception: the eptr channel - the noexcept
+         * would std::terminate otherwise (#56 inc 2) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): the native CallBuiltinLV - a mutating (lvalue-ABI)
+ * builtin call `pop(a)`/`insert(a,i,v)`/`erase(a,i)`/`sort(a[,cmp])`/`reverse(a)`
+ * /`intptr(a)`, the interpreter's exact CallBuiltinLV. Forms arg0's LValue* from
+ * `kind` (0 local / 1 global / 2 capture) + arg0_slot (an unbound global ->
+ * status 2, jit_lv_base). `rest_base` >= 0 -> a REST-NATIVE
+ * op (its value args are the register run [rest_base, +n_rest); via
+ * vm_call_builtin_lv_rest); `rest_base` == -1 -> a NO-value-arg op (pop/intptr/
+ * sort-no-cmp -> func_lv with an empty rest). Every reachable throw is a
+ * RuntimeException now (NotLValueEx/TypeErrorEx/OutOfBoundsEx/CannotChangeConstEx
+ * /InvalidArgument/InvalidNumberOfArgs/InvalidValue) -> caught into g_vm_jit_exc
+ * (loc from the builtin_calls pool) + re-raised. NOT op_fully_native.
+ */
+extern "C" int jit_call_builtin_lv(int_type kind, int_type arg0_slot,
+                                   int_type dst_slot, int_type rest_base,
+                                   const void *bcv) noexcept
+{
+    ML_JIT_OP_RAN(CallBuiltinLV);
+    const Chunk::BuiltinCall *bc =
+        static_cast<const Chunk::BuiltinCall *>(bcv);
+    EvalContext *ctx = g_current_ctx;
+    LValue *target = jit_lv_base(ctx, kind, arg0_slot);
+    if (!target)
+        return 2;
+    try {
+        EvalValue res;
+        if (rest_base >= 0) {
+            res = vm_call_builtin_lv_rest(*ctx, *bc, target, rest_base);
+        } else {
+            ArgLocs al;
+            al.start = bc->start;
+            al.end = bc->end;
+            al.args = bc->args.data();
+            al.nargs = bc->args.size();
+            al.arr_hint = bc->arr_hint;
+            al.ctype = bc->ctype;
+            al.ct_store = bc->ct_store;
+            res = bc->builtin.func_lv(ctx, &al, target, nullptr, 0);
+        }
+        ctx->frame->at(dst_slot).put(std::move(res));
+    } catch (RuntimeException &e) {
+        if (!e.loc_start) { e.loc_start = bc->start; e.loc_end = bc->end; }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        /* a plain (non-Runtime) Exception: the eptr channel - the noexcept
+         * would std::terminate otherwise (#56 inc 2) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): the native CallBuiltinLVElem - a mutating lvalue
+ * builtin whose arg0 is a SUBSCRIPT target `append(a[i], x)`/`pop(a[i])`. Forms
+ * the base's LValue* (by kind), then the ELEMENT's LValue* via the runtime
+ * Type::subscript (the SAME COW path Subscript::do_eval uses given the identical
+ * base LValue*); a non-lvalue element (flat scalar / read-only / missing key ->
+ * a throw) gives a null target -> NotLValueEx, like the tree-walker. The run at
+ * `run_base` holds the index (run[0]) then the value args (run[1..]). The
+ * interpreter's exact CallBuiltinLVElem; every throw is a RuntimeException ->
+ * g_vm_jit_exc (arg0's caret if loc-less) + re-raise. NOT op_fully_native.
+ */
+/* The target of a mutating builtin whose arg0 is an element `a[i]` of the
+ * base `base`: the element's LValue, or `hold` holding its value when the
+ * subscript gave a value (a flat array's scalar, a read-only container's
+ * element) - the builtin works on it held, as the tree-walker's
+ * (lv_builtin_target). `sub` keeps the subscript's result alive. */
+static inline LValue *
+vm_builtin_elem_target(LValue *base, const EvalValue &idx, EvalValue &sub,
+                       LValue &hold)
+{
+    sub = base->get().get_type()->subscript(EvalValue(base), idx,
+                                            /*for_write=*/false);
+    if (sub.is<LValue *>())
+        return sub.get<LValue *>();
+    hold = LValue(std::move(sub), false);
+    return &hold;
+}
+
+/* The target of a mutating builtin whose arg0 is a MEMBER access
+ * (CallBuiltinLVMember): the one-step form `s.f` is the boxed field's
+ * LValue (vm_member_lvalue: the struct owned, a POD or read-only field's
+ * value held); the CHAIN form (#32, `bc.steps`: `o.i.a`, `m[0].a`, a
+ * member of a base not proven a struct) walks the base through every
+ * step (vm_chain_walk - each struct it enters owned, as the tree-walker's
+ * store_walk) and works on what the walk reached: its LValue, or its
+ * value held. */
+static LValue *
+vm_lv_member_target(EvalContext &ctx, const Chunk::MemberKey *mkeys,
+                    const Chunk::BuiltinCall &bc, LValue *base, LValue &hold)
+{
+    if (bc.steps.empty())
+        return vm_member_lvalue(base, bc.member,
+                                bc.args[0].start, bc.args[0].end,
+                                bc.args[0].start, bc.args[0].end, hold);
+    EvalValue cur(base);
+    PodPlace place;
+    vm_chain_walk(ctx, mkeys, cur, bc.steps, bc.steps.size(), place);
+    if (place.bytes)
+        cur = pod_place_value(place);
+    if (cur.is<LValue *>())
+        return cur.get<LValue *>();
+    hold = LValue(std::move(cur), false);
+    return &hold;
+}
+
+/* An INDIRECT call's arg0 in its #32 CHAIN form (CallSite::A0::chain),
+ * for a func_lv callee: the base walked through every step (each struct
+ * it enters owned) - its LValue, or null when the walk ends at a value
+ * (a POD field, a value's element), which the builtin then sees as
+ * arg0's value, as the tree-walker's by-ref arg0. `keep` holds what the
+ * walk reached alive across the call. */
+static LValue *
+vm_a0_chain_lvalue(EvalContext &ctx, const Chunk::MemberKey *mkeys,
+                   const Chunk::CallSite &cs, LValue *base, EvalValue &keep)
+{
+    keep = EvalValue(base);
+    PodPlace place;
+    vm_chain_walk(ctx, mkeys, keep, cs.a0_steps, cs.a0_steps.size(), place);
+    if (place.bytes || !keep.is<LValue *>())
+        return nullptr;
+    return keep.get<LValue *>();
+}
+
+extern "C" int jit_call_builtin_lv_elem(int_type kind, int_type base_slot,
+                                        int_type dst_slot, int_type run_base,
+                                        const void *bcv) noexcept
+{
+    ML_JIT_OP_RAN(CallBuiltinLVElem);
+    const Chunk::BuiltinCall *bc =
+        static_cast<const Chunk::BuiltinCall *>(bcv);
+    EvalContext *ctx = g_current_ctx;
+    LValue *base = jit_lv_base(ctx, kind, base_slot);
+    if (!base)
+        return 2;
+    const int_type n_rest = static_cast<int_type>(bc->args.size()) - 1;
+    try {
+        EvalValue holder;   /* keeps the subscript result alive */
+        LValue hold;
+        LValue *elem = vm_builtin_elem_target(
+            base, ctx->frame->at(run_base).get(), holder, hold);
+        SmallArgs<8> restbuf;   /* n_rest small (append 1, pop 0); B1 */
+        for (int_type i = 0; i < n_rest; i++)
+            restbuf.push(ctx->frame->at(run_base + 1 + i).get());
+        ArgLocs al;
+        al.start = bc->start;
+        al.end = bc->end;
+        al.args = bc->args.data();
+        al.nargs = bc->args.size();
+        al.arr_hint = bc->arr_hint;
+        al.ctype = bc->ctype;
+        al.ct_store = bc->ct_store;
+        ctx->frame->at(dst_slot).put(
+            bc->builtin.func_lv(ctx, &al, elem,
+                                n_rest ? restbuf.data() : nullptr,
+                                static_cast<size_t>(n_rest)));
+    } catch (RuntimeException &e) {
+        if (!e.loc_start) {                /* the subscript's caret = arg0. */
+            e.loc_start = bc->args[0].start;
+            e.loc_end = bc->args[0].end;
+        }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        /* a plain (non-Runtime) Exception: the eptr channel - the noexcept
+         * would std::terminate otherwise (#56 inc 2) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * model-flip (nativize-ops): the native CallBuiltinLVMember - a mutating lvalue
+ * builtin whose arg0 is a struct-MEMBER target `append(s.f, x)`. Forms the base's
+ * LValue* (by kind), the boxed FIELD LValue* via vm_member_lvalue (the SAME check
+ * MemberExpr does; a POD/readonly field's value is held, a missing one throws),
+ * then func_lv. The run at
+ * `run_base` holds ONLY the value args (NO index, unlike LVElem). The
+ * interpreter's exact CallBuiltinLVMember; every throw is a RuntimeException ->
+ * g_vm_jit_exc (arg0's caret if loc-less) + re-raise. NOT op_fully_native.
+ */
+extern "C" int jit_call_builtin_lv_member(int_type kind, int_type base_slot,
+                                          int_type dst_slot, int_type run_base,
+                                          const void *bcv,
+                                          const void *mkeysv) noexcept
+{
+    ML_JIT_OP_RAN(CallBuiltinLVMember);
+    const Chunk::BuiltinCall *bc =
+        static_cast<const Chunk::BuiltinCall *>(bcv);
+    EvalContext *ctx = g_current_ctx;
+    LValue *base = jit_lv_base(ctx, kind, base_slot);
+    if (!base)
+        return 2;
+    const int_type n_rest = static_cast<int_type>(bc->args.size()) - 1;
+    try {
+        LValue hold;
+        LValue *field = vm_lv_member_target(*ctx,
+            static_cast<const Chunk::MemberKey *>(mkeysv), *bc, base, hold);
+        SmallArgs<8> restbuf;   /* append/push 1 value arg; #97 B1 */
+        for (int_type i = 0; i < n_rest; i++)
+            restbuf.push(ctx->frame->at(run_base + i).get());
+        ArgLocs al;
+        al.start = bc->start;
+        al.end = bc->end;
+        al.args = bc->args.data();
+        al.nargs = bc->args.size();
+        al.arr_hint = bc->arr_hint;
+        al.ctype = bc->ctype;
+        al.ct_store = bc->ct_store;
+        ctx->frame->at(dst_slot).put(
+            bc->builtin.func_lv(ctx, &al, field,
+                                n_rest ? restbuf.data() : nullptr,
+                                static_cast<size_t>(n_rest)));
+    } catch (RuntimeException &e) {
+        if (!e.loc_start) {
+            e.loc_start = bc->args[0].start;
+            e.loc_end = bc->args[0].end;
+        }
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    } catch (...) {
+        /* a plain (non-Runtime) Exception: the eptr channel - the noexcept
+         * would std::terminate otherwise (#56 inc 2) */
+        g_vm_jit_eptr = std::current_exception();
+        return 1;
+    }
+    return 0;
+}
 
 /*
  * Inc 4: if the op at `pc` was spliced from an INLINED body, flush that body's
@@ -1404,12 +7525,30 @@ std::unique_ptr<RuntimeException> g_vm_exc_pending;
  * propagates through a call op (a call FROM inlined code). Cold: error path
  * only. No-op for a chunk with no inlined ops (inline_ctx_at returns null).
  */
-static void vm_flush_inline(const Chunk &chunk, size_t pc, Exception &e)
+static ML_NOINLINE void
+vm_flush_inline_walk(const Chunk &chunk, size_t pc, Exception &e)
 {
     if (e.inline_origin_emitted)
         return;
-    int32_t idx = chunk.inline_frame_at(pc);
-    if (idx < 0)
+    /* #56: a conveying FRAGMENT bakes its op's chain (Exception::
+     * jit_inline_frame) because a deleted run's pcs have collapsed onto the
+     * head EnterNative - prefer it over the pc lookup, which cannot
+     * discriminate there. */
+    int32_t idx = e.jit_inline_frame;
+    if (idx != -1) {
+        /* #88: BAKED. >= 0 is a chain; -2 is the fragment saying "this op
+         * is not inlined code" - an answer, not a missing value, so do NOT
+         * fall back to the pc lookup, which on a deleted run would resolve
+         * against collapsed pcs and invent someone else's chain. */
+#ifdef TESTS
+        g_jit_inline_baked++;
+#endif
+        if (idx < 0)
+            return;
+    } else {
+        idx = chunk.inline_frame_at(pc);
+    }
+    if (idx < 0 || static_cast<size_t>(idx) >= chunk.inline_frames.size())
         return;
     /* Walk the flattened inline_frames pool by parent index (innermost callee
      * first) - same BacktraceFrames as flush_inline_frames over the InlineCtx
@@ -1421,6 +7560,153 @@ static void vm_flush_inline(const Chunk &chunk, size_t pc, Exception &e)
     e.inline_origin_emitted = true;
 }
 
+static ML_ALWAYS_INLINE void
+vm_flush_inline(const Chunk &chunk, size_t pc, Exception &e)
+{
+    /* the common no-inlining chunk: skip the call + pc search entirely
+     * (~27 Ir per raise measured on 70_exc, which never inlines); the
+     * walk stays out-of-line (the loop-body text rule). */
+    if (chunk.inline_ctxs.empty())
+        return;
+    vm_flush_inline_walk(chunk, pc, e);
+}
+
+/*
+ * The CALL-SITE flush - the record-based twin of do_func_call's catch, which
+ * flushes `call_site_inl` UNCONDITIONALLY. The two protocols differ and the
+ * difference is load-bearing:
+ *
+ *   - the RAISE site (vm_flush_inline above / Construct::eval) emits the
+ *     chain of the op that threw, ONCE, keyed off inline_origin_emitted;
+ *   - a PHYSICAL CALL that unwinds emits the chain of ITS OWN call op every
+ *     time, however many such calls the exception crosses - each one is a
+ *     distinct spliced site, and each one's virtual frames belong in the
+ *     backtrace.
+ *
+ * Routing the call sites through the once-guarded form dropped every virtual
+ * frame after the first (a recursion whose self-call sits inside an inlined
+ * region rendered 3 frames where the tree-walker rendered 5).
+ *
+ * Always the pc lookup, never the baked Exception::jit_inline_frame: that
+ * index names the op that RAISED, which is not this call site.
+ */
+/* The walk itself, over the flattened pool by parent index (innermost
+ * first). Taken by BASE POINTER rather than by Chunk so a native caller,
+ * which has only a baked pool address, shares this exact code (#88). */
+static ML_NOINLINE void
+vm_flush_inline_call_pool(const Chunk::InlineFrame *frames, int32_t idx,
+                          Exception &e)
+{
+    for (int32_t i = idx; i >= 0; i = frames[i].parent) {
+        const Chunk::InlineFrame &f = frames[i];
+        e.backtrace.push_back({f.callee_name, f.params, f.call_site});
+    }
+    e.inline_origin_emitted = true;
+}
+
+static ML_NOINLINE void
+vm_flush_inline_call_walk(const Chunk &chunk, size_t pc, Exception &e)
+{
+    const int32_t idx = chunk.inline_frame_at(pc);
+    if (idx < 0 || static_cast<size_t>(idx) >= chunk.inline_frames.size())
+        return;
+    vm_flush_inline_call_pool(chunk.inline_frames.data(), idx, e);
+}
+
+static ML_ALWAYS_INLINE void
+vm_flush_inline_call(const Chunk &chunk, size_t pc, Exception &e)
+{
+    if (chunk.inline_ctxs.empty())
+        return;
+    vm_flush_inline_call_walk(chunk, pc, e);
+}
+
+/*
+ * #88 - the native sync call's baked call site, passed by SIDE CHANNEL.
+ *
+ * A sync_stop record cannot resolve its call site's inlined-at chain the
+ * way the walk's ordinary pop does: its ret_chunk is the loc-less sentinel
+ * and its C++ owner is a native fragment, whose pcs have all collapsed onto
+ * the head EnterNative once the run's originals were deleted. So the
+ * EMITTED call site bakes the two halves - the chain index (from its
+ * pre-collapse old_pc) and the pool base - and stores them here immediately
+ * before the call, the g_jit_pending_key pattern.
+ *
+ * WHY A GLOBAL AND NOT A PARAMETER: jit_call_sync_core already uses all six
+ * SysV argument registers, so two more would spill to the stack on EVERY
+ * sync call to fix a backtrace-only defect. The side channel costs the
+ * emitted site two stores on the SLOW tier's path only.
+ *
+ * THE NESTING RULE, which is what makes a global safe here: each helper
+ * copies both values into its own frame AT ENTRY, before it can dispatch a
+ * callee that would overwrite them, and uses only that copy afterwards. The
+ * globals are a parameter hand-off, never live state.
+ *
+ * The base is inline_frames.data() and NEVER a Chunk * - codegen_chunk
+ * builds the chunk on the stack and moves it out, so the chunk address
+ * dangles while the vector's heap buffer survives (the &ck.locs[i]
+ * argument).
+ */
+static int32_t g_jit_call_inline_chain = -1;
+static const void *g_jit_call_inline_pool = nullptr;
+
+/*
+ * Stamp the baked call-site loc onto the innermost captured frame, then
+ * flush that call site's virtual frames - the pair the walk's ordinary pop
+ * performs (vm_capture_rec_frame + vm_flush_inline_call). Shared by every
+ * sync-call exit that converts an exception, so the two halves cannot drift
+ * apart at one of them.
+ */
+static ML_NOINLINE void
+vm_jit_stamp_call_site(Exception &e, const FuncDescriptor *d,
+                       int_type site_packed, int32_t chain, const void *pool)
+{
+    if (!e.backtrace.empty() && e.backtrace.back().desc == d
+            && !e.backtrace.back().call_site.line)
+        e.backtrace.back().call_site =
+            Loc(packed_hi(site_packed), packed_lo(site_packed));
+    if (chain >= 0 && pool) {
+#ifdef TESTS
+        g_jit_inline_call_baked++;
+#endif
+        vm_flush_inline_call_pool(
+            static_cast<const Chunk::InlineFrame *>(pool), chain, e);
+    } else {
+        /* the site is NOT inlined code - an answer, like the fragment
+         * stamp's -2. Recorded, because the conversion's exit is a
+         * plain exit_pc: the caller's EnterNative re-raises at a
+         * COLLAPSED pc, where the raise-site flush's pc lookup named
+         * the first inlined op's chain - a phantom `step(n)` above every
+         * `od(n, k)` of a mutual recursion (#38 repro B). */
+        e.inline_origin_emitted = true;
+    }
+}
+
+/*
+ * The -2 CONVEYANCE's stamp (#97 increment 2, found by the frameless
+ * site). When a callee's own raise unwound to this site, the innermost
+ * captured frame - `back()`, the direct callee's, captured LOC-LESS by
+ * the raise arm or by the walk's pop of an inline-pushed record - is
+ * exactly the frame whose call site THIS site is. The desc to match is
+ * therefore the frame's own, not a guess from the caller side: the
+ * record path used to read `back_rec().desc` AFTER the pop (the caller's
+ * descriptor, so the stamp landed only for a self-recursive callee), and
+ * the record-less arm passed a null desc to "match" that miss. Both
+ * rendered `[1] caller at line 0` for a WARMED inline call whose callee
+ * throws - a RULE 2 divergence from `-nj` that every net missed because
+ * every enumerated throw happens on a FIRST descent, which the record
+ * high-water gate sends through the C++ tier. The frameless site has no
+ * such gate, so vm_inlined_backtrace_parity saw it on the first call.
+ */
+static ML_NOINLINE void
+vm_jit_stamp_callee_frame(Exception &e, int_type site_packed,
+                          int32_t chain, const void *pool)
+{
+    vm_jit_stamp_call_site(
+        e, e.backtrace.empty() ? nullptr : e.backtrace.back().desc,
+        site_packed, chain, pool);
+}
+
 /* fwd (defined below CachedCallV's probe) - vm_raise now walks natively. */
 static ML_COLD bool
 vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
@@ -1429,7 +7715,7 @@ vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
 /*
  * Raise an exception FROM a VM op - a `throw` / `rethrow` / reraise, or a
  * runtime error the op detects itself (div/mod-by-zero). G1
- * (plans/vm-performance-roadmap.md): the ENTIRE propagation is the native
+ * (plans/archived/vm-performance-roadmap.md): the ENTIRE propagation is the native
  * FRAME WALK (vm_unwind_walk) - dispatch to a handler in the current frame,
  * else pop in-VM records (capturing their backtrace frames) until a handler
  * or the activation's BOUNDARY record; only the boundary converts to the
@@ -1446,131 +7732,571 @@ vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
  */
 static bool
 vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
-         std::unique_ptr<RuntimeException> ex)
+         std::unique_ptr<RuntimeException> ex,
+         const void *frag_rbp = nullptr, const void *raise_desc = nullptr)
 {
-    if (!ex->loc_start) {
-        Loc s, en;
-        chunk->loc_at(pc, s, en);
-        ex->loc_start = s;
-        ex->loc_end = en;
+    /*
+     * 4-v, THE DIRECT RAISE OUT OF A RECORD-LESS FRAME (category (a) of
+     * the conveyance-uniform model - design 4-v-ii REFINED). The window
+     * compare is the discrimination: the running frame's window not being
+     * the top record's means this frame has no record - so back_rec() is
+     * an ANCESTOR whose chunk must caption nothing here (a handler search
+     * against it with OUR pc could FALSE-MATCH a region), and the record
+     * walk may not run. Clean THIS frame only, exactly what the walk's
+     * sync_stop stop does for a record-ful frame: capture it LOC-LESS
+     * (the level-up postexit's stamp fills outer frames; the innermost
+     * one deliberately stays loc-less - frame [0] renders from
+     * ex.loc_start, the 4-ii(b) pinned rule), release its ref slots,
+     * un-account used/seg-top by its own totals, restore the caller's
+     * captures from the residue, repoint the view at the parent (window
+     * from the chain, totals from the parent chunk via the site), set
+     * pending, and return false - the fragment then exits -2 and the
+     * conveyance crosses the levels above one site at a time. Only
+     * jit_throw can arrive here in this state (rethrow/EndFinally need
+     * trys, which a record-less frame cannot have), and it pre-stamps
+     * the caret from its baked entry, so the loc branch below never
+     * consults the wrong chunk; the inline flush must though, hence the
+     * chunk swap to the RAISING function's own.
+     */
+    const bool norec_raiser =
+        frag_rbp && act.top_rec && ctx.frame
+        && ctx.frame->slots != act.top_rec->window;
+    if (norec_raiser) {
+        const auto *d = static_cast<const FuncDescriptor *>(raise_desc);
+        ML_CHECK(d && d->vm_chunk);
+        chunk = static_cast<const Chunk *>(d->vm_chunk);
     }
+    vm_stamp_caret(*chunk, pc, *ex);       /* op_locs for an op error */
     vm_flush_inline(*chunk, pc, *ex);      /* frames if raised in inlined */
+    if (norec_raiser) {
+        const auto *d = static_cast<const FuncDescriptor *>(raise_desc);
+        ex->push_frame(d, Loc());
+        LValue *win = ctx.frame->slots;
+        const int_type total = static_cast<int_type>(chunk->slot_count)
+                               + chunk->n_temps;
+        for (const int32_t s : chunk->ref_slots) {
+            if (s >= total)
+                break;
+            LValue &lv = win[s];
+            if (lv.get().get_type()->t >= Type::t_str)
+                lv.frame_release();
+        }
+        const char *fp = static_cast<const char *>(frag_rbp);
+        /* #97 increment 2: a FRAMELESS raiser's window is on the native
+         * stack (bit 0 of the residue's dst word at [rbp+24]) - it took
+         * no segment space, so there is none to give back */
+        if (!(*reinterpret_cast<const uintptr_t *>(fp + 24) & 1))
+            act.cur_sg->cur -= total;
+        ctx.captures =
+            *reinterpret_cast<CaptureSlots *const *>(fp + 16);
+        const void *ra = *reinterpret_cast<const void *const *>(fp + 8);
+        const NorecSite *S = jit_norec_site_for(ra);
+        ML_CHECK(S && S->caller);
+        act.view_frame.point_at(
+            *reinterpret_cast<LValue *const *>(
+                const_cast<char *>(fp) - 8),
+            static_cast<int>(S->caller->slot_count + S->caller->n_temps));
+        g_vm_exc_pending = std::move(ex);
+        return false;
+    }
+#ifdef TESTS
+    /*
+     * G1 step 4-ii: THE RAISE-TIME CHAIN WALK. `frag_rbp` is the RAISING
+     * fragment's frame pointer (null from every interpreted raiser), so
+     * the frame at it is the CURRENT frame - records[rec_n-1]. The same
+     * traversal the push verification runs, at a DIFFERENT moment: after
+     * arbitrary body execution, which is what proves rbp still holds the
+     * fragment's frame (callee-saved + never emitted) at exactly the
+     * point step 4's record-less unwind will anchor on it.
+     */
+    if (frag_rbp && act.rec_n && !jit_norec_on()) {
+        /* the counters are `unsigned long`, which is 32-bit on
+         * WINDOWS (LLP64) - narrowing a size_t into one is MSVC C4267,
+         * and WERROR makes it a build failure there while GCC/clang say
+         * nothing. Cast at every such site. */
+        g_jit_norec_raise_frames += static_cast<unsigned long>(
+            norec_walk_chain(&act, static_cast<const char *>(frag_rbp),
+                             act.rec_n, nullptr));
+        g_jit_norec_raise_walk++;
+        /*
+         * STEP 4-ii(b) - THE RECONSTRUCTION. Build the backtrace prefix
+         * this segment will contribute, from hardware + baked constants
+         * ONLY: `raise_desc` (the raising function, baked at the throw
+         * emit - the one datum no site can supply, since a site names
+         * its CALLER) seeds the descent; each level's entry is
+         * {the frame's desc, site([fp+8]).site_loc} and the next desc is
+         * that site's caller_desc (the 3b recipe, now producing the
+         * actual capture-shaped data). Cross-checked per level against
+         * the record that still exists; the -rt harness then compares
+         * the whole prefix against the exception's REAL captured
+         * backtrace - the end-to-end composition check.
+         */
+        g_norec_recon.clear();
+        const void *dcur = raise_desc;
+        const char *fp = static_cast<const char *>(frag_rbp);
+        size_t idx = act.rec_n;        /* record of the frame at fp */
+        while (idx) {
+            const void *ra =
+                *reinterpret_cast<const void *const *>(fp + 8);
+            const NorecSite *s = jit_norec_site_for(ra);
+            if (!s)
+                break;                 /* the segment floor */
+            const VmCallRec &r = act.records[idx - 1];
+            if (dcur != static_cast<const void *>(r.desc))
+                norec_fail("recon desc != record desc", dcur, r.desc);
+            if (!r.norec_site
+                    || s->site_loc
+                           != static_cast<const NorecSite *>(
+                                  r.norec_site)->site_loc)
+                norec_fail("recon site_loc != record site", s,
+                           r.norec_site);
+            g_norec_recon.push_back({ dcur, s->site_loc });
+            dcur = s->caller_desc;
+            fp = *reinterpret_cast<const char *const *>(fp);
+            idx--;
+        }
+    }
+#endif
 
     /* The SAME-FRAME fast path first (the pre-G1 shape, kept out of the
      * ML_COLD walk: a same-frame `throw`+catch loop - 42_exceptions - pays
      * only this dispatch; routing it through the cold-section walk cost a
      * measured +12% there). Not cold-marked itself for the same reason. */
-    VmCallRec &cur = act.records.back();
-    if (vm_dispatch_exc(act, cur, pc)) {
-        cur.exc = std::move(ex);
-        return true;                       /* chunk unchanged */
-    }
+    VmCallRec &cur = act.back_rec();
+    if (vm_dispatch_exc_hot(act, cur, ctx, pc, ex))
+        return true;                       /* chunk unchanged; ex parked */
     return vm_unwind_walk(act, ctx, chunk, pc, std::move(ex));
 }
 
+/* the parked handler pc's ADDRESS (g_vm_resume_pc is TU-local), baked by
+ * the Throw emit so the fragment can return it without a second call. */
+void *jit_addr_resume_pc()
+{
+    return &g_vm_resume_pc;
+}
+
+/* C4c: the resume CHUNK's address too - the emitted inline pop (the fast
+ * jit_ret shape, emit_ret_native) stores both resume globals directly. */
+void *jit_addr_resume_chunk()
+{
+    return &g_vm_resume_chunk;
+}
+
+/*
+ * C4c: the hardened-build AUDIT for the emitted inline pop. The inline path
+ * necessarily skips pop_window's ML_VM_CHECK net - including the C3
+ * every-slot-trivial re-scan that is the LOAD-BEARING net for the proven-type
+ * ref_slots exclusions - so a VM_HARDENING build's emit adds a call to this
+ * right before the inline guards run. That keeps BOTH properties: the
+ * hardened lanes exercise the same emitted path a release runs (never "the
+ * configuration nobody runs"), and the audit stays alive exactly where the
+ * frames now pop. Runs on the still-live top record, before any mutation.
+ */
+/* C4c: release one frame slot's reference - the per-slot body of
+ * pop_window's release scan (the assignment unregisters a slice from its
+ * parent's set, which is why this CANNOT be an inline refcount dec - the
+ * jit_bind_ref_arg lesson from the push side). Called by the emitted
+ * inline pop's cold arm for a ref-listed slot whose current value is a
+ * reference; the emitted check mirrors the scan's own type test. */
+extern "C" void jit_release_slot(LValue *lv) noexcept
+{
+    lv->frame_release();
+}
+
+extern "C" void jit_drop_dst(LValue *lv) noexcept
+{
+    lv->drop_for_overwrite();
+}
+
+extern "C" void jit_member_fact_audit(int_type slot,
+                                      const void *def) noexcept
+{
+#if ML_VM_HARDENING
+    /* #142: VM_HARDENING=1 with ASSERTS=0 is a real configuration (the CI
+     * release lanes are close to it), and there ML_VM_CHECK compiles away
+     * while the get_ref below does not - so the audit itself would throw
+     * out of a noexcept helper. Test structurally, assert on the result.
+     * And like jit_ret_audit, it audits OUR codegen - not a disk image. */
+#if ML_UNTRUSTED_CHECKS
+    if (g_untrusted_bytecode)
+        return;
+#endif
+    const EvalValue &v = g_current_ctx->frame->at(slot).get();
+    const bool is_struct = v.is<intrusive_ptr<StructObject>>();
+    ML_VM_CHECK(is_struct);
+    ML_VM_CHECK(!is_struct
+                || v.get_ref<intrusive_ptr<StructObject>>()->def
+                       == static_cast<const StructTypeDef *>(def));
+#else
+    (void)slot; (void)def;
+#endif
+}
+
+/* #97 R4: the window of the frame calling jit_ret_audit - the emitted
+ * code stores rbx here right before the call, so the audit need not
+ * read it through a published vframe (a lazy frameless leaf publishes
+ * none on its normal-return path) */
+const LValue *g_jit_audit_window = nullptr;
+
+extern "C" void jit_ret_audit() noexcept
+{
+#if ML_VM_HARDENING
+    /*
+     * #137/#142: every assertion below audits OUR OWN CODEGEN's output -
+     * that `ref_slots` lists what the emitted code can actually put in a
+     * slot, that a plain frame moved no watermark. On bytecode read off a
+     * DISK none of that is our output and the premise simply does not
+     * hold, so the audit is not a bug report, it is a false alarm that
+     * aborts the process. (`ref_slots` itself is DERIVED at load since
+     * myv v18 - rebuilt from the verified code, never read from the
+     * file - so it cannot disagree with the code beside it; the other
+     * premises here still can.)
+     */
+#if ML_UNTRUSTED_CHECKS
+    if (g_untrusted_bytecode)
+        return;
+#endif
+    VmActivation &act = *g_vm_act;
+    VmCallRec &rec = act.back_rec();     /* also re-checks the top_rec mirror */
+    /*
+     * THE 4-v FORK. Every check below reads `rec` as THIS frame's
+     * record. Once record-less frames interleave that is FALSE: a
+     * gate-passing frame wrote no record, so back_rec() is an
+     * ANCESTOR, and these checks then compare this frame's live state
+     * against a DIFFERENT frame's bases.
+     *
+     * Found by the Net 3 enumeration (2026-08-13) on a
+     * plain -> try -> plain -> dict-iter chain: the program is CORRECT
+     * in every engine (-tw, -nj, jit, norec-off all print the same
+     * answer), but this audit ABORTED the process under VM_HARDENING -
+     * which CI turns ON in the RELEASE lanes. A CI abort waiting on a
+     * mixed-kind chain; no corpus program had one.
+     *
+     * The discriminator is the tier's own (jit_norec_push_verify's
+     * fork check, step 3c's rule): a frame is record-ful iff the top
+     * record's window is the frame's own - windows are unique among
+     * live frames.
+     *
+     * THE TWO HALVES SPLIT DIFFERENTLY, so only one of them is lost:
+     *
+     * The REF-SLOT scan needs the frame's WINDOW (ctx->frame->slots -
+     * always available) and its CHUNK. The chunk is recovered WITHOUT
+     * an ABI change: our own return address points INTO the fragment
+     * that called us, and jit_norec_frag_for maps any address in a
+     * fragment's range to that fragment's chunk. So this half audits
+     * BOTH frame kinds - strictly MORE coverage than before the fork
+     * existed, when a record-less frame was scanned against an
+     * ancestor's window and length.
+     * (Handing the chunk in rdi from the emit site was tried first and
+     * REVERTED: a fragment has an implicit rdi argument -
+     * plans/jit-registers.md's recorded trap - and the audit then read
+     * a dangling stack address, ASan stack-use-after-scope.)
+     *
+     * The WATERMARK checks genuinely need this frame's OWN bases, and
+     * a record-less frame stores them nowhere - there is no value to
+     * compare against, so they stay record-ful-only. That residue is
+     * counted (`_done` vs `_skipped`) rather than left silent.
+     */
+#if ML_JIT_SUPPORTED
+    const Chunk *my_ck =
+        jit_norec_frag_for(__builtin_return_address(0));
+#else
+    const Chunk *my_ck = nullptr;    /* never called off-platform */
+#endif
+    /* the C3 net, pre-release form: every slot holding a REFERENCE must be
+     * ref-listed (an unlisted one would leak - exactly what the ref_slots
+     * audit in pop_window catches after ITS release scan; here the scan
+     * has not run yet, so a listed slot may legitimately hold one). */
+    const LValue *win = g_jit_audit_window;
+    if (my_ck && win) {
+        const int_type total = static_cast<int_type>(my_ck->slot_count)
+                               + my_ck->n_temps;
+        for (int_type i = 0; i < total; i++) {
+            const bool init_free = i < 64
+                && (my_ck->frameless_init_free >> i & 1);
+#ifdef TESTS
+            /* #97 inc 3 W3: a frameless SITE poisons the window slots it
+             * proved nothing reads (jit_poison_type, a non-trivial `t`,
+             * so this scan would take it for an unlisted reference).
+             * The poison is legitimate on exactly the slots the chunk
+             * claims - anywhere else it is the site writing a slot the
+             * derivation did not clear, and stays an abort. */
+            if (win[i].get().get_type() == jit_poison_type()) {
+                /* (W4's poison CAPTURES carry the same type: a slot
+                 * holding it that the chunk does not claim means a
+                 * capture was copied in through ctx->captures - which
+                 * is how the epilogue's capbase refresh was caught) */
+                ML_VM_CHECK(init_free);
+                continue;
+            }
+#else
+            /* Without TESTS the site does not poison such a slot: it is
+             * RAW STACK until an op writes it, and its type word may
+             * point anywhere - reading it SEGFAULTED this audit on a
+             * hardened build with no test suite (2026-10-11: any
+             * frameless call returning before the write, e.g. a
+             * recursion's base case). The TESTS poison above is the
+             * check for these slots; here they are skipped unread. */
+            if (init_free)
+                continue;
+#endif
+            /* REGCALL step 2: a register-resident value this return
+             * did not write back (Chunk::ret_unflushed) - its slot may
+             * hold stale stack in a frameless window, and is not
+             * ref-listed by construction */
+            if (i < 64 && (my_ck->ret_unflushed >> i & 1)) {
+                ML_VM_CHECK(!std::binary_search(my_ck->ref_slots.begin(),
+                                                my_ck->ref_slots.end(),
+                                                static_cast<int32_t>(i)));
+                continue;
+            }
+            if (win[i].get().get_type()->t >= Type::t_str)
+                ML_VM_CHECK(std::binary_search(my_ck->ref_slots.begin(),
+                                               my_ck->ref_slots.end(),
+                                               static_cast<int32_t>(i)));
+        }
+        g_jit_ret_audit_refscan++;
+    }
+    if (win && rec.window != win) {
+        g_jit_ret_audit_skipped++;   /* record-less: no bases to compare */
+        return;
+    }
+    /* THE RECOVERY IS SELF-CHECKED where a record exists: the chunk we
+     * derived from our own return address must BE the record's. The
+     * record-less frames then inherit that confidence - the same
+     * "verify the reconstruction against records wherever there are
+     * records" shape the G1 nets are built on. */
+    ML_VM_CHECK(!my_ck || my_ck == rec.run_chunk);
+    g_jit_ret_audit_done++;
+    /* the emit gate was plain_frame: no watermark can have moved */
+    ML_VM_CHECK(act.handlers.size() == rec.handler_base);
+    ML_VM_CHECK(act.diters_n == rec.diter_base);
+    ML_VM_CHECK(act.dyiters_n == rec.dyiter_base);
+#endif
+}
+
+extern "C" int jit_throw(int_type val_slot, int_type pc,
+                         const void *lep, const void *frag_rbp,
+                         const void *raise_desc) noexcept
+{
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    const Chunk::LocEntry *le = static_cast<const Chunk::LocEntry *>(lep);
+    std::unique_ptr<RuntimeException> ex;
+    try {
+        ex = vm_make_thrown_exc(ctx.frame->at(val_slot).get(),
+                                le ? le->start : Loc(),
+                                le ? le->end : Loc());
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 2;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    }
+    /* STAMP the throw-site caret from the BAKED entry: vm_make_thrown_exc
+     * builds the ExceptionObject loc-less and vm_raise would stamp it from
+     * loc_at(pc) - but a DELETED run collapses every op's pc onto the head
+     * EnterNative, where loc_at returns the FIRST entry at that pc (the
+     * ctor's, in `throw E(9)`). The baked entry is pc-independent. */
+    if (le && !ex->loc_start) {
+        ex->loc_start = le->start;
+        ex->loc_end = le->end;
+    }
+    const Chunk *c2 = act.back_rec().run_chunk;
+    size_t p2 = static_cast<size_t>(pc);
+    if (!vm_raise(c2, p2, act, ctx, std::move(ex), frag_rbp, raise_desc))
+        return 1;                          /* boundary: signal set */
+    g_vm_resume_chunk = c2;                /* same-frame: the handler pc */
+    g_vm_resume_pc = p2;
+    return 0;
+}
+
+/*
+ * #78 step E: the cold RERAISE arm of EndFinally.
+ *
+ * The hot NORMAL arm stays an inline byte compare in the fragment; only
+ * "the finally did NOT handle the exception" reaches here, and it runs the
+ * interpreted op's exact body (the shared vm_raise), reporting like
+ * jit_throw:
+ *    0 = dispatched to a handler - g_vm_resume_chunk/pc are parked and the
+ *        fragment returns that pc as an ordinary external exit (the op
+ *        already ran: this is a RESUME, not a re-run);
+ *    1 = boundary reached (the signal is set; the invocation stops);
+ *    2 = a C++ throw escaped the walk, conveyed via g_vm_jit_exc/eptr;
+ *    3 = nothing to re-raise - fall through, as the normal arm would.
+ *
+ * This was the LAST bail in the exception ops, and hence the corpus' last
+ * kept run (72_exc_finally): with it conveying, a run containing
+ * EndFinally is op_fully_native and its interpreted originals DELETE.
+ *
+ * `inline_chain` is the op's inlined-at chain index, resolved at COMPILE
+ * time from its pre-collapse pc: a deleted run's pcs all collapse onto the
+ * head EnterNative, where vm_raise's own pc lookup cannot discriminate
+ * (Exception::jit_inline_frame - the same bake a conveying fragment does).
+ */
+extern "C" int jit_end_finally(int_type region, int_type pc,
+                               int_type inline_chain,
+                               const void *frag_rbp,
+                               const void *raise_desc) noexcept
+{
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    VmCallRec &rec = act.back_rec();
+    VmPendState &ps = act.pend_at(rec, region);
+
+#ifdef TESTS
+    g_jit_end_finally_reraise++;
+#endif
+    /*
+     * ⛔ #118: ON A CORRUPT IMAGE THE PEND NEED NOT BE A RERAISE, and
+     * the ML_VM_CHECK below is compiled away under ASSERTS=0 - so a
+     * mutated `.myv` reached here with `Pend::ret`/`brk` and aborted a
+     * debug build while a release proceeded on a state this code does
+     * not describe. Whether the parked pend matches the EndFinally that
+     * jumped here is VALUE-dependent, so verify_chunk cannot decide it.
+     *
+     * This helper CAN report, unlike the dict-iterator's: it is
+     * `noexcept` but returns a STATUS the emitter tests, and status 2
+     * means "an exception is conveyed in g_vm_jit_exc". So the check
+     * throws as it does everywhere else and the catch turns it into
+     * that conveyance - the same idiom the vm_raise call below already
+     * uses, three lines down. The corrupt image is then REPORTED with a
+     * caret and a backtrace instead of aborting or drifting.
+     */
+    try {
+        ML_UNTRUSTED_CHECK(ps.pend == Pend::reraise,
+                           "EndFinally: the parked pend is not a reraise");
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 2;
+    }
+    ML_VM_CHECK(ps.pend == Pend::reraise);
+    std::unique_ptr<RuntimeException> ex = std::move(ps.exc);
+    if (!ex)
+        return 3;                      /* nothing pending - fall through */
+
+    if (inline_chain >= 0 && ex->jit_inline_frame < 0)
+        ex->jit_inline_frame = static_cast<int32_t>(inline_chain);
+
+    const Chunk *c2 = rec.run_chunk;
+    size_t p2 = static_cast<size_t>(pc);
+    try {
+        if (!vm_raise(c2, p2, act, ctx, std::move(ex), frag_rbp, raise_desc))
+            return 1;                  /* boundary: signal set */
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 2;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    }
+    g_vm_resume_chunk = c2;
+    g_vm_resume_pc = p2;
+    return 0;
+}
+
+/*
+ * #80: the native `rethrow`.
+ *
+ * Structurally EndFinally's reraise arm plus a loc stamp: take the caught
+ * exception out of the ENCLOSING catch's region slot, restamp it with the
+ * RETHROW SITE's caret, and run the shared vm_raise. Reports exactly as
+ * jit_throw / jit_end_finally: 0 = dispatched (g_vm_resume_chunk/pc parked
+ * and returned as an ordinary external exit), 1 = boundary, 2 = conveyed.
+ * It never falls through - a rethrow always raises.
+ *
+ * `lep` is the op's BAKED LocEntry and `inline_chain` its inlined-at chain,
+ * both resolved at COMPILE time: the interpreted op reads them via
+ * loc_at(pc) / inline_frame_at(pc), which a DELETED run's collapsed pcs
+ * cannot resolve (every op of the run shares the head EnterNative's pc).
+ *
+ * The slot is guaranteed non-empty by construction: the dispatch PARKS
+ * every caught exception there, and a rethrow raises a COPY, leaving it
+ * parked for a second rethrow and for the chain (question 12).
+ */
+extern "C" int jit_rethrow(int_type region, int_type pc, const void *lep,
+                           int_type inline_chain,
+                           const void *frag_rbp,
+                           const void *raise_desc) noexcept
+{
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    VmCallRec &rec = act.back_rec();
+    VmPendState &ps = act.pend_at(rec, region);
+
+#ifdef TESTS
+    g_jit_rethrow_native++;
+#endif
+    ML_VM_CHECK(ml_untrusted_bytecode() || ps.exc != nullptr);
+    std::unique_ptr<RuntimeException> ex(ps.exc ? ps.exc->clone() : nullptr);
+    if (!ex) {
+        /* unreachable for our own bytecode (the dispatch parks every
+         * caught exception); a mutated image reaches it (fat-1150) - be
+         * LOUD, not silent */
+        try {
+            throw InternalErrorEx();
+        } catch (...) {
+            g_vm_jit_eptr = std::current_exception();
+        }
+        return 2;
+    }
+
+    const Chunk::LocEntry *le = static_cast<const Chunk::LocEntry *>(lep);
+    if (le) {                          /* the rethrow SITE's caret, as the
+                                        * interpreted op stamps it */
+        ex->loc_start = le->start;
+        ex->loc_end = le->end;
+    }
+    if (inline_chain >= 0 && ex->jit_inline_frame < 0)
+        ex->jit_inline_frame = static_cast<int32_t>(inline_chain);
+
+    const Chunk *c2 = rec.run_chunk;
+    size_t p2 = static_cast<size_t>(pc);
+    try {
+        if (!vm_raise(c2, p2, act, ctx, std::move(ex), frag_rbp, raise_desc))
+            return 1;                  /* boundary: signal set */
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 2;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    }
+    g_vm_resume_chunk = c2;
+    g_vm_resume_pc = p2;
+    return 0;
+}
+
 /* The desc-based twin of do_func_call's vm_capture_frame for the invoke
- * boundary: name/params/pure tag; the call site is loc-less (builtin
- * callbacks pass no call site - matching eval_func's captures today). */
+ * boundary: name/params/pure tag. The call site is loc-less unless the
+ * caller has one: VmInvoker passes its builtin call's (#44). */
 static ML_COLD void
-vm_capture_desc_frame(Exception &e, const FuncDescriptor *d)
+vm_capture_desc_frame(Exception &e, const FuncDescriptor *d,
+                      Loc site = Loc())
 {
     if (d->pure_ctx)
         if (auto *undefEx = dynamic_cast<UndefinedVariableEx *>(&e))
             undefEx->in_pure_func = true;
 
     /* profile #3: the LAZY frame - no strings at capture time */
-    e.backtrace.emplace_back(d, Loc());
+    e.push_frame(d, site);
 }
 
-/*
- * Phase D (plans/vm-native-call-stack.md): a builtin's USER-CALLBACK call
- * (map/filter/sort's comparator/make_dict's generator/find's keyfunc, via
- * eval_func) runs the callee as a BOUNDARY frame on the CURRENT activation
- * - the per-element do_func_call + EvalContext construction is gone; the
- * cost is one window push/bind/pop plus the loop entry. Returns false
- * (nothing done) when the invoke path isn't available: no activation /
- * invoke context (a tree-walk or const-eval caller), or a chunk-less
- * callee - the caller falls back to do_func_call. Exception contract as
- * do_func_call with as_signal=false: a C++ throw and the pending signal
- * both surface as a C++ throw carrying this frame's backtrace entry.
- */
-bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
-                   const EvalValue *argv, size_t n, EvalValue &out)
-{
-    if (g_exec_engine != ExecEngine::Vm || !g_vm_act
-            || !g_vm_act->invoke_ctx || caller_ctx->in_const_eval())
-        return false;
-    if (!obj.func->vm_chunk_tried || !obj.func->vm_chunk)
-        return false;
-
-    VmActivation &act = *g_vm_act;
-    EvalContext &c = *act.invoke_ctx;
-    const FuncDescriptor *d = obj.func;
-    const Chunk *cck = static_cast<const Chunk *>(d->vm_chunk);
-    const size_t nparams = d->params.size();
-    if (n > nparams || n < static_cast<size_t>(d->min_args))
-        throw InvalidNumberOfArgsEx();
-
-    const int_type total =
-        d->frame_size + static_cast<int_type>(cck->n_temps);
-    Frame *w = act.push_window(total, cck, /*boundary=*/true);
-
-    struct Restore {
-        VmActivation &a;
-        EvalContext &c;
-        std::vector<LValue> *caps;
-        ~Restore() {
-            a.pop_window();
-            c.captures = caps;
-        }
-    } restore{act, c, c.captures};
-
-    /* Bind from the pre-evaluated values (do_func_bind_params' value
-     * overloads' exact semantics: non-const, none for omitted trailing opt
-     * params, i/f coercion; a bind throw pops WITHOUT capturing). */
-    if (d->fast_bind) {
-        for (size_t i = 0; i < n; i++)
-            w->at(static_cast<int_type>(i)) = LValue(argv[i], false);
-        for (size_t i = n; i < nparams; i++)
-            w->at(static_cast<int_type>(i)) = LValue(EvalValue(), false);
-    } else {
-        for (size_t i = 0; i < nparams; i++) {
-            const FuncDescriptor::ParamDesc &p = d->params[i];
-            EvalValue val = i < n ? argv[i] : EvalValue();
-            if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
-                val = vm_coerce_decl_num(val, p.decl_type == DeclType::f);
-            w->at(static_cast<int_type>(i)) = LValue(std::move(val), false);
-        }
-    }
-
-    c.captures = &obj.capture_slots;
-    c.flow->type = FlowState::none;
-
-    try {
-        vm_run_chunk(*cck, c);
-    } catch (Exception &e) {
-        vm_capture_desc_frame(e, d);
-        throw;
-    }
-
-    if (g_vm_exc_pending) {
-        vm_capture_desc_frame(*g_vm_exc_pending, d);
-        std::unique_ptr<RuntimeException> ex = std::move(g_vm_exc_pending);
-        ex->rethrow();
-    }
-
-    if (c.flow->type == FlowState::ret) {
-        c.flow->type = FlowState::none;
-        out = std::move(c.flow->value);
-    } else {
-        out = EvalValue();
-    }
-    return true;
-}
+/* #60 (b): the bare dispatch loop, split out of vm_run_chunk so a builtin
+ * CALLBACK loop (VmInvoker) that already owns the activation +
+ * boundary window + g_current_ctx re-enters it PER ELEMENT with ZERO entry
+ * setup (no EntryGuard construct/destruct, no vm_enter_invocation_fast, no
+ * CtxGuard). vm_run_chunk = the entry prologue + this. `act` is the caller's
+ * activation (the top boundary record is this invocation's frame). */
+static void vm_dispatch(const Chunk &chunk0, EvalContext &ctx,
+                        VmActivation &act, size_t start_pc = 0);
 
 /*
- * VmInvoker (vm.h): the prepared per-loop callback invoker. The ctor gates
- * exactly like vm_try_invoke and pushes ONE boundary window; invoke()
+ * VmInvoker (vm.h): the prepared per-loop callback invoker (Phase D,
+ * plans/archived/vm-native-call-stack.md). The ctor gates on an
+ * activation to run on - the VM engine, an invoke context, not const-eval,
+ * a callee with a chunk - and pushes ONE boundary window; invoke()
  * rebinds the param slots, resets the reusable flow, re-enters the loop,
  * and resets the window's REFERENCE slots afterwards (per-call frame-death
  * semantics: references die where a fresh frame's would; stale trivial
@@ -1579,8 +8305,66 @@ bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
  * pops the window and restores the shared invoke context's captures on any
  * exit path (including a throw unwinding the builtin's loop).
  */
-VmInvoker::VmInvoker(EvalContext *ctx, FuncObject &obj)
+#ifdef TESTS
+unsigned long g_jit_invoke_direct = 0;   /* lever 2 execution proof */
+/* Which entry each callback ELEMENT took: the prepared window (invoke) vs
+ * the per-call fallback (eval_func, when there is no activation to run a
+ * boundary frame on). A tier is only proven by the counter for ITS OWN
+ * shape, so a test must reset both first - they are process-global. */
+unsigned long g_invoke_prepared = 0;
+unsigned long g_invoke_raw = 0;
+unsigned long g_invoke_test_inline = 0;  /* #84: inline test() entries */
+unsigned long g_invoke_test_regs = 0;    /* #84: ...answered from rdx */
+unsigned long g_invoke_fallback = 0;
+#endif
+
+/* Lever 2's COLD exit path: the invoker's direct-entered fragment exited
+ * at an interior pc. Mirrors EnterNative's post-exit for a BOUNDARY frame
+ * (standalone rather than sharing jit_sync_postexit - the sync version's
+ * pending-conveyance/site-stamping halves are sync_stop semantics that do
+ * not apply here): a conveyed raise dispatches via vm_raise (same-frame
+ * handler, else the walk stops at the boundary record and sets
+ * g_vm_exc_pending - which invoke()'s existing check converts); a plain
+ * eptr rethrows (propagates out of invoke like the dispatch path's own
+ * throw); a bail or a dispatched handler continues INTERPRETED at the
+ * resolved pc - the one dispatch re-entry the old path paid ALWAYS. */
+static ML_NOINLINE void
+vm_invoke_postexit(const Chunk &cck, EvalContext &ctx, VmActivation &act,
+                   size_t r)
 {
+    const Chunk *c2 = &cck;
+    size_t p2 = r;
+    bool cont = true;
+    if (r == JIT_RET_SWITCH) {
+        /* #56: a capped sync call inside the callback was pushed
+         * interpreted-flat - continue at the callee; the record chain
+         * resumes the callback chunk at the baked stub and its boundary
+         * return sets ctx.flow as usual. */
+        vm_dispatch(*g_vm_resume_chunk, ctx, act, g_vm_resume_pc);
+        return;
+    }
+    if (g_vm_jit_raise) {
+        const int kind = g_vm_jit_raise;
+        g_vm_jit_raise = 0;
+        cont = vm_raise(c2, p2, act, ctx, vm_jit_raise_kind_new(kind));
+    } else if (g_vm_jit_exc) {
+        cont = vm_raise(c2, p2, act, ctx, std::move(g_vm_jit_exc));
+    } else if (g_vm_jit_eptr) {
+        std::exception_ptr p = std::move(g_vm_jit_eptr);
+        g_vm_jit_eptr = nullptr;
+        std::rethrow_exception(p);
+    }
+    if (cont)
+        vm_dispatch(*c2, ctx, act, p2);
+    /* !cont: the walk stopped at the boundary record - g_vm_exc_pending
+     * is set for invoke()'s existing conversion. */
+}
+
+VmInvoker::VmInvoker(EvalContext *ctx, FuncObject &obj, Loc site)
+{
+    site_ = site;
+    caller_ctx_ = ctx;
+    obj_ = &obj;
     if (g_exec_engine != ExecEngine::Vm || !g_vm_act
             || !g_vm_act->invoke_ctx || ctx->in_const_eval())
         return;
@@ -1591,83 +8375,316 @@ VmInvoker::VmInvoker(EvalContext *ctx, FuncObject &obj)
     c_ = act_->invoke_ctx.get();
     desc_ = obj.func;
     cck_ = static_cast<const Chunk *>(desc_->vm_chunk);
+    /* Lever 2 (plans/archived/native-gap-roadmap.md): a body that STARTS native
+     * (the whole-body-native common case) is entered DIRECTLY per element
+     * - jit_enter, no vm_dispatch entry/exit, no EnterNative op dispatch.
+     * Computed once per LOOP. */
+    entry_ = cck_->sync_entry_off >= 0
+        ? static_cast<const char *>(cck_->native.base) + cck_->sync_entry_off
+        : nullptr;
+    fast_bind_ = desc_->fast_bind;
+    nparams_ = desc_->params.size();
+    min_args_ = static_cast<size_t>(desc_->min_args);
     const int_type total =
         desc_->frame_size + static_cast<int_type>(cck_->n_temps);
     w_ = act_->push_window(total, cck_, /*boundary=*/true);
     saved_caps_ = c_->captures;
     c_->captures = &obj.capture_slots;
+    /* #60: own g_current_ctx for the whole loop - each invoke() re-enters
+     * vm_dispatch directly (no per-element CtxGuard); jit_ret reads it. */
+    saved_gctx_ = g_current_ctx;
+    g_current_ctx = c_;
     ready_ = true;
+    /* #49: a raw scalar bind checks nothing, so a callee with a fit check
+     * (a `str s` comparator fed a dyn array's ints) takes the boxed one */
+    raw_ok_ = fast_bind_ && !desc_->fit_any;
 }
 
 VmInvoker::~VmInvoker()
 {
     if (!ready_)
         return;
+    g_current_ctx = saved_gctx_;
     c_->captures = saved_caps_;
     act_->pop_window();
 }
 
+/*
+ * The POST-BIND half of a prepared callback call - everything that does not
+ * depend on how the arguments got into the window: run the body, convert a
+ * pending raise, reset the reference slots, read the flow.
+ *
+ * ⛔ ALWAYS-INLINE ON PURPOSE, AND MEASURED. It is a separate function only
+ * so the bind above it reads as one step; it must fold BACK into invoke(),
+ * which is the single out-of-line call a callback element pays. An earlier
+ * version of this file let a second entry share it as an ordinary
+ * out-of-line function, so an element paid TWO calls: 34_sort_custom_cmp
+ * +19% wall clock at -27.2% instructions. If a second caller ever appears,
+ * it must inline this too - never call it.
+ */
+static ML_ALWAYS_INLINE void
+vm_invoker_run(const Chunk *cck, EvalContext *c, VmActivation *act,
+               const FuncDescriptor *d, LValue *win, int_type total,
+               const char *entry, Loc site,
+               const std::vector<int32_t> &scan)
+{
+    c->flow->type = FlowState::none;
+
+    /* Lever 2: DIRECT fragment entry per element - the whole vm_dispatch
+     * entry/exit + the EnterNative op dispatch removed from the hot loop.
+     * A BOUNDARY sentinel (native ReturnV set flow / native Halt left it
+     * none) falls straight through to the flow read below; a non-sentinel
+     * exit takes the cold vm_invoke_postexit (raise dispatch or the ONE
+     * interpreted continuation the dispatch path always paid). #60 (b)'s
+     * dispatch re-entry remains the fallback for a body that does not
+     * start native. */
+    try {
+        if (entry) {
+#ifdef TESTS
+            g_jit_invoke_direct++;
+#endif
+            const size_t r = jit_enter(entry, win);
+            /* an IN-VM sentinel is impossible here (this frame is a
+             * BOUNDARY record; jit_ret/jit_halt return the boundary form)
+             * - a surfaced one would mean ignored resume globals */
+            ML_CHECK(r != JIT_RET_SENTINEL);
+            if (r != JIT_RET_BOUNDARY)
+                vm_invoke_postexit(*cck, *c, *act, r);
+        } else {
+            vm_dispatch(*cck, *c, *act);
+        }
+    } catch (Exception &e) {
+        vm_capture_desc_frame(e, d, site);
+        throw;
+    }
+
+    if (g_vm_exc_pending) {
+        vm_capture_desc_frame(*g_vm_exc_pending, d, site);
+        std::unique_ptr<RuntimeException> ex = std::move(g_vm_exc_pending);
+        ex->rethrow();
+    }
+
+    /* Per-call frame death for REFERENCES (see the class comment).
+     * Profile #2: only the chunk's audited ref_slots - this scan runs per
+     * CALLBACK ELEMENT (sort's comparator, map/filter/make_dict), where
+     * the old whole-window walk was a measured cost. Runs BEFORE the result
+     * extraction below - it touches only the window SLOTS, never flow->value
+     * (a separate FlowState member), so the order is immaterial and this lets
+     * the result be MOVE-CONSTRUCTED into the return (#60 Tier 1) instead of
+     * move-ASSIGNED into a default-constructed local. `scan` is
+     * ref_slots, or ref_slots_raw after a raw scalar bind (#97 CB5). */
+    for (const int32_t sidx : scan) {
+        if (sidx >= total)
+            break;                       /* sorted */
+        if (win[sidx].get().get_type()->t >= Type::t_str)
+            win[sidx].frame_release();
+    }
+#if ML_VM_HARDENING
+    for (int_type i = 0; i < total; i++)
+        ML_VM_CHECK(win[i].get().get_type()->t < Type::t_str);
+#endif
+}
+
+static ML_ALWAYS_INLINE EvalValue
+vm_invoker_body(const Chunk *cck, EvalContext *c, VmActivation *act,
+                const FuncDescriptor *d, LValue *win, int_type total,
+                const char *entry, Loc site,
+                const std::vector<int32_t> &scan)
+{
+    vm_invoker_run(cck, c, act, d, win, total, entry, site, scan);
+    if (c->flow->type == FlowState::ret) {
+        c->flow->type = FlowState::none;
+        return std::move(c->flow->value);
+    }
+    return EvalValue();
+}
+
+/* #97 CB7: the body's result as a truth value, read IN PLACE. A reference
+ * result is released here, as the moved-out temporary's destructor would
+ * have done at the same point - it must not outlive the element. */
+static ML_ALWAYS_INLINE bool
+vm_invoker_test(const Chunk *cck, EvalContext *c, VmActivation *act,
+                const FuncDescriptor *d, LValue *win, int_type total,
+                const char *entry, Loc site,
+                const std::vector<int32_t> &scan)
+{
+    vm_invoker_run(cck, c, act, d, win, total, entry, site, scan);
+    if (c->flow->type != FlowState::ret)
+        return false;                     /* no value: none, falsy */
+    c->flow->type = FlowState::none;
+    EvalValue &v = c->flow->value;
+    const bool t = v.truthy();
+    if (v.get_type()->t >= Type::t_str)
+        v = EvalValue();
+    return t;
+}
+
+/*
+ * The PREPARED entry: bind the argv run into the window the ctor pushed,
+ * then run the body. One out-of-line call per callback element.
+ */
+/* VmInvoker::bind_raw lives in vminvoke.h (#84: the test path inlines
+ * it into the builtin's loop) */
+
+EvalValue VmInvoker::call_scalars(const CbScalar *ra, size_t n)
+{
+    if (!raw_ok_ || n != nparams_)
+        return call_scalars_boxed(ra, n);
+    bind_raw(ra, n);
+    return vm_invoker_body(cck_, c_, act_, desc_, w_->slots,
+                           static_cast<int_type>(w_->size), entry_,
+                           site_, cck_->ref_slots_raw);
+}
+
+/*
+ * #84: everything after the fragment call that the inline test path
+ * (VmInvoker::test_scalars, vminvoke.h) does not handle itself - a
+ * non-boundary exit (the raise dispatch or the interpreted
+ * continuation), a pending raise, a release scan, a result that is
+ * not a bool or an int - in exactly vm_invoker_run's order. ONE
+ * out-of-line call, on the uncommon path only.
+ */
+ML_NOINLINE bool VmInvoker::test_tail(size_t r)
+{
+    if (r != JIT_RET_BOUNDARY) {
+        try {
+            vm_invoke_postexit(*cck_, *c_, *act_, r);
+        } catch (Exception &e) {
+            vm_capture_desc_frame(e, desc_, site_);
+            throw;
+        }
+    }
+    if (g_vm_exc_pending) {
+        vm_capture_desc_frame(*g_vm_exc_pending, desc_, site_);
+        std::unique_ptr<RuntimeException> ex = std::move(g_vm_exc_pending);
+        ex->rethrow();
+    }
+    LValue *win = w_->slots;
+    const int_type total = static_cast<int_type>(w_->size);
+    for (const int32_t sidx : cck_->ref_slots_raw) {
+        if (sidx >= total)
+            break;                       /* sorted */
+        if (win[sidx].get().get_type()->t >= Type::t_str)
+            win[sidx].frame_release();
+    }
+#if ML_VM_HARDENING
+    for (int_type i = 0; i < total; i++)
+        ML_VM_CHECK(win[i].get().get_type()->t < Type::t_str);
+#endif
+    return test_result();
+}
+
+/* the result's truth, read in place (CB7) - shared by the inline path's
+ * rare result kinds and the tail above */
+ML_NOINLINE bool VmInvoker::test_result()
+{
+    if (c_->flow->type != FlowState::ret)
+        return false;                     /* no value: none, falsy */
+    c_->flow->type = FlowState::none;
+    EvalValue &v = c_->flow->value;
+    const bool t = v.truthy();
+    if (v.get_type()->t >= Type::t_str)
+        v = EvalValue();
+    return t;
+}
+
+bool VmInvoker::call_scalars_test(const CbScalar *ra, size_t n)
+{
+    if (!raw_ok_ || n != nparams_)
+        return call_scalars_boxed(ra, n).truthy();
+    bind_raw(ra, n);
+    return vm_invoker_test(cck_, c_, act_, desc_, w_->slots,
+                           static_cast<int_type>(w_->size), entry_,
+                           site_, cck_->ref_slots_raw);
+}
+
+/* declined: box each argument once, as the template does */
+ML_NOINLINE EvalValue
+VmInvoker::call_scalars_boxed(const CbScalar *ra, size_t n)
+{
+    SmallArgs<4> argv;
+    ML_CHECK(n <= 4);
+    for (size_t i = 0; i < n; i++) {
+        if (ra[i].kind == 0)
+            argv.push(EvalValue(ra[i].i));
+        else if (ra[i].kind == 1)
+            argv.push(EvalValue(ra[i].f));
+        else
+            argv.push(EvalValue(ra[i].i != 0));
+    }
+    if (ready_)
+        return invoke(argv.data(), n);
+    return call_eval_func(argv.data(), n);
+}
+
 EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
 {
+#ifdef TESTS
+    g_invoke_prepared++;
+#endif
     const FuncDescriptor *d = desc_;
-    const size_t nparams = d->params.size();
-    if (n > nparams || n < static_cast<size_t>(d->min_args))
+    const size_t nparams = nparams_;
+    if (n > nparams || n < min_args_)
         throw InvalidNumberOfArgsEx();
+    /* RULE 1: a boxed callback argument may be none (a general array's
+     * element), or (#49) misfit a typed parameter; the raw-scalar binds
+     * (call_scalars) cannot carry either - raw_ok_ excludes a callee
+     * with a fit check */
+    const BindFault nf = bind_fault_in_range(d, n,
+                       [&](size_t i) -> const EvalValue & {
+                           return argv[i];
+                       });
+    if (nf.idx >= 0)
+        throw bind_fault_error(d, nf, -1);
 
-    if (d->fast_bind) {
+    if (fast_bind_) {
         for (size_t i = 0; i < n; i++)
-            w_->at(static_cast<int_type>(i)) = LValue(argv[i], false);
+            w_->at(static_cast<int_type>(i)).rebind(argv[i]);
         for (size_t i = n; i < nparams; i++)
-            w_->at(static_cast<int_type>(i)) = LValue(EvalValue(), false);
+            w_->at(static_cast<int_type>(i)).rebind(EvalValue());
     } else {
         for (size_t i = 0; i < nparams; i++) {
             const FuncDescriptor::ParamDesc &p = d->params[i];
             EvalValue val = i < n ? argv[i] : EvalValue();
             if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
                 val = vm_coerce_decl_num(val, p.decl_type == DeclType::f);
-            w_->at(static_cast<int_type>(i)) = LValue(std::move(val), false);
+            w_->at(static_cast<int_type>(i)).rebind(std::move(val));
         }
     }
 
-    c_->flow->type = FlowState::none;
+    return vm_invoker_body(cck_, c_, act_, d, w_->slots,
+                           static_cast<int_type>(w_->size), entry_, site_,
+                           cck_->ref_slots);
+}
 
+/*
+ * The NOT-READY arm of call() (vm.h): no activation to run a boundary frame
+ * on - the tree-walk engine, const-eval, or a chunk-less callee - so the
+ * callback runs through the ordinary per-call path. Absorbing it here is
+ * what lets a builtin spell its whole callback ladder as `inv.call(x)`.
+ */
+EvalValue VmInvoker::call_eval_func(const EvalValue *argv, size_t n)
+{
+#ifdef TESTS
+    g_invoke_fallback++;
+#endif
     try {
-        vm_run_chunk(*cck_, *c_);
+        if (n == 1)
+            return eval_func(caller_ctx_, *obj_, argv[0]);
+        if (n == 2)
+            return eval_func(caller_ctx_, *obj_,
+                             std::make_pair(argv[0], argv[1]));
+        return eval_func(caller_ctx_, *obj_,
+                         std::vector<EvalValue>(argv, argv + n));
     } catch (Exception &e) {
-        vm_capture_desc_frame(e, d);
+        /* eval_func has no call site to give the callback's frame, so it
+         * captured it loc-less - and nothing can have captured a frame
+         * since, so back() IS that frame; the builtin call is its site
+         * (#44), exactly as invoke() captures it directly */
+        if (!e.backtrace.empty() && !e.backtrace.back().call_site.line)
+            e.backtrace.back().call_site = site_;
         throw;
     }
-
-    if (g_vm_exc_pending) {
-        vm_capture_desc_frame(*g_vm_exc_pending, d);
-        std::unique_ptr<RuntimeException> ex = std::move(g_vm_exc_pending);
-        ex->rethrow();
-    }
-
-    EvalValue res;
-    if (c_->flow->type == FlowState::ret) {
-        c_->flow->type = FlowState::none;
-        res = std::move(c_->flow->value);
-    }
-
-    /* Per-call frame death for REFERENCES (see the class comment).
-     * Profile #2: only the chunk's audited ref_slots - this scan runs per
-     * CALLBACK ELEMENT (sort's comparator, map/filter/make_dict), where
-     * the old whole-window walk was a measured cost. */
-    LValue *win = w_->slots;
-    const int_type total = static_cast<int_type>(w_->size);
-    for (const int32_t sidx : cck_->ref_slots) {
-        if (sidx >= total)
-            break;                       /* sorted */
-        if (win[sidx].get().get_type()->t >= Type::t_str)
-            win[sidx] = LValue();
-    }
-#if ML_VM_HARDENING
-    for (int_type i = 0; i < total; i++)
-        ML_VM_CHECK(win[i].get().get_type()->t < Type::t_str);
-#endif
-
-    return res;
 }
 
 /*
@@ -1696,7 +8713,7 @@ vm_enter_invocation_fast(const Chunk *chunk,
                          bool &swapped, bool &pushed)
 {
     VmActivation *a = g_vm_act;
-    if (a && !a->records.empty() && a->records.back().run_chunk == chunk)
+    if (a && !a->no_recs() && a->back_rec().run_chunk == chunk)
         return a;
     return vm_enter_invocation(chunk, own, swapped, pushed);
 }
@@ -1710,8 +8727,8 @@ vm_enter_invocation(const Chunk *chunk, std::unique_ptr<VmActivation> &own,
         swapped = true;
         g_vm_act = own.get();
     }
-    if (g_vm_act->records.empty()
-            || g_vm_act->records.back().run_chunk != chunk) {
+    if (g_vm_act->no_recs()
+            || g_vm_act->back_rec().run_chunk != chunk) {
         g_vm_act->push_window(0, chunk, /*boundary=*/true);
         pushed = true;
     }
@@ -1719,7 +8736,7 @@ vm_enter_invocation(const Chunk *chunk, std::unique_ptr<VmActivation> &own,
 }
 
 /*
- * THE IN-VM CALL (plans/vm-native-call-stack.md): push the callee's frame
+ * THE IN-VM CALL (plans/archived/vm-native-call-stack.md): push the callee's frame
  * window + record and continue the loop in the callee's chunk - no
  * do_func_call, no EvalContext, no C++ recursion. Arity = two compares
  * (the same InvalidNumberOfArgsEx, reaching the unwind walk like any bind
@@ -1732,11 +8749,11 @@ vm_enter_invocation(const Chunk *chunk, std::unique_ptr<VmActivation> &own,
  * frame WITHOUT capturing a backtrace frame for it - do_func_call's bind
  * ran BEFORE its try, so a bind error never recorded the callee.
  */
-static ML_NOINLINE void
-vm_enter_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
-              size_t &pc, FuncObject &fo, const Chunk *cck,
-              int_type argbase, size_t nargs, int_type dst,
-              std::unique_ptr<PureCacheKey> ckey)
+static ML_NOINLINE Frame *
+vm_frame_setup(VmActivation &act, EvalContext &ctx, const Chunk *ret_chunk,
+               size_t ret_pc, FuncObject &fo, const Chunk *cck,
+               int_type argbase, size_t nargs, int_type dst,
+               std::unique_ptr<PureCacheKey> ckey)
 {
     const FuncDescriptor *d = fo.func;
     const size_t nparams = d->params.size();
@@ -1747,20 +8764,23 @@ vm_enter_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
     const int_type total =
         d->frame_size + static_cast<int_type>(cck->n_temps);
     Frame *w = act.push_window(total, cck, /*boundary=*/false);
-    VmCallRec &rec = act.records.back();
-    rec.ret_chunk = chunk;
-    rec.ret_pc = pc + 1;
+    VmCallRec &rec = act.back_rec();
+    rec.ret_chunk = ret_chunk;
+    rec.ret_pc = ret_pc + 1;
     rec.dst = dst;
     rec.desc = d;
     rec.caller_captures = ctx.captures;
+    rec.call_site_packed = 0;            /* #56: no stale switch site */
+    rec.call_site_chain = -1;
     rec.cache_key = std::move(ckey);
 
     if (d->fast_bind) {
+        const uint64_t noesc = d->noescape_params;
         for (size_t i = 0; i < nargs; i++)
-            w->at(static_cast<int_type>(i)) =
-                LValue(argrun[i].get(), false);
+            vm_bind_arg(w->at(static_cast<int_type>(i)), argrun[i].get(),
+                        i < 64 && (noesc >> i & 1));
         for (size_t i = nargs; i < nparams; i++)
-            w->at(static_cast<int_type>(i)) = LValue(EvalValue(), false);
+            w->at(static_cast<int_type>(i)).rebind(EvalValue());
     } else {
         try {
             for (size_t i = 0; i < nparams; i++) {
@@ -1770,9 +8790,11 @@ vm_enter_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
                 if (p.decl_type == DeclType::i
                         || p.decl_type == DeclType::f)
                     val = vm_coerce_decl_num(
-                        val, p.decl_type == DeclType::f);
-                w->at(static_cast<int_type>(i)) =
-                    LValue(std::move(val), false);
+                        val, p.decl_type == DeclType::f,
+                        static_cast<int>(i));    /* a call-site bind:
+                                                  * the throw names the
+                                                  * argument (RULE 2) */
+                w->at(static_cast<int_type>(i)).rebind(std::move(val));
             }
         } catch (...) {
             act.pop_window();
@@ -1781,29 +8803,3151 @@ vm_enter_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
     }
 
     ctx.captures = &fo.capture_slots;
+    return w;
+}
+
+/*
+ * LEVER 1 STEP 2 (plans/archived/native-gap-roadmap.md) - the COMMON-SHAPE call
+ * push. The callgrind split on 10_recursion_deep put ~500 Ir of protocol
+ * on EVERY call: vm_frame_setup 232 (of which ~30 was just the prologue/
+ * epilogue - the unique_ptr<PureCacheKey> PARAMETER drags in exception
+ * scaffolding and a fat spill frame even when it is always null),
+ * vm_frame_leave ~174, jit_ret ~64, and the vm_enter_call wrapper ~36 (a
+ * second NOINLINE layer whose only job was two assignments). This twin is
+ * the same push with the cold machinery hoisted by its GATE instead of
+ * re-decided per call: the caller checks `d->fast_bind` (no coerced
+ * params -> the bind is a plain copy loop that CANNOT throw, so no
+ * try/cleanup), and there is NO cache-key parameter at all (a plain CallV
+ * / a value call never has one; a CachedCallV with a live miss-key takes
+ * the general path). push_window itself measured lean already (its
+ * segment/record-reuse branches are predicted) - it is shared, not
+ * duplicated. rec.cache_key is left untouched: a reused record's was
+ * reset by pop_window, a fresh one default-constructs null (checked).
+ * ALWAYS_INLINE: inlined into the two NOINLINE users below/in the sync
+ * core, so the call depth stays ONE out-of-line call per VM call op.
+ */
+static ML_ALWAYS_INLINE Frame *
+vm_frame_setup_lean(VmActivation &act, EvalContext &ctx,
+                    const Chunk *ret_chunk, size_t ret_pc, FuncObject &fo,
+                    const Chunk *cck, int_type argbase, size_t nargs,
+                    int_type dst)
+{
+    const FuncDescriptor *d = fo.func;
+    const size_t nparams = d->params.size();
+    if (nargs > nparams || nargs < static_cast<size_t>(d->min_args))
+        throw InvalidNumberOfArgsEx();
+
+    LValue *argrun = nargs ? &ctx.frame->at(argbase) : nullptr;
+    const int_type total =
+        d->frame_size + static_cast<int_type>(cck->n_temps);
+    Frame *w = act.push_window(total, cck, /*boundary=*/false);
+    VmCallRec &rec = act.back_rec();
+    rec.ret_chunk = ret_chunk;
+    rec.ret_pc = ret_pc + 1;
+    rec.dst = dst;
+    rec.desc = d;
+    rec.caller_captures = ctx.captures;
+    rec.call_site_packed = 0;            /* #56: no stale switch site */
+    rec.call_site_chain = -1;
+    ML_CHECK(!rec.cache_key);            /* pop reset it / fresh is null */
+
+    const uint64_t noesc = d->noescape_params;
+    for (size_t i = 0; i < nargs; i++)
+        vm_bind_arg(w->at(static_cast<int_type>(i)), argrun[i].get(),
+                    i < 64 && (noesc >> i & 1));
+    for (size_t i = nargs; i < nparams; i++)
+        w->at(static_cast<int_type>(i)).rebind(EvalValue());
+
+    ctx.captures = &fo.capture_slots;
+    return w;
+}
+
+#ifdef TESTS
+/*
+ * G1 REACH PROBE (#118, 2026-08-09) - measurement only, no behaviour.
+ *
+ * The design fork asks: what would a callee that needs NO VM frame record
+ * look like, and how many real calls would qualify? Rather than guess,
+ * classify every in-VM call against four progressively tighter gates and
+ * count. Reported by MYLANG_JITSTATS=1.
+ *
+ * It runs on the C++ push path, which means it must be measured with the
+ * JIT OFF - and that is sound for THIS question, because the JIT does not
+ * change WHICH callee a call reaches, only how the push is emitted. The
+ * shape distribution is identical.
+ *
+ * `leaf` is computed from the BYTECODE (any call-like opcode in the body),
+ * not from Chunk::native_leaf, which is a JIT product and is therefore
+ * false on the very run this probe needs.
+ */
+unsigned long g_norec_total, g_norec_plain, g_norec_leaf,
+              g_norec_arity, g_norec_scalar;
+
+static bool norec_body_is_leaf(const Chunk *c)
+{
+    if (c->norec_leaf_memo >= 0)
+        return c->norec_leaf_memo != 0;
+    bool leaf = true;
+    for (const Instr &i : c->code) {
+        switch (i.op) {
+        case OpCode::CallV: case OpCode::CachedCallV:
+        case OpCode::CallValueV: case OpCode::CallValueGenericV:
+        case OpCode::CallBuiltinV: case OpCode::CallBuiltinLV:
+        case OpCode::CallBuiltinLVElem: case OpCode::CallBuiltinLVMember:
+            leaf = false; break;
+        default: break;
+        }
+        if (!leaf)
+            break;
+    }
+    c->norec_leaf_memo = leaf ? 1 : 0;
+    return leaf;
+}
+
+static void norec_classify(const FuncDescriptor *fd, const Chunk *cck)
+{
+    g_norec_total++;
+    if (!cck->plain_frame)
+        return;                       /* handlers / iterators to unwind */
+    g_norec_plain++;
+    if (!norec_body_is_leaf(cck))
+        return;                       /* a deeper frame needs our record */
+    g_norec_leaf++;
+    const auto &ps = fd->params;
+    if (fd->min_args != static_cast<int>(ps.size()))
+        return;                       /* a skipped opt param binds none */
+    g_norec_arity++;
+    for (const auto &p : ps) {
+        const DeclType t = p.decl_type != DeclType::none ? p.decl_type
+                                                         : p.proven_type;
+        if (t != DeclType::i && t != DeclType::f && t != DeclType::b)
+            return;                   /* a reference param needs refcounting */
+    }
+    g_norec_scalar++;
+}
+
+/* the classifier on a compiled function directly, for its test - which
+ * must not depend on which call path a platform's run takes into it */
+void vm_test_norec_classify(const FuncDescriptor *fd, const Chunk *cck)
+{
+    norec_classify(fd, cck);
+}
+#endif
+
+/*
+ * THE CALL'S SETUP CARET (RULE 2, 2026-09-20). A loc-less exception
+ * escaping a call's SETUP - an arity throw, a bind coercion (`func f(int
+ * k)` handed a float), the window push - carets the ARGUMENT LIST in the
+ * tree-walker (CallExpr::do_eval's catch stamps `args->start/end` on
+ * anything loc-less out of do_func_call). The VM's in-VM push escaped
+ * with NO location at all, and the JIT's tiers stamped the whole call;
+ * the argument list's span is the call op's second caret (base_locs,
+ * the same table a store op's base caret rides - codegen records it on
+ * CallV/CachedCallV/CallValueV). Applied to the interpreter's two
+ * enter paths here and to the boundary call (vm_call_func); the JIT's
+ * conveyance stamps it itself (emit_exc_stamp's args form), since its
+ * pcs collapse.
+ */
+void vm_stamp_setup_caret(Exception &e, const Chunk &chunk, size_t pc)
+{
+    if (e.loc_start)
+        return;
+    Loc s, en;
+    /* A BIND COERCION names the argument it rejected (Exception::bind_arg,
+     * set by vm_frame_setup's coercing loop and the tree-walker's
+     * call-site binds): the op's THIRD caret, arg_locs, is that argument's
+     * own span. An out-of-range index (a stale value) takes the list;
+     * nothing is invented. */
+    if (e.bind_arg >= 0
+            && chunk.arg_loc_at(pc, static_cast<size_t>(e.bind_arg), s, en)) {
+        e.loc_start = s;
+        e.loc_end = en;
+        return;
+    }
+    /* NO fallback to `locs`: an op that records no args entry (the
+     * generic dyn-callee call, whose CallSite carries its own arg
+     * carets) stamps downstream as it always did - a whole-call caret
+     * from here would pre-empt it (watched: the arity error through a
+     * dyn callee moved from the argument to the call) */
+    if (!chunk.base_loc_at(pc, s, en))
+        return;
+    e.loc_start = s;
+    e.loc_end = en;
+}
+
+/*
+ * LoadBoxV / StoreBoxV (bytecode.h): `*b`, through the box_load_want /
+ * box_store every engine shares; a raise takes the `*b` caret from the loc
+ * side table. Out of line: the dispatch loop's frame stays small.
+ */
+static ML_NOINLINE void
+vm_load_box(EvalContext &ctx, const Instr &in, const Chunk &chunk, size_t pc)
+{
+    const int want = static_cast<int>(in.b_lit());
+    const StructTypeDef *def = want == 5
+        ? chunk.struct_defs[static_cast<size_t>(in.target2)] : nullptr;
+    try {
+        EvalValue v = box_load_want(ctx.frame->at(in.a_slot()).get(), want,
+                                    def);
+        ctx.frame->at(in.target).put(std::move(v));
+    } catch (Exception &e) {
+        vm_stamp_loc(chunk, pc, e);
+        throw;
+    }
+}
+
+/* #49: the interpreted CheckFitV - check_fit's refusal takes the op's
+ * caret (the stored value, from the loc side table). Out of line: the
+ * dispatch loop's frame stays small. */
+static ML_NOINLINE void
+vm_check_fit_op(EvalContext &ctx, const Instr &in, const Chunk &chunk,
+                size_t pc)
+{
+    try {
+        check_fit(ctx.frame->at(in.a_slot()).get(),
+                  chunk.fit_specs[static_cast<size_t>(in.target2)]);
+    } catch (Exception &e) {
+        vm_stamp_loc(chunk, pc, e);
+        throw;
+    }
+}
+
+/* CastV (plans/cast.md): cast_value, a refusal taking the op's caret
+ * (the cast's argument, from the loc side table). Out of line: the
+ * dispatch loop's frame stays small. */
+static ML_NOINLINE void
+vm_cast_op(EvalContext &ctx, const Instr &in, const Chunk &chunk, size_t pc)
+{
+    try {
+        EvalValue v = cast_value(
+            ctx.frame->at(in.a_slot()).get(),
+            *chunk.cast_types[static_cast<size_t>(in.target2)], false);
+        ctx.frame->at(in.target).put(std::move(v));
+    } catch (Exception &e) {
+        vm_stamp_loc(chunk, pc, e);
+        throw;
+    }
+}
+
+static ML_NOINLINE void
+vm_store_box(EvalContext &ctx, const Instr &in, const Chunk &chunk,
+             size_t pc)
+{
+    try {
+        box_store(ctx.frame->at(in.a_slot()).get(),
+                  ctx.frame->at(in.b_slot()).get());
+    } catch (Exception &e) {
+        vm_stamp_loc(chunk, pc, e);
+        throw;
+    }
+}
+
+/*
+ * RULE 1: the interpreted CheckNoneArgsV - vm_none_args_fault's refusal
+ * takes the op's carets (it records the call's argument spans, read
+ * through vm_stamp_setup_caret like a call's own) and raises before the
+ * call enters its callee: no callee frame, exactly where a bind error
+ * raises. Out of line: the dispatch loop's frame stays small.
+ */
+static ML_NOINLINE void
+vm_check_none_args(EvalContext &ctx, const Instr &in, const Chunk &chunk,
+                   size_t pc)
+{
+    const FuncDescriptor *d = nullptr;
+    const BindFault f = vm_none_args_fault(ctx, in.target, in.target2,
+                                           in.a_lit(), in.b_lit(), d);
+    if (f.idx < 0)
+        return;
+    TypeErrorEx e = bind_fault_error(d, f, f.idx);
+    vm_stamp_setup_caret(e, chunk, pc);
+    throw e;
+}
+
+/*
+ * The generic dyn-callee op's twin of vm_stamp_setup_caret: its carets
+ * live in its CallSite (an ArgLocs view), not the pc-keyed tables. A
+ * loc-less exception out of the call takes the FAILING ARGUMENT's span
+ * when the bind named one (Exception::bind_arg, in range), else the
+ * argument list's. Shared by the interpreted op and the JIT's generic
+ * helper (jit_call_value_generic), so the two cannot drift.
+ */
+static inline void vm_stamp_args_caret(Exception &e, const ArgLocs &al)
+{
+    if (e.loc_start)
+        return;
+    const int i = e.bind_arg;
+    /* an argument with no span of its own - a const-folded LITERAL, which
+     * only a dyn callee can hand to a coercing parameter (`f(2.5)` with
+     * `f` a dyn) - takes the list's, as the tree-walker's stamp_args_loc
+     * does; writing its empty Loc would leave the exception loc-less
+     * (watched: no location under -nj, the whole call under the JIT) */
+    if (i >= 0 && static_cast<size_t>(i) < al.nargs && al.args
+            && al.args[static_cast<size_t>(i)].start) {
+        e.loc_start = al.args[static_cast<size_t>(i)].start;
+        e.loc_end = al.args[static_cast<size_t>(i)].end;
+        return;
+    }
+    e.loc_start = al.start;
+    e.loc_end = al.end;
+}
+
+/* The lean twin of vm_enter_call (the common shape: fast_bind + no cache
+ * key). ONE out-of-line call from the dispatch loop (the loop-body text
+ * rule), with the setup inlined - the old shape paid a second nested
+ * NOINLINE call plus the null unique_ptr's ABI. */
+static ML_NOINLINE void
+vm_enter_call_lean(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
+                   size_t &pc, FuncObject &fo, const Chunk *cck,
+                   int_type argbase, size_t nargs, int_type dst)
+{
+#ifdef TESTS
+    norec_classify(fo.func, cck);
+#endif
+    try {
+        vm_frame_setup_lean(act, ctx, chunk, pc, fo, cck, argbase, nargs,
+                            dst);
+    } catch (Exception &e) {
+        vm_stamp_setup_caret(e, *chunk, pc);
+        throw;
+    }
     chunk = cck;
     pc = 0;
 }
 
-/* Pop the TOP (in-VM) frame with `res` as its return value: store a cached
- * call's SCALAR result in the caller's cache (pure_cache_call's exact
- * rule), write the parent's dst slot, resume after the call. */
+/*
+ * The interpreter's in-VM CALL: the frame-setup core plus the chunk/pc SWITCH
+ * to the callee (the loop then dispatches the callee's ops). The native-call
+ * path (plans/archived/native-aot.md #55) will instead `call` the callee's fragment
+ * after vm_frame_setup, so the switch stays here.
+ */
+static ML_NOINLINE void
+vm_enter_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
+              size_t &pc, FuncObject &fo, const Chunk *cck,
+              int_type argbase, size_t nargs, int_type dst,
+              std::unique_ptr<PureCacheKey> ckey)
+{
+#ifdef TESTS
+    norec_classify(fo.func, cck);
+#endif
+    try {
+        vm_frame_setup(act, ctx, chunk, pc, fo, cck, argbase, nargs, dst,
+                       std::move(ckey));
+    } catch (Exception &e) {
+        vm_stamp_setup_caret(e, *chunk, pc);
+        throw;
+    }
+    chunk = cck;
+    pc = 0;
+}
+
+/*
+ * The RETURN-side leave CORE (the twin of vm_frame_setup; #55). Pop the TOP
+ * in-VM frame with `res` as its return value: store a cached call's SCALAR
+ * result in the caller's cache (pure_cache_call's exact rule), pop the window,
+ * write the parent's dst slot. The PARENT's resume point goes into
+ * g_vm_resume_chunk/pc (NOT a C++ ref to the loop's chunk/pc locals) so this
+ * core is reusable by the native ReturnV (#55), whose fragment has no handle
+ * on those locals: the native ReturnV will read a slot into `res`, call this,
+ * and ret a SENTINEL that makes EnterNative apply the same globals.
+ */
+/* The CACHED-call tail (cold): the unique_ptr key handling lives OUT of
+ * the hot leave below - a unique_ptr local drags exception scaffolding
+ * and a fat spill frame into every return otherwise (the same disease
+ * the lean setup cured on the push side; lever 1). */
+static ML_NOINLINE void
+vm_frame_leave_cached(VmActivation &act, EvalContext &ctx, EvalValue &&res,
+                      int_type dst)
+{
+    std::unique_ptr<PureCacheKey> ckey = std::move(act.back_rec().cache_key);
+    act.pop_window();
+    if (res.get_type()->t < Type::t_str)
+        ctx.frame->ensure_pure_cache().emplace(std::move(*ckey), res);
+    if (dst >= 0)
+        ctx.frame->at(dst).put(std::move(res));
+}
+
+/*
+ * The leave BODY, inlined into each of its three callers (jit_ret, jit_halt,
+ * vm_leave_call). Each is already an out-of-line function with its own frame,
+ * and NONE is inside vm_dispatch's loop body - vm_leave_call is itself
+ * ML_NOINLINE - so absorbing this costs the dispatch loop no text while it
+ * removes a call plus a prologue/epilogue from every return.
+ *
+ * That frame was NOT small: the `EvalValue res` parameter is a 32-byte type
+ * with a non-trivial destructor, which drags a spill slot and cleanup
+ * scaffolding into the callee - measured 13 Ir of prologue plus 11 of
+ * epilogue per return, against a body doing ~10 Ir of real work. Same disease
+ * as vm_dispatch_exc_frame (#82) and the unique_ptr parameter lever 1 removed
+ * from the push side; same cure.
+ */
+static ML_ALWAYS_INLINE void
+vm_frame_leave_body(VmActivation &act, EvalContext &ctx, EvalValue &&res)
+{
+    VmCallRec &dead = act.back_rec();
+    ctx.captures = dead.caller_captures;
+    g_vm_resume_chunk = dead.ret_chunk;
+    g_vm_resume_pc = dead.ret_pc;
+    const int_type dst = dead.dst;
+    if (dead.cache_key) {                        /* cold: a CachedCallV miss */
+        vm_frame_leave_cached(act, ctx, std::move(res), dst);
+        return;
+    }
+    act.pop_window();
+    if (dst >= 0) {              /* -1 = a DISCARDED call statement's dst
+                                  * (the peephole's dead-dst rule) */
+        /* #121: the same dispatch-free reference re-bind jit_ret_norec
+         * takes. Wired HERE as well so the tier is not JIT-only: `-nj`
+         * and MYLANG_JIT_OFF are shipping configurations, and an
+         * optimization that exists in one tier only makes any test of it
+         * silently vacuous in the other. */
+        LValue &d = ctx.frame->at(dst);
+        if (!vm_slot_bind_ref(d, res))
+            d.put(std::move(res));
+    }
+}
+
+
+/*
+ * #55 native calls: the native ReturnV. The fragment flushed its register
+ * cache and calls this with the result value's frame slot; g_current_ctx (the
+ * running vm_run_chunk's ctx) + g_vm_act (its activation) locate the frame.
+ * IN-VM frame: read the result from the CALLEE window (still current), pop it
+ * (vm_frame_leave writes the parent's dst + sets the resume globals), and
+ * return the resume SENTINEL - EnterNative switches to the parent. BOUNDARY
+ * frame: set flow (the do_func_call / callback contract, like the interpreted
+ * ReturnV boundary path) and return the boundary sentinel - EnterNative stops
+ * the invocation; the C++ caller (VmInvoker) pops the window.
+ * noexcept: a fully-native leaf body is throw-free, so nothing here throws.
+ *
+ * C4c: the COMMON shape of this function (non-boundary, no cache key, no
+ * stashed pure cache, plain frame, empty ref_slots, trivial old dst) is now
+ * EMITTED INLINE at the ReturnV/Halt site (emit_ret_native, jit.cpp) - the
+ * return-side twin of the M5b inline push. This helper is that path's SLOW
+ * TIER: every emitted guard declines here BEFORE any mutation, so it always
+ * redoes the whole pop from scratch, byte-identically.
+ */
+extern "C" size_t jit_ret(int_type res_slot) noexcept
+{
+    g_jit_native_returns++;
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    ML_CHECK(res_slot >= 0
+             && res_slot < static_cast<int_type>(ctx.frame->size));
+    /* the callee window dies right after - MOVE the result out (lever 1) */
+    EvalValue res = ctx.frame->at(res_slot).steal_value();
+    if (act.back_rec().boundary) {
+        ctx.flow->value = std::move(res);
+        ctx.flow->type = FlowState::ret;
+        return JIT_RET_BOUNDARY;
+    }
+    vm_frame_leave_body(act, ctx, std::move(res));
+    return JIT_RET_SENTINEL;
+}
+
+/*
+ * model-flip (nativize-ops): the native Halt - a fall-through body's implicit
+ * `return none`. The interpreted analog (VM_CASE(Halt)) with the result value
+ * hard-wired to none (no result slot). IN-VM frame: vm_frame_leave writes the
+ * parent's dst = none + sets the resume globals -> JIT_RET_SENTINEL (EnterNative
+ * switches to the parent). BOUNDARY frame (main / a callback callee): just
+ * return the boundary sentinel WITHOUT touching flow - the interpreted Halt
+ * boundary path is a bare `return` (a fall-through body left flow == none, so
+ * the caller reads none), NOT the ReturnV boundary path (which sets flow=ret).
+ * noexcept: nothing here throws.
+ */
+extern "C" size_t jit_halt() noexcept
+{
+    ML_JIT_OP_RAN(Halt);
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    if (act.back_rec().boundary)
+        return JIT_RET_BOUNDARY;             /* flow stays none -> caller none */
+    EvalValue none_res;
+    vm_frame_leave_body(act, ctx, std::move(none_res));  /* none to parent */
+    return JIT_RET_SENTINEL;
+}
+
+/* 4-v: the record-less return's decline tier (see jit.h). The steal /
+ * the dst put are the C++ moves the emitted arm's guards exist for (an
+ * array result must unregister its slice from the dying slot; a raw
+ * bit-1 dst must be constructed - #97 R1 moves every other reference
+ * and releases the old dst natively); the rest mirrors the emitted arm.
+ * The vframe/captures restores are the CALLER's sentinel arm's job. */
+extern "C" size_t jit_ret_norec(int_type res_slot, LValue *dst_addr_raw,
+                                const void *descv,
+                                const void *rbp) noexcept
+{
+    g_jit_native_returns++;
+    /* #97 increment 2: bit 0 of the residue's dst word marks a FRAMELESS
+     * frame (its window is on the native stack, not the segment) */
+    const uintptr_t dst_bits = reinterpret_cast<uintptr_t>(dst_addr_raw);
+    const bool frameless = (dst_bits & 1) != 0;
+    /* #97 E2b: bit 1 - the old dst value is trivial and the slot may be
+     * RAW (a calling frameless body's W3-skipped call dst): construct a
+     * valid LValue before the put reads the old one */
+    const bool raw_dst = (dst_bits & 2) != 0;
+    LValue *dst_addr = reinterpret_cast<LValue *>(dst_bits & ~uintptr_t(3));
+    if (raw_dst && dst_addr)
+        new (dst_addr) LValue();
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    const auto *desc = static_cast<const FuncDescriptor *>(descv);
+    const Chunk *ck =
+        desc ? static_cast<const Chunk *>(desc->vm_chunk) : nullptr;
+    ML_CHECK(ck != nullptr);
+    /* #97 R4: a FRAMELESS frame's window is at a fixed offset from its
+     * rbp (the site built it there), and its arm calls here WITHOUT
+     * publishing the vframe - a lazy leaf's cell may name the caller */
+    LValue *win = frameless
+        ? reinterpret_cast<LValue *>(const_cast<char *>(
+              static_cast<const char *>(rbp)) + JIT_FRAMELESS_WIN_OFF)
+        : ctx.frame->slots;
+    EvalValue res = res_slot >= 0 ? win[res_slot].steal_value()
+                                  : EvalValue();
+    const int_type total = static_cast<int_type>(ck->slot_count)
+                           + ck->n_temps;
+    for (const int32_t s : ck->ref_slots) {
+        if (s >= total)
+            break;
+        LValue &lv = win[s];
+        if (lv.get().get_type()->t >= Type::t_str)
+            lv.frame_release();
+    }
+    if (!frameless)
+        act.cur_sg->cur -= total;
+    ctx.captures = *reinterpret_cast<CaptureSlots *const *>(
+        static_cast<const char *>(rbp) + 16);
+    /* #121: a REFERENCE result re-binding a slot that already holds the same
+     * reference kind - the steady state of every factory loop - skips the
+     * put/operator=/move_assign frame chain entirely. It declines to put()
+     * for a first bind, a type change, and every trivial result. */
+    if (dst_addr && !vm_slot_bind_ref(*dst_addr, res))
+        dst_addr->put(std::move(res));
+    return JIT_RET_SENTINEL;
+}
+
+/* #55 STEP 2.1: native CallVs set up process-wide (coverage - see jit.h). */
+unsigned long g_jit_native_calls = 0;
+unsigned long g_jit_inline_baked = 0;
+unsigned long g_jit_inline_call_baked = 0;
+#ifdef TESTS
+/* #78 step C: catch dispatches served by the HANDLER TABLE (the coverage
+ * counter proving the table path - not the CatchTest chain - ran). */
+unsigned long g_vm_table_dispatch = 0;
+/* #78 step E: times EndFinally's cold RERAISE arm ran IN THE FRAGMENT
+ * (jit_end_finally). It is the arm that used to bail, so a test asserting
+ * this bumped is what proves the deletable form actually executes rather
+ * than the interpreter re-running a kept original. */
+unsigned long g_jit_end_finally_reraise = 0;
+/* #80: times the native `rethrow` ran IN THE FRAGMENT (jit_rethrow). */
+unsigned long g_jit_rethrow_native = 0;
+#endif
+
+/* model-flip M3: native-container island calls set up process-wide (coverage -
+ * proves a container's jit_exec_block path actually ran; a `jit:` test asserts
+ * it > 0, per the "prove the code ran" rule). */
+unsigned long g_jit_container_calls = 0;
+
+/* #55 STEP 2.1: member offsets the native-call emitter bakes. Measured via a
+ * probe object (no offsetof-on-non-standard-layout warning); both types are
+ * default-constructible and cheap (a Chunk's NativeCode dtor is a no-op when
+ * base is null, which it is here). */
+/* De-helperize 6b (roadmap step 6): the ctx-indirect address chain the
+ * LoadCaptureV / StoreCaptureV / StoreGlobalV inlines walk at runtime -
+ * &g_current_ctx (the file-static the helpers already use), the
+ * EvalContext::captures / ::gfuncs member offsets, and GlobalFuncTable's
+ * slots / defined vector offsets (their _M_start lives at +0, the layout
+ * fact the flat-array reads already rely on). Probed from real objects so
+ * they cannot drift. */
+EvalContext **jit_addr_current_ctx()
+{
+    return &g_current_ctx;
+}
+ptrdiff_t jit_off_ctx_captures()
+{
+    EvalContext c(nullptr, true);
+    return reinterpret_cast<const char *>(&c.captures)
+         - reinterpret_cast<const char *>(&c);
+}
+ptrdiff_t jit_off_ctx_gfuncs()
+{
+    EvalContext c(nullptr, true);
+    return reinterpret_cast<const char *>(&c.gfuncs)
+         - reinterpret_cast<const char *>(&c);
+}
+/* C4c: EvalContext::flow - the inline BOUNDARY return writes the flow
+ * state directly (the jit_ret boundary path's two stores). */
+ptrdiff_t jit_off_ctx_flow()
+{
+    EvalContext c(nullptr, true);
+    return reinterpret_cast<const char *>(&c.flow)
+         - reinterpret_cast<const char *>(&c);
+}
+ptrdiff_t jit_off_gft_slots()
+{
+    GlobalFuncTable g;
+    return reinterpret_cast<const char *>(&g.slots)
+         - reinterpret_cast<const char *>(&g);
+}
+ptrdiff_t jit_off_gft_defined()
+{
+    GlobalFuncTable g;
+    return reinterpret_cast<const char *>(&g.defined)
+         - reinterpret_cast<const char *>(&g);
+}
+
+/* CachedCallV's cache probe over an explicit (argbase, n, dst) triple - the
+ * shared core of the interpreted probe (vm_cache_probe below) and the lean
+ * sync helper. Hit -> dst written, true. Miss -> `pending` carries the key
+ * (it rides the callee record and is stored by vm_frame_leave). */
+static bool
+vm_cache_probe_vals(EvalContext &ctx, const FuncDescriptor *d,
+                    int_type argbase, size_t n, int_type dst,
+                    std::unique_ptr<PureCacheKey> &pending)
+{
+    std::vector<EvalValue> vals;
+    vals.reserve(n);
+    const LValue *ap0 = n ? &ctx.frame->at(argbase) : nullptr;
+    for (size_t i = 0; i < n; i++)
+        vals.push_back(ap0[i].get());
+    PureCacheKey key{ d, std::move(vals) };
+    PureCache &cache = ctx.frame->ensure_pure_cache();
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        ctx.frame->at(dst).put(EvalValue(it->second));
+        return true;
+    }
+    pending = std::make_unique<PureCacheKey>(std::move(key));
+    return false;
+}
+
+/*
+ * M5 LEAN SYNC ENTER (inc 3; plans/archived/model-flip.md): a fragment's call op runs
+ * the callee to completion INSIDE the helper and the CALLER CONTINUES
+ * NATIVELY. Inc 1 used VmInvoker's BOUNDARY machinery (arg value copy,
+ * boundary window, flow round-trip) - measured heavier than the interpreted
+ * vm_enter_call it displaces (76_funcval 1.16x, 11_closure 1.23x). This
+ * reuses the interpreted call's OWN lean protocol: vm_frame_setup pushes a
+ * NON-boundary record (record REUSE, fast_bind straight from the caller's
+ * contiguous slot run - no arg copy) whose ret_chunk is the SENTINEL STOP
+ * CHUNK below, so the callee's ordinary ReturnV/Halt pop (vm_frame_leave)
+ * writes the caller's dst - and performs a CachedCallV's cache store for
+ * free - then "resumes after the call op", which IS the sentinel's
+ * ExitBlock: vm_dispatch returns to the helper. The record's sync_stop flag
+ * makes vm_unwind_walk stop there (capture + pop + g_vm_exc_pending), so an
+ * uncaught RuntimeException also returns here; a PLAIN (non-Runtime)
+ * exception C++-propagates out of vm_dispatch and rides g_vm_jit_eptr
+ * (records above die with the dying invocation, as interpreted).
+ *
+ * The C stack grows one helper+dispatch level per NESTED sync call
+ * (recursion through native call sites), so a depth cap bails the deep tail
+ * to the interpreted call op, whose flat in-VM record stack is unbounded.
+ * Returns 0 = done (dst written); 1 = BAIL pre-side-effect (undefined /
+ * non-callable callee, chunk-less callee, depth cap, an arity/bind/
+ * StackOverflow throw - all idempotent, the interpreter re-runs the op and
+ * re-throws byte-identically); 2 = the callee threw: a RuntimeException
+ * rides g_vm_jit_exc (its backtrace's innermost frame gets the BAKED
+ * call-site loc the lazy in-VM capture would have used), anything else
+ * rides g_vm_jit_eptr.
+ */
+/*
+ * ⛔ IN THE LOW ARENA, so the emitter can name it with an absolute
+ * disp32 (#96's whole point, extended 2026-08-26). As an ordinary PIE
+ * global this sat around 0x6348'0000'0000, so EVERY emitted access -
+ * five per sync call, plus the inc/dec pair - cost a `movabs reg,
+ * imm64` first, and the bump additionally borrowed a register with a
+ * push/pop bracket because it had nowhere to put the address. A
+ * REFERENCE bound at static init keeps every C++ use below unchanged
+ * (`g_jit_sync_depth++` still reads as it did), and `&g_jit_sync_depth`
+ * hands the emitter the low address. C++ touches it only on the SLOW
+ * sync paths; the hot path is emitted, which is what makes this side of
+ * the trade free. If the arena is unavailable ml_lowmem_new falls back
+ * to plain `new` and the emitter keeps the movabs form.
+ */
+static int &g_jit_sync_depth = *ml_lowmem_new<int>(0);
+/* M5a: 200 = the C-stack-safe cap; jit_native_stack_init raises it to
+ * ~500k when the dedicated native stack is armed (jit.cpp). A VARIABLE:
+ * the emitted guards bake it at chunk-compile time (the init runs before
+ * any emission), the helper wrappers read it at runtime, and a test can
+ * pin it low to exercise the interpreted-fallback paths. */
+static int g_jit_sync_cap = 200;
+
+/* The SENTINEL STOP CHUNK: one ExitBlock at the resume pc. A sync frame's
+ * rec.ret_pc = 1 (vm_frame_setup's ret_pc+1 with ret_pc = 0), so every
+ * return shape - interpreted ReturnV/Halt (vm_leave_call switches to the
+ * resume globals) AND the native ReturnV (jit_ret's sentinel makes
+ * EnterNative apply the same globals) - lands on code[1] = ExitBlock, which
+ * returns from vm_dispatch to the helper. code[0] exists only so the
+ * walk-side ret_pc-1 view stays in range (never executed; loc_at finds
+ * nothing on either pc - the capture is deliberately loc-less). */
+static const Chunk &vm_sync_stop_chunk()
+{
+    static const Chunk ck = [] {
+        Chunk c;
+        Instr ex{};
+        ex.op = OpCode::ExitBlock;
+        Operand o;
+        o.is_lit = true;
+        o.lit = 0;                       /* the (unused) block-resume pc */
+        ex.set_a(o);
+        c.code.push_back(ex);
+        c.code.push_back(ex);
+        return c;
+    }();
+    return ck;
+}
+
+/*
+ * Lever 1 step 5 (plans/archived/native-gap-roadmap.md) - the post-exit of a
+ * DIRECT-ENTERED sync callee fragment, shared by jit_call_sync_core's
+ * direct branch and the fragment-INLINE call path (which emits the push +
+ * the `call` + the sentinel test in machine code and calls this only on a
+ * non-sentinel exit). `r` = the exit pc (JIT_RET_BOUNDARY impossible - a
+ * sync record is non-boundary). The callee record is still TOP here (a
+ * bail does not pop), so the callee desc/chunk are read from it. Faithful
+ * EnterNative post-exit: a conveyed raise dispatches via vm_raise (caret
+ * from the callee's loc table; same-frame handler first, else the walk
+ * stops at the sync_stop record), a plain bail / dispatched handler
+ * continues INTERPRETED at the resolved pc; the walk's pending exception
+ * converts to g_vm_jit_exc with the baked call-site loc stamped (the lazy
+ * in-VM capture's loc_at would have produced it - the sentinel stop chunk
+ * is loc-less). Depth is the CALLER's business (already decremented).
+ */
+/*
+ * 4-v, category (b) of the conveyance-uniform model: the exited callee
+ * was RECORD-LESS (the vframe - still pointing at its window, a pc exit
+ * does not repoint it - differs from the top record's). Its native frame
+ * is dead, so the cleanup runs from LIVE state only: identity from the
+ * EXIT RELAY (the fragment epilogue's last store), window/total from the
+ * vframe, the caller's captures from the residue relay (the site's
+ * residue_pop parked them before the status dispatch). Mirrors the
+ * record path level-for-level:
+ *   r == -2   the callee's own raise (category (a)) already cleaned it
+ *             and captured its frame - only the pending conveyance
+ *             conversion remains; the stamp is passed a NULL desc so it
+ *             deliberately MISSES, exactly as the record path's
+ *             after-the-pop desc read makes it miss (frame [0] stays
+ *             loc-less; a self-recursive shape must not diverge on
+ *             whether [0] carries an unobservable loc).
+ *   r == pc   a conveyed exception (helper exc / raise kind; a plain
+ *             eptr stays untouched like the record path's) - replicate
+ *             the vm_raise-at-the-callee the record path performs: loc
+ *             stamp from the callee's own table (usually pre-stamped -
+ *             #56's op_fully_native contract), the raise site's inline
+ *             flush, the frame capture (LOC-LESS, then stamped in THIS
+ *             invocation with the callee's own desc - which is exactly
+ *             when the record path's stamp LANDS, its record still top
+ *             at its own r=pc postexit), the frame cleanup, and the
+ *             vframe repoint at the CALLER (window = the site's rbx
+ *             argument; total baked, or -1 for main = read
+ *             top_rec->nslots, main being record-ful always).
+ *   No handler search: a record-less callee is plain_frame.
+ *   An interpreted-continuation exit is impossible (fully deleted).
+ */
+static ML_COLD int
+jit_norec_postexit(size_t r, int_type site_packed, LValue *caller_win,
+                   int_type caller_total, VmActivation &act,
+                   EvalContext &ctx, int32_t inl_chain,
+                   const void *inl_pool) noexcept
+{
+    if (r == static_cast<size_t>(-2)) {
+        if (g_vm_exc_pending) {
+            Exception &e = *g_vm_exc_pending;
+            vm_jit_stamp_callee_frame(e, site_packed, inl_chain, inl_pool);
+            g_vm_jit_exc = std::move(g_vm_exc_pending);
+            return 2;
+        }
+        return 0;
+    }
+    if (g_vm_jit_eptr)
+        return 2;              /* fatal (uncatchable) - conveyed as-is,
+                                * the record path's exact behavior */
+    const auto *d = static_cast<const FuncDescriptor *>(g_norec_exit_desc);
+    const Chunk *ck =
+        d ? static_cast<const Chunk *>(d->vm_chunk) : nullptr;
+    ML_CHECK(d && ck);
+    std::unique_ptr<RuntimeException> ex;
+    if (g_vm_jit_raise) {
+        const int kind = g_vm_jit_raise;
+        g_vm_jit_raise = 0;
+        ex = vm_jit_raise_kind_new(kind);
+    } else if (g_vm_jit_exc) {
+        ex = std::move(g_vm_jit_exc);
+    } else {
+        ML_CHECK_MSG(false, "a record-less frame exited with no signal");
+        return 2;
+    }
+    if (!ex->loc_start) {
+        Loc s, en;
+        ck->loc_at(r, s, en);
+        ex->loc_start = s;
+        ex->loc_end = en;
+    }
+    vm_flush_inline(*ck, r, *ex);
+    ex->push_frame(d, Loc());
+    LValue *win = ctx.frame->slots;
+    const int_type total = static_cast<int_type>(ctx.frame->size);
+    for (const int32_t s : ck->ref_slots) {
+        if (s >= total)
+            break;
+        LValue &lv = win[s];
+        if (lv.get().get_type()->t >= Type::t_str)
+            lv.frame_release();
+    }
+    act.cur_sg->cur -= total;
+    ctx.captures = static_cast<CaptureSlots *>(
+        const_cast<void *>(g_jit_residue_caps));
+    act.view_frame.point_at(
+        caller_win,
+        caller_total >= 0 ? static_cast<int>(caller_total)
+                          : static_cast<int>(act.top_rec->nslots));
+    vm_jit_stamp_call_site(*ex, d, site_packed, inl_chain, inl_pool);
+    g_vm_jit_exc = std::move(ex);
+    return 2;
+}
+
+/*
+ * #97 increment 2: the post-exit of a FRAMELESS callee that left its
+ * fragment with an exception (rax = the exit pc). jit_norec_postexit's
+ * shape minus the two things a frameless frame has no more: its window
+ * died with its native-stack frame - the callee's exit epilogue released
+ * every ref-listed slot before the teardown (emit_epilogues), so there
+ * is nothing here to release and NOTHING here may read it - and it took
+ * no segment space, so the watermark is untouched. What remains: the
+ * exception's caret and callee frame, the caller's captures back from
+ * the relay, the caller's view repointed, the site stamped.
+ */
+extern "C" int jit_frameless_postexit(size_t r, int_type site_packed,
+                                      LValue *caller_win,
+                                      int_type caller_total) noexcept
+{
+    const int32_t inl_chain = g_jit_call_inline_chain;
+    const void *inl_pool = g_jit_call_inline_pool;
+    g_jit_call_inline_chain = -1;
+    g_jit_call_inline_pool = nullptr;
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    if (r == static_cast<size_t>(-2)) {
+        /* the callee's own native raise already cleaned its frame (the
+         * norec_raiser arm of vm_raise, which reads the frameless bit) -
+         * only the pending conveyance conversion remains */
+        if (g_vm_exc_pending) {
+            Exception &e = *g_vm_exc_pending;
+            vm_jit_stamp_callee_frame(e, site_packed, inl_chain, inl_pool);
+            g_vm_jit_exc = std::move(g_vm_exc_pending);
+            return 2;
+        }
+        return 0;
+    }
+    /* (a plain C++ exception: since 2026-10-06 nothing a script raises at
+     * run time is one - the rebind errors were the last - so only a C++
+     * library failure reaches this) */
+    if (g_vm_jit_eptr)         /* INT-COV-EXEMPT: no test makes one */
+        return 2;              /* fatal (uncatchable) - conveyed as-is */
+    const auto *d = static_cast<const FuncDescriptor *>(g_norec_exit_desc);
+    const Chunk *ck =
+        d ? static_cast<const Chunk *>(d->vm_chunk) : nullptr;
+    ML_CHECK(d && ck);
+    std::unique_ptr<RuntimeException> ex;
+    if (g_vm_jit_raise) {
+        const int kind = g_vm_jit_raise;
+        g_vm_jit_raise = 0;
+        ex = vm_jit_raise_kind_new(kind);
+    } else if (g_vm_jit_exc) {
+        ex = std::move(g_vm_jit_exc);
+    } else {
+        ML_CHECK_MSG(false, "a frameless frame exited with no signal");
+        return 2;
+    }
+    if (!ex->loc_start) {
+        Loc s, en;
+        ck->loc_at(r, s, en);
+        ex->loc_start = s;
+        ex->loc_end = en;
+    }
+    vm_flush_inline(*ck, r, *ex);
+    ex->push_frame(d, Loc());
+    ctx.captures = static_cast<CaptureSlots *>(
+        const_cast<void *>(g_jit_residue_caps));
+    act.view_frame.point_at(
+        caller_win,
+        caller_total >= 0 ? static_cast<int>(caller_total)
+                          : static_cast<int>(act.top_rec->nslots));
+    vm_jit_stamp_call_site(*ex, d, site_packed, inl_chain, inl_pool);
+    g_vm_jit_exc = std::move(ex);
+    return 2;
+}
+
+extern "C" int jit_sync_postexit(size_t r, int_type site_packed,
+                                 LValue *caller_win,
+                                 int_type caller_total) noexcept
+{
+    /* #88: CLAIM the baked call site - read it and reset, before anything
+     * is dispatched (see g_jit_call_inline_chain). Resetting is what lets a
+     * site with no chain emit no stores at all: it can then only observe
+     * the cleared value, never a previous site's. */
+    const int32_t inl_chain = g_jit_call_inline_chain;
+    const void *inl_pool = g_jit_call_inline_pool;
+    g_jit_call_inline_chain = -1;
+    g_jit_call_inline_pool = nullptr;
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    /* 4-v: the record-less exited callee takes its own path (above) */
+    if (act.top_rec && ctx.frame
+            && ctx.frame->slots != act.top_rec->window)
+        return jit_norec_postexit(r, site_packed, caller_win,
+                                  caller_total, act, ctx, inl_chain,
+                                  inl_pool);
+    const FuncDescriptor *d = act.back_rec().desc;
+    const Chunk *cck = act.back_rec().run_chunk;
+    try {
+        const Chunk *c2 = cck;
+        size_t p2 = r;
+        bool cont = true;
+        if (r == static_cast<size_t>(-2)) {
+            /* #56 (native Throw): the callee's raise already walked to
+             * our sync_stop record (pending set) - no dispatch, just the
+             * conveyance tail below. */
+            cont = false;
+        } else if (g_vm_jit_raise) {
+            const int kind = g_vm_jit_raise;
+            g_vm_jit_raise = 0;
+            cont = vm_raise(c2, p2, act, ctx,
+                            vm_jit_raise_kind_new(kind));
+        } else if (g_vm_jit_exc) {
+            cont = vm_raise(c2, p2, act, ctx, std::move(g_vm_jit_exc));
+        } else if (g_vm_jit_eptr) {
+            /* a nested sync callee's plain exception: convey upward as-is
+             * (the records above die with the invocation, exactly the
+             * dispatch path's rethrow contract). */
+            return 2;
+        }
+        if (cont)
+            vm_dispatch(*c2, ctx, act, p2);
+        /* !cont: the walk reached the sync record - popped, pending set;
+         * fall through to the conveyance below. */
+    } catch (Exception &e) {
+        /* A PLAIN exception from the interpreted continuation (a
+         * RuntimeException is walked inside vm_dispatch, never
+         * C++-escapes it): capture the callee frame + stamp the baked
+         * site, exactly what the walk + the pending path produce for a
+         * RuntimeException. */
+        vm_capture_desc_frame(e, d);
+        vm_jit_stamp_call_site(e, d, site_packed, inl_chain,
+                               inl_pool);
+        if (auto *re = dynamic_cast<RuntimeException *>(&e))
+            g_vm_jit_exc.reset(re->clone());
+        else
+            g_vm_jit_eptr = std::current_exception();
+        return 2;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    }
+    if (g_vm_exc_pending) {
+        Exception &e = *g_vm_exc_pending;
+#ifdef TESTS
+        /* G1 step 2: the loc the RENDER path stamps into the loc-less
+         * frame must be the loc the TABLE stored for that same site -
+         * the two travelled from one emission through entirely different
+         * machinery (a baked immediate argument vs C++ bookkeeping). */
+        if (g_norec_stash) {
+            if (static_cast<uint64_t>(site_packed)
+                    != g_norec_stash->site_loc)
+                norec_fail("stamp != table site_loc",
+                           reinterpret_cast<const void *>(site_packed),
+                           g_norec_stash);
+            g_norec_stash = nullptr;
+            g_jit_norec_stamp_verify++;
+        }
+#endif
+        /* the frame to stamp is the one the walk captured last - at a
+         * -2 exit the callee record is already popped, so `d` (read at
+         * the top) is the CALLER's; see vm_jit_stamp_callee_frame */
+        vm_jit_stamp_callee_frame(e, site_packed, inl_chain, inl_pool);
+        g_vm_jit_exc = std::move(g_vm_exc_pending);
+        return 2;
+    }
+    return 0;                              /* dst written by vm_frame_leave */
+}
+
+/* M5c - the CachedCallV fast path's probe. The map lookup is inherently
+ * C++ (PureCacheKey hash/eq over arg values); the emitted site calls this
+ * lean helper: a HIT writes the dst slot and returns 1 (the fragment
+ * continues past the call); a MISS constructs the key ONCE and parks the
+ * released pointer in g_jit_pending_key for the INLINE push to store into
+ * rec.cache_key (3 emitted movs). Any decline between the probe and that
+ * store jumps to the full jit_call_sync_cached tier, whose core CONSUMES
+ * the pending key instead of re-probing - no leak, no double probe. A
+ * disabled/unavailable cache is a plain miss with no pending key. */
+static PureCacheKey *g_jit_pending_key = nullptr;
+
+extern "C" int jit_cached_probe(const void *descv, int_type argbase,
+                                int_type nargs, int_type dst) noexcept
+{
+#ifdef TESTS
+    g_jit_cached_probe_calls++;
+#endif
+    EvalContext &ctx = *g_current_ctx;
+    const FuncDescriptor *d =
+        static_cast<const FuncDescriptor *>(descv);
+    if (!ctx.frame || !g_pure_cache_enabled)
+        return 0;
+    std::unique_ptr<PureCacheKey> key;
+    if (vm_cache_probe_vals(ctx, d, argbase,
+                            static_cast<size_t>(nargs), dst, key))
+        return 1;                          /* hit - dst written */
+    g_jit_pending_key = key.release();
+    return 0;
+}
+
+void *jit_addr_pending_key()
+{
+    return &g_jit_pending_key;
+}
+
+/* #88: the emitted sync call stores its baked call site here (see
+ * g_jit_call_inline_chain's comment for why this is a side channel). */
+void *jit_addr_call_inline_chain()
+{
+    return &g_jit_call_inline_chain;
+}
+
+void *jit_addr_call_inline_pool()
+{
+    return &g_jit_call_inline_pool;
+}
+
+/* M5b: the jit_sync_push_* HELPERS are gone - the push is emitted INLINE
+ * at the call site (emit_sync_push_native, jit.cpp; offsets from
+ * jit_fill_push_layout below). Declines go straight to the full
+ * jit_call_sync* tier. */
+
+/* the emitted depth guard's address (g_jit_sync_depth is TU-local) */
+void *jit_addr_sync_depth()
+{
+    return &g_jit_sync_depth;
+}
+
+/* #97 E2: the decline relay (jit.h: jit_addr_nosw). In the low arena so
+ * the emitted store is one instruction. */
+static int_type &g_jit_nosw = *ml_lowmem_new<int_type>(0);
+const void *jit_empty_captures()
+{
+    static CaptureSlots empty;       /* never written: nothing captures */
+    return &empty;
+}
+
+void *jit_addr_nosw()
+{
+    return &g_jit_nosw;
+}
+
+int jit_sync_depth_cap()
+{
+    return g_jit_sync_cap;
+}
+
+void jit_set_sync_depth_cap(int cap)
+{
+    g_jit_sync_cap = cap;
+}
+
+#ifdef TESTS
+unsigned long g_jit_sync_switch = 0;        /* #56: cap SWITCH pushes */
+unsigned long g_jit_sync_boundary_call = 0; /* #56: chunk-less helper calls */
+/* #97 probe elision: how many times the emitted site CALLED
+ * jit_cached_probe - 0 for every program while the pure cache is off,
+ * which is what the elision test asserts (the helper's own early return
+ * would keep the answers right with the call still emitted). */
+unsigned long g_jit_cached_probe_calls = 0;
+#endif
+
+/* #56 step 2: the CHUNK-LESS boundary call, performed in the helper (the
+ * interpreted CallV/CachedCallV tail verbatim: vm_call_func / vm_cached_call
+ * with a null chunk - do_func_call captures the callee frame; the loc-less
+ * innermost call-site is stamped from the baked site, exactly the core's
+ * pending-conversion shape). Cold (post-precompile territory). */
+static ML_COLD int
+jit_sync_boundary_call(EvalContext &ctx, FuncObject &fo, int_type argbase,
+                       int_type nargs, int_type dst, int_type site_packed,
+                       bool cached, int32_t inl_chain,
+                       const void *inl_pool) noexcept
+{
+#ifdef TESTS
+    g_jit_sync_boundary_call++;
+#endif
+    /* the caret AND the site's inlined-at chain - the pair every other
+     * conversion stamps (#38 repro B; the chain was claimed by the
+     * caller and used to be dropped here) */
+    const auto stamp_site = [&](Exception &e) {
+        vm_jit_stamp_call_site(e, fo.func, site_packed, inl_chain,
+                               inl_pool);
+    };
+    try {
+        LValue *ap = nargs ? &ctx.frame->at(argbase) : nullptr;
+        EvalValue res = cached
+            ? vm_cached_call(&ctx, fo, ap, nargs, nullptr, 0)
+            : vm_call_func(&ctx, fo, ap, nargs, nullptr, 0);
+        if (g_vm_exc_pending) {
+            stamp_site(*g_vm_exc_pending);
+            g_vm_jit_exc = std::move(g_vm_exc_pending);
+            return 2;
+        }
+        if (dst >= 0)
+            ctx.frame->at(dst).put(std::move(res));
+    } catch (RuntimeException &e) {
+        stamp_site(e);
+        g_vm_jit_exc.reset(e.clone());
+        return 2;
+    } catch (Exception &e) {
+        stamp_site(e);
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    }
+    return 0;
+}
+
+/*
+ * G1 STEP 4-iv - THE SWITCH RETARGET (task #148; the -3 materializer of
+ * plans/archived/g1-no-record-tier.md 4d, generalized). The -3 propagation is
+ * about to unwind every native frame in the topmost segment - and every
+ * one of those frames' records carries the SENTINEL resume (sync_stop,
+ * ret = the stop chunk), which is only meaningful while its C/native
+ * consumer waits. Without this walk the flat continuation's first pop
+ * past the switching caller dispatched the sentinel's ExitBlock,
+ * vm_dispatch RETURNED, and the whole rest of the program was silently
+ * ABANDONED with exit 0 - main's remaining statements never ran. That
+ * hole shipped WITH the switch protocol (born at its introducing commit)
+ * and was invisible because the coverage test's asserts sat AFTER the
+ * deep call: the lost continuation skipped them, which reads as a pass.
+ *
+ * The retarget rewrites each doomed record's resume to the REAL one -
+ * (site.caller, site.resume_pc), the caller's post-call entry stub, the
+ * exact fields the SWITCH-pushed record itself uses - so the flat pop
+ * chain re-enters each caller fragment natively, link by link, all the
+ * way back to main. Everything downstream already handles a real resume
+ * (it is the interpreted call's own model): vm_frame_leave and the C4c
+ * inline pop read rec.ret_* into the resume globals, and the EnterNative
+ * SENTINEL consumer dispatches them.
+ *
+ * The walk is the norec chain walk's release twin: records paired
+ * POSITIONALLY with native frames (records[idx-1] is the frame at fp),
+ * the site found via the frame's return address. It stops at a
+ * non-sentinel record (an interpreted/flat/boundary frame - a live
+ * consumer) or a C++ return address (the segment floor - that frame was
+ * pushed by a jit_enter_deep core, which retargets it ITSELF at its
+ * r == JIT_RET_SWITCH branch, where its own C frame's death is decided;
+ * a dispatch-driven consumer never propagates the switch, so its records
+ * are never doomed and never reach this walk). sync_stop is CLEARED so a
+ * later raise walks through the frame normally (its C conveyance target
+ * is gone) and the full-stack audit skips it; call_site_packed carries
+ * the site's baked caret (a deleted run's loc table collapsed, the
+ * reason that field exists); the 4-iii residue flag dies with the native
+ * frames. Under MYLANG_JIT_OFF=norec the sites still EXIST (inc 5: the
+ * table is unconditional) but no frame is ever record-less, so the walk
+ * degenerates to pure retargets - the pre-flip default's behaviour.
+ */
+/*
+ * ⛔ `seg` / `sg` NAME THE SEGMENT THE WALKED FRAMES LIVE IN, and the
+ * caller must pass them - they are NOT `act.cur_seg` in general
+ * (2026-09-23). Every frame the walk visits was pushed natively (a push
+ * that does not fit declines to C++, whose frame is the walk's floor),
+ * so they all share ONE segment: the switching caller's. For the -3
+ * switch itself that is the current one. For jit_call_sync_core's
+ * r == JIT_RET_SWITCH branch it is NOT: the core's own push may have
+ * ADVANCED to a new segment for its callee, so `cur_seg` names the
+ * callee's segment while the frames being materialised sit in the
+ * caller's. The inserted records then claimed the wrong segment, and
+ * the next pop - an overflow unwind, typically - aborted on
+ * `cur_sg == segs[rec.seg]` (or, assert-free, gave back a watermark in
+ * the wrong segment). Found by driver_checks' overflow-depth parity
+ * case: a mutual recursion that overflows TWICE, the second pass
+ * reusing the segment the first one allocated, with a sync depth cap
+ * low enough that the crossing call is a core call (a sanitized build,
+ * or MYLANG_NATIVE_STACK=0).
+ */
+static void norec_switch_retarget(VmActivation &act, const char *fp,
+                                  size_t idx, const Chunk *my_ck,
+                                  const FuncDescriptor *my_desc,
+                                  LValue *my_win, int seg, VmStackSeg *sg)
+{
+    /* `guard` exists ONLY to feed the ML_CHECK below, which an
+     * ASSERTS=0 build compiles away - so there it is incremented and
+     * never read, and clang says so (-Wunused-but-set-variable). The
+     * attribute is the declaration that this is intended, rather than a
+     * pragma that would hide the next REAL one. Only a non-LTO build
+     * emits this warning at all, which is why the lto0 CI lane found
+     * it and four years of release builds did not. */
+    for ([[maybe_unused]] int guard = 0;; guard++) {
+        ML_CHECK(guard <= 100000);
+        const void *ra = *reinterpret_cast<const void *const *>(fp + 8);
+        const NorecSite *S = jit_norec_site_for(ra);
+        /* #97 E2: the invariant the whole calling-frameless tier rests on
+         * - its window is on the native stack this unwind destroys, and
+         * no record can be made for it (jit_call_sync_boundary is what
+         * keeps a switch from ever getting here) */
+        ML_CHECK_MSG(!S || !S->frameless,
+                     "a SWITCH is materializing a FRAMELESS frame");
+        if (idx && act.records[idx - 1].window == my_win) {
+            /* RECORD-FUL: 4-iv's retarget - its sentinel consumer dies
+             * with the -3 unwind, so its resume becomes the real one */
+            VmCallRec &rec = act.records[idx - 1];
+            if (!rec.sync_stop)
+                break;                 /* a live consumer resumes it */
+            if (!S)
+                break;                 /* the segment floor: core-pushed,
+                                        * retargeted by its own core */
+            rec.ret_chunk = S->caller;
+            rec.ret_pc = S->resume_pc;
+            rec.sync_stop = 0;
+            rec.call_site_packed = static_cast<int_type>(S->site_loc);
+            rec.call_site_chain = S->inline_chain;
+            idx--;
+        } else {
+            /* RECORD-LESS (4-v): INSERT the full record this frame never
+             * had, from the walk's live data - after this the frame IS
+             * the record world's, and the flat continuation resumes it
+             * through the same machinery as everyone else. The insert
+             * position is records[idx] (above the deepest record the
+             * walk has not yet passed); walking top-down, positions
+             * below are untouched by each insert. */
+            ML_CHECK(S != nullptr);    /* only an emitted site creates a
+                                        * record-less frame */
+            ML_CHECK(my_ck != nullptr && my_win != nullptr);
+            /* the inline-push invariant: a record-less frame shares
+             * its caller's segment - the one the caller named */
+            ML_CHECK(sg != nullptr && my_win >= sg->slots.data()
+                     && my_win < sg->end);
+            VmCallRec nr;
+            nr.window = my_win;
+            nr.nslots = static_cast<int_type>(my_ck->slot_count)
+                        + my_ck->n_temps;
+            nr.seg = seg;
+            nr.run_chunk = my_ck;
+            nr.desc = my_desc;
+            nr.ret_chunk = S->caller;
+            nr.ret_pc = S->resume_pc;
+            nr.dst = S->dst;
+            nr.call_site_packed = static_cast<int_type>(S->site_loc);
+            nr.call_site_chain = S->inline_chain;
+            nr.caller_captures =
+                *reinterpret_cast<CaptureSlots *const *>(fp + 16);
+            /* a record-less frame is plain: the watermarks never moved,
+             * so the live sizes ARE its bases (pop's hardened branch
+             * re-checks exactly this) */
+            nr.handler_base = static_cast<uint32_t>(act.handlers.size());
+            nr.diter_base = act.diters_n;
+            nr.dyiter_base = act.dyiters_n;
+            nr.native_rbp = *reinterpret_cast<const char *const *>(fp);
+#ifdef TESTS
+            nr.norec_site = S;
+#endif
+            /* the parent view (4-v inc 1) - the next level's descent */
+            nr.parent_window =
+                *reinterpret_cast<LValue *const *>(fp - 8);
+            nr.parent_nslots = static_cast<int32_t>(
+                S->caller->slot_count + S->caller->n_temps);
+            nr.parent_seg = static_cast<int32_t>(seg);
+            nr.parent_sg = sg;
+            act.records.insert(
+                act.records.begin() + static_cast<ptrdiff_t>(idx),
+                std::move(nr));
+            act.rec_n++;
+            act.recs_high = static_cast<uint32_t>(act.records.size());
+            act.top_rec = &act.records[act.rec_n - 1];
+#ifdef TESTS
+            g_jit_norec_mat_insert++;
+#endif
+        }
+        if (!S)
+            break;
+        /* the descent: the parent's identity from the site, its window
+         * from the chain */
+        my_ck = S->caller;
+        my_desc = static_cast<const FuncDescriptor *>(S->caller_desc);
+        my_win = *reinterpret_cast<LValue *const *>(fp - 8);
+        fp = *reinterpret_cast<const char *const *>(fp);
+    }
+}
+
+/* #56 step 3: past the DEPTH CAP the call is PUSHED interpreted-flat (the
+ * interpreted op's exact in-VM protocol) and status 3 is returned - the
+ * emitted site translates it to the JIT_RET_SWITCH fragment return, whose
+ * consumers switch this dispatch loop (or a fresh one at a direct-entry
+ * site) onto the callee. The record's ret_pc = the call's POST-CALL
+ * ENTRY-STUB pc (baked by the emit as resume_pc), so the eventual pop
+ * re-enters the caller fragment natively. g_jit_sync_depth is NOT touched:
+ * the continuation is FLAT interpretation (the cap bounds C recursion,
+ * which this path adds none of). */
+static int
+jit_call_sync_switch(EvalContext &ctx, VmActivation &act, FuncObject &fo,
+                     int_type argbase, int_type nargs, int_type dst,
+                     int_type site_packed, int_type resume_pc,
+                     bool cached, const char *entry_rbp) noexcept
+{
+    /* #88's CLAIM (read + reset), which every other helper the emitted
+     * slow tail reaches already performs. This one did not (#38 repro
+     * B): the switch left the site's chain in the globals, and the next
+     * claimer - a postexit at a site with NO chain, which stores
+     * nothing - flushed it as its own, a phantom virtual frame. The
+     * claimed chain rides the record instead (call_site_chain). */
+    const int32_t inl_chain = g_jit_call_inline_chain;
+    const void *inl_pool = g_jit_call_inline_pool;
+    g_jit_call_inline_chain = -1;
+    g_jit_call_inline_pool = nullptr;
+    const FuncDescriptor *d = fo.func;
+    if (!d->vm_chunk_tried) {
+        fo.func->vm_chunk = vm_func_chunk(fo.func);
+        fo.func->vm_chunk_tried = true;
+    }
+    if (!d->vm_chunk)
+        return jit_sync_boundary_call(ctx, fo, argbase, nargs, dst,
+                                      site_packed, cached, inl_chain,
+                                      inl_pool);
+    const Chunk *cck = static_cast<const Chunk *>(d->vm_chunk);
+
+    std::unique_ptr<PureCacheKey> key;
+    if (cached && g_jit_pending_key) {
+        key.reset(g_jit_pending_key);
+        g_jit_pending_key = nullptr;
+    } else if (cached && ctx.frame && g_pure_cache_enabled
+            && vm_cache_probe_vals(ctx, d, argbase,
+                                   static_cast<size_t>(nargs), dst, key))
+        return 0;                          /* cache hit - dst written */
+
+#ifdef TESTS
+    /* 4-iv: the -3 MATERIALIZER's shadow, at the exact moment the
+     * retarget runs - after the probe (a hit switches nothing), before
+     * the push (the record top is still the switching caller's) and
+     * BEFORE the retarget below mutates the records it verifies. */
+    norec_materialize_shadow(act, ctx, resume_pc, dst, site_packed,
+                             entry_rbp);
+#endif
+    /* 4-iv/4-v (task #148): MATERIALIZE the topmost native segment
+     * before the -3 unwinds its consumers - retarget each record-ful
+     * frame's sentinel resume, INSERT a full record for each record-less
+     * one (see norec_switch_retarget). The descent is seeded by the
+     * relay SITE (the switching caller's own identity - back_rec() can
+     * be an ancestor's in the record-less world) and the caller's window.
+     *
+     * ⛔ THE PUSH COMES FIRST, THE MATERIALIZATION SECOND (2026-09-23).
+     * The push can THROW - StackOverflowEx, an arity or bind-coercion
+     * error - and a throw here conveys as status 2, i.e. through the
+     * NATIVE frames, each of which unwinds itself as the record-less or
+     * record-ful frame it was pushed as. Materialized first, those frames
+     * had records they then never popped (a record-less exit gives its
+     * window back and returns; it has no record to pop), and the catch's
+     * unwind walk popped them a second time - an abort in any checked
+     * build (`cur_sg == segs[rec.seg]`, jit_ret_audit), a double
+     * segment give-back without one. Only a push that SUCCEEDED commits
+     * the switch, so only then may the native chain become the record
+     * world's. Found by driver_checks' overflow-depth case: an overflow
+     * whose first descent went through the C++ core (every record at a
+     * new high-water) was fine; the SECOND run of the same recursion
+     * took the emitted pushes and overflowed inside the switch.
+     *
+     * Everything the walk reads is captured BEFORE the push, which
+     * repoints the view at the callee and may advance the segment. */
+    const NorecSite *seed =
+        entry_rbp ? static_cast<const NorecSite *>(g_norec_switch_site)
+                  : nullptr;
+    ML_CHECK(!entry_rbp || seed != nullptr);
+    LValue *const caller_win = ctx.frame ? ctx.frame->slots : nullptr;
+    const size_t rec_n0 = act.rec_n;
+    const int caller_seg = act.cur_seg;
+    VmStackSeg *const caller_sg = act.cur_sg;
+    /* the switching caller's chunk: the seed's (which is what the
+     * materialized top record will run), else the record top's */
+    const Chunk *caller_ck = seed ? seed->caller : act.back_rec().run_chunk;
+    try {
+        if (d->fast_bind && !key)
+            vm_frame_setup_lean(act, ctx, caller_ck,
+                                /*ret_pc=*/static_cast<size_t>(resume_pc) - 1,
+                                fo, cck, argbase,
+                                static_cast<size_t>(nargs), dst);
+        else
+            vm_frame_setup(act, ctx, caller_ck,
+                           static_cast<size_t>(resume_pc) - 1, fo, cck,
+                           argbase, static_cast<size_t>(nargs), dst,
+                           std::move(key));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 2;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    }
+    /* the inserts land BELOW the callee's record (positions <= rec_n0)
+     * and repoint top_rec at it, so back_rec() is the callee below */
+    if (seed)
+        norec_switch_retarget(
+            act, entry_rbp, rec_n0, seed->caller,
+            static_cast<const FuncDescriptor *>(seed->caller_desc),
+            caller_win, caller_seg, caller_sg);
+    act.back_rec().call_site_packed = site_packed;   /* backtrace caret */
+    act.back_rec().call_site_chain = inl_chain;      /* ...and its chain */
+#ifdef TESTS
+    g_jit_sync_switch++;
+#endif
+    g_vm_resume_chunk = cck;
+    g_vm_resume_pc = 0;
+    return 3;
+}
+
+static int
+jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
+                   int_type dst, int_type site_packed, bool cached,
+                   int_type resume_pc, const char *entry_rbp,
+                   bool via_dispatch = false) noexcept
+{
+    /* #88: CLAIM the baked call site (read + reset) before dispatching the
+     * callee, which would otherwise overwrite it. */
+    const int32_t inl_chain = g_jit_call_inline_chain;
+    const void *inl_pool = g_jit_call_inline_pool;
+    g_jit_call_inline_chain = -1;
+    g_jit_call_inline_pool = nullptr;
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    /* 4-v: the CALLER's identity + window, captured at entry for the
+     * r == JIT_RET_SWITCH materialization - the site relay names the
+     * caller (back_rec() can be an ancestor's in the record-less world)
+     * and the vframe still points at its window here. Trustworthy only
+     * when entry_rbp is (both are stored by the same slow tail); the
+     * generic dyn-callee caller passes a null entry_rbp and neither is
+     * read. */
+    const auto *entry_site =
+        static_cast<const NorecSite *>(g_norec_switch_site);
+    LValue *const entry_caller_win = ctx.frame ? ctx.frame->slots : nullptr;
+    const FuncDescriptor *d = fo.func;
+    if (!d->vm_chunk_tried) {              /* the interpreted op's AOT net */
+        fo.func->vm_chunk = vm_func_chunk(fo.func);
+        fo.func->vm_chunk_tried = true;
+    }
+    if (!d->vm_chunk)
+        /* #56 step 2: a genuinely chunk-less callee (a never-called template
+         * base reached indirectly) - PERFORM the boundary call here (the
+         * interpreted op's own tail) instead of declining to a re-run. */
+        return jit_sync_boundary_call(ctx, fo, argbase, nargs, dst,
+                                      site_packed, cached, inl_chain,
+                                      inl_pool);
+    const Chunk *cck = static_cast<const Chunk *>(d->vm_chunk);
+
+    std::unique_ptr<PureCacheKey> key;
+    if (cached && g_jit_pending_key) {
+        /* M5c: the emitted probe already ran (miss) and parked the key -
+         * consume it instead of re-probing (the inline push declined
+         * between the probe and the record store). */
+        key.reset(g_jit_pending_key);
+        g_jit_pending_key = nullptr;
+    } else if (cached && ctx.frame && g_pure_cache_enabled
+            && vm_cache_probe_vals(ctx, d, argbase,
+                                   static_cast<size_t>(nargs), dst, key))
+        return 0;                          /* cache hit - dst written */
+
+    /* 4-iv (task #148): the caller's chunk, read BEFORE the push - with
+     * resume_pc it is the retarget the r == JIT_RET_SWITCH branch below
+     * applies to the record this call pushes, whose sentinel consumer
+     * (this very C frame) dies when the switch propagates. */
+    const Chunk *caller_ck = act.back_rec().run_chunk;
+
+    /* The push. An arity/bind-coerce/StackOverflow throw is PRE-side-effect
+     * and idempotent (setup pops its half-built frame) - bail and let the
+     * interpreted op re-run and re-throw byte-identically. */
+    Frame *w;
+    try {
+        if (d->fast_bind && !key)        /* lever 1: the lean push */
+            w = vm_frame_setup_lean(act, ctx, &vm_sync_stop_chunk(),
+                                    /*ret_pc=*/0, fo, cck, argbase,
+                                    static_cast<size_t>(nargs), dst);
+        else
+            w = vm_frame_setup(act, ctx, &vm_sync_stop_chunk(), /*ret_pc=*/0,
+                               fo, cck, argbase, static_cast<size_t>(nargs),
+                               dst, std::move(key));
+    } catch (RuntimeException &e) {
+        /* #56 step 1: a setup throw (arity / bind-coerce / StackOverflow)
+         * is pre-side-effect and idempotent - CONVEY it (the emit's
+         * exc-stamp gives the loc-less ones the call's caret) instead of
+         * declining to a re-run. No callee backtrace frame, exactly as
+         * the interpreted push (setup pops its half-frame pre-capture). */
+        g_vm_jit_exc.reset(e.clone());
+        return 2;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    }
+
+    act.back_rec().sync_stop = 1;
+    /* 4-iv: the pushed record's INDEX (never a pointer - `records` may
+     * reallocate at a deeper high-water peak). Fixed until this frame
+     * pops, which a switch never does. */
+    const size_t my_idx = act.rec_n;
+
+    g_jit_sync_depth++;
+#ifdef TESTS
+    if (static_cast<unsigned long>(g_jit_sync_depth) > g_jit_sync_depth_max)
+        g_jit_sync_depth_max = static_cast<unsigned long>(g_jit_sync_depth);
+#endif
+    /* DIRECT FRAGMENT ENTRY: when the callee body STARTS with an
+     * EnterNative (the common shape - a whole-native body is a bare
+     * `enter.nat`), hoist that first op out of vm_dispatch: enter the
+     * fragment (its head sets its own tag registers) and hand any
+     * non-sentinel exit to the SHARED jit_sync_postexit (which the
+     * fragment-INLINE call path also uses - lever 1 step 5). A fragment
+     * cannot C++-throw (machine-code frames are non-unwindable; every
+     * helper it calls conveys), so the entry sits OUTSIDE the try. */
+    if (cck->sync_entry_off >= 0 && !via_dispatch) {
+        const size_t r =
+            jit_enter_deep(static_cast<const char *>(cck->native.base)
+                               + cck->sync_entry_off,
+                           w->slots);
+        if (r == JIT_RET_SENTINEL) {   /* native ReturnV: frame popped,
+                                        * dst written - done */
+            g_jit_sync_depth--;
+            return 0;
+        }
+        if (r == JIT_RET_SWITCH) {
+            /* #56: a DEEPER sync site hit the cap and pushed its call
+             * interpreted-flat; propagate as status 3 (the emitted slow
+             * tail translates back to the fragment return). Our depth
+             * level ended (the callee fragment's C frame died; its
+             * continuation is flat interpretation via the record chain).
+             *
+             * 4-iv (task #148): THIS C frame was the sentinel consumer of
+             * the record this call pushed - and it is returning for good,
+             * so retarget that record to its REAL resume: (caller chunk,
+             * this call's post-call entry stub), the same fields a
+             * SWITCH-pushed record carries. resume_pc < 0 = the caller
+             * emit bakes no resume (the generic dyn-callee path) - leave
+             * the record alone there rather than resume at a wrong pc.
+             * Then retarget the CALLER's segment (the frames the -3 is
+             * about to unwind above our return) from the relay anchor -
+             * records[my_idx - 2] is the caller's frame at entry_rbp. */
+            if (resume_pc >= 0) {
+                VmCallRec &mine = act.records[my_idx - 1];
+                mine.ret_chunk =
+                    (entry_rbp && entry_site) ? entry_site->caller
+                                              : caller_ck;
+                mine.ret_pc = static_cast<size_t>(resume_pc);
+                mine.sync_stop = 0;
+                mine.call_site_packed = site_packed;
+                mine.call_site_chain = inl_chain;
+            }
+            if (entry_rbp && entry_site && my_idx >= 2) {
+                /* the CALLER's segment - OUR record's parent view, not
+                 * cur_seg, which our own push may have advanced (read
+                 * before the walk: its inserts shift records) */
+                const VmCallRec &mine = act.records[my_idx - 1];
+                const int pseg = mine.parent_seg;
+                VmStackSeg *const psg = mine.parent_sg;
+                norec_switch_retarget(
+                    act, entry_rbp, my_idx - 1, entry_site->caller,
+                    static_cast<const FuncDescriptor *>(
+                        entry_site->caller_desc),
+                    entry_caller_win, pseg, psg);
+            }
+            g_jit_sync_depth--;
+            return 3;
+        }
+        if (r == JIT_RET_BOUNDARY) {
+            /* #56 (native Throw): the callee raised past this sync frame -
+             * vm_raise's walk stopped at our sync_stop record and set the
+             * pending signal. Convert it exactly as the interpreted tail
+             * below does (stamp the baked site on the innermost frame). */
+            g_jit_sync_depth--;
+            if (g_vm_exc_pending) {
+                Exception &e = *g_vm_exc_pending;
+                vm_jit_stamp_call_site(e, d, site_packed, inl_chain,
+                                       inl_pool);
+                g_vm_jit_exc = std::move(g_vm_exc_pending);
+                return 2;
+            }
+            return 0;
+        }
+        /* the DEC runs AFTER the postexit: its interpreted continuation
+         * (a vm_dispatch C frame per level) must stay depth-COUNTED, or
+         * a deep recursion of mid-body-exiting fragments stacks un-capped
+         * C frames (the clang-ASan stack overflow; see the emitted site's
+         * twin comment in jit.cpp). */
+        /* hand OUR saved call site back through the side channel: the
+         * callee we just ran may have overwritten the globals. */
+        g_jit_call_inline_chain = inl_chain;
+        g_jit_call_inline_pool = inl_pool;
+        const int pr = jit_sync_postexit(r, site_packed,
+                                         /*caller_win=*/nullptr,
+                                         /*caller_total=*/-1);
+        g_jit_sync_depth--;
+        return pr;
+    }
+    try {
+        vm_dispatch(*cck, ctx, act);
+        g_jit_sync_depth--;
+    } catch (Exception &e) {
+        /* A PLAIN exception (a RuntimeException is walked inside
+         * vm_dispatch, never C++-escapes it): capture the callee frame +
+         * stamp the baked site, exactly what the walk + the pending path
+         * below produce for a RuntimeException. */
+        g_jit_sync_depth--;
+        vm_capture_desc_frame(e, d);
+        vm_jit_stamp_call_site(e, d, site_packed, inl_chain,
+                               inl_pool);
+        if (auto *re = dynamic_cast<RuntimeException *>(&e))
+            g_vm_jit_exc.reset(re->clone());
+        else
+            g_vm_jit_eptr = std::current_exception();
+        return 2;
+    } catch (...) {
+        g_jit_sync_depth--;
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    }
+
+    if (g_vm_exc_pending) {
+        /* The walk stopped at our sync_stop record: the callee frame was
+         * captured LOC-LESS (the sentinel has no locs); stamp the baked
+         * call-site loc the lazy in-VM capture (loc_at(ret_chunk,
+         * ret_pc-1)) would have used. EnterNative re-raises at the call
+         * op's pc, so the caller-side handler dispatch / inline-frame flush
+         * runs exactly as an interpreted cross-frame throw. */
+        Exception &e = *g_vm_exc_pending;
+        vm_jit_stamp_call_site(e, d, site_packed, inl_chain,
+                               inl_pool);
+        g_vm_jit_exc = std::move(g_vm_exc_pending);
+        return 2;
+    }
+    return 0;                              /* dst written by vm_frame_leave */
+}
+
+/* #56 calls step 1: the ERROR declines CONVEY instead of re-interpreting.
+ * `lep` = the baked &chunk.locs[i] for this call op (the callee-identifier
+ * caret) - an UndefinedVariableEx is a PLAIN exception (uncatchable, rides
+ * g_vm_jit_eptr, the LoadGlobalV precedent) and needs its caret at
+ * CONSTRUCTION; a NotCallableEx (Runtime) conveys loc-less and the emit's
+ * exc-stamp writes the same caret. The DEPTH CAP and the core's chunk-less
+ * net remain declines (return 1) until the SWITCH-protocol step. */
+/*
+ * #97 E2: THE BOUNDARY CALL - a frameless frame's decline. A frameless
+ * frame's window is on the native stack, so the -3 SWITCH (which unwinds
+ * every native frame down to the nearest C++ one and turns each into a
+ * record) must never pass through it. This call is that C++ frame: the
+ * callee runs under a nested dispatch loop (the core's via_dispatch
+ * path), which consumes every switch below it and returns the value
+ * synchronously - never status 3.
+ *
+ * The depth is held at the CAP for the boundary's duration, so every
+ * sync call below it takes the switch (consumed here) and no frameless
+ * frame can form inside it: a second boundary cannot nest, and a chain
+ * that reached the cap or the native stack's floor continues in the flat
+ * interpreter, whose segment budget ends a runaway recursion in the
+ * catchable StackOverflowEx. Reached only from a frameless frame's
+ * declines (the cap, the floor, a guard) - cold.
+ */
+static int jit_call_sync_boundary(FuncObject &fo, int_type argbase,
+                                  int_type nargs, int_type dst,
+                                  int_type site_packed, bool cached,
+                                  int_type resume_pc) noexcept
+{
+#ifdef TESTS
+    g_jit_frameless_boundary++;
+#endif
+    /* D3's invariant, stated where it would break: nothing below a
+     * boundary is frameless, so nothing below it can ask for another */
+#ifndef NDEBUG
+    static bool active = false;
+    ML_CHECK_MSG(!active, "a BOUNDARY call nested - a frameless frame "
+                          "formed inside one");
+    active = true;
+#endif
+    const int saved = g_jit_sync_depth;
+    if (g_jit_sync_depth < g_jit_sync_cap)
+        g_jit_sync_depth = g_jit_sync_cap;
+    /* E2d: on the native stack a self site does not count depth - its
+     * bound is the floor, so the floor is what must say "decline" here
+     * (the highest address: rsp is always below it) */
+    char *const floor =
+        jit_nstack_floor_swap(reinterpret_cast<char *>(UINTPTR_MAX));
+    const int r = jit_call_sync_core(fo, argbase, nargs, dst, site_packed,
+                                     cached, resume_pc,
+                                     /*entry_rbp=*/nullptr,
+                                     /*via_dispatch=*/true);
+    jit_nstack_floor_swap(floor);
+    g_jit_sync_depth = saved;
+#ifndef NDEBUG
+    active = false;
+#endif
+    ML_CHECK_MSG(r != 3, "a boundary call propagated a SWITCH");
+    return r;
+}
+
+extern "C" int jit_call_sync(int_type callee_slot, int_type ab_n,
+                             int_type resume_pc, int_type dst,
+                             int_type site_packed, const void *lep) noexcept
+{
+    ML_JIT_OP_RAN(CallV);
+    /* #56 step 3: argbase|nargs<<32 packed (frees the reg resume_pc uses) */
+    const int_type argbase = ab_n & 0xffffffff;
+    const int_type nargs = packed_hi(ab_n);
+    EvalContext *ctx = g_current_ctx;
+    /*
+     * THE INVARIANT THE EMITTED PUSH RELIES ON: an undefined slot holds the
+     * default-constructed `none`, never a callable - which is why the inline
+     * call site no longer probes `defined` and simply lets the type test
+     * decline here (GlobalFuncTable::define / put_defined, eval.h). This is
+     * the natural place to check it: every decline, including every FIRST
+     * call at a site, arrives here.
+     */
+    ML_VM_CHECK(ctx->gfuncs->defined[callee_slot]
+                || !ctx->gfuncs->slots[callee_slot].get()
+                        .is<intrusive_ptr<FuncObject>>());
+    if (!ctx->gfuncs->defined[callee_slot]) {
+        const Chunk::LocEntry *le =
+            static_cast<const Chunk::LocEntry *>(lep);
+        try {
+            throw UnboundSymbolEx(
+                intern_msg("'"
+                           + std::string(ctx->gfuncs->names[callee_slot]->val)
+                           + "' is not bound yet"),
+                                      le ? le->start : Loc(),
+                                      le ? le->end : Loc());
+        } catch (...) {
+            g_vm_jit_eptr = std::current_exception();
+        }
+        return 2;
+    }
+    const EvalValue &cv = ctx->gfuncs->slots[callee_slot].get();
+    if (!cv.is<intrusive_ptr<FuncObject>>()) {
+        g_vm_jit_exc = std::make_unique<NotCallableEx>();
+        return 2;                          /* loc: the emit's exc-stamp */
+    }
+    FuncObject &fo = *cv.get_ref<intrusive_ptr<FuncObject>>().get();
+    /* 4-iv: CONSUME the materializer anchor (the emitted slow tail set it
+     * just before this call) - nulled so a path that skipped the relay
+     * can never walk a stale frame pointer. */
+    const char *arbp = static_cast<const char *>(g_norec_switch_rbp);
+    g_norec_switch_rbp = nullptr;
+    if (g_jit_nosw) {                      /* #97 E2: a frameless caller */
+        g_jit_nosw = 0;
+        return jit_call_sync_boundary(fo, argbase, nargs, dst, site_packed,
+                                      /*cached=*/false, resume_pc);
+    }
+    if (g_jit_sync_depth >= g_jit_sync_cap)
+        return jit_call_sync_switch(*ctx, *g_vm_act, fo, argbase, nargs,
+                                    dst, site_packed, resume_pc,
+                                    /*cached=*/false, arbp);
+    return jit_call_sync_core(fo, argbase, nargs, dst, site_packed,
+                              /*cached=*/false, resume_pc, arbp);
+}
+
+extern "C" int jit_call_sync_cached(int_type callee_slot, int_type ab_n,
+                                    int_type resume_pc, int_type dst,
+                                    int_type site_packed,
+                                    const void *lep) noexcept
+{
+    ML_JIT_OP_RAN(CachedCallV);
+    const int_type argbase = ab_n & 0xffffffff;
+    const int_type nargs = packed_hi(ab_n);
+    EvalContext *ctx = g_current_ctx;
+    /*
+     * THE INVARIANT THE EMITTED PUSH RELIES ON: an undefined slot holds the
+     * default-constructed `none`, never a callable - which is why the inline
+     * call site no longer probes `defined` and simply lets the type test
+     * decline here (GlobalFuncTable::define / put_defined, eval.h). This is
+     * the natural place to check it: every decline, including every FIRST
+     * call at a site, arrives here.
+     */
+    ML_VM_CHECK(ctx->gfuncs->defined[callee_slot]
+                || !ctx->gfuncs->slots[callee_slot].get()
+                        .is<intrusive_ptr<FuncObject>>());
+    if (!ctx->gfuncs->defined[callee_slot]) {
+        const Chunk::LocEntry *le =
+            static_cast<const Chunk::LocEntry *>(lep);
+        try {
+            throw UnboundSymbolEx(
+                intern_msg("'"
+                           + std::string(ctx->gfuncs->names[callee_slot]->val)
+                           + "' is not bound yet"),
+                                      le ? le->start : Loc(),
+                                      le ? le->end : Loc());
+        } catch (...) {
+            g_vm_jit_eptr = std::current_exception();
+        }
+        return 2;
+    }
+    const EvalValue &cv = ctx->gfuncs->slots[callee_slot].get();
+    if (!cv.is<intrusive_ptr<FuncObject>>()) {
+        g_vm_jit_exc = std::make_unique<NotCallableEx>();
+        return 2;
+    }
+    FuncObject &fo = *cv.get_ref<intrusive_ptr<FuncObject>>().get();
+    /* 4-iv: consume the materializer anchor (see jit_call_sync) */
+    const char *arbp = static_cast<const char *>(g_norec_switch_rbp);
+    g_norec_switch_rbp = nullptr;
+    if (g_jit_nosw) {                      /* #97 E2: a frameless caller */
+        g_jit_nosw = 0;
+        return jit_call_sync_boundary(fo, argbase, nargs, dst, site_packed,
+                                      /*cached=*/true, resume_pc);
+    }
+    if (g_jit_sync_depth >= g_jit_sync_cap)
+        return jit_call_sync_switch(*ctx, *g_vm_act, fo, argbase, nargs,
+                                    dst, site_packed, resume_pc,
+                                    /*cached=*/true, arbp);
+    return jit_call_sync_core(fo, argbase, nargs, dst, site_packed,
+                              /*cached=*/true, resume_pc, arbp);
+}
+
+extern "C" int jit_call_sync_value(int_type callee_temp, int_type ab_n,
+                                   int_type resume_pc, int_type dst,
+                                   int_type site_packed,
+                                   const void *lep) noexcept
+{
+    ML_JIT_OP_RAN(CallValueV);
+    (void)lep;
+    const int_type argbase = ab_n & 0xffffffff;
+    const int_type nargs = packed_hi(ab_n);
+    EvalContext *ctx = g_current_ctx;
+    /* the callee VALUE was evaluated into a temp slot (CallValueV's
+     * target2); a dyn-laundered non-func CONVEYS the interpreted op's
+     * NotCallableEx (its caret from the emit's exc-stamp). */
+    const EvalValue &cv = ctx->frame->at(callee_temp).get();
+    if (!cv.is<intrusive_ptr<FuncObject>>()) {
+        g_vm_jit_exc = std::make_unique<NotCallableEx>();
+        return 2;
+    }
+    FuncObject &fo = *cv.get_ref<intrusive_ptr<FuncObject>>().get();
+    /* 4-iv: consume the materializer anchor (see jit_call_sync) */
+    const char *arbp = static_cast<const char *>(g_norec_switch_rbp);
+    g_norec_switch_rbp = nullptr;
+    if (g_jit_nosw) {                      /* #97 E2: a frameless caller */
+        g_jit_nosw = 0;
+        return jit_call_sync_boundary(fo, argbase, nargs, dst, site_packed,
+                                      /*cached=*/false, resume_pc);
+    }
+    if (g_jit_sync_depth >= g_jit_sync_cap)
+        return jit_call_sync_switch(*ctx, *g_vm_act, fo, argbase, nargs,
+                                    dst, site_packed, resume_pc,
+                                    /*cached=*/false, arbp);
+    return jit_call_sync_core(fo, argbase, nargs, dst, site_packed,
+                              /*cached=*/false, resume_pc, arbp);
+}
+
+/*
+ * model-flip (nativize-ops): the native CallValueGenericV - the generic
+ * indirect call of a DYN callee, the interpreter's exact dispatch over the
+ * serializable CallSite pool (the op has been AST-free since F1 step 2;
+ * only its emit case was missing). `cs` = &chunk.call_sites[i] and `mkeys`
+ * = chunk.member_keys.data() are baked pool-buffer addresses; `dst_callee`
+ * packs the dst slot (lo32, sign-preserved) with the callee temp (hi32);
+ * `site_packed` = the call-site loc (line << 32 | col) for a FuncObject
+ * callee's backtrace frame.
+ *
+ * Dispatch by the RUNTIME callee (CheckCallableV already threw for a
+ * non-callable BEFORE the args evaluated):
+ *  - FuncObject: fill run[0] with arg0's RValue (an UndefinedId throws
+ *    here, stamped with the args caret - the interpreted order), then run
+ *    the callee via the LEAN SYNC core: the caller fragment stays native
+ *    across the call. A depth-cap / chunkless bail (1) is SOUND - all
+ *    pre-call work is idempotent, the interpreted op re-runs identically.
+ *  - Builtin: dispatch_builtin_values by Kind; a func_lv (mutating)
+ *    builtin re-derives arg0's true LValue* from the descriptor (slot /
+ *    elem via Type::subscript / member via vm_member_lvalue_ref - the
+ *    same idempotent re-derive the interpreted op does). An elem/member
+ *    arg0 whose GLOBAL base is undefined BAILS (the interpreted re-run
+ *    throws the exact UndefinedVariableEx with its table caret).
+ *  - struct descriptor: construct_struct_v (runtime arity + per-field
+ *    coercion with the pooled carets).
+ * A loc-less throw is stamped with the ARGS caret from the pool (the
+ * interpreted catch's exact rule) - self-loc'd, no emit-side stamp; a
+ * plain Exception (an UndefinedId's RValue) rides g_vm_jit_eptr. Returns
+ * 0 done (dst written) / 1 bail / 2 threw. NOT op_fully_native (bails).
+ */
+extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
+                                      int_type nargs, const void *csv,
+                                      const void *mkeysv,
+                                      int_type site_packed) noexcept
+{
+    ML_JIT_OP_RAN(CallValueGenericV);
+    const Chunk::CallSite &cs = *static_cast<const Chunk::CallSite *>(csv);
+    const Chunk::MemberKey *mkeys =
+        static_cast<const Chunk::MemberKey *>(mkeysv);
+    EvalContext &ctx = *g_current_ctx;
+    const int_type callee_slot = static_cast<int_type>(
+        static_cast<uint64_t>(dst_callee) >> 32);
+    const int_type dst = static_cast<int_type>(
+        static_cast<int32_t>(dst_callee & 0xffffffff));
+    const size_t n = static_cast<size_t>(nargs);
+
+    ArgLocs al;
+    al.start = cs.start;
+    al.end = cs.end;
+    al.args = cs.args.data();
+    al.nargs = cs.args.size();
+    al.arr_hint = cs.arr_hint;
+    al.ctype = cs.ctype;
+    al.ct_store = cs.ct_store;
+
+    const EvalValue &callee = ctx.frame->at(callee_slot).get();
+
+    auto a0_value = [&]() -> EvalValue {
+        switch (cs.a0_form) {
+        case Chunk::CallSite::A0::slot:
+            switch (cs.a0_kind) {
+            case 0:  return ctx.frame->at(cs.a0_slot).get();
+            case 1:
+                if (ctx.gfuncs->defined[cs.a0_slot])
+                    return ctx.gfuncs->slots[cs.a0_slot].get();
+                return EvalValue(
+                    UndefinedId{ctx.gfuncs->names[cs.a0_slot]->val});
+            case 2:  return (*ctx.captures)[cs.a0_slot].get();
+            default: return builtin_slot(cs.a0_slot).get();
+            }
+        case Chunk::CallSite::A0::undef:
+            return EvalValue(UndefinedId{cs.a0_name->val});
+        default:
+            return ctx.frame->at(argbase).get();
+        }
+    };
+
+    if (callee.is<intrusive_ptr<FuncObject>>()) {
+        if (g_jit_sync_depth >= g_jit_sync_cap)
+            return 1;                       /* deep tail -> interpreted */
+        if (n) {
+            try {
+                ctx.frame->at(argbase).put(RValue(a0_value()));
+            } catch (Exception &e) {
+                vm_stamp_args_caret(e, al);
+                if (auto *re = dynamic_cast<RuntimeException *>(&e))
+                    g_vm_jit_exc.reset(re->clone());
+                else
+                    g_vm_jit_eptr = std::current_exception();
+                return 2;
+            } catch (...) {
+                g_vm_jit_eptr = std::current_exception();
+                return 2;
+            }
+        }
+        /* RULE 1: none bound to a non-opt parameter - the interpreted op's
+         * check, conveyed with the same args caret */
+        const FuncDescriptor *gd =
+            callee.get_ref<intrusive_ptr<FuncObject>>()->func;
+        const BindFault nf = bind_fault(gd, n,
+            [&](size_t i) -> const EvalValue & {
+                const int_type s = argbase + static_cast<int_type>(i);
+                return ctx.frame->at(s).get();  /* INT-COV-EXEMPT: at() */
+            });
+        if (nf.idx >= 0) {
+            TypeErrorEx e = bind_fault_error(gd, nf, nf.idx);
+            vm_stamp_args_caret(e, al);
+            g_vm_jit_exc.reset(e.clone());
+            return 2;
+        }
+        /* 4-iv (task #148): the generic emit bakes NO post-call resume
+         * stub, so a deeper switch under this call cannot retarget this
+         * level (resume_pc -1 tells core to leave its record's sentinel
+         * resume alone) - and the generic SITE would mistranslate a
+         * propagated status 3 into a re-run bail (observed as a
+         * double-call abort). So a switch is CONSUMED here instead of
+         * propagated: drive the flat continuation in THIS dispatch
+         * invocation, which thereby becomes the sentinel consumer of the
+         * record core pushed - when the callee finally pops, its
+         * sentinel resume dispatches the stop chunk's ExitBlock and
+         * vm_dispatch returns right here, core's own protocol one level
+         * up. The frames above this call are never doomed (nothing
+         * propagates past it), so they need no retarget. The tail
+         * mirrors core's dispatch path: a pending exception (the walk
+         * stopped at our sync_stop record) conveys with the baked site
+         * stamped; a plain C++ throw conveys likewise. */
+        const int r = jit_call_sync_core(
+            *callee.get_ref<intrusive_ptr<FuncObject>>().get(), argbase, nargs,
+            dst, site_packed, /*cached=*/false, /*resume_pc=*/-1,
+            /*entry_rbp=*/nullptr);
+        if (r != 3) {
+            /* a SETUP throw the core conveyed loc-less (arity, a bind
+             * coercion, the window push): the args caret, as every other
+             * catch here stamps it and as the interpreted op does - the
+             * generic site emits no exc-stamp of its own, so a loc-less
+             * conveyance would otherwise get the whole call's caret at
+             * the re-raise (RULE 2; watched: the arity error through a
+             * dyn callee carets `i` in the tree-walker and `-nj`) */
+            if (r == 2 && g_vm_jit_exc)
+                vm_stamp_args_caret(*g_vm_jit_exc, al);
+            return r;
+        }
+        try {
+            vm_dispatch(*g_vm_resume_chunk, ctx, *g_vm_act,
+                        g_vm_resume_pc);
+        } catch (Exception &e) {
+            vm_stamp_args_caret(e, al);
+            if (auto *re = dynamic_cast<RuntimeException *>(&e))
+                g_vm_jit_exc.reset(re->clone());
+            else
+                g_vm_jit_eptr = std::current_exception();
+            return 2;
+        } catch (...) {
+            g_vm_jit_eptr = std::current_exception();
+            return 2;
+        }
+        if (g_vm_exc_pending) {
+            vm_stamp_args_caret(*g_vm_exc_pending, al);
+            g_vm_jit_exc = std::move(g_vm_exc_pending);
+            return 2;
+        }
+        return 0;
+    }
+
+    bool bail = false;
+    EvalValue holder;                       /* keeps an elem arg0 alive */
+    auto a0_base = [&]() -> LValue * {
+        if (cs.a0_kind == 1) {
+            if (!ctx.gfuncs->defined[cs.a0_slot]) {
+                bail = true;                /* undefined global base: the
+                                             * interpreted re-run throws
+                                             * with its table caret */
+                return nullptr;
+            }
+            return &ctx.gfuncs->slots[cs.a0_slot];
+        }
+        if (cs.a0_kind == 2)
+            return &(*ctx.captures)[cs.a0_slot];
+        return &ctx.frame->at(cs.a0_slot);
+    };
+    auto a0_lvalue = [&]() -> LValue * {
+        switch (cs.a0_form) {
+        case Chunk::CallSite::A0::slot:
+            switch (cs.a0_kind) {
+            case 0:  return &ctx.frame->at(cs.a0_slot);
+            case 1:  return ctx.gfuncs->defined[cs.a0_slot]
+                         ? &ctx.gfuncs->slots[cs.a0_slot] : nullptr;
+            case 2:  return &(*ctx.captures)[cs.a0_slot];
+            default: return &builtin_slot(cs.a0_slot);
+            }
+        case Chunk::CallSite::A0::elem: {
+            LValue *base = a0_base();
+            if (!base)
+                return nullptr;
+            const EvalValue &key = ctx.frame->at(cs.a0_operand).get();
+            holder = base->get().get_type()->subscript(
+                EvalValue(base), key, /*for_write=*/false);
+            return holder.is<LValue *>() ? holder.get<LValue *>() : nullptr;
+        }
+        case Chunk::CallSite::A0::member: {
+            LValue *base = a0_base();
+            if (!base)
+                return nullptr;
+            const Chunk::MemberKey &mk = mkeys[cs.a0_operand];
+            EvalValue cur(base);
+            return vm_member_lvalue_ref(cur, mk.memId, mk.memUid,
+                                        /*for_write=*/false,
+                                        mk.mstart, mk.mend);
+        }
+        case Chunk::CallSite::A0::chain: {
+            LValue *base = a0_base();
+            if (!base)
+                return nullptr;
+            return vm_a0_chain_lvalue(ctx, mkeys, cs, base, holder);
+        }
+        default:
+            return nullptr;
+        }
+    };
+
+    try {
+        EvalValue stackbuf[8];
+        std::vector<EvalValue> heapbuf;
+        EvalValue *buf = stackbuf;
+        if (n > 8) {
+            heapbuf.resize(n);
+            buf = heapbuf.data();
+        }
+        if (n)
+            buf[0] = a0_value();
+        for (size_t i = 1; i < n; i++)
+            buf[i] = ctx.frame->at(argbase + static_cast<int_type>(i)).get();
+
+        EvalValue res;
+        if (callee.is<Builtin>()) {
+            const Builtin &b = callee.get<Builtin>();
+            if (b.kind == Builtin::Kind::lvalue) {
+                LValue tmp;
+                LValue *target =
+                    n ? builtin_lv_target(b, a0_lvalue(), buf[0], tmp)
+                      : nullptr;
+                if (bail)
+                    return 1;
+                EvalValue rest[8];
+                std::vector<EvalValue> resth;
+                EvalValue *rp = rest;
+                const size_t nr = n ? n - 1 : 0;
+                if (nr > 8) {
+                    resth.resize(nr);
+                    rp = resth.data();
+                }
+                for (size_t i = 0; i < nr; i++)
+                    rp[i] = RValue(buf[i + 1]);
+                res = b.func_lv(&ctx, &al, target, nr ? rp : nullptr, nr);
+            } else {
+                res = dispatch_builtin_values(&ctx, b, &al, buf, n);
+            }
+        } else if (callee.is<StructTypeDef *>()) {
+            res = construct_struct_v(callee.get<StructTypeDef *>(), &al,
+                                     buf, n);
+        } else {
+            throw NotCallableEx();          /* net: CheckCallableV ran */
+        }
+        ctx.frame->at(dst).put(std::move(res));
+    } catch (Exception &e) {
+        vm_stamp_args_caret(e, al);
+        if (auto *re = dynamic_cast<RuntimeException *>(&e))
+            g_vm_jit_exc.reset(re->clone());
+        else
+            g_vm_jit_eptr = std::current_exception();
+        return 2;
+    } catch (...) {
+        g_vm_jit_eptr = std::current_exception();
+        return 2;
+    }
+    return 0;
+}
+
+/* Step 7a (the INLINE exception ops): the activation-side layout the
+ * PushHandler/PopHandler/SetPend inlines walk - &g_vm_act, the handlers /
+ * records / rec_n member offsets, the record stride and its pend offset.
+ * Probed from real objects so they cannot drift. The vector-internals
+ * layout (_M_start +0 / _M_finish +8 / _M_end_of_storage +16) is the same
+ * three-pointer fact the flat-array reads already rely on. */
+VmActivation **jit_addr_vm_act()
+{
+    return &g_vm_act;
+}
+ptrdiff_t jit_off_act_handlers()
+{
+    VmActivation a;
+    return reinterpret_cast<const char *>(&a.handlers)
+         - reinterpret_cast<const char *>(&a);
+}
+ptrdiff_t jit_off_act_records()
+{
+    VmActivation a;
+    return reinterpret_cast<const char *>(&a.records)
+         - reinterpret_cast<const char *>(&a);
+}
+/* M5b: the aggregated push-layout probe (see jit.h). Real objects, real
+ * members - the co-located-probe rule. The FuncObject probe needs a live
+ * root EvalContext (its ctor walks get_root_ctx); a throwaway root is
+ * cheap (a script root loads no builtins into the map). */
+void jit_fill_push_layout(JitPushLayout *L)
+{
+    VmActivation a;
+    const char *ab = reinterpret_cast<const char *>(&a);
+    L->act_segs = reinterpret_cast<const char *>(&a.segs) - ab;
+    L->act_cur_seg = reinterpret_cast<const char *>(&a.cur_seg) - ab;
+    L->act_recs_high = reinterpret_cast<const char *>(&a.recs_high) - ab;
+    L->act_diters_n = reinterpret_cast<const char *>(&a.diters_n) - ab;
+    L->act_dyiters_n = reinterpret_cast<const char *>(&a.dyiters_n) - ab;
+    L->act_cur_sg = reinterpret_cast<const char *>(&a.cur_sg) - ab;
+    L->act_top_rec = reinterpret_cast<const char *>(&a.top_rec) - ab;
+    L->act_vframe = reinterpret_cast<const char *>(&a.view_frame) - ab;
+    L->act_handlers2 = reinterpret_cast<const char *>(&a.handlers) - ab;
+    Frame &f = a.view_frame;
+    const char *fb = reinterpret_cast<const char *>(&f);
+    L->frame_slots = reinterpret_cast<const char *>(&f.slots) - fb;
+    L->frame_size = reinterpret_cast<const char *>(&f.size) - fb;
+    L->frame_pure_cache =
+        reinterpret_cast<const char *>(&f.pure_cache) - fb;
+    VmStackSeg sg(1);
+    const char *sb = reinterpret_cast<const char *>(&sg);
+    L->seg_slots = reinterpret_cast<const char *>(&sg.slots) - sb;
+    L->seg_cur = reinterpret_cast<const char *>(&sg.cur) - sb;
+    L->seg_end = reinterpret_cast<const char *>(&sg.end) - sb;
+    VmCallRec r;
+    const char *rb = reinterpret_cast<const char *>(&r);
+    L->rec_window = reinterpret_cast<const char *>(&r.window) - rb;
+    L->rec_nslots = reinterpret_cast<const char *>(&r.nslots) - rb;
+    L->rec_seg = reinterpret_cast<const char *>(&r.seg) - rb;
+    L->rec_run_chunk = reinterpret_cast<const char *>(&r.run_chunk) - rb;
+    L->rec_ret_chunk = reinterpret_cast<const char *>(&r.ret_chunk) - rb;
+    L->rec_ret_pc = reinterpret_cast<const char *>(&r.ret_pc) - rb;
+    L->rec_dst = reinterpret_cast<const char *>(&r.dst) - rb;
+    L->rec_desc = reinterpret_cast<const char *>(&r.desc) - rb;
+    L->rec_caller_caps =
+        reinterpret_cast<const char *>(&r.caller_captures) - rb;
+    L->rec_handler_base =
+        reinterpret_cast<const char *>(&r.handler_base) - rb;
+    L->rec_diter_base = reinterpret_cast<const char *>(&r.diter_base) - rb;
+    L->rec_dyiter_base =
+        reinterpret_cast<const char *>(&r.dyiter_base) - rb;
+    L->rec_boundary = reinterpret_cast<const char *>(&r.boundary) - rb;
+    L->rec_sync_stop = reinterpret_cast<const char *>(&r.sync_stop) - rb;
+    L->rec_cache_key = reinterpret_cast<const char *>(&r.cache_key) - rb;
+    L->rec_caller_cache =
+        reinterpret_cast<const char *>(&r.caller_cache) - rb;
+    L->rec_norec_site =
+        reinterpret_cast<const char *>(&r.norec_site) - rb;
+    L->rec_native_rbp =
+        reinterpret_cast<const char *>(&r.native_rbp) - rb;
+    L->rec_parent_window =
+        reinterpret_cast<const char *>(&r.parent_window) - rb;
+    L->rec_parent_nslots =
+        reinterpret_cast<const char *>(&r.parent_nslots) - rb;
+    L->rec_parent_seg =
+        reinterpret_cast<const char *>(&r.parent_seg) - rb;
+    L->rec_parent_sg =
+        reinterpret_cast<const char *>(&r.parent_sg) - rb;
+    static FuncDescriptor fd;         /* static: fo.func may outlive scope */
+    const char *db = reinterpret_cast<const char *>(&fd);
+    L->desc_params = reinterpret_cast<const char *>(&fd.params) - db;
+    L->desc_frame_size =
+        reinterpret_cast<const char *>(&fd.frame_size) - db;
+    L->desc_fast_bind = reinterpret_cast<const char *>(&fd.fast_bind) - db;
+    L->desc_bind_req = reinterpret_cast<const char *>(&fd.bind_req) - db;
+    L->desc_noescape =
+        reinterpret_cast<const char *>(&fd.noescape_params) - db;
+    L->param_desc_size = sizeof(FuncDescriptor::ParamDesc);
+    Chunk ck;
+    const char *cb = reinterpret_cast<const char *>(&ck);
+    L->ck_n_temps = reinterpret_cast<const char *>(&ck.n_temps) - cb;
+    L->ck_plain_frame =
+        reinterpret_cast<const char *>(&ck.plain_frame) - cb;
+    L->ck_sync_entry =
+        reinterpret_cast<const char *>(&ck.sync_entry_off) - cb;
+    L->ck_norec_ok =
+        reinterpret_cast<const char *>(&ck.norec_ok) - cb;
+    {
+        static EvalContext probe_root(nullptr, false, false);
+        FuncObject fo(&fd, &probe_root);
+        const char *ob = reinterpret_cast<const char *>(&fo);
+        L->fo_func = reinterpret_cast<const char *>(&fo.func) - ob;
+        L->fo_capture_slots =
+            reinterpret_cast<const char *>(&fo.capture_slots) - ob;
+        L->t_func =
+            EvalValue(intrusive_ptr<FuncObject>(
+                make_intrusive<FuncObject>(&fd, &probe_root))).get_type();
+    }
+    L->stop_chunk = &vm_sync_stop_chunk();
+    /* the emitted handler_base computation shifts by 2 (#78 step D:
+     * VmHandler is back to a bare 4-byte region id) */
+    static_assert(sizeof(VmHandler) == 4, "handler_base >> 2 bake");
+    /* the emitted seg/rec addressing */
+    static_assert(sizeof(std::unique_ptr<VmStackSeg>) == sizeof(void *),
+                  "segs[i] raw-pointer load");
+}
+
+/*
+ * G1 NO-RECORD TIER, STEP 1 - the SHADOW VERIFICATION (the Net 1 seed,
+ * plans/archived/g1-no-record-tier.md "THE TESTING PLAN").
+ *
+ * jit_norec_push_verify runs after EVERY M5b inline push in a TESTS
+ * build (the emitter inserts the call beside its other TESTS-only
+ * counter bumps), with the just-filled record on top of the activation.
+ * It compares the record against the side-table entry for the site that
+ * pushed it - the table built by the C++ emitter's bookkeeping against
+ * the record filled by the emitted instructions, two paths from the same
+ * emit-time knowledge, which is exactly the divergence that would poison
+ * the tier's later steps.
+ *
+ * A mismatch is a DELIBERATE, LOCATED abort: this is the testing
+ * contract ("SHADOW MISMATCH ... -> abort"), it must fire in the
+ * TESTS=1 OPT=1 ASSERTS=0 lane too (so not ML_CHECK), and per the #142
+ * rule the helper never throws.
+ *
+ * g_norec_audit additionally re-verifies EVERY live record's site
+ * association on every push - the full-stack audit (Net 1b), O(depth)
+ * per call, enabled per-test or via MYLANG_NOREC_AUDIT=1.
+ */
+unsigned long g_jit_norec_sites = 0;
+unsigned long g_jit_norec_verify = 0;
+unsigned long g_jit_norec_audit_frames = 0;
+unsigned long g_jit_norec_ret_verify = 0;
+bool g_norec_audit = false;
+
+/*
+ * NET 2 - THE DETERMINISTIC EVENT SWEEP (`MYLANG_RECON_AT=N`;
+ * plans/archived/g1-no-record-tier.md "Net 2", SQLite's
+ * fail-the-Nth-malloc applied to reconstruction).
+ *
+ * WHY THIS EXISTS WHEN NETS 1/1b ALREADY WALK THE CHAIN. Those two
+ * verify chain INTEGRITY - that each frame's site resolves and its
+ * anchor matches the link. They say nothing about the ARITHMETIC the
+ * record-less unwind performs: the production path
+ * (vm_raise's `norec_raiser` arm) un-accounts the segment top and the
+ * segment top by the frame's own totals and repoints the view at the
+ * parent using values it derives from hardware. A frame whose
+ * window disagrees with that derivation unwinds to a WRONG
+ * slot-stack top, and nothing in Nets 1/1b looks. The sabotage matrix
+ * names exactly that defect ("wrong watermark restore") with this
+ * net as its only catcher.
+ *
+ * WHAT IT FORCES. Reconstruction is normally demanded only where an
+ * exception happens to fall. `MYLANG_RECON_AT=N` demands it at the Nth
+ * CALL EVENT instead - one deterministic point per run - and the sweep
+ * driver (tests/norec_sweep) walks N over a program's whole event
+ * count, so every point at which reconstruction COULD be demanded gets
+ * exercised, not just the points a corpus happens to reach.
+ *
+ * The probe is READ-ONLY: it reconstructs and compares, then lets the
+ * program continue untouched. It cannot use the real unwind, which
+ * would need an exception in flight and would end the run at the first
+ * event.
+ */
+/* the ret audit's fork accounting: SKIPPED must not become "all", or
+ * the audit is silently dead (see jit_ret_audit) */
+unsigned long g_jit_ret_audit_done = 0;
+unsigned long g_jit_ret_audit_skipped = 0;
+unsigned long g_jit_ret_audit_refscan = 0;
+/* Net 3's two enumerated cases, made MEASURABLE (they are reached by
+ * depth, not by shape, so nothing else can tell you they happened):
+ *   seg_advance    slot-stack SEGMENT boundaries crossed
+ *   sync_depth_max high-water mark of the NATIVE sync depth */
+unsigned long g_vm_seg_advance = 0;
+unsigned long g_jit_sync_depth_max = 0;
+
+unsigned long g_norec_recon_at = 0;      /* 0 = off, else the 1-based event */
+unsigned long g_norec_events = 0;        /* call events seen this run */
+unsigned long g_jit_norec_recon_probes = 0;
+unsigned long g_jit_norec_recon_frames = 0;
+
+#ifdef TESTS
+static void norec_check_rec(const VmCallRec &rec, const NorecSite *ns)
+{
+    if (rec.norec_site != ns)
+        norec_fail("record's site pointer", rec.norec_site, ns);
+    if (rec.dst != ns->dst)
+        norec_fail("dst", reinterpret_cast<const void *>(rec.dst),
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(ns->dst)));
+    if (!rec.sync_stop)
+        norec_fail("sync_stop clear on an emitted push", nullptr, ns);
+    if (rec.ret_chunk != &vm_sync_stop_chunk() || rec.ret_pc != 1)
+        norec_fail("M5b sentinel resume fields", rec.ret_chunk, ns);
+    /* the registries: both return addresses must find THIS entry, and
+     * the callee chunk's code range must map back to the callee */
+    if (jit_norec_site_for(ns->ret_switched) != ns)
+        norec_fail("ret_switched lookup", ns->ret_switched, ns);
+    if (jit_norec_site_for(ns->ret_plain) != ns)
+        norec_fail("ret_plain lookup", ns->ret_plain, ns);
+    if (rec.run_chunk && rec.run_chunk->native.base
+            && jit_norec_frag_for(rec.run_chunk->native.base)
+                   != rec.run_chunk)
+        norec_fail("callee fragment-range lookup",
+                   rec.run_chunk->native.base, rec.run_chunk);
+}
+#endif
+
+#ifdef TESTS
+/* THE CHAIN WALK - the shared shadow traversal (steps 3a/3b/3c): the
+ * frame at `fp` has record records[idx-1]; verify site / anchor / desc
+ * / window per level down to the segment floor. Two callers, two
+ * MOMENTS: the PUSH verification (fp = the pushing caller's rbp,
+ * idx = rec_n-1, before the callee runs) and - since 4-ii - the RAISE
+ * path (fp = the raising fragment's rbp, idx = rec_n): the same chain
+ * read after arbitrary body execution, proving rbp survives the body
+ * untouched (it is callee-saved and the Reg enum omits it, so no
+ * emitted code can clobber it - this walk is what would catch a
+ * violation). `ns` is failure context only. */
+static size_t norec_walk_chain(VmActivation *act, const char *fp,
+                               size_t idx, const void *ns)
+{
+    size_t levels = 0;
+    for (int guard = 0; idx; guard++) {
+        if (guard > 100000)
+            norec_fail("shadow walk did not terminate", fp, ns);
+        const VmCallRec &r = act->records[idx - 1];
+        const void *ra =
+            *reinterpret_cast<const void *const *>(fp + 8);
+        /*
+         * The rbp chain covers only the TOPMOST CONTIGUOUS native
+         * call segment. A C++ return address is that segment's floor:
+         * the fragment was entered from the interpreter (jit_enter),
+         * or a deeper call declined to the C++ tier (the sync depth
+         * cap runs interpreted-flat - exactly ackermann). Below it
+         * the record stack continues with earlier segments the rbp
+         * chain cannot reach, so STOP - do not walk into a C++ rbp
+         * link. The cross-segment ORDER is step 4's concern, checked
+         * with the records still present.
+         */
+        if (!jit_norec_frag_for(ra))
+            break;
+        /* an EMITTED return address means an emitted `call` created
+         * this frame, so its record MUST carry that call's site */
+        if (!r.norec_site)
+            norec_fail("emitted RA but the record has no site",
+                       ra, ns);
+        const auto *rs =
+            static_cast<const NorecSite *>(r.norec_site);
+        if (ra != rs->ret_plain && ra != rs->ret_switched)
+            norec_fail("walk RA is not the record's site", ra, rs);
+        if (jit_norec_site_for(ra) != rs)
+            norec_fail("walk RA resolves to a different site",
+                       ra, rs);
+        /* r.native_rbp is r's CALLER's rbp - the NEXT link up, i.e.
+         * [fp], not fp itself (fp is r's own frame pointer). */
+        const char *link =
+            *reinterpret_cast<const char *const *>(fp);
+        if (r.native_rbp != link)
+            norec_fail("record anchor != the chain link", link,
+                       r.native_rbp);
+        /*
+         * STEP 3b - THE DESCRIPTOR CHAIN. A backtrace frame names its
+         * function; the site does not carry the CALLEE, but it carries
+         * the CALLER (caller_desc, known at emit time). r was called
+         * from the frame BELOW it, so that frame's function IS
+         * rs->caller_desc. record[idx-2] is that frame - and its desc
+         * must equal rs->caller_desc, whether or not it has a site (the
+         * gluing point across a segment boundary is a desc match too).
+         * This is exactly how step 4 names each reconstructed frame:
+         * desc(frame below) = site(this frame).caller_desc. main has a
+         * null descriptor and a null-desc boundary record, so null ==
+         * null closes the bottom.
+         */
+        if (idx >= 2) {
+            if (rs->caller_desc
+                    != static_cast<const void *>(
+                           act->records[idx - 2].desc))
+                norec_fail("site caller_desc != the frame below's "
+                           "desc", rs->caller_desc,
+                           act->records[idx - 2].desc);
+            g_jit_norec_desc_chain++;
+            /*
+             * STEP 3c - THE WINDOW CHAIN. frag_entry saves the
+             * caller's rbx (the frame-base register) FIRST after
+             * `push rbp`, so [fp-8] is the WINDOW of the frame
+             * BELOW - readable from the native frame alone. This is
+             * step 4's DISCRIMINATION mechanism: a frame is
+             * record-ful iff the top record's window matches the
+             * frame's own window (windows are unique among live
+             * frames), and the walk learns each next frame's window
+             * as it descends - so the mixed unwind walk needs NO new
+             * release-mode record field to tell the two frame kinds
+             * apart. Verified here against the full record stack
+             * while it still exists. The rbx-first prologue order is
+             * LOAD-BEARING (comment in frag_entry).
+             */
+            const void *below_win =
+                *reinterpret_cast<const void *const *>(fp - 8);
+            if (act->records[idx - 2].window != below_win)
+                norec_fail("frame-below window != [fp-8]",
+                           act->records[idx - 2].window, below_win);
+            g_jit_norec_win_chain++;
+        }
+        fp = link;
+        idx--;
+        g_jit_norec_walk_frames++;
+        levels++;
+    }
+    return levels;
+}
+
+/*
+ * G1 step 4-iv - THE -3/SWITCH MATERIALIZER'S SHADOW (design doc 4d).
+ * Runs in jit_call_sync_switch at every depth-cap switch, the moment the
+ * 4-v materializer will run at: the flat push is about to happen and the
+ * -3 propagation is about to unwind every native frame in the topmost
+ * segment, after which each frame's RECORD is its only resume vehicle.
+ * A record-less frame would be unresumable, so 4-v inserts records for
+ * them here - and this shadow reconstructs, per frame, every field that
+ * insert will bake, comparing against the records while they still
+ * exist:
+ *
+ *   desc/run_chunk - the site DESCENT: seeded by the RELAYED site (the
+ *          slow tail stores its own NorecSite*, whose caller/caller_desc
+ *          name the switching frame), propagated upward per level by the
+ *          site at each frame's return address (a site names its
+ *          CALLER's function);
+ *   window - seeded by the live vframe, propagated by [fp-8] (the 3c
+ *          window chain);
+ *   dst / resume - from the frame's own site: dst = S.dst, and the
+ *          inserted record's ret fields are (S.caller, S.resume_pc) -
+ *          exactly the SWITCH-record shape, so the flat pop re-enters
+ *          the caller fragment at its baked entry stub;
+ *   nslots - the chunk totals (slot_count + n_temps), the 4-iii arm's
+ *          my_total;
+ *   seg math - all chain frames live in act.cur_seg (an emitted push
+ *          never crosses a segment - the fit test declines to C++, which
+ *          writes a record), and the watermark IS the window;
+ *   captures - the residue at [fp+16] (and dst_addr at [fp+24]), read
+ *          at the switch moment - the residues sit untouched deeper in
+ *          the native stack, which is the liveness claim the insert
+ *          depends on.
+ *
+ * The full reconstruction is checked for the frames that WOULD be
+ * record-less (the 4-iii era's residue-flagged frames - historical);
+ * the identity descent is checked for every chain frame in both modes.
+ * The relayed seed is additionally pinned against the helper's own
+ * ARGUMENTS (resume_pc / dst / site loc rode a different vehicle from
+ * the same emit). Null seed = a switch that made no emitted
+ * sync calls (only the slow tails store the relay). The seed is deliberately
+ * NOT cleared after reading: every slow tail overwrites it, so a switch
+ * arriving with a stale seed means a path that skipped the relay - and
+ * the seed-association checks abort loudly instead of skipping.
+ */
+static void norec_materialize_shadow(VmActivation &act, EvalContext &ctx,
+                                     int_type resume_pc, int_type dst,
+                                     int_type site_packed,
+                                     const char *entry_rbp)
+{
+    const auto *seed = static_cast<const NorecSite *>(g_norec_switch_site);
+    if (!seed)
+        return;
+    if (jit_norec_on())
+        return;    /* 4-v: the real INSERT runs; the shadow's positional
+                    * record pairing does not hold in the mixed world */
+    const char *fp = entry_rbp;
+    if (!fp)
+        norec_fail("mat: a relayed site with no rbp", seed, nullptr);
+
+    /* 1. the SEED ASSOCIATION - this must be THIS call's site */
+    if (!act.rec_n)
+        norec_fail("mat: no records at a switch", seed, nullptr);
+    const VmCallRec &top = act.back_rec();
+    if (seed->caller != top.run_chunk)
+        norec_fail("mat: seed chunk != the switching frame's",
+                   seed->caller, top.run_chunk);
+    if (seed->caller_desc != static_cast<const void *>(top.desc))
+        norec_fail("mat: seed desc != the switching frame's",
+                   seed->caller_desc, top.desc);
+    if (static_cast<int_type>(seed->resume_pc) != resume_pc)
+        norec_fail("mat: seed resume_pc != the helper's",
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(seed->resume_pc)),
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(resume_pc)));
+    if (static_cast<int_type>(seed->dst) != dst)
+        norec_fail("mat: seed dst != the helper's",
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(seed->dst)),
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(dst)));
+    if (static_cast<int_type>(seed->site_loc) != site_packed)
+        norec_fail("mat: seed site_loc != the helper's",
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(seed->site_loc)),
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(site_packed)));
+
+    /* 2. the walk + per-frame insert reconstruction */
+    const Chunk *my_ck = seed->caller;
+    const void *my_desc = seed->caller_desc;
+    const LValue *my_win = ctx.frame->slots;
+    size_t idx = act.rec_n;
+    size_t levels = 0;
+    bool hit_floor = false;
+    for (int guard = 0; idx; guard++) {
+        if (guard > 100000)
+            norec_fail("mat walk did not terminate", fp, seed);
+        const VmCallRec &rec = act.records[idx - 1];
+        /* the identity descent vs the record - the exact desc/chunk/
+         * window the 4-v insert would bake for this frame */
+        if (rec.run_chunk != my_ck)
+            norec_fail("mat: chunk descent != record", my_ck,
+                       rec.run_chunk);
+        if (static_cast<const void *>(rec.desc) != my_desc)
+            norec_fail("mat: desc descent != record", my_desc, rec.desc);
+        if (rec.window != my_win)
+            norec_fail("mat: window descent != record", my_win,
+                       rec.window);
+        const void *ra = *reinterpret_cast<const void *const *>(fp + 8);
+        if (!jit_norec_frag_for(ra)) {
+            /* the segment FLOOR: entered via jit_enter from C++, never
+             * record-less - identity verified above, nothing to insert */
+            levels++;
+            hit_floor = true;
+            break;
+        }
+        const auto *S = jit_norec_site_for(ra);
+        if (!S)
+            norec_fail("mat: emitted RA with no site", ra, nullptr);
+        if (ra != S->ret_plain && ra != S->ret_switched)
+            norec_fail("mat: RA is not the site's", ra, S);
+        if (rec.norec_site != static_cast<const void *>(S))
+            norec_fail("mat: record's site != the RA's", rec.norec_site,
+                       S);
+        /* the parent identity per the site - next level's descent, and
+         * the inserted record's ret_chunk */
+        const char *link = *reinterpret_cast<const char *const *>(fp);
+        const void *parent_win =
+            *reinterpret_cast<const void *const *>(fp - 8);
+        /* (the per-frame residue reconstruction that lived here died
+         * with the 4-iii residue flag: this shadow runs UNFORCED only,
+         * where no residue exists - the fork's real insert is verified
+         * by g_jit_norec_mat_insert + the end-to-end nets instead) */
+        my_ck = S->caller;
+        my_desc = S->caller_desc;
+        my_win = static_cast<const LValue *>(parent_win);
+        fp = link;
+        idx--;
+        levels++;
+    }
+    if (!hit_floor)
+        norec_fail("mat: records exhausted before the segment floor",
+                   fp, seed);
+    g_jit_norec_mat_walk++;
+    g_jit_norec_mat_frames += static_cast<unsigned long>(levels);
+}
+
+/*
+ * NET 2's PROBE - "if the record-less unwind started HERE, would it
+ * reconstruct what the records say?"
+ *
+ * Walks the topmost native segment from `fp0` (the caller fragment's
+ * frame pointer at a push event, the same anchor norec_walk_chain
+ * uses) and, per frame, rebuilds from HARDWARE + BAKED CONSTANTS only:
+ *
+ *   the site        S = jit_norec_site_for([fp+8])
+ *   the parent view window [fp-8], nslots S->caller totals
+ *   the frame total slot_count + n_temps of its own chunk
+ *
+ * and compares each against the live record. The SLOT-STACK ARITHMETIC
+ * is the part no other net checks, and it is checked CUMULATIVELY:
+ * `window + nslots` of each frame must land exactly on the next frame
+ * down's `window`, with the topmost landing on the live `seg->cur`.
+ * A single frame with a wrong `window` breaks the
+ * chain of equalities wherever it sits - which is the defect the
+ * sabotage matrix assigns to this net.
+ *
+ * Record comparison needs records, so it runs in SHADOW mode (the
+ * `norec` lever off). In the production mixed world the positional
+ * record<->frame pairing does not hold - record-less frames interleave
+ * - so there the probe still walks and validates the record-FREE half
+ * (termination, site resolution, RA agreement, anchor links), which is
+ * what the walk can honestly assert without a record to read.
+ */
+static void norec_recon_probe(VmActivation *act, const char *fp0,
+                              const void *ns, bool report)
+{
+    const bool shadow = !jit_norec_on();
+    const char *fp = fp0;
+    /* the frame at fp0 is the CALLER of the just-pushed callee, so its
+     * record is records[rec_n-2] - norec_walk_chain's correspondence */
+    size_t idx = act->rec_n ? act->rec_n - 1 : 0;
+    size_t levels = 0;
+    bool hit_floor = false;
+
+    /* seeded from the live segment top: the CALLEE just pushed is the
+     * top of the slot stack, so the first equality we can demand is on
+     * that record, then one per frame down. */
+    const LValue *expect_cur = nullptr;
+    if (shadow && act->rec_n) {
+        const VmCallRec &callee = act->back_rec();
+        if (callee.seg >= 0
+                && static_cast<size_t>(callee.seg) < act->segs.size()) {
+            const VmStackSeg &sg =
+                *act->segs[static_cast<size_t>(callee.seg)];
+            if (sg.cur != callee.window + callee.nslots)
+                norec_fail("recon: live seg->cur != top record's "
+                           "window + nslots",
+                           static_cast<const void *>(sg.cur),
+                           static_cast<const void *>(
+                               callee.window + callee.nslots));
+            expect_cur = callee.window;
+        }
+    }
+
+    /*
+     * Driven by the NATIVE CHAIN, not by the record count: in the
+     * production world most frames have no record, so a loop keyed on
+     * `idx` would walk zero frames there and the probe would be
+     * silently vacuous in exactly the mode that ships. (It was, on the
+     * first run - the "0 frames, production" line is what showed it.)
+     * `idx` only gates the record-comparing half.
+     */
+    for (int guard = 0; ; guard++) {
+        if (guard > 100000)
+            norec_fail("recon probe walk did not terminate", fp, ns);
+        if (shadow && !idx)
+            break;                  /* records exhausted - see below */
+        const void *ra = *reinterpret_cast<const void *const *>(fp + 8);
+        if (!jit_norec_frag_for(ra)) {
+            hit_floor = true;         /* the segment floor - see the walk */
+            break;
+        }
+        const NorecSite *S = jit_norec_site_for(ra);
+        if (!S)
+            norec_fail("recon: emitted RA with no site", ra, ns);
+        if (ra != S->ret_plain && ra != S->ret_switched)
+            norec_fail("recon: RA is not the site's", ra, S);
+        if (!S->caller)
+            norec_fail("recon: site with no caller chunk", ra, S);
+        const char *link = *reinterpret_cast<const char *const *>(fp);
+        if (link <= fp)
+            norec_fail("recon: chain link does not ascend", link, fp);
+
+        if (shadow) {
+            const VmCallRec &R = act->records[idx - 1];
+            /* R.native_rbp is R's CALLER's rbp - the NEXT link up, i.e.
+             * [fp], not fp itself (fp is R's own frame pointer). Same
+             * rule as norec_walk_chain; getting it wrong is the first
+             * thing this probe caught, on its own author. */
+            if (R.native_rbp != link)
+                norec_fail("recon: record anchor != the chain link",
+                           link, R.native_rbp);
+            /* the parent view, rebuilt from hardware + the site */
+            const void *pw =
+                *reinterpret_cast<const void *const *>(fp - 8);
+            if (static_cast<const void *>(R.parent_window) != pw)
+                norec_fail("recon: rebuilt parent window != record's",
+                           pw, R.parent_window);
+            const int32_t pn =
+                static_cast<int32_t>(S->caller->slot_count)
+                + static_cast<int32_t>(S->caller->n_temps);
+            if (R.parent_nslots != pn)
+                norec_fail("recon: rebuilt parent nslots != record's",
+                           reinterpret_cast<const void *>(
+                               static_cast<intptr_t>(pn)),
+                           reinterpret_cast<const void *>(
+                               static_cast<intptr_t>(R.parent_nslots)));
+            /* the frame's OWN total, derived from its chunk the way the
+             * record-less un-accounting derives it */
+            if (R.run_chunk) {
+                const int_type total =
+                    static_cast<int_type>(R.run_chunk->slot_count)
+                    + R.run_chunk->n_temps;
+                if (R.nslots != total)
+                    norec_fail("recon: chunk totals != record nslots",
+                               reinterpret_cast<const void *>(
+                                   static_cast<intptr_t>(total)),
+                               reinterpret_cast<const void *>(
+                                   static_cast<intptr_t>(R.nslots)));
+            }
+            /*
+             * THE CUMULATIVE SLOT-STACK EQUALITY, in ADDRESSES. The
+             * watermark used to be a slot INDEX saved per record
+             * (`seg_top_before`), and this net demanded `seg_top_before
+             * + nslots == the frame above's seg_top_before`. The
+             * watermark is a POINTER now and the record no longer saves
+             * a copy, so the same invariant is stated on the window
+             * itself - which is the SAME quantity (the old field was
+             * `window - slots.data()`) and a strictly stronger check:
+             * an index equality can hold with the frames in the wrong
+             * SEGMENT, an address equality cannot.
+             */
+            if (expect_cur) {
+                if (R.window + R.nslots != expect_cur)
+                    norec_fail("recon: window + nslots != the frame "
+                               "above's window",
+                               static_cast<const void *>(
+                                   R.window + R.nslots),
+                               static_cast<const void *>(expect_cur));
+                expect_cur = R.window;
+            }
+            idx--;
+        }
+        fp = link;
+        levels++;
+    }
+    if (shadow && !hit_floor && idx)
+        norec_fail("recon: records exhausted before the segment floor",
+                   fp, ns);
+    g_jit_norec_recon_probes++;
+    g_jit_norec_recon_frames += static_cast<unsigned long>(levels);
+    /* The sweep driver reads this line to know the event existed; when N
+     * exceeds a run's event count nothing prints and the sweep stops.
+     * Only the ENV-driven form reports - an in-suite test drives the
+     * global and asserts the counters instead, so -rt stays quiet. */
+    if (report)
+        fprintf(stderr, "norec recon probe: event %lu, %zu frames, %s\n",
+                g_norec_events, levels, shadow ? "shadow" : "production");
+}
+
+#endif
+
+/*
+ * G1 step 4-iii: the RECORD-LESS RETURN ARM's shadow oracle - called by
+ * the emitted arm (TESTS builds, norec tier on - the default) BEFORE any of
+ * its mutations, with the record still fully valid. Verifies every
+ * record-less data source against the record it replaces: the residue
+ * ([rbp+24] = dst_addr, [rbp+16] = the caller's captures), the window
+ * chain ([rbp-8] = the parent's window, which the arm stores into
+ * vframe.slots), the baked callee total, and the seg-top induction fact
+ * (seg->cur == rec.window + total - what makes the arm's baked
+ * subtraction equal the record path's absolute restore). Never throws
+ * (#142); a mismatch is the deliberate located abort.
+ */
+extern "C" void jit_norec_retarm_verify(const void *dst_addr,
+                                        const void *rbp,
+                                        int_type total) noexcept
+{
+#ifdef TESTS
+    VmActivation *act = g_vm_act;
+    if (!act || act->rec_n < 1)
+        norec_fail("retarm: no activation / no record stack", act,
+                   nullptr);
+    const VmCallRec &rec = act->back_rec();
+    {
+        /* the arm only fires on the WINDOW-COMPARE mismatch, so the
+         * returning frame has NO record by construction - the top
+         * record is an ancestor's, and only the live facts remain
+         * checkable: the discrimination itself, the baked total vs the
+         * vframe (the push set it from the same chunk), and the window
+         * chain's [rbp-8] being a real pointer distinct from our own
+         * window. (The 4-iii record-compare half died with the residue
+         * flag.) */
+        EvalContext *fctx = g_current_ctx;
+        if (!fctx || !fctx->frame)
+            norec_fail("retarm fork: no ctx", fctx, nullptr);
+        /* #97 R4: a LAZY frameless body publishes no vframe on this
+         * path (the call reaching here does not publish either) - its
+         * entry left the POISON window, and the vframe facts below are
+         * then not facts about this frame. The [rbp-8] chain still is. */
+        if (fctx->frame->slots
+                == static_cast<const LValue *>(jit_poison_window())) {
+            const void *pw = *reinterpret_cast<const void *const *>(
+                static_cast<const char *>(rbp) - 8);
+            if (!pw)
+                norec_fail("retarm fork: [rbp-8] is null", pw, nullptr);
+            g_jit_norec_retarm_verify++;
+            return;
+        }
+        if (rec.window == fctx->frame->slots)
+            norec_fail("retarm fork: top record IS this frame's",
+                       rec.window, fctx->frame->slots);
+        if (total != static_cast<int_type>(fctx->frame->size))
+            norec_fail("retarm fork: baked total != vframe.size",
+                       reinterpret_cast<const void *>(total),
+                       reinterpret_cast<const void *>(
+                           static_cast<intptr_t>(fctx->frame->size)));
+        const char *ffp = static_cast<const char *>(rbp);
+        const void *pwin =
+            *reinterpret_cast<const void *const *>(ffp - 8);
+        if (!pwin || pwin == static_cast<const void *>(fctx->frame->slots))
+            norec_fail("retarm fork: [rbp-8] not a distinct window",
+                       pwin, fctx->frame->slots);
+        g_jit_norec_retarm_verify++;
+        return;
+    }
+    if (!rec.run_chunk || !rec.run_chunk->norec_ok)
+        norec_fail("retarm: a residue frame whose chunk is not norec_ok",
+                   &rec, rec.run_chunk);
+    /* a frame with a parked key / stashed cache may legally reach the
+     * oracle - the arm's emitted cache guards run AFTER it and decline
+     * to jit_ret; the residue checks below hold either way */
+    if (rec.boundary)
+        norec_fail("retarm on a boundary frame", &rec, nullptr);
+    const VmCallRec &par = act->records[act->rec_n - 2];
+    const void *want =
+        rec.dst < 0 ? nullptr
+                    : static_cast<const void *>(par.window + rec.dst);
+    if (dst_addr != want)
+        norec_fail("residue dst_addr != &parent[rec.dst]", dst_addr,
+                   want);
+    const char *fp = static_cast<const char *>(rbp);
+    const void *caps = *reinterpret_cast<const void *const *>(fp + 16);
+    if (caps != static_cast<const void *>(rec.caller_captures))
+        norec_fail("residue captures != rec.caller_captures", caps,
+                   rec.caller_captures);
+    const void *below_win =
+        *reinterpret_cast<const void *const *>(fp - 8);
+    if (below_win != static_cast<const void *>(par.window))
+        norec_fail("retarm [rbp-8] != the parent window", below_win,
+                   par.window);
+    if (total != rec.nslots)
+        norec_fail("retarm baked total != rec.nslots",
+                   reinterpret_cast<const void *>(total),
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(rec.nslots)));
+    if (act->cur_seg != rec.seg)
+        norec_fail("retarm cur_seg != rec.seg",
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(act->cur_seg)),
+                   reinterpret_cast<const void *>(
+                       static_cast<intptr_t>(rec.seg)));
+    const VmStackSeg &sg = *act->segs[static_cast<size_t>(act->cur_seg)];
+    if (sg.cur != rec.window + total)
+        norec_fail("retarm seg->cur != window + total",
+                   static_cast<const void *>(sg.cur),
+                   static_cast<const void *>(rec.window + total));
+    g_jit_norec_retarm_verify++;
+#else
+    (void)dst_addr; (void)rbp; (void)total;
+#endif
+}
+
+extern "C" void jit_norec_push_verify(const void *site,
+                                      const void *rbp) noexcept
+{
+#ifdef TESTS
+    const NorecSite *ns = static_cast<const NorecSite *>(site);
+    VmActivation *act = g_vm_act;
+    if (!act || !act->rec_n || !ns)
+        norec_fail("no activation/record at a verify", act, ns);
+    /*
+     * NET 2 - every emitted push is a CALL EVENT. Counted HERE, before
+     * the record-less fork returns early below, so event N addresses
+     * the same call in shadow and production mode and the sweep's runs
+     * are comparable across the two.
+     */
+    static const unsigned long env_recon_at = [] {
+        const auto v = env_get("MYLANG_RECON_AT");
+        return v ? std::strtoul(v->c_str(), nullptr, 10) : 0UL;
+    }();
+    const unsigned long recon_at =
+        g_norec_recon_at ? g_norec_recon_at : env_recon_at;
+    g_norec_events++;
+    if (recon_at && g_norec_events == recon_at)
+        norec_recon_probe(act, static_cast<const char *>(rbp), ns,
+                          /*report=*/g_norec_recon_at == 0);
+    /* 4-v FORK: a gate-passing push made NO record - the vframe (the
+     * callee's window, just repointed by the push) differs from the top
+     * record's. Verify exactly that absence plus the gate's own terms,
+     * then stop: every record check below reads a record this frame
+     * does not have. */
+    if (g_current_ctx && g_current_ctx->frame
+            && act->top_rec->window != g_current_ctx->frame->slots) {
+        if (!jit_norec_on())
+            norec_fail("a record-less push outside the fork", ns,
+                       nullptr);
+        g_jit_norec_verify++;
+        return;
+    }
+    norec_check_rec(act->back_rec(), ns);
+    g_jit_norec_verify++;
+    /*
+     * STEP 4 GATE REACH - classify this push against the no-record
+     * tier's CALLEE gate, per call on the real (native) path, so the
+     * numbers answer "how many of the calls that would skip their
+     * record actually may". No extra emit: this helper already runs on
+     * every M5b inline push. The gate, per the step-4 design
+     * (plans/archived/g1-no-record-tier.md):
+     *   - not a CACHED call (the pure-cache exclusion - fib declines);
+     *   - callee plain_frame (no handler/iterator watermark, so the
+     *     unwind never searches the frame);
+     *   - callee FULLY DELETED - every op is EnterNative, so the frame
+     *     can never resume through the interpreter mid-body (the
+     *     record is the interpreter's only resume vehicle);
+     *   - callee ref_slots small (the C4c release-arm bound).
+     * The chunk-side predicate is jit_chunk_norec_ok (jit.cpp) - the
+     * SAME function step 4's emitted gate will consult, so the reach
+     * numbers and the tier cannot drift (4-i's unification).
+     */
+    /* 4-v: the PARENT-VIEW capture must equal the record below - the
+     * all-record-world identity that let every consumer (pop_window's
+     * vframe repoint, the C4c arm's parent reads) switch from
+     * "records[rec_n-2]" to the captured fields with zero behavior
+     * change. Once records stop being written the two legitimately
+     * diverge (the record below becomes an ancestor) - this pin then
+     * moves behind the record-ful case. */
+    if (act->rec_n >= 2 && !jit_norec_on()) {
+        const VmCallRec &rec = act->back_rec();
+        const VmCallRec &par = act->records[act->rec_n - 2];
+        if (rec.parent_window != par.window)
+            norec_fail("parent_window != the record below's",
+                       rec.parent_window, par.window);
+        if (static_cast<int_type>(rec.parent_nslots) != par.nslots)
+            norec_fail("parent_nslots != the record below's",
+                       reinterpret_cast<const void *>(
+                           static_cast<intptr_t>(rec.parent_nslots)),
+                       reinterpret_cast<const void *>(
+                           static_cast<intptr_t>(par.nslots)));
+        if (rec.parent_seg != par.seg)
+            norec_fail("parent_seg != the record below's",
+                       reinterpret_cast<const void *>(
+                           static_cast<intptr_t>(rec.parent_seg)),
+                       reinterpret_cast<const void *>(
+                           static_cast<intptr_t>(par.seg)));
+    }
+    {
+        const VmCallRec &rec = act->back_rec();
+        const Chunk *cck = rec.run_chunk;
+        if (rec.cache_key || rec.caller_cache)
+            g_jit_norec_gate_cached++;
+        else if (!cck || !cck->plain_frame)
+            g_jit_norec_gate_plain++;
+        else if (!jit_chunk_norec_ok(*cck))
+            g_jit_norec_gate_body++;
+        else
+            g_jit_norec_gate_ok++;
+        /* the DERIVED byte must agree with the function it derives from
+         * (the emitted push reads the BYTE; a stale byte is a silently
+         * dead tier - which is exactly how 4-iii's arm was first found
+         * not running) */
+        if (cck && cck->norec_ok != jit_chunk_norec_ok(*cck))
+            norec_fail("chunk norec_ok byte != the predicate", cck,
+                       nullptr);
+    }
+    /*
+     * G1 STEP 3 - THE SHADOW WALK. `rbp` is the CALLER fragment's frame
+     * pointer (the push runs BEFORE the callee is entered), so the frame
+     * it points at is the one the record BELOW the just-pushed callee
+     * describes. Two facts anchor the correspondence:
+     *
+     *   - the just-pushed callee's record stored `rbp` as its anchor:
+     *     records[rec_n-1].native_rbp == rbp (tautological - same reg -
+     *     but it confirms the emitted store hit the right offset);
+     *   - for each frame at fp: its RETURN address sits at [fp+8], and
+     *     its record's anchor R.native_rbp is the NEXT link up == [fp]
+     *     (R's caller's rbp), NOT fp itself.
+     *
+     * The chain covers only the TOPMOST CONTIGUOUS native segment (the
+     * stop below): a C++ return address is its floor. Within the segment,
+     * a frame with an emitted return address must have a record carrying
+     * that call's site, the site must resolve, and the anchor must equal
+     * the chain link. A C++ frame's rbp is NEVER dereferenced - the stop
+     * is decided by the return address alone, so garbage C++ rbp values
+     * (frames built without frame pointers) are unreachable.
+     */
+    if (!jit_norec_on()) {
+        /* the positional record<->frame pairing the walk checks does not
+         * hold once record-less frames interleave (4-v) - the fork's
+         * verification lives in the release machinery + the end-to-end
+         * nets instead */
+        const VmCallRec &callee = act->records[act->rec_n - 1];
+        if (callee.native_rbp != rbp)
+            norec_fail("callee anchor != the push rbp",
+                       callee.native_rbp, rbp);
+        norec_walk_chain(act, static_cast<const char *>(rbp),
+                         act->rec_n - 1, ns);
+    }
+    static const bool env_audit =
+        env_get("MYLANG_NOREC_AUDIT").has_value();
+    if (g_norec_audit || env_audit) {
+        /* the FULL-STACK audit: every live emitted-pushed record must
+         * still agree with its site - the net that can see a TRANSIENT
+         * corruption a normal pop never reads */
+        for (size_t i = 0; i < act->rec_n; i++) {
+            const VmCallRec &r = act->records[i];
+            if (!r.norec_site)
+                continue;             /* a C++-pushed record has no site */
+            if (!r.sync_stop)
+                continue;             /* 4-iv: RETARGETED by a switch (its
+                                       * sentinel resume was rewritten to
+                                       * the real one; norec_check_rec's
+                                       * sentinel pins no longer apply) */
+            const auto *rs = static_cast<const NorecSite *>(r.norec_site);
+            norec_check_rec(r, rs);
+            /* step 2, the CHAIN: the site's caller chunk must be the
+             * frame BELOW's run_chunk - the frame identity the mixed
+             * walk (step 3) will derive from interleave order */
+            if (i && !jit_norec_on()
+                    && rs->caller != act->records[i - 1].run_chunk)
+                norec_fail("site caller != parent frame's chunk",
+                           rs->caller, act->records[i - 1].run_chunk);
+            g_jit_norec_audit_frames++;
+        }
+    }
+#else
+    (void)site;
+#endif
+}
+
+ptrdiff_t jit_off_act_rec_n()
+{
+    VmActivation a;
+    return reinterpret_cast<const char *>(&a.rec_n)
+         - reinterpret_cast<const char *>(&a);
+}
+ptrdiff_t jit_sizeof_vm_rec()
+{
+    return static_cast<ptrdiff_t>(sizeof(VmCallRec));
+}
+ptrdiff_t jit_off_act_top_rec()
+{
+    VmActivation a;
+    return reinterpret_cast<const char *>(&a.top_rec)
+         - reinterpret_cast<const char *>(&a);
+}
+ptrdiff_t jit_off_act_pends()
+{
+    VmActivation a;
+    return reinterpret_cast<const char *>(&a.pends)
+         - reinterpret_cast<const char *>(&a);
+}
+ptrdiff_t jit_off_rec_pend_base()
+{
+    VmCallRec r;
+    return reinterpret_cast<const char *>(&r.pend_base)
+         - reinterpret_cast<const char *>(&r);
+}
+ptrdiff_t jit_sizeof_pend_state()
+{
+    return static_cast<ptrdiff_t>(sizeof(VmPendState));
+}
+ptrdiff_t jit_off_pend_state_pend()
+{
+    VmPendState ps;
+    return reinterpret_cast<const char *>(&ps.pend)
+         - reinterpret_cast<const char *>(&ps);
+}
+
+/* The COLD grow path of the inline PushHandler: the handlers vector is at
+ * capacity - do the real push_back (realloc). Never throws in practice. */
+extern "C" void jit_push_handler_grow(int_type region) noexcept
+{
+    g_vm_act->handlers.push_back({ static_cast<uint32_t>(region) });
+}
+
+/* A flagged SetPend's drop (question 12): a catch body is done, so the
+ * exception the dispatch parked for it goes - the interpreted op's
+ * `ps.exc.reset()`. Handed the {exc, pend} slot the inline store just
+ * addressed, so it does not recompute it. Never throws: an exception's
+ * destructor does not. */
+extern "C" void jit_drop_caught(void *pend_state) noexcept
+{
+    static_cast<VmPendState *>(pend_state)->exc.reset();
+}
+
+ptrdiff_t jit_off_desc_vm_chunk()
+{
+    FuncDescriptor fd;
+    return reinterpret_cast<const char *>(&fd.vm_chunk)
+         - reinterpret_cast<const char *>(&fd);
+}
+ptrdiff_t jit_off_chunk_native_base()
+{
+    Chunk ck;
+    return reinterpret_cast<const char *>(&ck.native.base)
+         - reinterpret_cast<const char *>(&ck);
+}
+ptrdiff_t jit_off_chunk_native_entry()
+{
+    Chunk ck;
+    return reinterpret_cast<const char *>(&ck.native_entry_off)
+         - reinterpret_cast<const char *>(&ck);
+}
+
+/*
+ * #55 STEP 2.1: push the callee frame for a NATIVE CallV (see jit.h). The gate
+ * proved the callee slot is write-once + holds a native_leaf FuncObject, so the
+ * resolve can't miss; vm_frame_setup binds the args from the caller window at
+ * [argbase, argbase+nargs) and sets the record's ret_chunk/ret_pc (backtrace).
+ * Returns the callee window slots (the caller loads rdi from it, then `call`s
+ * the callee fragment). Any RuntimeException (StackOverflow at push, or a bind
+ * coercion the gate didn't exclude) is caught -> g_vm_jit_exc + null return; the
+ * caller exits to callv_pc and EnterNative re-raises with the call-site caret.
+ */
+extern "C" LValue *jit_call_setup(int_type callee_slot, int_type argbase,
+                                  size_t nargs, int_type dst,
+                                  const FuncDescriptor *caller_desc,
+                                  size_t callv_pc) noexcept
+{
+    g_jit_native_calls++;
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    FuncObject &fo = *ctx.gfuncs->slots[callee_slot].get()
+                          .get_ref<intrusive_ptr<FuncObject>>().get();
+    try {
+        Frame *w = vm_frame_setup(
+            act, ctx, static_cast<const Chunk *>(caller_desc->vm_chunk),
+            callv_pc, fo, static_cast<const Chunk *>(fo.func->vm_chunk),
+            argbase, nargs, dst, nullptr);
+        return w->slots;
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return nullptr;
+    }
+}
+
+/* The interpreter's ReturnV/Halt: the leave core + the chunk/pc SWITCH back to
+ * the parent (from the resume globals vm_frame_leave set). The native ReturnV
+ * (#55) will instead ret a SENTINEL and let EnterNative apply the same globals
+ * - the reason the parent resume is a global, not a ref. */
 static ML_NOINLINE void
 vm_leave_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
               size_t &pc, EvalValue res)
 {
-    VmCallRec &dead = act.records.back();
-    ctx.captures = dead.caller_captures;
-    chunk = dead.ret_chunk;
-    pc = dead.ret_pc;
-    const int_type dst = dead.dst;
-    std::unique_ptr<PureCacheKey> ckey = std::move(dead.cache_key);
-    act.pop_window();
-    if (ckey && res.get_type()->t < Type::t_str)
-        ctx.frame->ensure_pure_cache().emplace(std::move(*ckey), res);
-    if (dst >= 0)                /* -1 = a DISCARDED call statement's dst
-                                  * (the peephole's dead-dst rule) */
-        ctx.frame->at(dst).put(std::move(res));
+    vm_frame_leave_body(act, ctx, std::move(res));
+    chunk = g_vm_resume_chunk;
+    pc = g_vm_resume_pc;
 }
 
 /* CachedCallV's cache probe (vm_cached_call's exact flow): a HIT writes the
@@ -1813,21 +11957,9 @@ static ML_NOINLINE bool
 vm_cache_probe(EvalContext &ctx, const Instr *in, const FuncDescriptor *d,
                std::unique_ptr<PureCacheKey> &pending)
 {
-    std::vector<EvalValue> vals;
-    const size_t n = static_cast<size_t>(in->b_lit());
-    vals.reserve(n);
-    const LValue *ap0 = n ? &ctx.frame->at(in->a_lit()) : nullptr;
-    for (size_t i = 0; i < n; i++)
-        vals.push_back(ap0[i].get());
-    PureCacheKey key{ d, std::move(vals) };
-    PureCache &cache = ctx.frame->ensure_pure_cache();
-    auto it = cache.find(key);
-    if (it != cache.end()) {
-        ctx.frame->at(in->target).put(EvalValue(it->second));
-        return true;
-    }
-    pending = std::make_unique<PureCacheKey>(std::move(key));
-    return false;
+    return vm_cache_probe_vals(ctx, d, in->a_lit(),
+                               static_cast<size_t>(in->b_lit()), in->target,
+                               pending);
 }
 
 /*
@@ -1844,13 +11976,27 @@ static ML_COLD bool
 vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
                size_t &pc, std::unique_ptr<RuntimeException> ex)
 {
+#ifdef TESTS
+    g_norec_stash = nullptr;      /* G1 step 2: one stash per walk */
+#endif
     for (;;) {
-        VmCallRec &cur = act.records.back();
-        if (vm_dispatch_exc(act, cur, pc)) {
-            cur.exc = std::move(ex);           /* like saved_ex */
-            return true;
-        }
+        VmCallRec &cur = act.back_rec();
+        if (vm_dispatch_exc(act, cur, ctx, pc, ex))
+            return true;                       /* ex parked per-region */
         if (cur.boundary) {
+            g_vm_exc_pending = std::move(ex);
+            return false;
+        }
+        if (cur.sync_stop) {
+            /* M5 lean sync enter: this frame's C++ owner is a native
+             * caller's jit_call_sync* helper, not a parent record - capture
+             * the callee frame (site LOC-LESS: the sentinel ret_chunk has no
+             * locs; the helper stamps the baked call-site loc), pop it, and
+             * convert like a boundary so the helper's vm_dispatch re-entry
+             * returns with g_vm_exc_pending set. */
+            vm_capture_rec_frame(*ex, cur);
+            ctx.captures = cur.caller_captures;
+            act.pop_window();
             g_vm_exc_pending = std::move(ex);
             return false;
         }
@@ -1858,17 +12004,25 @@ vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
         ctx.captures = cur.caller_captures;
         chunk = cur.ret_chunk;
         pc = cur.ret_pc - 1;                   /* the call op */
+        /* a SWITCH-pushed / retargeted record BAKED its call site's
+         * chain (call_site_chain, #38) under the same gate as its
+         * caret: its ret_pc is a resume stub in a possibly DELETED run,
+         * where the pc lookup cannot name the call op's chain */
+        const bool baked = cur.call_site_packed && !cur.sync_stop;
+        const int32_t chain = cur.call_site_chain;
         act.pop_window();
-        vm_flush_inline(*chunk, pc, *ex);
+        if (!baked)
+            vm_flush_inline_call(*chunk, pc, *ex);
+        else if (chain >= 0
+                 && static_cast<size_t>(chain) < chunk->inline_frames.size())
+            vm_flush_inline_call_pool(chunk->inline_frames.data(), chain,
+                                      *ex);
     }
 }
 
 void
 vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 {
-    /* The CURRENT chunk - reseatable LOOP STATE (the native call stack: an
-     * in-VM call switches it to the callee's chunk; a pop switches it
-     * back). Every op reads the current chunk through it. */
     const Chunk *chunk = &chunk0;
 
     /*
@@ -1897,6 +12051,30 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                                                   entry_guard.swapped,
                                                   entry_guard.pushed);
 
+    /* #55 native calls: announce THIS invocation's ctx for jit_ret (the native
+     * ReturnV helper), restored on every exit incl. a throw. A nested callback
+     * (a builtin re-entering with the invoke ctx) saves/restores the outer. */
+    struct CtxGuard {
+        EvalContext *prev;
+        CtxGuard(EvalContext *c) : prev(g_current_ctx) { g_current_ctx = c; }
+        ~CtxGuard() { g_current_ctx = prev; }
+    } ctx_guard(&ctx);
+
+    /* #60 (b): the entry setup above is per-INVOCATION; the dispatch loop is
+     * split into vm_dispatch so a callback loop re-enters it directly (see the
+     * forward decl / VmInvoker::invoke). */
+    vm_dispatch(chunk0, ctx, act);
+}
+
+static void
+vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
+            size_t start_pc)
+{
+    /* The CURRENT chunk - reseatable LOOP STATE (the native call stack: an
+     * in-VM call switches it to the callee's chunk; a pop switches it
+     * back). Every op reads the current chunk through it. */
+    const Chunk *chunk = &chunk0;
+
     /*
      * The CURRENT chunk's instruction array, cached as loop state: `chunk`
      * is a reseatable pointer (an in-VM call switches it), so the compiler
@@ -1906,13 +12084,13 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
      * enter/leave call, the unwind dispatch (vm_resume), and entry.
      */
     const Instr *code = chunk->code.data();
-    size_t pc = 0;
+    size_t pc = start_pc;   /* model-flip: vm_exec_block enters mid-chunk */
     /* CachedCallV's pending {func,args} key between the cache miss and the
      * frame push. LOOP-scope (like `in`): clang forbids an INDIRECT goto
      * from exiting a scope with a live non-trivial local, and every label
      * lives inside this one, so no dispatch ever exits it. */
     std::unique_ptr<PureCacheKey> pending_key;
-    auto cur_rec = [&]() -> VmCallRec & { return act.records.back(); };
+    auto cur_rec = [&]() -> VmCallRec & { return act.back_rec(); };
     auto diter = [&](int_type i) -> DictIterState & {
         return act.dict_iters[cur_rec().diter_base + i];
     };
@@ -1921,7 +12099,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
     };
 
 
-    /* Inc 0 (P8): the exception BOUNDARY (plans/vm-exceptions.md). It routes a
+    /* Inc 0 (P8): the exception BOUNDARY (plans/archived/vm-exceptions.md). It routes a
      * RuntimeException thrown by any op (a runtime-library error, a fallback
      * `throw`, or a callee) into the VM handler stack: on a caught exception
      * with an active handler, resume at its catch-dispatch pc. PROVEN hot-path-
@@ -1953,6 +12131,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 #else
     for (; ; ) {
 
+        VM_INT_STATE();
         in = &code[pc];
 
         switch (in->op) {
@@ -1964,16 +12143,19 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 
 
         VM_CASE(IncDecCheckedV): {
-            /* A dyn/general scalar `--d`/`d++`: throw if not int/float
-             * (inc-dec is int/float-ONLY), else apply +-1 in place. Slot kind:
-             * 0 local / 1 global (defined-guarded) / 2 capture. */
+            /* A dyn/general scalar `--d`/`d++` - the shared body (also
+             * jit_incdec_checked's). Slot kind: 0 local / 1 global
+             * (defined-guarded) / 2 capture. */
             LValue *lvp;
             if (in->target2 == 1) {
                 if (!ctx.gfuncs->defined[in->target]) {
                     Loc s, en;
                     chunk->loc_at(pc, s, en);
-                    throw UndefinedVariableEx(
-                        ctx.gfuncs->names[in->target]->val, s, en);
+                    throw UnboundSymbolEx(
+                        intern_msg("'"
+                                   + std::string(ctx.gfuncs->names[in->target]
+                                                 ->val)
+                                   + "' is not bound yet"), s, en);
                 }
                 lvp = &ctx.gfuncs->slots[in->target];
             } else if (in->target2 == 2) {
@@ -1981,16 +12163,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             } else {
                 lvp = &ctx.frame->at(in->target);
             }
-            LValue &lv = *lvp;
-            EvalValue nv = lv.get();
-            if (!nv.is<int_type>() && !nv.is<float_type>()) {
-                Loc s, en;
-                chunk->loc_at(pc, s, en);
-                throw TypeErrorEx("'++'/'--' requires an int or float", s, en);
-            }
-            num_bin_op(nv, EvalValue(static_cast<int_type>(1)),
-                       binop_pmf(in->a_lit() ? Op::plus : Op::minus));
-            lv.put(std::move(nv));
+            vm_incdec_scalar_body(*lvp, in->a_lit() != 0, chunk, pc);
             pc++;
         }
         VM_NEXT;
@@ -2022,14 +12195,16 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         VM_CASE(IncDecMemberCheckedV): {
             /* `d.f++` / `d.f--` on a dyn/unproven base: form the member LValue
              * (struct field / dict value), enforce int/float, apply +-1.
-             * AST-FREE: the member key + its TWO carets - the MEMBER loc (a
-             * KeyNotFound) vs the INC-DEC loc (its own NotLValue/const/
-             * TypeError) - come from the incdec_sites pool (`b`). */
+             * AST-FREE: the member key + its THREE carets - the MEMBER loc
+             * (a KeyNotFound), the BASE loc ("Expected dict object") and the
+             * INC-DEC loc (its own NotLValue/const/TypeError) - come from
+             * the incdec_sites pool (`b`). */
             const Chunk::IncDecSite &site = chunk->incdec_sites[in->b_lit()];
             LValue *blv =
                 vm_store_base(ctx, in->target, in->target2, *chunk, pc, nullptr);
             vm_incdec_member(blv, site.memId, site.memUid, in->aop == Op::plus,
-                             site.lstart, site.lend, site.istart, site.iend);
+                             site.lstart, site.lend, site.bstart, site.bend,
+                             site.istart, site.iend);
             pc++;
         }
         VM_NEXT;
@@ -2089,10 +12264,38 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         ML_IRI(IntOrRI,  a | b)
         ML_IRR(IntXorRR, a ^ b)
         ML_IRI(IntXorRI, a ^ b)
-        ML_IRR(IntShlRR, bit_shl(a, b))
-        ML_IRI(IntShlRI, bit_shl(a, b))
-        ML_IRR(IntShrRR, bit_shr(a, b))
-        ML_IRI(IntShrRI, bit_shr(a, b))
+        /*
+         * The SHIFTS raise on a negative count, and that raise must carry
+         * the op's caret like any other - it used to leave bit_shl's
+         * loc-less C++ throw to the boundary walk, which stamps nothing,
+         * so `v << k` with k < 0 rendered with NO location in the
+         * interpreter where the tree-walker (and the JIT's emitted
+         * negative-count arm) mark the shift (RULE 2). The raise goes
+         * through vm_raise, exactly as IntBin's div0 does. (An RI form
+         * with a negative immediate is never JIT'd - imm_shift_ok - so
+         * the interpreter is the only engine that runs it.)
+         */
+#define ML_ISH(NAME, BREAD, FN)                                              \
+        VM_CASE(NAME): {                                                     \
+            const int_type a = read_int_slot(&ctx, in->a_slot());              \
+            const int_type b = (BREAD);                                        \
+            if (b < 0) {                                                     \
+                if (!vm_raise(chunk, pc, act, ctx,                           \
+                              std::make_unique<InvalidValueEx>(              \
+                                  "negative shift count")))                  \
+                    return;               /* boundary: signal set */         \
+                code = chunk->code.data();                                   \
+                VM_NEXT;                  /* dispatched: skip the write */   \
+            }                                                                \
+            write_int_slot(&ctx, in->target, FN(a, b));                     \
+            pc++;                                                            \
+        }                                                                    \
+        VM_NEXT;
+        ML_ISH(IntShlRR, read_int_slot(&ctx, in->b_slot()), bit_shl)
+        ML_ISH(IntShlRI, in->b_lit(), bit_shl)
+        ML_ISH(IntShrRR, read_int_slot(&ctx, in->b_slot()), bit_shr)
+        ML_ISH(IntShrRI, in->b_lit(), bit_shr)
+#undef ML_ISH
 
         VM_CASE(IntModRI): {
             /* selected only for a NONZERO immediate - no zero check */
@@ -2132,18 +12335,24 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             case Op::minus: r = a - b; break;
             case Op::times: r = a * b; break;
             case Op::div:
-                if (b == 0) {
-                    if (!vm_raise(chunk, pc, act, ctx,
-                                  std::make_unique<DivisionByZeroEx>()))
+                if (b == 0 || (b == -1 && a == INT_TYPE_MIN)) {
+                    if (!vm_raise(chunk, pc, act, ctx, b == 0
+                            ? std::unique_ptr<RuntimeException>(
+                                  std::make_unique<DivisionByZeroEx>())
+                            : std::make_unique<InvalidValueEx>(
+                                  "integer overflow in division")))
                         return;       /* boundary: signal set */
                     code = chunk->code.data();
                     VM_NEXT;          /* dispatched: skip the write */
                 }
                 r = a / b; break;
             case Op::mod:
-                if (b == 0) {
-                    if (!vm_raise(chunk, pc, act, ctx,
-                                  std::make_unique<DivisionByZeroEx>()))
+                if (b == 0 || (b == -1 && a == INT_TYPE_MIN)) {
+                    if (!vm_raise(chunk, pc, act, ctx, b == 0
+                            ? std::unique_ptr<RuntimeException>(
+                                  std::make_unique<DivisionByZeroEx>())
+                            : std::make_unique<InvalidValueEx>(
+                                  "integer overflow in division")))
                         return;
                     code = chunk->code.data();
                     VM_NEXT;
@@ -2152,9 +12361,20 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             case Op::band: r = a & b;          break;
             case Op::bor:  r = a | b;          break;
             case Op::bxor: r = a ^ b;          break;
-            case Op::shl:  r = bit_shl(a, b);  break;
-            case Op::shr:  r = bit_shr(a, b);  break;
-            case Op::ushr: r = bit_ushr(a, b); break;
+            case Op::shl: case Op::shr: case Op::ushr:
+                /* a negative count raises WITH the op's caret (see the
+                 * specialized shifts; bit_* would throw it loc-less) */
+                if (b < 0) {
+                    if (!vm_raise(chunk, pc, act, ctx,
+                                  std::make_unique<InvalidValueEx>(
+                                      "negative shift count")))
+                        return;
+                    code = chunk->code.data();
+                    VM_NEXT;
+                }
+                r = in->aop == Op::shl ? bit_shl(a, b)
+                  : in->aop == Op::shr ? bit_shr(a, b) : bit_ushr(a, b);
+                break;
             default: throw InternalErrorEx();
             }
 
@@ -2184,6 +12404,24 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 pc = in->target;
         }
         VM_NEXT;
+
+        VM_CASE(CmpIntV):
+            /* dst = (a <cmp> b) as a bool - the VALUE form of a typed int
+             * compare (the native counterpart of the boxed CmpV). Body off the
+             * dispatch frame (loop-body text rule). Never throws -> loc/node-
+             * free. */
+            vm_cmp_int_v(*in, &ctx);
+            pc++;
+            VM_NEXT;
+
+        VM_CASE(CmpFloatV):
+            /* Float operands (int/bool promote via read_float_operand); plain
+             * C++ compares give IEEE semantics (a NaN yields false for
+             * </<=/>/>=/==, true for !=), matching TypeFloat + the tree-walker.
+             * Never throws. */
+            vm_cmp_float_v(*in, &ctx);
+            pc++;
+            VM_NEXT;
 
         VM_CASE(FloatBin): {
 
@@ -2308,7 +12546,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 else if (arr.skind() == SharedArrayObj::Storage::bools)
                     v = arr.flat_bools()[at] ? 1 : 0;
                 else
-                    v = arr.get_vec()[at].getval<int_type>();
+                    v = vm_general_elem_int(arr.get_vec()[at], chunk, pc);
                 if (v == 0) {
                     pc = in->target;
                     VM_NEXT;
@@ -2394,12 +12632,91 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 else if (arr.skind() == SharedArrayObj::Storage::bools)
                     v = arr.flat_bools()[at] ? 1 : 0;
                 else
-                    v = arr.get_vec()[at].getval<int_type>();
+                    v = vm_general_elem_int(arr.get_vec()[at], chunk, pc);
                 write_int_slot(&ctx, in->b_dual_hi(), v);
             } else {
                 throw InternalErrorEx();   /* base proven an array */
             }
             pc = in->target;
+        }
+        VM_NEXT;
+
+        VM_CASE(EnterNative): {
+            /* Native-AOT (plans/archived/native-aot.md): run the compiled fragment
+             * - a frameless leaf (slots base in rdi, resume pc out). It
+             * either completes the whole run or BAILS at some interior
+             * pc, whose ORIGINAL op the interpreter then re-executes
+             * (incl. any throw, with the exact caret). Fragments never
+             * throw and touch nothing but the slot window. jit_enter (a
+             * no_sanitize("function") helper) makes the indirect call, so
+             * UBSan's -fsanitize=function does NOT read a CFI type
+             * signature from before the JIT fragment (which has none -
+             * the read faults on the guard page below `base`). */
+            /* #137: a fragment always has a frame - jit_compile_chunk
+             * refuses a chunk with no slots and no temps, which is the one
+             * shape for which vm_run skips the window push. Stated here
+             * because it is THIS line that would form a member address on a
+             * null pointer if that ever stopped holding. */
+            ML_VM_CHECK(ctx.frame != nullptr);
+            /* (the 4-iii residue-flag clear that lived here died with
+             * the flag: the return arm's WINDOW COMPARE is self-truthing
+             * - a re-entered record-ful frame's top_rec IS its own
+             * record, so it takes the record arm with no flag needed) */
+            pc = jit_enter(static_cast<char *>(chunk->native.base)
+                               + in->a_lit(),
+                           ctx.frame->slots);
+            /* #55: a native ReturnV returned a resume SENTINEL. IN-VM: switch
+             * to the parent (the globals vm_frame_leave set). BOUNDARY: stop
+             * this invocation (the do_func_call / callback contract) - exactly
+             * the interpreted ReturnV's two paths. Checked BEFORE the raise
+             * flags (a return set neither). */
+            if (pc == JIT_RET_SENTINEL || pc == JIT_RET_SWITCH) {
+                /* SENTINEL: a native return popped to the parent. SWITCH
+                 * (#56): a capped sync call was pushed interpreted-flat -
+                 * drive the callee in THIS loop (zero new C frames); its
+                 * pop resumes the caller fragment at the baked stub. */
+                ML_CHECK(g_vm_resume_chunk != nullptr);
+                chunk = g_vm_resume_chunk;
+                pc = g_vm_resume_pc;
+                code = chunk->code.data();
+                VM_NEXT;
+            }
+            if (pc == JIT_RET_BOUNDARY)
+                return;
+            /* Approach A: a native fragment that hit a proven exception
+             * (OOB / negative shift) set g_vm_jit_raise + returned the op's
+             * pc; raise it via vm_raise (the caret is stamped from the loc
+             * table at `pc`, byte-identical to the interpreted throw), NOT
+             * by re-interpreting the op. A temporary (not a named local)
+             * keeps no destructor live at the dispatch goto. */
+            if (g_vm_jit_raise) {
+                const int kind = g_vm_jit_raise;
+                g_vm_jit_raise = 0;
+                if (!vm_raise(chunk, pc, act, ctx,
+                              vm_jit_raise_kind_new(kind)))
+                    return;                    /* boundary: signal set */
+                code = chunk->code.data();     /* dispatched to a handler */
+            }
+            /* A container-store helper (jit_store_elem_int/float) CAUGHT a
+             * LOC-LESS exception; vm_raise stamps its caret from THIS chunk's
+             * loc table at the returned (store op) pc - byte-identical to the
+             * interpreted store's throw. Mutually exclusive with
+             * g_vm_jit_raise per exit. */
+            else if (g_vm_jit_exc) {
+                if (!vm_raise(chunk, pc, act, ctx, std::move(g_vm_jit_exc)))
+                    return;                    /* boundary: signal set */
+                code = chunk->code.data();     /* dispatched to a handler */
+            }
+            /* M5: a PLAIN (non-Runtime) exception from a native sync call
+             * (a callee's UndefinedVariableEx - no clone(), so it rode a
+             * std::exception_ptr). Rethrow: it propagates out of
+             * vm_dispatch exactly like the interpreted in-VM call's own
+             * throw (non-catchable, rendered at the top level). */
+            else if (g_vm_jit_eptr) {
+                std::exception_ptr p = std::move(g_vm_jit_eptr);
+                g_vm_jit_eptr = nullptr;
+                std::rethrow_exception(p);
+            }
         }
         VM_NEXT;
 
@@ -2418,80 +12735,71 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         }
         VM_NEXT;
 
-        VM_CASE(LoadElemInt): {
-
-            /* a[i] into a temp (mirrors Subscript::eval_int for a flat array;
-             * a dict / general base falls back to the node). */
-            const EvalValue &base = ctx.frame->at(in->target2).get();
-            if (base.is<SharedArrayObj>()) {
-                const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
-                int_type idx = read_int_operand(in->a(), &ctx);
-                if (idx < 0)
-                    idx += arr.size();
-                if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
-                    Loc ls, le;
-                    chunk->loc_at(pc, ls, le);
-                    throw OutOfBoundsEx(ls, le);
-                }
-                const size_type at = arr.offset() + idx;
-                int_type v;
-                if (arr.skind() == SharedArrayObj::Storage::ints)
-                    v = arr.flat_ints()[at];
-                else if (arr.skind() == SharedArrayObj::Storage::bools)
-                    v = arr.flat_bools()[at] ? 1 : 0;
-                else
-                    v = arr.get_vec()[at].getval<int_type>();
-                write_int_slot(&ctx, in->target, v);
-            } else {
-                /* base_array is PROVEN at this op, so the base is always an
-                 * array here - the old node->eval_int fallback was unreachable
-                 * (an invariant net; freeing it dropped the op's node). */
-                throw InternalErrorEx();
-            }
+        VM_CASE(LoadElemInt):
+            /* a[i] into a temp - the shared core (also the JIT slow tier's,
+             * #56; the non-array arm is the proven-base InternalErrorEx
+             * net). */
+            write_int_slot(&ctx, in->target,
+                           vm_load_elem_int_core(
+                               ctx.frame->at(in->target2).get(),
+                               read_int_operand(in->a(), &ctx), chunk, pc));
             pc++;
-        }
-        VM_NEXT;
+            VM_NEXT;
 
-        VM_CASE(LoadElemFloat): {
-
-            const EvalValue &base = ctx.frame->at(in->target2).get();
-            if (base.is<SharedArrayObj>()) {
-                const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
-                int_type idx = read_int_operand(in->a(), &ctx);
-                if (idx < 0)
-                    idx += arr.size();
-                if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
-                    Loc ls, le;
-                    chunk->loc_at(pc, ls, le);
-                    throw OutOfBoundsEx(ls, le);
-                }
-                const size_type at = arr.offset() + idx;
-                float_type v;
-                if (arr.skind() == SharedArrayObj::Storage::floats)
-                    v = arr.flat_floats()[at];
-                else if (arr.skind() == SharedArrayObj::Storage::ints)
-                    v = static_cast<float_type>(arr.flat_ints()[at]);
-                else
-                    v = arr.get_vec()[at].getval<float_type>();
-                write_float_slot(&ctx, in->target, v);
-            } else {
-                throw InternalErrorEx();   /* unreachable: base_array proven */
-            }
+        VM_CASE(LoadElemFloat):
+            write_float_slot(&ctx, in->target,
+                             vm_load_elem_float_core(
+                                 ctx.frame->at(in->target2).get(),
+                                 read_int_operand(in->a(), &ctx), chunk, pc));
             pc++;
-        }
-        VM_NEXT;
+            VM_NEXT;
+
+        VM_CASE(LoadElem2Int):
+            /* base[i][j] with the row BORROWED (the fused pair - see the
+             * opcode comment). a DUAL = (outer index slot, chain_locs idx);
+             * b = the inner index operand. */
+            write_int_slot(&ctx, in->target,
+                           vm_load_elem2_int_core(
+                               ctx.frame->at(in->target2).get(),
+                               read_int_slot(&ctx, in->a_dual_lo()),
+                               read_int_operand(in->b(), &ctx),
+                               chunk->chain_locs[in->a_dual_hi()].data()));
+            pc++;
+            VM_NEXT;
+
+        VM_CASE(LoadElem2Float):
+            write_float_slot(&ctx, in->target,
+                             vm_load_elem2_float_core(
+                                 ctx.frame->at(in->target2).get(),
+                                 read_int_slot(&ctx, in->a_dual_lo()),
+                                 read_int_operand(in->b(), &ctx),
+                                 chunk->chain_locs[in->a_dual_hi()].data()));
+            pc++;
+            VM_NEXT;
 
         VM_CASE(LoadElemBool): {
             /* bool-foreach loop var: bind a[i] as a real BOOL (not 0/1), so
              * `print(x)` shows true/false. `i` is loop-bounded (< ArrLen); the
              * base is a proven flat array<bool> (elem_is_bool). */
-            const SharedArrayObj &arr =
-                ctx.frame->at(in->target2).get().get_ref<SharedArrayObj>();
+            /* #142: the interpreted twin of the JIT's inline tier - both the
+             * base's type and the index are compile-proven, and a corrupt
+             * image breaks either into a wild flat read. */
+            const EvalValue &bv = ctx.frame->at(in->target2).get();
             const int_type idx = read_int_operand(in->a(), &ctx);
-            const bool b =
-                arr.skind() == SharedArrayObj::Storage::bools
-                    ? arr.flat_bools()[arr.offset() + idx] != 0
-                    : arr.get_view()[idx].get().get<bool>();  /* general fallbk */
+            bool b = false;
+            if (bv.is<SharedArrayObj>()) {
+                /* #53: the element the body removed, and a non-bool one
+                 * (vm_bool_elem), each raise at the container's caret */
+                const int r = vm_bool_elem(bv.get_ref<SharedArrayObj>(),
+                                           idx, b);
+                if (r != 0) {
+                    Loc ls, le;
+                    chunk->loc_at(pc, ls, le);
+                    if (r == 1)
+                        throw OutOfBoundsEx(ls, le);
+                    throw TypeErrorEx(ls, le);
+                }
+            }
             ctx.frame->at(in->target).put(EvalValue(b));
             pc++;
         }
@@ -2499,63 +12807,48 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 
         VM_CASE(LoadElemValue): {
 
-            /* a[i] (an array-valued element of a GENERAL array) into a temp
-             * slot, so a 2-D read `a[i][k]` is native (both indices). The base
-             * is a PROVEN general array (base_array + a general element type),
-             * so the old non-general node->eval fallback was unreachable. */
+            /* `a[i]` read as a VALUE, for ANY element storage (H2,
+             * 2026-08-12). It was general-or-strs only, because its one
+             * caller was compile_array_base's nested read (whose outer
+             * element is itself a container, hence general); every other
+             * storage kind was an InternalErrorEx. It is now the general
+             * boxed array-element READ - `vm_arr_elem` IS `arr_elem_at`,
+             * the same function TypeArr::subscript's read path calls, so
+             * ints/floats/bools/structs box exactly as they always did
+             * and there is one implementation, not a second copy. That
+             * is what lets a plain `x = a[i]` on a PROVEN array lower
+             * here instead of to the generic SubscriptV, whose
+             * Type-virtual dispatch + LValue back-pointer dance is
+             * computed and then thrown away by the RValue(). */
             const EvalValue &base = ctx.frame->at(in->target2).get();
             if (base.is<SharedArrayObj>()) {
                 const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
-                if (arr.skind() == SharedArrayObj::Storage::general) {
-                    int_type idx = read_int_operand(in->a(), &ctx);
-                    if (idx < 0)
-                        idx += arr.size();
-                    if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
-                        Loc ls, le;
-                        chunk->loc_at(pc, ls, le);
-                        throw OutOfBoundsEx(ls, le);
-                    }
-                    ctx.frame->at(in->target).put(
-                        arr.get_vec()[arr.offset() + idx].get());
-                    pc++;
-                    VM_NEXT;
+                int_type idx = read_int_operand(in->a(), &ctx);
+                if (idx < 0)
+                    idx += arr.size();
+                if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
+                    Loc ls, le;
+                    chunk->loc_at(pc, ls, le);
+                    throw OutOfBoundsEx(ls, le);
                 }
-                if (arr.skind() == SharedArrayObj::Storage::strs) {
-                    /* Flat STRING array (top-10 #7): an array<str> is a
-                     * general-ELEMENT type statically but may hold flat strs
-                     * storage - bind a boxed SharedStr copy (a handle;
-                     * strings are immutable, so a copy == the tree-walker's
-                     * reference bind). */
-                    int_type idx = read_int_operand(in->a(), &ctx);
-                    if (idx < 0)
-                        idx += arr.size();
-                    if (idx < 0 || static_cast<size_t>(idx) >= arr.size()) {
-                        Loc ls, le;
-                        chunk->loc_at(pc, ls, le);
-                        throw OutOfBoundsEx(ls, le);
-                    }
-                    ctx.frame->at(in->target).put(EvalValue(
-                        SharedStr(arr.flat_strs()[arr.offset() + idx])));
-                    pc++;
-                    VM_NEXT;
-                }
+                ctx.frame->at(in->target).put(
+                    vm_arr_elem(arr, static_cast<size_type>(idx)));
+                pc++;
+                VM_NEXT;
             }
-            throw InternalErrorEx();   /* unreachable: base_array general proven */
+            throw InternalErrorEx();   /* unreachable: base_array proven */
         }
 
         VM_CASE(DictIterInit): {
 
             /* Pin the dict (an intrusive_ptr copy keeps it alive for the loop,
              * matching the tree-walker's lifetime-extended `cval`) and set the
-             * live iterator to begin(). The inferencer proved a Dict static
-             * type; the ML_VM_CHECKs are the hardening net. */
+             * live iterator to begin() - the shared body (also jit_dict_iter_
+             * init's). The ML_VM_CHECKs are the hardening net. */
             ML_VM_CHECK(in->target >= 0
                 && in->target < static_cast<int_type>(chunk->n_dict_iters));
-            const EvalValue &base = ctx.frame->at(in->target2).get();
-            ML_VM_CHECK(base.is<intrusive_ptr<DictObject>>());
-            DictIterState &st = diter(in->target);
-            st.dict = base.get<intrusive_ptr<DictObject>>();
-            st.it = st.dict->get_ref().begin();
+            vm_dict_iter_init_body(diter(in->target),
+                                   ctx.frame->at(in->target2).get());
             pc++;
         }
         VM_NEXT;
@@ -2563,22 +12856,16 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         VM_CASE(DictIterNext): {
 
             /* Test the live iterator: on end jump to end_pc; else bind the key
-             * (and value) box-free - a plain EvalValue copy (LoadElemValue),
-             * matching the tree-walker's `elems = {p.first, p.second.get()}` -
-             * then advance. A slot of -1 is a `_` placeholder / the keys-only
-             * 1-var form (bind nothing). */
+             * (and value) box-free + advance - the shared body (also
+             * jit_dict_iter_next's). A slot of -1 is a `_` placeholder / the
+             * keys-only 1-var form (bind nothing). */
             ML_VM_CHECK(in->target2 >= 0
                 && in->target2 < static_cast<int_type>(chunk->n_dict_iters));
-            DictIterState &st = diter(in->target2);
-            if (st.it == st.dict->get_ref().end()) {
+            if (!vm_dict_iter_next_body(diter(in->target2), *ctx.frame,
+                                        in->a_slot(), in->b_slot())) {
                 pc = static_cast<size_t>(in->target);
                 VM_NEXT;
             }
-            if (in->a_slot() >= 0)
-                ctx.frame->at(in->a_slot()).put(st.it->first);
-            if (in->b_slot() >= 0)
-                ctx.frame->at(in->b_slot()).put(st.it->second.get());
-            ++st.it;
             pc++;
         }
         VM_NEXT;
@@ -2586,98 +12873,38 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         VM_CASE(ForeachDynInit): {
             /* Dispatch the DYN container once: pin it, record the loop shape
              * (nvars | indexed, the per-var target slots from the
-             * unpack_targets pool), and set up an array or dict cursor. An
-             * unsupported runtime value throws (loc side table). */
+             * unpack_targets pool), and set up an array or dict cursor - the
+             * shared body (also jit_foreach_dyn_init's). An unsupported
+             * runtime value throws (loc side table). */
             ML_VM_CHECK(in->target >= 0
                 && in->target < static_cast<int_type>(chunk->n_dyn_iters));
-            DynIterState &st = dyiter(in->target);
-            st.container = ctx.frame->at(in->target2).get();
-            st.nvars = static_cast<int>(in->a_lit() & 0xff);
-            st.indexed = (in->a_lit() >> 8) != 0;
-            st.targets = &chunk->unpack_targets[in->b_lit()];
-            st.counter = 0;
-            if (st.container.is<SharedArrayObj>()) {
-                st.is_dict = false;
-                st.idx = 0;
-                st.size = st.container.get<SharedArrayObj>().size();
-            } else if (st.container.is<intrusive_ptr<DictObject>>()) {
-                st.is_dict = true;
-                st.it = st.container.get<intrusive_ptr<DictObject>>()
-                            ->get_ref().begin();
-            } else {
-                Loc s, en;
-                chunk->loc_at(pc, s, en);
-                throw TypeErrorEx(
-                    "foreach: expected an array or dict", s, en);
-            }
+            vm_foreach_dyn_init_body(dyiter(in->target),
+                                     ctx.frame->at(in->target2).get(),
+                                     in->a_lit(),
+                                     &chunk->unpack_targets[in->b_lit()],
+                                     chunk, pc);
             pc++;
         }
         VM_NEXT;
 
         VM_CASE(ForeachDynNext): {
             /* On exhaustion jump to end_pc; else bind the loop vars from the
-             * state (targets slots, -1 == `_` skipped) exactly as do_iter:
+             * state + advance - the shared body (also jit_foreach_dyn_next's):
              * `indexed` binds targets[0] = the counter; an ARRAY element binds
              * the single remaining var BOX-FREE (vm_arr_elem) or STRICT-
              * unpacks an array element into the N remaining vars; a DICT
-             * binds key [, value [, none...]] (do_iter's count=2 padding).
-             * Then advance. */
+             * binds key [, value] (more is do_iter's TypeErrorEx). */
             ML_VM_CHECK(in->target2 >= 0
                 && in->target2 < static_cast<int_type>(chunk->n_dyn_iters));
-            DynIterState &st = dyiter(in->target2);
-            const std::vector<int32_t> &tg = *st.targets;
-            const size_t tb = st.indexed ? 1 : 0;    /* first value var */
-            const size_t nv = static_cast<size_t>(st.nvars) - tb;
-            auto bind = [&](size_t i, const EvalValue &v) {
-                if (tg[i] >= 0)
-                    ctx.frame->at(tg[i]).put(v);
-            };
-            if (!st.is_dict) {
-                if (st.idx >= st.size) {
-                    pc = static_cast<size_t>(in->target);
-                    VM_NEXT;
+            DynIterState &dst_ = dyiter(in->target2);
+            if (!dst_.next(dst_, *ctx.frame, chunk, pc)) {
+                if (dst_.oob) {                 /* #53: the element is gone */
+                    Loc ls, le;
+                    chunk->loc_at(pc, ls, le);
+                    throw OutOfBoundsEx(ls, le);
                 }
-                if (st.indexed)
-                    bind(0, EvalValue(
-                        static_cast<int_type>(st.idx)));
-                if (nv == 1) {
-                    bind(tb, vm_arr_elem(st.container, st.idx));
-                } else if (nv >= 2) {
-                    /* N-var over an ARRAY: the element must be an array of
-                     * EXACTLY nv, unpacked into the vars - do_iter's STRICT
-                     * destructure (same messages/loc via the side table). */
-                    const EvalValue elem = vm_arr_elem(st.container, st.idx);
-                    if (!elem.is<SharedArrayObj>())
-                        vm_throw_unpack_nonarray(*chunk, pc,
-                                                 static_cast<int>(nv));
-                    const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
-                    if (sub.size() != static_cast<size_type>(nv))
-                        vm_throw_unpack_len(*chunk, pc, sub.size(),
-                                            static_cast<int>(nv));
-                    for (size_t i = 0; i < nv; i++) {
-                        bind(tb + i, vm_arr_elem(elem,
-                                                 static_cast<size_type>(i)));
-                }
-                }
-                st.idx++;
-            } else {
-                DictObject &d = *st.container.get<intrusive_ptr<DictObject>>();
-                if (st.it == d.get_ref().end()) {
-                    pc = static_cast<size_t>(in->target);
-                    VM_NEXT;
-                }
-                if (st.indexed)
-                    bind(0, EvalValue(st.counter++));
-                /* do_iter's count==2 else-branch: key, value, then `none`
-                 * for any further vars. */
-                if (nv >= 1)
-                    bind(tb, st.it->first);
-                if (nv >= 2)
-                    bind(tb + 1, st.it->second.get());
-                for (size_t i = 2; i < nv; i++) {
-                    bind(tb + i, none);
-                }
-                ++st.it;
+                pc = static_cast<size_t>(in->target);
+                VM_NEXT;
             }
             pc++;
         }
@@ -2687,150 +12914,53 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         VM_CASE(UnpackElemFloat):
         VM_CASE(UnpackElemValue): {
 
-            /* STRICT foreach-unpack: read pairs[i] (a general outer element = a
-             * sub-array), check it is an array of EXACTLY N, write its N scalars
-             * into the consecutive loop-var slots base..base+N-1 - matching
-             * do_iter's strict destructure element for element. `i` is the loop
-             * counter (in-range), so the outer read never OOB; the only throws
-             * are the two strict errors. */
-            const bool is_int = in->op == OpCode::UnpackElemInt;
-            const bool is_float = in->op == OpCode::UnpackElemFloat;
-            const EvalValue &base_v = ctx.frame->at(in->target2).get();
-            ML_VM_CHECK(base_v.is<SharedArrayObj>());
-            const SharedArrayObj &outer = base_v.get_ref<SharedArrayObj>();
-            const int_type idx = read_int_operand(in->a(), &ctx);
-            const EvalValue &elem =
-                outer.get_vec()[outer.offset() + idx].get();
-            const int_type N = in->b_lit();
-            if (!elem.is<SharedArrayObj>())
-                vm_throw_unpack_nonarray(*chunk, pc, N);
-            const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
-            if (sub.size() != static_cast<size_type>(N))
-                vm_throw_unpack_len(*chunk, pc, sub.size(), N);
-            const size_type off = sub.offset();
-            const auto sk = sub.skind();
-            if (is_int && sk == SharedArrayObj::Storage::ints) {
-                for (int_type k = 0; k < N; k++) {
-                    write_int_slot(&ctx, in->target + k,
-                                   sub.flat_ints()[off + k]);
-                }
-            } else if (is_float && sk == SharedArrayObj::Storage::floats) {
-                for (int_type k = 0; k < N; k++) {
-                    write_float_slot(&ctx, in->target + k,
-                                     sub.flat_floats()[off + k]);
-                }
-            } else {
-                /* UnpackElemValue (a general/dyn/str/mixed sub-array), OR a flat
-                 * op whose sub-array's storage is NOT the expected kind (a
-                 * mixed-numeric `[int, float]` literal - inference types it
-                 * array<float> by int|float join but builds GENERAL - or a flat
-                 * array of the OTHER scalar kind). Bind each element's ACTUAL
-                 * boxed value (vm_arr_elem is skind-dispatched) - byte-identical
-                 * to do_iter's bind_loop_var, so an int stays int / a str stays
-                 * str. */
-                for (int_type k = 0; k < N; k++) {
-                    ctx.frame->at(in->target + k).put(
-                        vm_arr_elem(elem, static_cast<size_type>(k)));
-                }
-            }
+            /* STRICT foreach-unpack: pairs[i] must be an array of EXACTLY N,
+             * its scalars written to the consecutive loop-var slots - the
+             * shared body (also jit_unpack_elem's). `i` is the loop counter
+             * (in-range), so the outer read never OOB. */
+            const int kind = in->op == OpCode::UnpackElemInt ? 0
+                           : in->op == OpCode::UnpackElemFloat ? 1 : 2;
+            vm_unpack_elem_body(ctx, ctx.frame->at(in->target2).get(),
+                                read_int_operand(in->a(), &ctx), in->b_lit(),
+                                kind, in->target, nullptr, chunk, pc);
             pc++;
         }
         VM_NEXT;
 
         VM_CASE(UnpackElemTargets): {
-            /* STRICT foreach-unpack with a per-position target list (a `_`
-             * placeholder / non-consecutive slots): read pairs[i] (a general
-             * outer element = a sub-array), check length == N, then bind each
-             * element box-free (vm_arr_elem) to targets[k] (skip -1 == `_`). */
-            const EvalValue &base_v = ctx.frame->at(in->target2).get();
-            ML_VM_CHECK(base_v.is<SharedArrayObj>());
-            const SharedArrayObj &outer = base_v.get_ref<SharedArrayObj>();
-            const int_type idx = read_int_operand(in->a(), &ctx);
-            const EvalValue &elem =
-                outer.get_vec()[outer.offset() + idx].get();
-            const int_type N = in->b_lit();
-            if (!elem.is<SharedArrayObj>())
-                vm_throw_unpack_nonarray(*chunk, pc, N);
-            const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
-            if (sub.size() != static_cast<size_type>(N))
-                vm_throw_unpack_len(*chunk, pc, sub.size(), N);
-            const std::vector<int32_t> &targets =
-                chunk->unpack_targets[in->target];
-            for (int_type k = 0; k < N; k++) {
-                if (targets[k] >= 0)
-                    ctx.frame->at(targets[k]).put(
-                        vm_arr_elem(elem, static_cast<size_type>(k)));
-                }
+            /* STRICT foreach-unpack with a per-position target list (`_` /
+             * non-consecutive slots) - the shared body over the
+             * unpack_targets pool entry. */
+            vm_unpack_elem_body(ctx, ctx.frame->at(in->target2).get(),
+                                read_int_operand(in->a(), &ctx), in->b_lit(),
+                                /*kind=*/2, /*dst_base=*/-1,
+                                &chunk->unpack_targets[in->target], chunk, pc);
             pc++;
         }
         VM_NEXT;
 
         VM_CASE(StoreElemInt): {
 
-            /* a[i] = v / a[i] OP= v for a flat mutable int array (mirrors the
-             * int path of try_flat_subscript_store, COW), and a[i] = <bool>
-             * for a flat bool array (P1: plain assign only - no compound
-             * for bool; the value operand is the bool's 0/1, written to bvec).
-             * Anything else (const / read-only / general / float / dyn, or a
-             * COMPOUND on a bool array) takes the UNIVERSAL vm_subscript_store
-             * fallback (box the already-computed index/value operands, map the
-             * base op back to its Expr14 op) - AST-free and byte-identical to
-             * the tree-walker (the same path StoreElemValue uses). The base may
-             * be a global/capture array (in->target = the slot kind); the caret
-             * comes from the loc side table - looked up LAZILY, only on the cold
-             * throw/fallback paths, so the hot store pays no binary search. */
+            /* a[i] = v / a[i] OP= v for a flat mutable int/bool array (COW),
+             * else the UNIVERSAL vm_subscript_store fallback (const / general
+             * / dyn). The store logic lives in vm_store_elem_int_body, SHARED
+             * with the approach-A JIT helper jit_store_elem_int - so a native
+             * store fragment runs byte-identical C++ (see plans/archived/native-aot.md).
+             * The base may be a global/capture array (in->target = the slot
+             * kind); the caret comes from the loc side table, looked up LAZILY
+             * on the cold throw/fallback path only. */
             LValue &alv =
                 *vm_store_base(ctx, in->target, in->target2, *chunk, pc,
                                nullptr);
-            if (alv.is<SharedArrayObj>()) {
-                SharedArrayObj &arr = alv.getval<SharedArrayObj>();
-                const auto sk = arr.skind();
-                const bool is_bool = sk == SharedArrayObj::Storage::bools;
-                if ((sk == SharedArrayObj::Storage::ints
-                     || (is_bool && in->aop == Op::invalid))
-                    && !alv.is_const_var() && !arr.is_readonly()) {
-                    int_type idx = read_int_operand(in->a(), &ctx);
-                    if (idx < 0)
-                        idx += arr.size();
-                    if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
-                        vm_throw_oob(*chunk, pc);
-                    const int_type rhs = read_int_operand(in->b(), &ctx);
-                    /* div/mod by zero throws BEFORE any clone (tree-walker
-                     * throws during the op eval, before the COW). */
-                    if ((in->aop == Op::div || in->aop == Op::mod) && rhs == 0)
-                        vm_throw_div0(*chunk, pc);
-                    if (arr.is_slice())
-                        arr.clone_internal_vec();
-                    else if (arr.use_count() > 1)
-                        arr.clone_aliased_slices(arr.offset() + idx);
-                    if (is_bool) {
-                        arr.flat_bools()[arr.offset() + idx] = rhs ? 1 : 0;
-                        arr.invalidate_hash();
-                        pc++;
-                        VM_NEXT;
-                    }
-                    int_type &el = arr.flat_ints()[arr.offset() + idx];
-                    switch (in->aop) {
-                    case Op::invalid: el = rhs;  break;
-                    case Op::plus:    el += rhs; break;
-                    case Op::minus:   el -= rhs; break;
-                    case Op::times:   el *= rhs; break;
-                    case Op::div:     el /= rhs; break;
-                    case Op::mod:     el %= rhs; break;
-                    default: throw InternalErrorEx();
-                    }
-                    arr.invalidate_hash();
-                    pc++;
-                    VM_NEXT;
-                }
-            }
-            {
-                Loc ls, le;
-                chunk->loc_at(pc, ls, le);
-                vm_subscript_store(&alv,
-                                   EvalValue(read_int_operand(in->a(), &ctx)),
-                                   EvalValue(read_int_operand(in->b(), &ctx)),
-                                   vm_base_to_expr14_op(in->aop), ls, le);
+            try {
+                vm_store_elem_int_body(alv, read_int_operand(in->a(), &ctx),
+                                       read_int_operand(in->b(), &ctx),
+                                       in->aop, chunk, pc);
+            } catch (Exception &e) {
+                /* the universal fallback's loc-less throws (a read-only
+                 * base's OOB, an operation error) - RULE 2 */
+                vm_stamp_caret(*chunk, pc, e);
+                throw;
             }
             pc++;
         }
@@ -2843,45 +12973,13 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             LValue &alv =
                 *vm_store_base(ctx, in->target, in->target2, *chunk, pc,
                                nullptr);
-            if (alv.is<SharedArrayObj>()) {
-                SharedArrayObj &arr = alv.getval<SharedArrayObj>();
-                if (arr.skind() == SharedArrayObj::Storage::floats
-                    && !alv.is_const_var() && !arr.is_readonly()) {
-                    int_type idx = read_int_operand(in->a(), &ctx);
-                    if (idx < 0)
-                        idx += arr.size();
-                    if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
-                        vm_throw_oob(*chunk, pc);
-                    const float_type rhs = read_float_operand(in->b(), &ctx);
-                    if ((in->aop == Op::div || in->aop == Op::mod)
-                            && rhs == 0.0)
-                        vm_throw_div0(*chunk, pc);
-                    if (arr.is_slice())
-                        arr.clone_internal_vec();
-                    else if (arr.use_count() > 1)
-                        arr.clone_aliased_slices(arr.offset() + idx);
-                    float_type &el = arr.flat_floats()[arr.offset() + idx];
-                    switch (in->aop) {
-                    case Op::invalid: el = rhs;               break;
-                    case Op::plus:    el += rhs;              break;
-                    case Op::minus:   el -= rhs;              break;
-                    case Op::times:   el *= rhs;              break;
-                    case Op::div:     el /= rhs;              break;
-                    case Op::mod:     el = std::fmod(el, rhs); break;
-                    default: throw InternalErrorEx();
-                    }
-                    arr.invalidate_hash();
-                    pc++;
-                    VM_NEXT;
-                }
-            }
-            {
-                Loc ls, le;
-                chunk->loc_at(pc, ls, le);
-                vm_subscript_store(&alv,
-                                   EvalValue(read_int_operand(in->a(), &ctx)),
-                                   EvalValue(read_float_operand(in->b(), &ctx)),
-                                   vm_base_to_expr14_op(in->aop), ls, le);
+            try {
+                vm_store_elem_float_body(alv, read_int_operand(in->a(), &ctx),
+                                         read_float_operand(in->b(), &ctx),
+                                         in->aop, chunk, pc);
+            } catch (Exception &e) {
+                vm_stamp_caret(*chunk, pc, e);   /* see StoreElemInt */
+                throw;
             }
             pc++;
         }
@@ -2904,10 +13002,10 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * the hot case - pays no loc_at binary search); vm_subscript_store
              * uses it only when it throws. */
             try {
-                vm_subscript_store(&dlv, key, val, in->aop, Loc(), Loc());
+                vm_subscript_store(&dlv, key, val, in->aop, Loc(), Loc(),
+                                   in->ct_checked());
             } catch (Exception &e) {
-                if (!e.loc_start)
-                    chunk->loc_at(pc, e.loc_start, e.loc_end);
+                vm_stamp_caret(*chunk, pc, e);
                 throw;
             }
             pc++;
@@ -2929,7 +13027,12 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 vm_member_store(blv, mk.memUid, in->aop, val,
                                 mk.mstart, mk.mend, mk.bstart, mk.bend);
             } catch (Exception &e) {
-                if (!e.loc_start) {          /* a compound div/mod is loc-less */
+                /* a compound's OPERATION error carets the whole
+                 * expression (op_locs); anything else loc-less the
+                 * member (RULE 2) */
+                if (!e.loc_start
+                    && !(e.op_caret
+                         && chunk->op_loc_at(pc, e.loc_start, e.loc_end))) {
                     e.loc_start = mk.mstart;
                     e.loc_end = mk.mend;
                 }
@@ -2952,10 +13055,10 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             const EvalValue &val = ctx.frame->at(in->b_slot()).get();
             /* Loc looked up LAZILY on the throw path only (see DictStore). */
             try {
-                vm_subscript_store(&alv, idx, val, in->aop, Loc(), Loc());
+                vm_subscript_store(&alv, idx, val, in->aop, Loc(), Loc(),
+                                   in->ct_checked());
             } catch (Exception &e) {
-                if (!e.loc_start)
-                    chunk->loc_at(pc, e.loc_start, e.loc_end);
+                vm_stamp_caret(*chunk, pc, e);
                 throw;
             }
             pc++;
@@ -2973,8 +13076,17 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             const EvalValue &k1 = ctx.frame->at(in->a_dual_lo()).get();
             const EvalValue &k2 = ctx.frame->at(in->b_slot()).get();
             const EvalValue &val = ctx.frame->at(in->target).get();
-            vm_nested_subscript_store(&alv, k1, k2, val, in->aop,
-                                      chunk->chain_locs[in->a_dual_hi()].data());
+            try {
+                vm_nested_subscript_store(
+                    &alv, k1, k2, val, in->aop,
+                    chunk->chain_locs[in->a_dual_hi()].data(),
+                    in->ct_checked());
+            } catch (Exception &e) {
+                /* an operation error left loc-less by the per-step
+                 * carets: the whole expression's (op_locs) */
+                vm_stamp_caret(*chunk, pc, e);
+                throw;
+            }
             pc++;
         }
         VM_NEXT;
@@ -2989,8 +13101,14 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                                          *chunk, pc, nullptr);
             const EvalValue &val = ctx.frame->at(in->target).get();
             const auto &cl = chunk->chain_locs[in->a_dual_lo()];
-            vm_chain_store_op(ctx, base, in->b_lit(), cl.data(), cl.size(),
-                              val, in->aop);
+            try {
+                vm_chain_store_op(ctx, base, in->b_lit(), cl.data(),
+                                  cl.size(), val, in->aop,
+                                  in->ct_checked());
+            } catch (Exception &e) {
+                vm_stamp_caret(*chunk, pc, e);   /* see StoreElem2V */
+                throw;
+            }
             pc++;
         }
         VM_NEXT;
@@ -3005,11 +13123,11 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                                          *chunk, pc, nullptr);
             const EvalValue &val = ctx.frame->at(in->target).get();
             try {
-                vm_chain_lvalue_store_op(ctx, *chunk, base, in->a_dual_lo(), val,
-                                         in->aop);
+                vm_chain_lvalue_store_op(ctx, chunk->chain_steps[in->a_dual_lo()],
+                                         chunk->member_keys.data(), base, val,
+                                         in->aop, in->ct_checked());
             } catch (Exception &e) {
-                if (!e.loc_start)
-                    chunk->loc_at(pc, e.loc_start, e.loc_end);
+                vm_stamp_caret(*chunk, pc, e);
                 throw;
             }
             pc++;
@@ -3018,66 +13136,16 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 
         VM_CASE(MultiUnpackV): {
 
-            /* Multi-assign `a, b, c = <rvalue>` (F-1): the tree-walker's STRICT
-             * destructure, AST-free. An ARRAY rvalue must have EXACTLY as many
-             * elements as targets (else the length TypeErrorEx, caret from the
-             * side table); each element (box-free for a flat scalar via
-             * vm_arr_elem) writes to its target slot (-1 == `_`, skipped). A
-             * NON-array rvalue SPREADS to every target. */
-            const EvalValue &rval = ctx.frame->at(in->a_slot()).get();
-            const std::vector<int32_t> &targets =
-                chunk->unpack_targets[in->target];
-            /* Typed targets (R5): a PLAIN assign coerces each stored value
-             * per target (widen / dyn-narrowing throw, Expr14-span caret);
-             * a compound doesn't coerce. Kinds from the unpack_coerce pool. */
-            const std::vector<unsigned char> *coerce =
-                in->b_is_lit() ? &chunk->unpack_coerce[in->b_lit()] : nullptr;
-            /* A COMPOUND `a, b OP= rhs` (in->aop != invalid): each target reads
-             * its CURRENT value, applies the op with its element/scalar, writes
-             * back — else a plain distribute. */
-            const bool compound = in->aop != Op::invalid;
-            size_t ti = 0;
-            auto store = [&](int32_t t, const EvalValue &v) {
-                if (!compound) {
-                    if (coerce && (*coerce)[ti]) {
-                        try {
-                            ctx.frame->at(t).put(vm_coerce_decl_num(
-                                v, (*coerce)[ti] == 2));
-                        } catch (Exception &e) {
-                            vm_stamp_loc(*chunk, pc, e);
-                            throw;
-                        }
-                        return;
-                    }
-                    ctx.frame->at(t).put(v);
-                    return;
-                }
-                EvalValue nv = ctx.frame->at(t).get();
-                try {
-                    num_bin_op(nv, v, binop_pmf(in->aop));
-                } catch (Exception &e) {
-                    vm_stamp_loc(*chunk, pc, e);
-                    throw;
-                }
-                ctx.frame->at(t).put(std::move(nv));
-            };
-            if (rval.is<SharedArrayObj>()) {
-                const size_type m = rval.get_ref<SharedArrayObj>().size();
-                if (m != static_cast<size_type>(targets.size()))
-                    vm_throw_multi_unpack_len(*chunk, pc, m, targets.size());
-                for (size_t i = 0; i < targets.size(); i++) {
-                    ti = i;
-                    if (targets[i] >= 0)
-                        store(targets[i],
-                              vm_arr_elem(rval, static_cast<size_type>(i)));
-                }
-            } else {
-                for (size_t i = 0; i < targets.size(); i++) {
-                    ti = i;
-                    if (targets[i] >= 0)
-                        store(targets[i], rval);
-                }
-            }
+            /* Multi-assign `a, b, c = <rvalue>` (F-1): the tree-walker's
+             * STRICT destructure / spread, via the shared body (also
+             * jit_multi_unpack's). Typed targets coerce per the
+             * unpack_coerce pool; a compound applies the base op per
+             * target. */
+            vm_multi_unpack_body(
+                ctx, ctx.frame->at(in->a_slot()).get(),
+                chunk->unpack_targets[in->target],
+                in->b_is_lit() ? &chunk->unpack_coerce[in->b_lit()] : nullptr,
+                in->aop, chunk, pc);
             pc++;
         }
         VM_NEXT;
@@ -3102,6 +13170,11 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             if (base.is<intrusive_ptr<DictObject>>())
                 if (const EvalValue *v = dict_present_value(
                         base.get_ref<intrusive_ptr<DictObject>>(), key)) {
+                    /* a laundered misfit raises at this read's caret
+                     * (reads_as_int): write_scalar_slot's throw is
+                     * loc-less, and nothing here stamps it */
+                    if (!(is_int ? reads_as_int(*v) : reads_as_float(*v)))
+                        vm_elem_type_error(chunk, pc, nullptr);
                     write_scalar_slot(&ctx, in->target, is_int, *v);
                     pc++;
                     VM_NEXT;
@@ -3132,13 +13205,12 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             const int_type base = in->a_lit(), n = in->b_lit();
             try {
                 if (n <= 8) {
-                    EvalValue stackbuf[8];
-                    for (int_type i = 0; i < n; i++) {
-                        stackbuf[i] = ctx.frame->at(base + i).get();
-                }
+                    SmallArgs<8> stackbuf;            /* #97 B1 */
+                    for (int_type i = 0; i < n; i++)
+                        stackbuf.push(ctx.frame->at(base + i).get());
                     ArgLocs al = chunk->arglocs_at(in->target2);
                     ctx.frame->at(in->target).put(
-                        bc.builtin.func_v(&ctx, &al, stackbuf, n));
+                        bc.builtin.func_v(&ctx, &al, stackbuf.data(), n));
                 } else {
                     ctx.frame->at(in->target).put(
                         vm_call_builtin_big(ctx, *chunk, in->target2, base, n));
@@ -3161,7 +13233,12 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * multiplied by VM recursion depth). `target2` = the ArrHint; never
              * throws. */
             ctx.frame->at(in->target).put(vm_make_array(
-                ctx, in->a_lit(), in->b_lit(), static_cast<ArrHint>(in->target2)));
+                ctx, in->a_lit(), in->b_lit(),
+                static_cast<ArrHint>(in->target2 & 0xff)));
+            /* Q2: the type it is made with (target2's high bits) */
+            stamp_ctype_top(ctx.frame->at(in->target).get(),
+                        chunk->ctype_ref(
+                            static_cast<unsigned>(in->target2) >> 8));
             pc++;
         }
         VM_NEXT;
@@ -3169,9 +13246,20 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         VM_CASE(MakeDictV): {
 
             /* Build a dict LITERAL via vm_make_dict (key/value buffer kept out
-             * of vm_run_chunk's frame). Never throws (all values hashable). */
-            ctx.frame->at(in->target).put(
-                vm_make_dict(ctx, in->a_lit(), in->b_lit()));
+             * of vm_run_chunk's frame). It FREEZES + HASHES each key, so an
+             * UNHASHABLE key (a function value laundered through `dyn`) throws
+             * TypeErrorEx - stamp the literal's caret from the loc side table,
+             * matching the tree-walker's Construct::eval stamp. */
+            try {
+                ctx.frame->at(in->target).put(
+                    vm_make_dict(ctx, in->a_lit(), in->b_lit()));
+            } catch (Exception &e) {
+                vm_stamp_loc(*chunk, pc, e);
+                throw;
+            }
+            stamp_ctype_top(ctx.frame->at(in->target).get(),   /* Q2 */
+                            chunk->ctype_ref(
+                                static_cast<unsigned>(in->target2)));
             pc++;
         }
         VM_NEXT;
@@ -3183,9 +13271,21 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * FuncDescriptor* from the pool (the Instr holds only the index) -
              * no AST. The ctor never throws (a resolved closure's captures are
              * defined), so no loc. */
-            ctx.frame->at(in->target).put(EvalValue(intrusive_ptr<FuncObject>(
-                make_intrusive<FuncObject>(chunk->closure_defs[in->target2],
-                                           &ctx))));
+            if (in->a_dual_hi() > 0) {
+                /* #97 increment 3: spliced from a factory - every capture
+                 * a frame local, `off` slots higher than the descriptor
+                 * says (the verifier bounded the span) */
+                const FuncDescriptor *cd = chunk->closure_defs[in->target2];
+                const int off = make_closure_offset(*in, cd);
+                ctx.frame->at(in->target).put(EvalValue(
+                    intrusive_ptr<FuncObject>(make_intrusive<FuncObject>(
+                        cd, get_root_ctx(&ctx), &ctx.frame->at(off),
+                        FuncObject::LocalCaptures()))));
+            } else {
+                ctx.frame->at(in->target).put(EvalValue(
+                    intrusive_ptr<FuncObject>(make_intrusive<FuncObject>(
+                        chunk->closure_defs[in->target2], &ctx))));
+            }
             pc++;
         }
         VM_NEXT;
@@ -3197,11 +13297,21 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * ctor's loc (side table). */
             StructTypeDef *def =
                 const_cast<StructTypeDef *>(chunk->struct_defs[in->target2]);
-            try {
-                vm_struct_ctor(ctx, def, in->a_lit(), in->b_lit(), in->target);
-            } catch (Exception &e) {
-                vm_stamp_loc(*chunk, pc, e);
-                throw;
+            const int32_t plan = in->b_dual_hi();
+            if (plan >= 0) {
+                /* the baked plan: raw reads (from each field's src slot -
+                 * a computed-run temp or a direct local), direct byte
+                 * stores, no coerce calls, never throws */
+                vm_struct_ctor_planned(ctx, def, chunk->ctor_plans[plan],
+                                       in->target);
+            } else {
+                try {
+                    vm_struct_ctor(ctx, def, in->a_lit(), in->b_dual_lo(),
+                                   in->target);   /* unplanned: a = run base */
+                } catch (Exception &e) {
+                    vm_stamp_loc(*chunk, pc, e);
+                    throw;
+                }
             }
             pc++;
         }
@@ -3214,13 +13324,15 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             const Chunk::ThrowSite &t = chunk->throws[in->target];
             switch (t.kind) {
                 case Chunk::ThrowKind::undefined_var:
+                    /* UNDEFINED, not unbound: codegen emits this kind ONLY
+                     * for a SymKind::unresolved name - a name with no slot
+                     * anywhere. After FIX-1 (#130) that is `_` (never bound
+                     * by design) and the REPL's open world. An unbound
+                     * GLOBAL has a slot and goes through
+                     * LoadGlobalV/StoreGlobalV, which raise UnboundSymbolEx. */
                     throw UndefinedVariableEx(t.name->val, t.start, t.end);
                 case Chunk::ThrowKind::not_lvalue:
                     throw NotLValueEx(t.start, t.end);
-                case Chunk::ThrowKind::rebind_builtin:
-                    throw CannotRebindBuiltinEx(t.start, t.end);
-                case Chunk::ThrowKind::rebind_const:
-                    throw CannotRebindConstEx(t.start, t.end);
                 case Chunk::ThrowKind::bad_args:
                     throw InvalidNumberOfArgsEx(t.start, t.end);
             }
@@ -3237,7 +13349,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             ctx.frame->at(in->target).put(vm_struct_ctor_boxed(
                 ctx, def, in->a_lit(),
                 static_cast<int_type>(bc.arg_locs.size()),
-                bc.arg_locs.data()));
+                bc.arg_locs.data(), bc.fit));
             pc++;
         }
         VM_NEXT;
@@ -3265,28 +13377,62 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             /* pts[i].f (scalar int/bool field) read straight from the flat
              * struct-array bytes into a slot - the struct-foreach direct read,
              * no StructObject. target2 = the array slot, a = the counter, b =
-             * the field index. */
-            write_int_slot(&ctx, in->target,
-                vm_struct_field_int(ctx.frame->at(in->target2).get(),
-                                    read_int_operand(in->a(), &ctx), in->b_lit()));
+             * the field index. `struct_checked` is G4's SUBSCRIPT form: it
+             * wraps a negative index, bounds-checks (OutOfBoundsEx, stamped
+             * with this op's caret) and also serves a PROMOTED general array. */
+            if (in->struct_checked()) {
+                try {
+                    write_int_slot(&ctx, in->target,
+                        vm_struct_elem_field_int(
+                            ctx.frame->at(in->target2).get(),
+                            read_int_operand(in->a(), &ctx), in->b_lit()));
+                } catch (Exception &e) {
+                    vm_stamp_loc(*chunk, pc, e);
+                    throw;
+                }
+            } else {
+                write_int_slot(&ctx, in->target,
+                    vm_struct_field_int(ctx.frame->at(in->target2).get(),
+                                        read_int_operand(in->a(), &ctx),
+                                        in->b_lit()));
+            }
             pc++;
             VM_NEXT;
 
         VM_CASE(LoadStructElemV):
             /* Whole-`p` foreach bind: materialize a fresh StructObject from the
              * flat struct-array element into the loop var. target = loop var,
-             * target2 = the array slot, a = the counter. */
-            ctx.frame->at(in->target).put(
-                vm_struct_elem(ctx.frame->at(in->target2).get(),
-                               read_int_operand(in->a(), &ctx)));
+             * target2 = the array slot, a = the counter. #53: the element
+             * may be GONE (the body shrank the array) - the loc-less
+             * OutOfBoundsEx takes the container's caret here. */
+            try {
+                vm_struct_elem_into(ctx.frame->at(in->target),
+                                    ctx.frame->at(in->target2).get(),
+                                    read_int_operand(in->a(), &ctx));
+            } catch (Exception &e) {
+                vm_stamp_loc(*chunk, pc, e);
+                throw;
+            }
             pc++;
             VM_NEXT;
 
         VM_CASE(LoadStructFieldFloat):
-            write_float_slot(&ctx, in->target,
-                vm_struct_field_float(ctx.frame->at(in->target2).get(),
-                                      read_int_operand(in->a(), &ctx),
-                                      in->b_lit()));
+            if (in->struct_checked()) {         /* G4: the subscript form */
+                try {
+                    write_float_slot(&ctx, in->target,
+                        vm_struct_elem_field_float(
+                            ctx.frame->at(in->target2).get(),
+                            read_int_operand(in->a(), &ctx), in->b_lit()));
+                } catch (Exception &e) {
+                    vm_stamp_loc(*chunk, pc, e);
+                    throw;
+                }
+            } else {
+                write_float_slot(&ctx, in->target,
+                    vm_struct_field_float(ctx.frame->at(in->target2).get(),
+                                          read_int_operand(in->a(), &ctx),
+                                          in->b_lit()));
+            }
             pc++;
             VM_NEXT;
 
@@ -3294,19 +13440,17 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             /* D1: `append(a, x)` / `push(a, x)` - the CallBuiltinLV shape
              * with the marshaling deleted. arr_append_fast appends a fitting
              * element in place (flat or general, hash maintained); any other
-             * shape (const/readonly/slice/non-array/flat mismatch/undefined
-             * global -> null target) falls back to the FULL builtin via the
-             * pooled carets - byte-identical errors and result. */
-            LValue *target;
-            switch (in->a_dual_hi()) {
-            case 0:  target = &ctx.frame->at(in->target2); break;
-            case 1:  target = ctx.gfuncs->defined[in->target2]
-                                  ? &ctx.gfuncs->slots[in->target2]
-                                  : nullptr;                     break;
-            default: target = &(*ctx.captures)[in->target2];    break;
-            }
+             * shape (const/readonly/slice/non-array/flat mismatch) falls
+             * back to the FULL builtin via the pooled carets - byte-identical
+             * errors and result. An unbound global arg0 raises
+             * UnboundSymbolEx at its own caret, as reading it does (#32). */
+            LValue *target = vm_store_base(ctx, in->a_dual_hi(),
+                                           in->target2, *chunk, pc, nullptr);
             const EvalValue &elem = ctx.frame->at(in->b_lit()).get();
-            if (target && arr_append_fast(target, elem, false)) {
+            /* Q2: a checked append (through `dyn`) takes the full builtin,
+             * which checks the element against the array's own type */
+            if (!chunk->builtin_calls[in->a_dual_lo()].ct_store
+                    && arr_append_fast(target, elem, false)) {
                 /* Call-cluster #4: a DISCARDED result (`append(a, x);` as a
                  * statement - the peephole proved the dst temp dead and set
                  * it to -1) skips materializing the array handle: one
@@ -3318,8 +13462,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             }
             try {
                 EvalValue res =
-                    vm_call_builtin_lv_rest(ctx, *chunk, in->a_dual_lo(),
-                                            target, in->b_lit());
+                    vm_call_builtin_lv_rest(
+                        ctx, chunk->builtin_calls[in->a_dual_lo()],
+                        target, in->b_lit());
                 if (in->target >= 0)
                     ctx.frame->at(in->target).put(std::move(res));
             } catch (Exception &e) {
@@ -3338,27 +13483,17 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * builtin_calls pool (a.slot). A REST-NATIVE op (`b` set) gets its
              * value args from the register run at `b`; a `b`-unset op (pop/intptr
              * - no value args) gets an empty rest. Mirrors Identifier::do_eval
-             * for each kind: a not-yet-defined global -> null target ->
-             * NotLValueEx, like the tree-walker. */
+             * for each kind: a not-yet-bound global raises UnboundSymbolEx at
+             * its own caret (base_locs), as the tree-walker's read does. */
             const Chunk::BuiltinCall &bc = chunk->builtin_calls[in->a_dual_lo()];
-            LValue *target;
-            switch (in->a_dual_hi()) {
-            case 0:   /* local */
-                target = &ctx.frame->at(in->target2);
-                break;
-            case 1:   /* global */
-                target = ctx.gfuncs->defined[in->target2]
-                             ? &ctx.gfuncs->slots[in->target2] : nullptr;
-                break;
-            default:  /* capture */
-                target = &(*ctx.captures)[in->target2];
-                break;
-            }
+            LValue *target = vm_store_base(ctx, in->a_dual_hi(), in->target2,
+                                           *chunk, pc, nullptr);
             try {
                 if (in->b_is_lit()) {
                     ctx.frame->at(in->target).put(
-                        vm_call_builtin_lv_rest(ctx, *chunk, in->a_dual_lo(), target,
-                                                in->b_lit()));
+                        vm_call_builtin_lv_rest(
+                            ctx, chunk->builtin_calls[in->a_dual_lo()], target,
+                            in->b_lit()));
                 } else {
                     ArgLocs al = chunk->arglocs_at(in->a_dual_lo());
                     ctx.frame->at(in->target).put(
@@ -3386,13 +13521,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * kind | idx << 2); the whole-args caret from the loc table. */
             const Chunk::EmplaceSite &site =
                 chunk->emplace_sites[in->a_lit() >> 2];
-            LValue *target;
-            switch (in->a_lit() & 3) {
-            case 0:  target = &ctx.frame->at(in->target2); break;
-            case 1:  target = ctx.gfuncs->defined[in->target2]
-                         ? &ctx.gfuncs->slots[in->target2] : nullptr; break;
-            default: target = &(*ctx.captures)[in->target2]; break;
-            }
+            LValue *target = vm_store_base(ctx, in->a_lit() & 3, in->target2,
+                                           *chunk, pc, nullptr);
             try {
                 ctx.frame->at(in->target).put(
                     vm_do_emplace(ctx, site, target, in->b_lit()));
@@ -3412,36 +13542,27 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * Subscript::do_eval uses, given the identical base LValue* - and
              * call func_lv REST-NATIVE. `b` = the run base: run[0] = the index,
              * run[1..] = the pre-evaluated value args (append/push 1, pop 0). A
-             * non-lvalue element (a flat scalar / read-only / missing dict key,
-             * which throws) gives a null target -> NotLValueEx, like the
-             * tree-walker. AST-FREE: Builtin + carets from the pool (a.slot). */
+             * non-lvalue element (a flat scalar, a read-only container's) is
+             * a value the builtin works on held, like the tree-walker (a
+             * missing dict key throws). AST-FREE: Builtin + carets from the
+             * pool (a.slot). An unbound global base raises UnboundSymbolEx
+             * at its own caret (base_locs, #32). */
             const Chunk::BuiltinCall &bc = chunk->builtin_calls[in->a_dual_lo()];
-            LValue *base;
-            switch (in->a_dual_hi()) {
-            case 0:  base = &ctx.frame->at(in->target2); break;
-            case 1:  base = ctx.gfuncs->defined[in->target2]
-                         ? &ctx.gfuncs->slots[in->target2] : nullptr; break;
-            default: base = &(*ctx.captures)[in->target2]; break;
-            }
+            LValue *base = vm_store_base(ctx, in->a_dual_hi(), in->target2,
+                                         *chunk, pc, nullptr);
             const int_type n_rest = static_cast<int_type>(bc.args.size()) - 1;
             try {
                 EvalValue holder;   /* keeps the subscript result alive */
-                LValue *elem = nullptr;
-                if (base) {
-                    const EvalValue &idx = ctx.frame->at(in->b_lit()).get();
-                    holder = base->get().get_type()->subscript(
-                        EvalValue(base), idx, /*for_write=*/false);
-                    if (holder.is<LValue *>())
-                        elem = holder.get<LValue *>();
-                }
-                EvalValue restbuf[8];   /* n_rest is small (append 1, pop 0) */
-                for (int_type i = 0; i < n_rest; i++) {
-                    restbuf[i] = ctx.frame->at(in->b_lit() + 1 + i).get();
-                }
+                LValue hold;
+                LValue *elem = vm_builtin_elem_target(
+                    base, ctx.frame->at(in->b_lit()).get(), holder, hold);
+                SmallArgs<8> restbuf;   /* n_rest small (append 1, pop 0) */
+                for (int_type i = 0; i < n_rest; i++)
+                    restbuf.push(ctx.frame->at(in->b_lit() + 1 + i).get());
                 ArgLocs al = chunk->arglocs_at(in->a_dual_lo());
                 ctx.frame->at(in->target).put(
                     bc.builtin.func_lv(&ctx, &al, elem,
-                                       n_rest ? restbuf : nullptr,
+                                       n_rest ? restbuf.data() : nullptr,
                                        static_cast<size_t>(n_rest)));
             } catch (Exception &e) {
                 if (!e.loc_start) {
@@ -3462,30 +13583,24 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * vm_member_lvalue (same checks as the tree-walker's MemberExpr),
              * then call func_lv REST-NATIVE. `b` = the rest run (values, NO
              * index — unlike LVElem). AST-free: Builtin + carets + field name
-             * from the pool (a.slot). */
+             * from the pool (a.slot). The CHAIN form (#32, `bc.steps`) walks
+             * the base to the location instead. An unbound global base raises
+             * UnboundSymbolEx at its own caret (base_locs). */
             const Chunk::BuiltinCall &bc = chunk->builtin_calls[in->a_dual_lo()];
-            LValue *base;
-            switch (in->a_dual_hi()) {
-            case 0:  base = &ctx.frame->at(in->target2); break;
-            case 1:  base = ctx.gfuncs->defined[in->target2]
-                         ? &ctx.gfuncs->slots[in->target2] : nullptr; break;
-            default: base = &(*ctx.captures)[in->target2]; break;
-            }
+            LValue *base = vm_store_base(ctx, in->a_dual_hi(), in->target2,
+                                         *chunk, pc, nullptr);
             const int_type n_rest = static_cast<int_type>(bc.args.size()) - 1;
             try {
-                LValue *field = nullptr;
-                if (base)
-                    field = vm_member_lvalue(base, bc.member,
-                                             bc.args[0].start, bc.args[0].end,
-                                             bc.args[0].start, bc.args[0].end);
-                EvalValue restbuf[8];   /* append/push 1 value arg */
-                for (int_type i = 0; i < n_rest; i++) {
-                    restbuf[i] = ctx.frame->at(in->b_lit() + i).get();
-                }
+                LValue hold;
+                LValue *field = vm_lv_member_target(
+                    ctx, chunk->member_keys.data(), bc, base, hold);
+                SmallArgs<8> restbuf;   /* append/push 1 value arg */
+                for (int_type i = 0; i < n_rest; i++)
+                    restbuf.push(ctx.frame->at(in->b_lit() + i).get());
                 ArgLocs al = chunk->arglocs_at(in->a_dual_lo());
                 ctx.frame->at(in->target).put(
                     bc.builtin.func_lv(&ctx, &al, field,
-                                       n_rest ? restbuf : nullptr,
+                                       n_rest ? restbuf.data() : nullptr,
                                        static_cast<size_t>(n_rest)));
             } catch (Exception &e) {
                 if (!e.loc_start) {
@@ -3518,8 +13633,10 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             if (!ctx.gfuncs->defined[in->target2]) {
                 Loc s, en;
                 chunk->loc_at(pc, s, en);
-                throw UndefinedVariableEx(
-                    ctx.gfuncs->names[in->target2]->val, s, en);
+                throw UnboundSymbolEx(
+                    intern_msg("'" +
+                               std::string(ctx.gfuncs->names[in->target2]->val)
+                               + "' is not bound yet"), s, en);
             }
             const EvalValue &callee = ctx.gfuncs->slots[in->target2].get();
             if (!callee.is<intrusive_ptr<FuncObject>>()) {
@@ -3527,7 +13644,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 chunk->loc_at(pc, s, en);
                 throw NotCallableEx(s, en);
             }
-            FuncObject &fo = *callee.get<intrusive_ptr<FuncObject>>().get();
+            FuncObject &fo = *callee.get_ref<intrusive_ptr<FuncObject>>().get();
 
             if (!fo.func->vm_chunk_tried) {       /* AOT net, as before */
                 fo.func->vm_chunk = vm_func_chunk(fo.func);
@@ -3548,9 +13665,18 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                     pc++;
                     VM_NEXT;
                 }
-                vm_enter_call(act, ctx, chunk, pc, fo, cck, in->a_lit(),
-                              static_cast<size_t>(in->b_lit()), in->target,
-                              std::move(pending_key));
+                /* lever 1: the common shape (plain-copy bind, no live
+                 * cache miss-key) takes the lean push - no unique_ptr
+                 * ABI, one call layer. */
+                if (fo.func->fast_bind && !pending_key)
+                    vm_enter_call_lean(act, ctx, chunk, pc, fo, cck,
+                                       in->a_lit(),
+                                       static_cast<size_t>(in->b_lit()),
+                                       in->target);
+                else
+                    vm_enter_call(act, ctx, chunk, pc, fo, cck, in->a_lit(),
+                                  static_cast<size_t>(in->b_lit()),
+                                  in->target, std::move(pending_key));
                 code = chunk->code.data();
                 VM_NEXT;
             }
@@ -3568,9 +13694,9 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * THIS call was spliced from inlined code, flush its virtual frames
              * as the exception passes through. */
             if (g_vm_exc_pending) {
-                vm_flush_inline(*chunk, pc, *g_vm_exc_pending);
-                if (vm_dispatch_exc(act, cur_rec(), pc)) {
-                    cur_rec().exc = std::move(g_vm_exc_pending);
+                vm_flush_inline_call(*chunk, pc, *g_vm_exc_pending);
+                if (vm_dispatch_exc(act, cur_rec(), ctx, pc,
+                                    g_vm_exc_pending)) {
                     VM_NEXT_COLD;
                 }
                 return;
@@ -3594,7 +13720,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 chunk->loc_at(pc, s, en);
                 throw NotCallableEx(s, en);
             }
-            FuncObject &fo = *callee.get<intrusive_ptr<FuncObject>>().get();
+            FuncObject &fo = *callee.get_ref<intrusive_ptr<FuncObject>>().get();
 
             if (!fo.func->vm_chunk_tried) {       /* AOT net, as before */
                 fo.func->vm_chunk = vm_func_chunk(fo.func);
@@ -3602,9 +13728,15 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             }
             if (const Chunk *cck =
                     static_cast<const Chunk *>(fo.func->vm_chunk)) {
-                vm_enter_call(act, ctx, chunk, pc, fo, cck, in->a_lit(),
-                              static_cast<size_t>(in->b_lit()), in->target,
-                              nullptr);
+                if (fo.func->fast_bind)          /* lever 1: lean push */
+                    vm_enter_call_lean(act, ctx, chunk, pc, fo, cck,
+                                       in->a_lit(),
+                                       static_cast<size_t>(in->b_lit()),
+                                       in->target);
+                else
+                    vm_enter_call(act, ctx, chunk, pc, fo, cck, in->a_lit(),
+                                  static_cast<size_t>(in->b_lit()),
+                                  in->target, nullptr);
                 code = chunk->code.data();
                 VM_NEXT;
             }
@@ -3613,9 +13745,10 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             EvalValue res = vm_call_func(&ctx, fo, ap, in->b_lit(), chunk,
                                          pc);
             if (g_vm_exc_pending) {                /* Inc v2: cross-frame */
-                vm_flush_inline(*chunk, pc, *g_vm_exc_pending);   /* Inc 4 */
-                if (vm_dispatch_exc(act, cur_rec(), pc)) {
-                    cur_rec().exc = std::move(g_vm_exc_pending);
+                vm_flush_inline_call(*chunk, pc,
+                                     *g_vm_exc_pending);         /* Inc 4 */
+                if (vm_dispatch_exc(act, cur_rec(), ctx, pc,
+                                    g_vm_exc_pending)) {
                     VM_NEXT_COLD;
                 }
                 return;
@@ -3702,10 +13835,16 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                         chunk->member_keys[cs.a0_operand];
                     LValue *base = vm_store_base(ctx, cs.a0_kind, cs.a0_slot,
                                                  *chunk, pc, nullptr);
-                    return vm_member_lvalue_ref(base->get(), mk.memId,
-                                                mk.memUid,
+                    EvalValue cur(base);
+                    return vm_member_lvalue_ref(cur, mk.memId, mk.memUid,
                                                 /*for_write=*/false,
                                                 mk.mstart, mk.mend);
+                }
+                case Chunk::CallSite::A0::chain: {
+                    LValue *base = vm_store_base(ctx, cs.a0_kind, cs.a0_slot,
+                                                 *chunk, pc, nullptr);
+                    return vm_a0_chain_lvalue(ctx, chunk->member_keys.data(),
+                                              cs, base, holder);
                 }
                 default:
                     return nullptr;
@@ -3713,14 +13852,53 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             };
 
             EvalValue res;
+            /* a FuncObject with a chunk is entered IN THIS ACTIVATION,
+             * like CallValueV - vm_call_func runs a NESTED vm_run_chunk,
+             * so a `dyn` recursion (every call under -nti) grew the C
+             * stack per level and crashed where every other call tier
+             * reaches the catchable StackOverflowEx at the slot cap
+             * (found 2026-09-30: a 300-deep linear recursion under -nti,
+             * ASan). The switch to the callee happens after this scope
+             * (the dispatch cannot jump out of it: `holder`/`res`). */
+            const Chunk *entered = nullptr;
             try {
                 if (callee.is<intrusive_ptr<FuncObject>>()) {
                     if (nargs)
                         ctx.frame->at(argbase).put(RValue(a0_value()));
-                    res = vm_call_func(
-                        &ctx,
-                        *callee.get<intrusive_ptr<FuncObject>>().get(),
-                        &ctx.frame->at(argbase), nargs, chunk, pc);
+                    FuncObject &fo =
+                        *callee.get_ref<intrusive_ptr<FuncObject>>().get();
+                    /* RULE 1: a dyn callee's parameters are known only
+                     * now - every such call checks (a slow path already);
+                     * the catch below stamps the argument's caret */
+                    /* INT-COV-EXEMPT, the at() line: its bounds assert */
+                    const BindFault nf = bind_fault(fo.func, nargs,
+                        [&](size_t i) -> const EvalValue & {
+                            const int_type s =
+                                argbase + static_cast<int_type>(i);
+                            return ctx.frame->at(s).get(); /* INT-COV-EXEMPT */
+                        });
+                    if (nf.idx >= 0)
+                        throw bind_fault_error(fo.func, nf, nf.idx);
+                    if (!fo.func->vm_chunk_tried) {   /* AOT net */
+                        fo.func->vm_chunk = vm_func_chunk(fo.func);
+                        fo.func->vm_chunk_tried = true;
+                    }
+                    const Chunk *cck =
+                        static_cast<const Chunk *>(fo.func->vm_chunk);
+                    if (cck) {
+#ifdef TESTS
+                        norec_classify(fo.func, cck);
+#endif
+                        /* its bind error takes THIS op's carets (the
+                         * CallSite's argument spans, stamped below), not
+                         * the pc-keyed tables vm_enter_call stamps from */
+                        vm_frame_setup(act, ctx, chunk, pc, fo, cck,
+                                       argbase, nargs, in->target, nullptr);
+                        entered = cck;
+                    } else {
+                        res = vm_call_func(&ctx, fo, &ctx.frame->at(argbase),
+                                           nargs, chunk, pc);
+                    }
                 } else {
                     /* Builtin / struct: the raw values (arg0 from the
                      * descriptor - may be UndefinedId, RValued by need). */
@@ -3741,7 +13919,11 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                         const Builtin &b = callee.get<Builtin>();
                         if (b.kind == Builtin::Kind::lvalue) {
                             /* the by-ref path: derive arg0's true LValue* */
-                            LValue *target = nargs ? a0_lvalue() : nullptr;
+                            LValue tmp;
+                            LValue *target = nargs
+                                ? builtin_lv_target(b, a0_lvalue(), buf[0],
+                                                    tmp)
+                                : nullptr;
                             EvalValue rest[8];
                             std::vector<EvalValue> resth;
                             EvalValue *rp = rest;
@@ -3767,22 +13949,27 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                     }
                 }
             } catch (Exception &e) {
-                if (!e.loc_start) {
-                    e.loc_start = al.start;
-                    e.loc_end = al.end;
-                }
+                vm_stamp_args_caret(e, al);        /* RULE 2: the failing
+                                                    * argument, else the
+                                                    * list */
                 throw;
             }
-            if (g_vm_exc_pending) {                /* FuncObject cross-frame */
-                vm_flush_inline(*chunk, pc, *g_vm_exc_pending);
-                if (vm_dispatch_exc(act, cur_rec(), pc)) {
-                    cur_rec().exc = std::move(g_vm_exc_pending);
-                    VM_NEXT_COLD;
+            if (entered) {                         /* the in-VM call */
+                chunk = entered;
+                pc = 0;
+                code = chunk->code.data();
+            } else {
+                if (g_vm_exc_pending) {            /* FuncObject cross-frame */
+                    vm_flush_inline_call(*chunk, pc, *g_vm_exc_pending);
+                    if (vm_dispatch_exc(act, cur_rec(), ctx, pc,
+                                        g_vm_exc_pending)) {
+                        VM_NEXT_COLD;
+                    }
+                    return;
                 }
-                return;
+                ctx.frame->at(in->target).put(std::move(res));
+                pc++;
             }
-            ctx.frame->at(in->target).put(std::move(res));
-            pc++;
         }
         VM_NEXT;
 
@@ -3802,6 +13989,46 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         }
         VM_NEXT;
 
+        VM_CASE(CheckNoneArgsV): {
+            /* RULE 1: the call that follows may hand `none` to a parameter
+             * not declared `opt` (codegen emits this op only where an
+             * argument's static type allows none). Check the RUNTIME
+             * callee's parameters; anything but a function (unbound, a
+             * struct, a non-callable) is the call's own error to raise. */
+            vm_check_none_args(ctx, *in, *chunk, pc);
+            pc++;
+        }
+            VM_NEXT;
+
+        VM_CASE(LoadBoxV):
+            vm_load_box(ctx, *in, *chunk, pc);
+            pc++;
+            VM_NEXT;
+
+        VM_CASE(StampTypeV):
+            /* Q2: the sum `a + b` takes its static type (ctype_sum_copy) */
+            stamp_ctype_top(ctx.frame->at(in->a_slot()).get(),
+                            chunk->ctype_ref(
+                                static_cast<unsigned>(in->target2)));
+            pc++;
+            VM_NEXT;
+
+        VM_CASE(CheckFitV):
+            /* #49: a stored value that may misfit its place's type */
+            vm_check_fit_op(ctx, *in, *chunk, pc);
+            pc++;
+            VM_NEXT;
+
+        VM_CASE(CastV):
+            vm_cast_op(ctx, *in, *chunk, pc);
+            pc++;
+            VM_NEXT;
+
+        VM_CASE(StoreBoxV):
+            vm_store_box(ctx, *in, *chunk, pc);
+            pc++;
+            VM_NEXT;
+
         VM_CASE(CheckFuncV):
             /* map/filter's arg0 guard: throw (arg0's caret, from the loc side
              * table) if it isn't a function, BEFORE arg1's code runs - the
@@ -3820,10 +14047,23 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * unsupported-container caret comes from the loc side table. */
             Loc s, en;
             chunk->loc_at(pc, s, en);
-            ctx.frame->at(in->target).put(
-                vm_map_filter(&ctx, ctx.frame->at(in->a_slot()).get(),
-                              ctx.frame->at(in->b_slot()).get(),
-                              in->target2 != 0, s, en));
+            try {
+                ctx.frame->at(in->target).put(
+                    vm_map_filter(&ctx, ctx.frame->at(in->a_slot()).get(),
+                                  ctx.frame->at(in->b_slot()).get(),
+                                  (in->target2 & 1) != 0, s, en, s,
+                                  static_cast<int>((in->target2 >> 1) & 3)));
+                stamp_ctype(ctx.frame->at(in->target).get(),     /* Q2 */
+                            chunk->ctype_ref(
+                                static_cast<unsigned>(in->target2) >> 3));
+            } catch (Exception &e) { /* INT-COV-EXEMPT: its type test */
+                /* a loc-less escape is a callback's BIND refusing an
+                 * element: the argument list's caret (base_locs), the
+                 * tree-walker's builtin-call stamp */
+                if (!e.loc_start)
+                    chunk->base_loc_at(pc, e.loc_start, e.loc_end);
+                throw;
+            }
             pc++;
         }
         VM_NEXT;
@@ -3834,24 +14074,78 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * slot, resume after the call op. The BOUNDARY frame keeps the
              * do_func_call contract: set flow, stop the invocation. */
             if (cur_rec().boundary) {
-                ctx.flow->value = ctx.frame->at(in->a_slot()).get();
+                /* the frame dies with the invocation - move the result out */
+                ctx.flow->value = ctx.frame->at(in->a_slot()).steal_value();
                 ctx.flow->type = FlowState::ret;
                 return;
             }
             vm_leave_call(act, ctx, chunk, pc,
-                          ctx.frame->at(in->a_slot()).get());
+                          ctx.frame->at(in->a_slot()).steal_value());
             code = chunk->code.data();
             VM_NEXT;
         }
 
-        VM_CASE(ArrLen):
+        VM_CASE(ArrLen): {
             /* n = size(array). The base is a flat array (ForeachStmt::elem_th
-             * guarantees array<int>/array<float>), so read size() directly. */
-            ctx.frame->at(in->target).put(EvalValue(static_cast<int_type>(
-                ctx.frame->at(in->target2).get()
-                    .get_ref<SharedArrayObj>().size())));
+             * guarantees array<int>/array<float>), so read size() directly.
+             * #142: the interpreted TWIN of jit_arr_len - a corrupt image can
+             * break the proof, so the type test is explicit here too rather
+             * than left to get_ref's throw. */
+            const EvalValue &b = ctx.frame->at(in->target2).get();
+            ctx.frame->at(in->target).put(
+                b.is<SharedArrayObj>()
+                    ? EvalValue(static_cast<int_type>(
+                          b.get_ref<SharedArrayObj>().size()))
+                    : EvalValue());
             pc++;
-            VM_NEXT;
+        }
+        VM_NEXT;
+
+        VM_CASE(ArrEpochMark): {
+            /* #53 option 1: the foreach's shift-guard mark (vm_epoch_mark
+             * is shared with jit_arr_epoch_mark) */
+            ctx.frame->at(in->target).put(EvalValue(
+                vm_epoch_mark(ctx.frame->at(in->target2).get())));
+            pc++;
+        }
+        VM_NEXT;
+
+        VM_CASE(UnpackLenCheck): {
+            /* the destructure's strict length test + its flat-kind flag
+             * (shared with jit_unpack_len_check) */
+            const EvalValue &v = ctx.frame->at(in->target2).get();
+            const int_type n = in->a_lit();
+            const int_type fl = in->b_lit();
+            const int64_t m = vm_unpack_len_bad(v, n);
+            if (m >= 0) {
+                if (fl & 1)                 /* the foreach flavour */
+                    vm_throw_unpack_len(chunk, pc,
+                                        static_cast<size_type>(m), n);
+                vm_throw_multi_unpack_len(chunk, pc,
+                                          static_cast<size_type>(m),
+                                          static_cast<size_t>(n));
+            }
+            if (in->target >= 0)
+                ctx.frame->at(in->target).put(EvalValue(
+                    static_cast<int_type>(vm_unpack_flat_ok(v, fl) ? 1
+                                                                   : 0)));
+            pc++;
+        }
+        VM_NEXT;
+
+        VM_CASE(ArrEpochCheck): {
+            /* ... and its per-step test (shared with jit_arr_epoch_check):
+             * the body MOVED elements - the foreach's OutOfBoundsEx at the
+             * container */
+            if (vm_epoch_shifted(ctx.frame->at(in->target2).get(),
+                                 ctx.frame->at(in->a_slot()).get())) {
+                Loc ls, le;
+                chunk->loc_at(pc, ls, le);
+                throw OutOfBoundsEx(ls, le);
+            }
+            pc++;
+        }
+        VM_NEXT;
 
         VM_CASE(StrLen):
             /* n = char count of the string (foreach bound over a proven str).
@@ -3866,14 +14160,29 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             /* x = a fresh 1-char string of the container's i-th char - matches
              * the tree-walker's SharedStr(string(&view[i], 1)). `i` is
              * loop-bounded (< StrLen), so view[i] is in range. */
-            const std::string_view view = ctx.frame->at(in->target2).get()
-                .get_ref<SharedStr>().get_view();
+            /* #142: the interpreted TWIN of jit_load_str_char. `i` being
+             * loop-bounded is a property of VALID bytecode; a corrupt image
+             * breaks it, and `&view[i]` unchecked is a WILD READ - worse
+             * than the wrong answer a mangled image is entitled to. */
+            const EvalValue &bv = ctx.frame->at(in->target2).get();
             const int_type i = read_int_operand(in->a(), &ctx);
+            const std::string_view view =
+                bv.is<SharedStr>() ? bv.get_ref<SharedStr>().get_view()
+                                   : std::string_view();
             ctx.frame->at(in->target).put(
-                EvalValue(SharedStr(std::string(&view[i], 1))));
+                i >= 0 && static_cast<size_t>(i) < view.size()
+                    ? EvalValue(SharedStr(std::string(&view[i], 1)))
+                    : EvalValue());
             pc++;
         }
         VM_NEXT;
+
+        VM_CASE(OrdCharV):
+            /* ord(s[i]) fused (lever 4b) - the ML_NOINLINE body (loop-body
+             * text rule + recursion stack hygiene; see vm_ord_char). */
+            vm_ord_char(chunk, pc, in, &ctx);
+            pc++;
+            VM_NEXT;
 
         VM_CASE(LoadImmInt):
             ctx.frame->at(in->target).put(
@@ -3894,13 +14203,11 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
 
         VM_CASE(LoadLiteralObjV): {
             /* Materialize a baked const array/dict/struct literal via shared
-             * eval_literal_obj (immutable share vs a fresh mutable clone, plus
-             * the general/flat_s arr_hint cases) - byte-identical to
-             * LiteralObj::do_eval. */
+             * eval_literal_obj (immutable share vs a fresh mutable clone) -
+             * byte-identical to LiteralObj::do_eval. */
             const Chunk::LiteralObjEntry &lo = chunk->literal_objs[in->target2];
             ctx.frame->at(in->target).put(
-                eval_literal_obj(lo.value, lo.immutable, lo.arr_hint,
-                                 lo.arr_hint_struct));
+                eval_literal_obj(lo.value, lo.immutable));
             pc++;
         }
         VM_NEXT;
@@ -3937,9 +14244,10 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * promotion, string `+` concat, bitwise). */
             EvalValue sa, sb;
             EvalValue val = boxed_operand(in->a(), &ctx, sa).clone();
+            ctype_sum_copy(val);   /* Q2: as the tree-walker's Expr04 */
             try {
-                num_bin_op(val, boxed_operand(in->b(), &ctx, sb),
-                           binop_pmf(in->aop));
+                const ArrSumScope g(val);
+                vm_num_binop(val, boxed_operand(in->b(), &ctx, sb), in->aop);
             } catch (Exception &e) {
                 /* Stamp the operand loc (side table) like stamp_operand_loc, so
                  * a div-zero / type error points where the tree-walker does. */
@@ -3958,8 +14266,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             EvalValue sb;
             EvalValue nv = ctx.frame->at(in->target).get();
             try {
-                num_bin_op(nv, boxed_operand(in->b(), &ctx, sb),
-                           binop_pmf(in->aop));
+                vm_num_binop(nv, boxed_operand(in->b(), &ctx, sb), in->aop);
             } catch (Exception &e) {
                 vm_stamp_loc(*chunk, pc, e);
                 throw;
@@ -3975,8 +14282,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             EvalValue sa, sb;
             EvalValue val = boxed_operand(in->a(), &ctx, sa);
             try {
-                num_bin_op(val, boxed_operand(in->b(), &ctx, sb),
-                           cmp_pmf(in->aop));
+                vm_num_binop(val, boxed_operand(in->b(), &ctx, sb), in->aop);
             } catch (Exception &e) {
                 vm_stamp_loc(*chunk, pc, e);
                 throw;
@@ -3989,12 +14295,19 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         VM_CASE(LogV): {
             /* Eager (MyLang &&/|| don't short-circuit at runtime) - both
              * operands are already computed (a slot or an immediate); combine
-             * truthiness. */
-            EvalValue sa, sb;
-            const bool a = boxed_operand(in->a(), &ctx, sa).is_true();
-            const bool b = boxed_operand(in->b(), &ctx, sb).is_true();
-            ctx.frame->at(in->target).put(
-                EvalValue(in->aop == Op::land ? (a && b) : (a || b)));
+             * truthiness. `is_true` is a virtual Type op whose BASE throws for a
+             * value with no bool conversion, so stamp the expression's caret
+             * from the loc side table (the VM used to report it with none). */
+            try {
+                EvalValue sa, sb;
+                const bool a = boxed_operand(in->a(), &ctx, sa).is_true();
+                const bool b = boxed_operand(in->b(), &ctx, sb).is_true();
+                ctx.frame->at(in->target).put(
+                    EvalValue(in->aop == Op::land ? (a && b) : (a || b)));
+            } catch (Exception &e) {
+                vm_stamp_loc(*chunk, pc, e);
+                throw;
+            }
             pc++;
         }
         VM_NEXT;
@@ -4043,8 +14356,10 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             if (!ctx.gfuncs->defined[in->target2]) {
                 Loc s, en;
                 chunk->loc_at(pc, s, en);
-                throw UndefinedVariableEx(
-                    ctx.gfuncs->names[in->target2]->val, s, en);
+                throw UnboundSymbolEx(
+                    intern_msg("'" +
+                               std::string(ctx.gfuncs->names[in->target2]->val)
+                               + "' is not bound yet"), s, en);
             }
             ctx.frame->at(in->target).put(
                 ctx.gfuncs->slots[in->target2].get());
@@ -4078,8 +14393,8 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 /* g = <expr>: write the shared global slot + mark defined -
                  * exactly slot_rmw(op==assign) (put(RValue)) + the decl's
                  * defined=1. Serves both a decl and a reassign (idempotent). */
-                lv.put(RValue(ctx.frame->at(in->a_slot()).get()));
-                ctx.gfuncs->defined[in->target] = 1;
+                ctx.gfuncs->put_defined(
+                    in->target, RValue(ctx.frame->at(in->a_slot()).get()));
             } else {
                 /* g OP= rhs / g++ (aop = the base op, rhs in `a`): a compound
                  * requires the slot already DEFINED (else UndefinedVariableEx,
@@ -4088,14 +14403,16 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 if (!ctx.gfuncs->defined[in->target]) {
                     Loc s, en;
                     chunk->loc_at(pc, s, en);
-                    throw UndefinedVariableEx(
-                        ctx.gfuncs->names[in->target]->val, s, en);
+                    throw UnboundSymbolEx(
+                        intern_msg("'"
+                                   + std::string(ctx.gfuncs->names[in->target]
+                                                 ->val)
+                                   + "' is not bound yet"), s, en);
                 }
                 EvalValue sb;
                 EvalValue nv = lv.get();
                 try {
-                    num_bin_op(nv, boxed_operand(in->a(), &ctx, sb),
-                               binop_pmf(in->aop));
+                    vm_num_binop(nv, boxed_operand(in->a(), &ctx, sb), in->aop);
                 } catch (Exception &e) {
                     vm_stamp_loc(*chunk, pc, e);
                     throw;
@@ -4114,8 +14431,7 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             if (in->target2 == 0) {
                 ctx.frame->at(in->target) = LValue(std::move(v), true);
             } else {
-                ctx.gfuncs->slots[in->target] = LValue(std::move(v), true);
-                ctx.gfuncs->defined[in->target] = 1;
+                ctx.gfuncs->define(in->target, LValue(std::move(v), true));
             }
             pc++;
         }
@@ -4132,14 +14448,46 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
                 EvalValue sb;
                 EvalValue nv = lv.get();
                 try {
-                    num_bin_op(nv, boxed_operand(in->a(), &ctx, sb),
-                               binop_pmf(in->aop));
+                    vm_num_binop(nv, boxed_operand(in->a(), &ctx, sb), in->aop);
                 } catch (Exception &e) {
                     vm_stamp_loc(*chunk, pc, e);
                     throw;
                 }
                 lv.put(std::move(nv));
             }
+            pc++;
+        }
+        VM_NEXT;
+
+        /*
+         * #97 closure inlining (plans/closure-inlining.md): the guard and
+         * the explicit-closure capture ops a splice at a value-call site
+         * emits. The guard falls through iff `a` holds a FuncObject of
+         * closure_defs[target2]; the capture ops then reach that object's
+         * captures through the same slot - the body's own frame is the
+         * CALLER's, whose ctx.captures is not the closure's.
+         */
+        VM_CASE(GuardCalleeV): {
+            const EvalValue &cv = ctx.frame->at(in->a_slot()).get();
+            if (cv.is<intrusive_ptr<FuncObject>>()
+                    && cv.get_ref<intrusive_ptr<FuncObject>>()->func
+                           == chunk->closure_defs[in->target2])
+                pc++;
+            else
+                pc = static_cast<size_t>(in->target);
+        }
+        VM_NEXT;
+
+        VM_CASE(LoadCaptureOfV): {
+            ctx.frame->at(in->target).put(
+                vm_closure_capture(ctx, in->a_slot(), in->target2).get());
+            pc++;
+        }
+        VM_NEXT;
+
+        VM_CASE(StoreCaptureOfV): {
+            vm_closure_capture(ctx, in->b_slot(), in->target).put(
+                RValue(ctx.frame->at(in->a_slot()).get()));
             pc++;
         }
         VM_NEXT;
@@ -4176,91 +14524,24 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         VM_NEXT;
 
         VM_CASE(LoadMemberInt): {
-            /* H1: typed standalone struct-member read `p.x` (th==i). The POD
-             * fast path reads the scalar straight from the instance's bytes -
-             * the VM analog of MemberExpr::eval_int; anything else falls to
-             * the shared member_read_core + write_scalar_slot (its int
-             * type-check/promotion == the tree-walker's boxed fallback). */
-            const Chunk::MemberKey &mk = chunk->member_keys[in->a_lit()];
-            const EvalValue &b = ctx.frame->at(in->target2).get();
-            if (b.is<intrusive_ptr<StructObject>>()) {
-                const StructObject &o =
-                    *b.get<intrusive_ptr<StructObject>>().get();
-                const int fs = o.def->slot_of(mk.memUid);
-                if (fs >= 0 && o.is_pod()) {
-                    const FieldDef &f = o.def->fields[fs];
-                    const char *p = o.bytes.data() + f.offset;
-                    if (f.kind == FieldKind::f_int) {
-                        int_type v;
-                        std::memcpy(&v, p, sizeof v);
-                        write_int_slot(&ctx, in->target, v);
-                        pc++;
-                        VM_NEXT;
-                    }
-                    if (f.kind == FieldKind::f_bool) {
-                        write_int_slot(&ctx, in->target,
-                            static_cast<unsigned char>(*p) != 0 ? 1 : 0);
-                        pc++;
-                        VM_NEXT;
-                    }
-                }
-            }
-            try {
-                write_scalar_slot(&ctx, in->target, /*is_int=*/true,
-                    member_read_core(b, mk.memId, mk.memUid, mk.optional,
-                                     mk.mstart, mk.mend, mk.bstart, mk.bend));
-            } catch (Exception &e) {
-                /* write_scalar_slot's get<> throw is loc-less - give it the
-                 * member's caret (member_read_core's own throws carry it) */
-                if (!e.loc_start) {
-                    e.loc_start = mk.mstart;
-                    e.loc_end = mk.mend;
-                }
-                throw;
-            }
+            /* H1: typed standalone struct-member read `p.x` (th==i) - the
+             * baked read straight from the instance's bytes, anything else
+             * the shared body (also jit_load_member's): member_read_core +
+             * write_scalar_slot. */
+            if (!vm_load_member_baked(ctx, in, chunk))
+                vm_load_member_scalar(ctx, chunk->member_keys[in->a_lit()],
+                                      in->target2, in->target,
+                                      /*is_int=*/true);
             pc++;
         }
         VM_NEXT;
 
         VM_CASE(LoadMemberFloat): {
-            /* the eval_float twin (th==f) */
-            const Chunk::MemberKey &mk = chunk->member_keys[in->a_lit()];
-            const EvalValue &b = ctx.frame->at(in->target2).get();
-            if (b.is<intrusive_ptr<StructObject>>()) {
-                const StructObject &o =
-                    *b.get<intrusive_ptr<StructObject>>().get();
-                const int fs = o.def->slot_of(mk.memUid);
-                if (fs >= 0 && o.is_pod()) {
-                    const FieldDef &f = o.def->fields[fs];
-                    const char *p = o.bytes.data() + f.offset;
-                    if (f.kind == FieldKind::f_float) {
-                        float_type v;
-                        std::memcpy(&v, p, sizeof v);
-                        write_float_slot(&ctx, in->target, v);
-                        pc++;
-                        VM_NEXT;
-                    }
-                    if (f.kind == FieldKind::f_int) {
-                        int_type v;
-                        std::memcpy(&v, p, sizeof v);
-                        write_float_slot(&ctx, in->target,
-                                         static_cast<float_type>(v));
-                        pc++;
-                        VM_NEXT;
-                    }
-                }
-            }
-            try {
-                write_scalar_slot(&ctx, in->target, /*is_int=*/false,
-                    member_read_core(b, mk.memId, mk.memUid, mk.optional,
-                                     mk.mstart, mk.mend, mk.bstart, mk.bend));
-            } catch (Exception &e) {
-                if (!e.loc_start) {
-                    e.loc_start = mk.mstart;
-                    e.loc_end = mk.mend;
-                }
-                throw;
-            }
+            /* the eval_float twin (th==f) - the shared body */
+            if (!vm_load_member_baked(ctx, in, chunk))
+                vm_load_member_scalar(ctx, chunk->member_keys[in->a_lit()],
+                                      in->target2, in->target,
+                                      /*is_int=*/false);
             pc++;
         }
         VM_NEXT;
@@ -4286,12 +14567,26 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         }
         VM_NEXT;
 
-        VM_CASE(JumpUnlessTrueV):
-            if (!ctx.frame->at(in->target2).get().is_true())
+        VM_CASE(JumpUnlessTrueV): {
+            /* The BOXED truthiness test (`if (dynvalue)`, `while (flag)`, a
+             * &&/|| conjunct, the boxed ternary). `is_true` is a virtual Type op
+             * whose BASE throws TypeErrorEx - reachable from a script with e.g.
+             * a builtin value as the condition - so stamp the CONDITION's caret
+             * from the loc side table, matching the tree-walker's
+             * Construct::eval stamp (the VM used to report it with NO caret). */
+            bool t;
+            try {
+                t = ctx.frame->at(in->target2).get().is_true();
+            } catch (Exception &e) {
+                vm_stamp_loc(*chunk, pc, e);
+                throw;
+            }
+            if (!t)
                 pc = in->target;
             else
                 pc++;
-            VM_NEXT;
+        }
+        VM_NEXT;
 
         VM_CASE(JumpIfNotNoneV):
             /* `a ?? b` short-circuit: a non-none lhs skips the rhs. */
@@ -4317,7 +14612,10 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         }
 
         VM_CASE(PushHandler):
-            act.handlers.push_back({ static_cast<uint32_t>(in->target) });
+            /* #78: the region id - it keys BOTH the try's handler_sites
+             * entry (the clauses the dispatch matches) and its per-frame
+             * pend/exc slot. */
+            act.handlers.push_back({ static_cast<uint32_t>(in->a_lit()) });
             pc++;
             VM_NEXT;
 
@@ -4326,67 +14624,47 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             pc++;
             VM_NEXT;
 
-        VM_CASE(CatchTest): {
-            /* vm_exc holds the caught exception. Match its type name against
-             * this clause (a.lit = catch_types idx, or -1 = catch-all). On a
-             * match: bind `catch (T as e)` (target2 = slot, -1 if none), jump to
-             * the catch body (target). Else fall to the next CatchTest /
-             * Reraise. vm_exc is KEPT (not cleared) so a `rethrow` in the catch
-             * body can re-raise it; a new throw overwrites it. */
-            bool match;
-            if (in->a_lit() < 0) {
-                match = true;
-            } else {
-                const std::vector<std::string> &names =
-                    chunk->catch_types[in->a_lit()];
-                const std::string_view en = vm_exc_name(cur_rec().exc.get());
-                match = false;
-                for (const std::string &nm : names) {
-                    if (nm == en) { match = true; break; }
-                }
-            }
-            if (match) {
-                if (in->target2 >= 0)
-                    ctx.frame->at(in->target2).put(
-                        vm_catch_bind_val(cur_rec().exc.get()));
-                pc = static_cast<size_t>(in->target);
-            } else {
-                pc++;
-            }
-        }
-        VM_NEXT;
-
-        VM_CASE(Reraise):
-            /* No clause matched: re-raise vm_exc - the native WALK finds the
-             * outer handler (same or ANY caller frame) or reaches the boundary
-             * (G1: no C++ throw; the walk's first step IS the old same-frame
-             * dispatch, and the boundary catch used to flush the reraise pc's
-             * inlined frames + clone - vm_raise does the flush, sans clone). */
-            if (!vm_raise(chunk, pc, act, ctx, std::move(cur_rec().exc)))
-                return;                 /* boundary: signal set */
-            code = chunk->code.data();
-            VM_NEXT;
-
         VM_CASE(Rethrow):
             /* `rethrow` in a catch body: re-raise the being-handled vm_exc with
-             * the rethrow-site loc (like do_catch's RethrowEx handling), to the
-             * OUTER handler (native) or C++-propagate. */
+             * the rethrow-site loc (like RethrowStmt::do_eval), to the nearest
+             * enclosing handler (native) or C++-propagate. */
             {
+                /* #78: a = the ENCLOSING catch's region id (baked by the
+                 * codegen: the innermost try whose catch body lexically
+                 * contains this `rethrow`) - its slot holds the caught
+                 * exception, immune to inner regions' traffic. */
+                VmPendState &ps = act.pend_at(cur_rec(), in->a_lit());
+                /* codegen bakes the region of the catch whose body holds
+                 * this op, so its slot is full - unless the image lied
+                 * (myv_fuzz fat-1150): then a defined InternalErrorEx,
+                 * as jit_rethrow raises, never a null dereference */
+                ML_VM_CHECK(ml_untrusted_bytecode() || ps.exc != nullptr);
+                if (!ps.exc)
+                    ps.exc = std::make_unique<InternalErrorEx>();
+                /* a COPY: the caught exception stays parked for a second
+                 * rethrow and for the chain (question 12) */
+                std::unique_ptr<RuntimeException> ex(ps.exc->clone());
                 Loc ls, le;
                 chunk->loc_at(pc, ls, le);
-                cur_rec().exc->loc_start = ls;
-                cur_rec().exc->loc_end = le;
+                ex->loc_start = ls;
+                ex->loc_end = le;
+                if (!vm_raise(chunk, pc, act, ctx, std::move(ex)))
+                    return;             /* boundary: signal set */
             }
-            if (!vm_raise(chunk, pc, act, ctx, std::move(cur_rec().exc)))
-                return;                 /* boundary: signal set */
             code = chunk->code.data();
             VM_NEXT;
 
         VM_CASE(SetPend):
             /* Record what the shared `finally` must resume - normal or reraise
-             * (Inc 2b). Flow ops inline their finally, so ret/brk/cont never
-             * reach the shared finally. */
-            cur_rec().pend = static_cast<Pend>(in->target);
+             * (Inc 2b) - in the try's per-REGION slot (a = region id, #78).
+             * Flow ops inline their finally, so ret/brk/cont never reach the
+             * shared finally. */
+            {
+                VmPendState &ps = act.pend_at(cur_rec(), in->a_lit());
+                ps.pend = static_cast<Pend>(in->target);
+                if (in->target2 == 1)          /* a catch body's exit */
+                    ps.exc.reset();
+            }
             pc++;
             VM_NEXT;
 
@@ -4395,16 +14673,18 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
              * the NORMAL and RERAISE exits reach here - a return/break/continue
              * crossing this try INLINES its own copy of the finally (Inc 2c),
              * so `vm_pend` is only ever normal or reraise here. */
-            if (cur_rec().pend == Pend::reraise) {
-                /* finally didn't handle the exception → re-raise it (the
-                 * native walk, like Reraise - G1). */
-                if (!vm_raise(chunk, pc, act, ctx,
-                              std::move(cur_rec().exc)))
-                    return;             /* boundary: signal set */
-                code = chunk->code.data();
-                VM_NEXT;
-            } else {
-                pc++;                                 /* fall through to Lend */
+            {
+                VmPendState &ps = act.pend_at(cur_rec(), in->a_lit());
+                if (ps.pend == Pend::reraise) {
+                    /* finally didn't handle the exception → re-raise it (the
+                     * native walk, like Reraise - G1). */
+                    if (!vm_raise(chunk, pc, act, ctx, std::move(ps.exc)))
+                        return;         /* boundary: signal set */
+                    code = chunk->code.data();
+                    VM_NEXT;
+                } else {
+                    pc++;                             /* fall through to Lend */
+                }
             }
             VM_NEXT;
 
@@ -4415,6 +14695,16 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
             vm_leave_call(act, ctx, chunk, pc, EvalValue());
             code = chunk->code.data();
             VM_NEXT;
+
+        VM_CASE(ExitBlock):
+            /* model-flip M2 (plans/archived/model-flip.md): an island's fall-through
+             * exit. Hand control back to the native container (vm_exec_block):
+             * stash the resume pc (the next block the container continues at)
+             * and return from the dispatch loop. ONLY reached via vm_exec_block
+             * - the codegen doesn't emit it yet (M3). A terminator (rets),
+             * never a fall-through, so no VM_NEXT. */
+            g_vm_block_resume = static_cast<size_t>(in->a_lit());
+            return;
 #ifndef ML_CGOTO
         case OpCode::OpCount_:      /* sentinel - never emitted (switch
                                      * exhaustiveness; cgoto has no entry) */
@@ -4448,3 +14738,174 @@ vm_run_chunk(const Chunk &chunk0, EvalContext &ctx)
         return;                /* signal set; do_func_call captures + goes on */
     }
 }
+
+/* =====================================================================
+ * model-flip M2 (plans/archived/model-flip.md): the interpreted-ISLAND executor.
+ * The endgame flips "bytecode with native islands" into "native with
+ * bytecode islands": every function becomes ONE call-able native container
+ * whose un-nativizable regions are ISLANDS reached via a `call vm_exec_block`.
+ * This is that executor + its self-test; the emitter wiring is M3.
+ * ===================================================================== */
+
+/* How an island run by vm_exec_block ended. */
+enum class BlockStatus {
+    FellThrough,   /* ExitBlock: island done -> container continues (resume pc)*/
+    Returned,      /* ReturnV/Halt: the function returns (value in ctx.flow)    */
+    Raised,        /* an UNCAUGHT throw: g_vm_exc_pending set (container raises)*/
+};
+
+/*
+ * Run a single-entry ISLAND of interpreted ops starting at from_pc in the
+ * CURRENT frame, then hand control back to the native container. It reuses the
+ * FULL vm_dispatch (every handler, nested calls, the per-frame handler stack) -
+ * the island is real interpreted execution, not a second interpreter. The one
+ * trick: the current frame's `boundary` bit is flipped for the run, so an island
+ * ReturnV/Halt or an UNCAUGHT throw HANDS BACK here (set flow / set the signal,
+ * then return) instead of popping the frame - the CONTAINER owns the frame's
+ * actual return. A fall-through island ends with an ExitBlock (-> FellThrough,
+ * *resume_pc = the next block). An exception CAUGHT within the island is handled
+ * by the handler stack and the island simply continues (-> FellThrough); only an
+ * uncaught one -> Raised. Do NOT hold a VmCallRec& across vm_dispatch (a nested
+ * call can grow+realloc the records vector); re-fetch back_rec() to restore.
+ */
+[[maybe_unused]] static BlockStatus
+vm_exec_block(EvalContext &ctx, VmActivation &act, const Chunk &chunk,
+              size_t from_pc, size_t *resume_pc)
+{
+    const unsigned char saved_boundary = act.back_rec().boundary;
+    act.back_rec().boundary = 1;         /* ReturnV/Halt/throw -> hand back */
+    const size_t saved_resume = g_vm_block_resume;
+    g_vm_block_resume = VM_BLOCK_NONE;
+
+    vm_dispatch(chunk, ctx, act, from_pc);
+
+    act.back_rec().boundary = saved_boundary;   /* re-fetch (realloc-safe) */
+    const size_t got = g_vm_block_resume;
+    g_vm_block_resume = saved_resume;
+
+    if (got != VM_BLOCK_NONE) {
+        if (resume_pc)
+            *resume_pc = got;
+        return BlockStatus::FellThrough;
+    }
+    if (g_vm_exc_pending)
+        return BlockStatus::Raised;
+    return BlockStatus::Returned;        /* ReturnV set flow.ret; Halt -> none */
+}
+
+/*
+ * model-flip M3 (plans/archived/model-flip.md): a native CONTAINER fragment, at an
+ * island, `call`s this - baking its OWN FuncDescriptor + the island's start pc.
+ * It runs the interpreted island via vm_exec_block in the container's frame
+ * (reached through g_current_ctx / g_vm_act, exactly like jit_ret) and returns
+ * the fall-through resume pc; on an UNCAUGHT island exception it bridges the
+ * pending signal into g_vm_jit_exc and returns the RAISED sentinel, so the
+ * caller fragment exits to the island pc and the EnterNative handler re-raises
+ * (byte-identical caret + backtrace). extern "C" + noexcept: vm_exec_block
+ * catches into the signal, so this never C++-throws out of native code.
+ */
+extern "C" size_t jit_exec_block(const FuncDescriptor *desc,
+                                 size_t from_pc) noexcept
+{
+    g_jit_container_calls++;
+    EvalContext &ctx = *g_current_ctx;
+    VmActivation &act = *g_vm_act;
+    const Chunk *ck = static_cast<const Chunk *>(desc->vm_chunk);
+    size_t resume = 0;
+    const BlockStatus st = vm_exec_block(ctx, act, *ck, from_pc, &resume);
+    if (st == BlockStatus::FellThrough)
+        return resume;                    /* a small pc; the fragment continues*/
+    if (st == BlockStatus::Raised) {
+        g_vm_jit_exc = std::move(g_vm_exc_pending);   /* EnterNative re-raises */
+        return JIT_BLOCK_RAISED;
+    }
+    /* Returned: an island ReturnV - the M3 container gate excludes it (ReturnV
+     * is native/terminal, never inside an island). A loud abort if a future
+     * gate ever admits one. */
+    ML_CHECK_MSG(false, "island ReturnV - excluded by the M3 container gate");
+    return JIT_BLOCK_RAISED;
+}
+
+#ifdef TESTS
+/* Hand-build tiny islands and drive vm_exec_block over each - the M2 unit
+ * test (no emitter wiring yet). */
+bool vm_exec_block_selftest()
+{
+    auto lit = [](int_type v) {
+        Operand o; o.is_lit = true; o.lit_kind = Operand::LitKind::i; o.lit = v;
+        return o;
+    };
+    auto sl = [](int s) { Operand o; o.is_lit = false; o.slot = s; return o; };
+    auto imm = [&](int slot, int_type v) {
+        Instr in; in.op = OpCode::LoadImmInt; in.target = slot; in.set_a(lit(v));
+        return in;
+    };
+
+    struct Res { BlockStatus st; size_t resume; EvalValue slot0; FlowState flow;};
+    auto run = [](std::vector<Instr> ops, int nslots) -> Res {
+        Chunk ck;
+        ck.code = std::move(ops);
+        ck.slot_count = nslots;
+        VmActivation act;
+        VmActivation *prev = g_vm_act;
+        g_vm_act = &act;
+        EvalContext ctx(nullptr, /*const_ctx=*/false);
+        ctx.frame = act.push_window(nslots, &ck, /*boundary=*/false);
+        g_vm_exc_pending.reset();
+        ctx.flow->type = FlowState::none;
+        size_t resume = VM_BLOCK_NONE;
+        const BlockStatus st = vm_exec_block(ctx, act, ck, 0, &resume);
+        Res r{ st, resume, ctx.frame->at(0).get(), *ctx.flow };
+        if (st == BlockStatus::Raised)
+            g_vm_exc_pending.reset();       /* consume the test's exception */
+        act.pop_window();
+        g_vm_act = prev;
+        return r;
+    };
+    auto is_int = [](const EvalValue &v, int_type n) {
+        return v.get_type()->t == Type::t_int && v.get<int_type>() == n;
+    };
+
+    bool ok = true;
+
+    /* (1) fall-through: LoadImmInt r0=42; ExitBlock -> resume 2. */
+    {
+        Instr ex; ex.op = OpCode::ExitBlock; ex.set_a(lit(2));
+        const Res r = run({ imm(0, 42), ex }, 1);
+        ok = ok && r.st == BlockStatus::FellThrough && r.resume == 2
+             && is_int(r.slot0, 42);
+    }
+    /* (2) internal boxed branch (NOT taken): r0=1; JumpUnlessTrueV r0 -> L3;
+     *     r0=99; ExitBlock -> resume 4. r0 true, so it falls to r0=99. */
+    {
+        Instr j; j.op = OpCode::JumpUnlessTrueV; j.target2 = 0; j.target = 3;
+        Instr ex; ex.op = OpCode::ExitBlock; ex.set_a(lit(4));
+        const Res r = run({ imm(0, 1), j, imm(0, 99), ex }, 1);
+        ok = ok && r.st == BlockStatus::FellThrough && r.resume == 4
+             && is_int(r.slot0, 99);
+    }
+    /* (2b) same branch TAKEN: r0=0 -> jump past r0=99, r0 stays 0. */
+    {
+        Instr j; j.op = OpCode::JumpUnlessTrueV; j.target2 = 0; j.target = 3;
+        Instr ex; ex.op = OpCode::ExitBlock; ex.set_a(lit(4));
+        const Res r = run({ imm(0, 0), j, imm(0, 99), ex }, 1);
+        ok = ok && r.st == BlockStatus::FellThrough && is_int(r.slot0, 0);
+    }
+    /* (3) a return: LoadImmInt r0=7; ReturnV r0 -> Returned, flow.value == 7. */
+    {
+        Instr ret; ret.op = OpCode::ReturnV; ret.set_a(sl(0));
+        const Res r = run({ imm(0, 7), ret }, 1);
+        ok = ok && r.st == BlockStatus::Returned
+             && r.flow.type == FlowState::ret && is_int(r.flow.value, 7);
+    }
+    /* (4) an uncaught throw: r0=10; r1=0; IntBin r2 = r0 / r1 -> Raised. */
+    {
+        Instr d; d.op = OpCode::IntBin; d.aop = Op::div; d.target = 2;
+        d.set_a(sl(0)); d.set_b(sl(1));
+        const Res r = run({ imm(0, 10), imm(1, 0), d }, 3);
+        ok = ok && r.st == BlockStatus::Raised;
+    }
+
+    return ok;
+}
+#endif  /* TESTS */

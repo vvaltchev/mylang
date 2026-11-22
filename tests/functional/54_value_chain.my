@@ -1,0 +1,96 @@
+# #72: a value call whose callee the analysis names as 3..8 functions is
+# spliced as a GUARD CHAIN (each arm checks identity, a miss makes the
+# real call), all or nothing. Every shape must print what the tree-walker
+# prints:
+#  - a three-way site whose RESULT is used, with int and float arms;
+#  - a four-way DISCARDED call (bench 100's shape);
+#  - an eight-way site (the cap);
+#  - closures (captures) as the candidates;
+#  - an error thrown from one arm, caught.
+func a1(x) { return x + 1; }
+func a2(x) { return x * 2; }
+func a3(x) { return x - 3; }
+var three = [a1, a2, a3];
+var s = 0;
+for (var i = 0; i < 30; i++) {
+    var f = three[i % 3];
+    s = s + f(i);
+}
+print("three  ", s);
+
+func add_op(st, x) { st[0] = st[0] + x; }
+func sub_op(st, x) { st[0] = st[0] - x; }
+func xor_op(st, x) { st[0] = st[0] ^ x; }
+func mix_op(st, x) { st[0] = (st[0] * 3 + x) % 1000000007; }
+var four = [add_op, sub_op, xor_op, mix_op];
+var st = [0];
+for (var i = 0; i < 40; i++) {
+    var fn = four[i % 4];
+    fn(st, i);
+}
+print("four   ", st[0]);
+
+func e0(x) { return x + 10; }
+func e1(x) { return x + 11; }
+func e2(x) { return x + 12; }
+func e3(x) { return x + 13; }
+func e4(x) { return x + 14; }
+func e5(x) { return x + 15; }
+func e6(x) { return x + 16; }
+func e7(x) { return x + 17; }
+var eight = [e0, e1, e2, e3, e4, e5, e6, e7];
+var t = 0;
+for (var i = 0; i < 64; i++) {
+    var g = eight[(i * 5) % 8];
+    t = t + g(i);
+}
+print("eight  ", t);
+
+var b = int(runtime(5));
+var c1 = func [b] (int x) { return x + b; };
+var c2 = func [b] (int x) { return x * b; };
+var c3 = func [b] (int x) { return x - b; };
+var cs = [c1, c2, c3];
+var u = 0;
+for (var i = 0; i < 12; i++) {
+    var h = cs[i % 3];
+    u = u + h(i);
+}
+print("closures", u);
+
+func q1(x) { return x + 1; }
+func q2(x) { return 100 / (x - 7); }
+func q3(x) { return x; }
+# the chain in a function of its own, the `try` in its caller: a chunk
+# holding a try region is not spliced at all (a separate, older gate)
+func run_q(int n) {
+    var qs = [q1, q2, q3];
+    var w = 0;
+    for (var i = 0; i < n; i++) {
+        var q = qs[i % 3];
+        w = w + q(i);
+    }
+    return w;
+}
+func guarded() {
+    try { return run_q(int(runtime(12))); }
+    catch (DivisionByZeroEx as e) { print("caught ", e); }
+    return -1;
+}
+print("thrown ", guarded(), run_q(int(runtime(6))));
+
+# a body returning its PARAMETER (read in place, step 1b) - the result
+# move must read the argument's source, not the never-bound param slot.
+# Latent in a two-arm site before #72, found by the three-arm one above.
+func r1(x) { return x + 1; }
+func r2(x) { return x; }
+func run_r(int n) {
+    var rs = [r1, r2];
+    var w = 0;
+    for (var i = 0; i < n; i++) {
+        var r = rs[i % 2];
+        w = w + r(i);
+    }
+    return w;
+}
+print("identity arm ", run_r(int(runtime(6))));

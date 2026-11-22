@@ -5,11 +5,12 @@
 #include "defs.h"
 #include "uniqueid.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
 /*
- * The SERIALIZABLE runtime function descriptor (plans/vm-ast-free-runtime.md).
+ * The SERIALIZABLE runtime function descriptor (plans/archived/vm-ast-free-runtime.md).
  *
  * FuncDescriptor is the RUNTIME identity of a function: everything
  * do_func_call, closure creation, backtraces, the per-frame pure cache, and
@@ -50,6 +51,7 @@ enum class DeclType : unsigned char {
     none, b, i, f, s, arr, dict,
     strct,   /* a user struct type; the exact type is in `decl_struct` */
     dyn,     /* `dyn` as a type (used inside a TypeAnnot, e.g. `array<dyn>`) */
+    box,     /* `box<T>` (a TypeAnnot; the boxed type in its `elem`) */
 };
 
 /*
@@ -79,6 +81,7 @@ struct ResolvedSym {
 };
 
 class FuncDeclStmt;
+struct TypeAnnot;
 
 struct FuncDescriptor {
 
@@ -90,6 +93,60 @@ struct FuncDescriptor {
         bool cnst;                   /* `const x` - binds as a const LValue */
         bool dyn_mod;                /* `dyn`/`~` (signature rendering only) */
         DeclType decl_type;          /* i/f trigger the bind-time coercion */
+        /*
+         * C3: the inference-PROVEN scalar kind of an UN-annotated param
+         * (i/f, else none). Stamped by the one-shot inferencer ONLY for
+         * a concrete, non-opt, non-dyn param of a non-template function
+         * that is NEVER used as a value (sym !value_used) and whose
+         * value the callee-set analysis says has not ESCAPED - so every
+         * call path is compile-checked and the param can only ever
+         * receive that scalar. METADATA, not a
+         * coercion trigger (bind paths ignore it): its one consumer is
+         * codegen's ref_slots param join, which may then exclude the
+         * param from the return-path reference-release scan exactly
+         * like a coerced i/f param. The VM_HARDENING full-window audit
+         * at pop_window is the net: a wrongly-excluded param holding a
+         * reference fails the every-slot-trivial assert at frame pop.
+         */
+        DeclType proven_type = DeclType::none;
+
+        /*
+         * The parameter's annotation as written, `[opt] TYPE`, when its
+         * DeclType keyword alone cannot say it: a struct (`P p`), a
+         * parameterized container (`array<int> a`, `dict<str,P>? d`) or a
+         * box (`box<int> b`). Null otherwise. Read by signature() only
+         * (reflect_param_str); set by sync_params from the Identifier's
+         * decl_struct / decl_annot, stored in a .myv (v36).
+         */
+        const UniqueId *sig_type = nullptr;
+
+        /*
+         * #49: the parameter's declared type as a run-time annotation,
+         * when an argument a `dyn` passed must be checked against it -
+         * a `bool`, `str`, struct, container or box parameter (`opt`
+         * when the parameter is). Null for an untyped, `dyn`, `int` or
+         * `float` one (the last two convert, bind_param). The check runs
+         * at a call whose arguments may not fit (CallExpr::fit_args) and
+         * at every call no compile-time proof covers (a dyn callee, a
+         * builtin's callback) - value_fits, eval.h. Set by sync_params,
+         * stored in a .myv (v37).
+         */
+        std::shared_ptr<const TypeAnnot> fit = nullptr;
+
+        /*
+         * "This param slot can never hold a REFERENCE" - an annotated i/f
+         * (bind_param's coercion guarantees it) or an inference-proven one
+         * (C3, above). TWO consumers must agree on this or one of them is
+         * wrong: codegen's ref_slots join (which then leaves the slot out
+         * of the return-path release scan) and the parameter escape
+         * analysis (which does not claim a slot with no reference to
+         * borrow). One predicate, so they cannot drift apart.
+         */
+        bool binds_scalar() const
+        {
+            return decl_type == DeclType::i || decl_type == DeclType::f
+                || proven_type == DeclType::i || proven_type == DeclType::f;
+        }
     };
 
     /* One capture-list entry, RESOLVED: closure creation snapshots the value
@@ -99,12 +156,32 @@ struct FuncDescriptor {
         const UniqueId *name;
         SymKind kind;
         int slot;
+        /* The capture-list entry's own span, so an UnboundSymbolEx raised by
+         * the snapshot carets THE NAME INSIDE THE BRACKETS rather than the
+         * whole closure expression (#131 step 4). Serializable (plain Locs);
+         * the ctor is AST-free, so the Identifier is long gone by then. */
+        Loc start;
+        Loc end;
     };
 
     const UniqueId *name = nullptr;  /* null for a lambda */
     std::string display_name;        /* backtrace override (spec clones) */
     std::vector<ParamDesc> params;
     std::vector<CaptureDesc> captures;
+
+    /*
+     * A number no other descriptor of this process has had (DescStamp,
+     * syntax.h): a descriptor CAN be freed before codegen - its lambda
+     * folded or dropped by an optimizer - and a new one may then be
+     * allocated at its address, so a pointer alone does not say which
+     * descriptor a stamp named. Compile-time only; not in a .myv image.
+     */
+    const uint64_t serial = next_serial();
+    static uint64_t next_serial()
+    {
+        static uint64_t n = 0;
+        return ++n;
+    }
 
     /* Compile results (see the field policy above). */
     bool resolved = false;
@@ -123,6 +200,11 @@ struct FuncDescriptor {
     /* A never-called monomorphization source: proven callee-less, so it has
      * neither a chunk nor (post-teardown) a body - calling it is a bug. */
     bool is_template_base = false;
+    /* A copy pt_typed_call (parser.cpp) type-inferred for a parse-time
+     * run: it runs as it is, typed; any other function run at parse time
+     * is typed first (EvalContext::parse_typed). COMPILE-only, never
+     * stored in an image. */
+    bool parse_typed = false;
 
     /*
      * The bytecode VM's compiled body chunk (an opaque `const Chunk *`; this
@@ -135,6 +217,47 @@ struct FuncDescriptor {
     mutable const void *vm_chunk = nullptr;
     mutable bool vm_chunk_tried = false;
     mutable bool fast_bind = false;
+
+    /*
+     * #93: per-parameter "this reference cannot outlive the call" bits, bit
+     * i for param i (computed by compute_noescape_params, resolver.cpp -
+     * read its header for the rules and for what a consumer still owes).
+     * A set bit means the callee's slot needs no COUNT of its own, because
+     * the CALLER's slot holds one for the whole of a synchronous call.
+     * Zero for every function until the pass runs, and zero for a param
+     * past 64 - so a missing answer costs the optimization, never
+     * soundness. NOT yet consumed by the bind; see plans/top5-cpp-gap.md.
+     */
+    mutable uint64_t noescape_params = 0;
+
+    /*
+     * G1: for a NON-fast_bind function, the Type singleton each parameter's
+     * bind-time coercion requires - `t_int` for a param declared `int`,
+     * `t_float` for `float`, null for one that needs no coercion. Empty when
+     * `fast_bind` holds (nothing reads it then).
+     *
+     * `coerce_to_decl_type` is the IDENTITY when the value already has that
+     * type, which is what the inferencer normally produces, so an emitted
+     * caller can check the argument against this and use the plain copy -
+     * instead of declining the whole call to the C++ tier, which is what a
+     * single `int`-annotated parameter used to cost (measured 1.61x on an
+     * otherwise identical closure call). A widening argument (bool into int,
+     * int into float) and a `none` still go the slow way; they are correct,
+     * just not fast.
+     *
+     * DERIVED with `fast_bind` by compute_bind_flags (eval.cpp) - the ONE
+     * place that reads `decl_type`, so the flag and this array cannot drift
+     * apart. Not serialized: a loaded image recomputes both, and ML_CHECKs
+     * the recomputed flag against the stored one.
+     */
+    mutable std::vector<const void *> bind_req;
+
+    /*
+     * #49: some parameter has a `fit` (ParamDesc::fit) - so a builtin's
+     * callback cannot bind it a raw scalar unchecked (VmInvoker's raw
+     * path declines). DERIVED with fast_bind by compute_bind_flags.
+     */
+    mutable bool fit_any = false;
 
     /*
      * COMPILE-TIME / tree-walker back-pointer to the owning decl (body eval,

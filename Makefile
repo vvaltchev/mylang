@@ -1,21 +1,29 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 BUILD_DIR ?= build
+# Every object is named by its ABSOLUTE path, however BUILD_DIR was given:
+# the .d files name it that way (DEPFLAGS below), so a header change
+# rebuilds it whichever spelling the next build uses. See DEPFLAGS.
+override BUILD_DIR := $(abspath $(BUILD_DIR))
 PROJ_ROOT:=$(shell pwd)
 
 OPT ?= 1
 LTO ?= $(OPT)
 FL_LANG ?= -std=c++17
-FL_DBG ?= -ggdb
-FL_WARN ?= -Wall -Wextra -Wno-unused-parameter
 
-# The codebase intentionally calls `move`/`forward` unqualified (see
-# `using std::move;` in defs.h), which recent clang reports under
-# -Wunqualified-std-cast-call. Silence it for clang only: GCC has no such
-# option and would note an unrecognized flag.
-ifneq (,$(findstring clang,$(shell $(CXX) --version 2>/dev/null)))
-	FL_WARN += -Wno-unqualified-std-cast-call
+# DEBUG_INFO (default 0, for EVERY build type): debug info multiplies the
+# binary's size many times over and is unused in the vast majority of
+# builds (maintainer-set, 2026-08-26 - disk wear). DEBUG_INFO=1 restores
+# the old unconditional -ggdb; pass it whenever a debugger, a symbolized
+# sanitizer report, or line-accurate callgrind attribution is wanted.
+# CI carries a DEBUG_INFO=1 lane so the configuration cannot rot.
+DEBUG_INFO ?= 0
+ifeq ($(DEBUG_INFO),1)
+	FL_DBG ?= -ggdb
+else
+	FL_DBG ?=
 endif
+FL_WARN ?= -Wall -Wextra -Wno-unused-parameter
 
 # WERROR (default 1): a warning FAILS the build, so it must be addressed, not
 # left to accumulate (see CLAUDE.md's warning rule). Matches CMake's -DWERROR.
@@ -28,6 +36,22 @@ endif
 
 FL_OTHER ?= -fwrapv
 FL_INC = -I$(PROJ_ROOT)/src
+
+# A 16 MB main-thread stack where the default is too small: the compile
+# passes recurse once per level of nesting (#98). Decided by what the
+# compiler builds FOR, not by `uname`: a-Shell on the iPad says Darwin too,
+# but its clang makes WebAssembly, whose linker has no -stack_size.
+# - macOS, as CMake gives it (see CMakeLists.txt): an ASan build's frames on
+#   arm64 outgrow the default 8 MB at the 256-level limit.
+# - WASI (a-Shell): wasm-ld's default stack is far smaller still, and
+#   --stack-first puts the stack below the data, so an overflow traps
+#   instead of silently overwriting memory.
+TARGET_TRIPLE := $(shell $(CXX) -dumpmachine)
+ifneq (,$(findstring wasm,$(TARGET_TRIPLE)))
+	LDFLAGS += -Wl,-z,stack-size=16777216 -Wl,--stack-first
+else ifneq (,$(findstring darwin,$(TARGET_TRIPLE)))
+	LDFLAGS += -Wl,-stack_size,0x1000000
+endif
 BASE_FLAGS ?= $(FL_INC) $(FL_LANG) $(FL_DBG) $(FL_WARN) $(FL_OTHER)
 
 ifdef OPT
@@ -41,7 +65,9 @@ endif
 # Build with LTO=0 to disable. -flto=auto is accepted by both GCC and clang, and
 # must be present at both compile and link (the link line passes BASE_FLAGS).
 ifeq ($(LTO),1)
-	BASE_FLAGS += -flto=auto
+	BASE_FLAGS += -flto=auto -DML_LTO=1
+else
+	BASE_FLAGS += -DML_LTO=0
 endif
 
 # AddressSanitizer / UndefinedBehaviorSanitizer. Both default ON for a debug
@@ -51,6 +77,13 @@ endif
 # UBSan excludes signed-integer-overflow: the project builds with -fwrapv and
 # *relies* on signed wraparound (see defs.h / the README), so that overflow is
 # defined behavior here, not a bug to flag.
+# A COVERAGE build (GCOV=1) defaults UBSan OFF: its check on every
+# variable shift and bounded access is a BRANCH gcov counts, whose taken
+# arm no input can reach - so the coverage universe would hold sanitizer
+# edges, not the product's. ASan stays (it adds no branches gcov sees).
+ifeq ($(GCOV),1)
+	UBSAN ?= 0
+endif
 ifeq ($(OPT),0)
 	ASAN ?= 1
 	UBSAN ?= 1
@@ -68,8 +101,12 @@ ifeq ($(UBSAN),1)
 	# diagnose-and-continue, so a real UB failure can't slip through CI's
 	# exit-code check (the default recovers and would still exit 0).
 	BASE_FLAGS += -fsanitize=undefined -fno-sanitize=signed-integer-overflow \
-	              -fno-sanitize-recover=undefined
+	              -fno-sanitize-recover=undefined -DML_UBSAN=1
+else
+	BASE_FLAGS += -DML_UBSAN=0
 endif
+# ML_UBSAN tells `mylang -v` (as ML_LTO does): GCC defines no macro for
+# -fsanitize=undefined, so the binary cannot learn it from the compiler.
 
 ifneq (,$(filter 1,$(ASAN) $(UBSAN)))
 	BASE_FLAGS += -fno-omit-frame-pointer
@@ -99,6 +136,25 @@ endif
 # syntax.cpp / the "Invariants & hazards" section in CLAUDE.md.
 ifeq ($(RECYCLE),1)
 	BASE_FLAGS += -DRECYCLE_ALLOC
+endif
+
+# Untrusted-bytecode checks (ML_UNTRUSTED_CHECK): the value-dependent guards a
+# corrupt `.myv` needs, gated at RUNTIME on where the bytecode came from rather
+# than at COMPILE time on the build type - so a release running a shipped image
+# keeps them, which is the one case that matters. NOT tied to ASSERTS.
+#
+# ON by default. It landed OFF, because ml_untrusted_fail throws and several
+# guarded sites are reached from `noexcept` JIT helpers where that is
+# std::terminate; those sites take a defined fallback now (this commit and
+# the noexcept sweep before it), so the tier is armed.
+# UNTRUSTED_CHECKS=0 compiles it away: the A/B lever for measuring what the
+# never-taken branch costs a trusted run, NOT a shipping configuration.
+# See ML_UNTRUSTED_CHECK in defs.h.
+UNTRUSTED_CHECKS ?= 1
+ifeq ($(UNTRUSTED_CHECKS),0)
+	BASE_FLAGS += -DML_UNTRUSTED_CHECKS=0
+else
+	BASE_FLAGS += -DML_UNTRUSTED_CHECKS=1
 endif
 
 # VM dispatch: computed-goto (direct-threaded) on GCC/clang, default ON.
@@ -131,8 +187,76 @@ ifdef TESTS
 	endif
 endif
 
-DEPDIR := .d
-DEPFLAGS = -MT $@ -MMD -MP -MF $(DEPDIR)/$*.Td
+# INT_TESTS: the INTRUSIVE test build (#107, plans/intrusive-tests.md). It
+# compiles in heavy instrumentation at every pipeline stage - observers,
+# forcing switches and test-only builtins - so it is NEVER a measurement
+# subject: `mylang -v` reports `int_tests 1` and bench/run.py refuses such
+# a binary. It is a superset of the `-rt` suite, so it implies TESTS. Off
+# by default; `make INT_TESTS=1 OPT=0 BUILD_DIR=build-claude/int`.
+INT_TESTS ?= 0
+ifeq ($(INT_TESTS),1)
+	BASE_FLAGS += -DINT_TESTS
+	ifneq ($(TESTS),1)
+		BASE_FLAGS += -DTESTS
+	endif
+endif
+
+# GCOV=1: a coverage build (parity with CMake's -DGCOV=ON). Use it with
+# OPT=0 (an optimized build folds branches away; with LTO the counters
+# would describe the link, not the source). Where the compiler supports
+# it (GCC >= 14) it also records MC/DC condition coverage
+# (-fcondition-coverage): the bar the intrusive suite is measured against
+# (plans/intrusive-tests.md, section 9; tests/int_coverage.py).
+ifeq ($(GCOV),1)
+	# ML_COVERAGE: the assertion macros check nothing (defs.h) - their
+	# failure arms are branches no correct run may take.
+	BASE_FLAGS += -fprofile-arcs -ftest-coverage -DML_COVERAGE=1
+	ifeq ($(shell $(CXX) -fcondition-coverage -fsyntax-only -x c++ \
+	              /dev/null 2>/dev/null && echo 1),1)
+		# GCC caps MC/DC at 64 conditions per decision, with no parameter
+		# to raise it; 5 decisions in vm.cpp's dispatch exceed it and keep
+		# plain BRANCH coverage. The warning still PRINTS (it is the record
+		# of which ones); it is only not fatal - a tool limit, not a code
+		# defect. Listed in plans/intrusive-tests.md section 9.1.
+		BASE_FLAGS += -fcondition-coverage \
+		              -Wno-error=coverage-too-many-conditions
+	endif
+endif
+
+# Header dependencies live INSIDE the build dir. They used to share one
+# top-level `.d/`, which two builds of different lanes running at once
+# (tests/run) both rewrite: the .Td temp file races, and the
+# surviving .d names the OTHER lane's object as its target, so this lane
+# silently loses its header dependencies and a later header edit leaves a
+# stale object behind.
+DEPDIR := $(BUILD_DIR)/.d
+# The dependency rule names the object under BOTH spellings of its path -
+# as make sees it this run ($@) and absolute. A lane built once with an
+# ABSOLUTE BUILD_DIR (tests/run passes one) and later with a
+# relative one (`make BUILD_DIR=build-claude/dbg`) otherwise has .d files
+# whose target is a DIFFERENT string from the object make is asked for:
+# the rule matches nothing, every header dependency is silently dropped,
+# and an object compiled against an old header survives a rebuild. That
+# happened (2026-09-28): a stale serialize.o kept the old opcode count
+# and refused every image holding a new opcode as "corrupt". A duplicate
+# target when the spellings agree is harmless.
+# THREE spellings, not two: `$(abspath $@)` only ADDS the absolute form,
+# so a .d written by an ABSOLUTE build named nothing else and a later
+# relative build still missed every header - watched the next day, a
+# stale vm.o compiled against the old Chunk layout (an ASan stack
+# overflow in vm_compile). The third is the path relative to the
+# Makefile's directory, whichever spelling the build was given.
+# AND THE SPELLINGS WERE STILL NOT ENOUGH (2026-10-10): the relative one
+# is relative to make's CURDIR, so a .d written by a build run from
+# ANOTHER directory (a copy of the tree, building into this lane) named
+# the absolute path three times, and a later relative build missed every
+# header again - a stale backtrace.o against a grown ParamDesc, an ASan
+# heap-buffer-overflow in every compile. BUILD_DIR is made absolute at
+# the top of this file now, so make always asks for the absolute target,
+# which every .d names.
+DEP_REL = $(patsubst $(CURDIR)/%,%,$(abspath $@))
+DEPFLAGS = -MT $@ -MT $(abspath $@) -MT $(DEP_REL) -MMD -MP \
+           -MF $(DEPDIR)/$*.Td
 # clang writes the -MF file after the object file; touch the object so its
 # .d is not newer than it (otherwise every object is rebuilt on every run).
 POSTCOMPILE = mv -f $(DEPDIR)/$*.Td $(DEPDIR)/$*.d && touch $@
@@ -161,6 +285,9 @@ clean:
 	rm -f $(BUILD_DIR)/*.o
 	rm -f $(BUILD_DIR)/$(TARGET)
 	rm -rf $(DEPDIR)
+	# a GCOV=1 lane's notes and counters: a stale .gcda left by a clean
+	# build of different code makes every later run warn about checksums
+	rm -f $(BUILD_DIR)/*.gcno $(BUILD_DIR)/*.gcda
 
 $(DEPDIR)/%.d: ;
 .PRECIOUS: $(DEPDIR)/%.d

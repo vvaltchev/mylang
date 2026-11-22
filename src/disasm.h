@@ -5,6 +5,7 @@
 #include "bytecode.h"
 
 #include <string>
+#include <vector>
 
 class Block;
 
@@ -15,26 +16,23 @@ class Block;
  * and immediates (`#N`), and the instructions are the fused superinstructions
  * (a for-loop counter is ONE `for.step`, not three ops).
  *
- * A residual runtime-node op - a fallback (`eval.stmt` / `eval.slot` /
- * `jmp.if.not`), a MUTATING/map-filter builtin call, or a flat-store caret -
- * holds its AST node as an INDEX into `Chunk::ast_nodes` (the `Instr` itself has
- * NO `Construct*` - that is what lets the bytecode serialize). The disassembler
- * renders that node via the SHARED AST decompiler (`render_construct_code`,
- * coderender.h) so it reads as the AST dump, not a duplicate, and dumps the
- * `ast_nodes` pool itself (labelled NOT serializable). A READ-ONLY value-ABI
- * builtin call (`call.blt.v`) is AST-FREE - it reads the serializable
- * `builtin_calls` pool (name + arg carets), also dumped. As the residual ops
- * become native (the no-fallback end-goal) the `ast_nodes` pool shrinks toward
- * EMPTY - a fully-native chunk has an empty `ast_nodes`, the accurate "the AST
- * can be dropped" signal for a stored-bytecode `.myv`.
+ * EVERY op's data comes from a SERIALIZABLE pool: a builtin call
+ * (`call.blt.v` and the LV family) reads `builtin_calls` (name + arg carets),
+ * a struct-append `emplace_sites`, an indirect call `call_sites`, and a caret
+ * with nowhere else to live rides the `locs` side table. There is no AST
+ * pointer to render: the no-fail codegen removed the fallback ops that needed
+ * one, and with them `Chunk::ast_nodes` / `node_table` (see CLAUDE.md's
+ * ZERO-AST rule). So the whole dump is what a `.myv` file stores.
  *
  * `cap_names` is a CLOSURE's capture list - its anonymous capture-struct field
  * names, in `cN` slot order: the header prints them (`; captures (anon struct):
  * { ... }`) and the capture ops read a `cN` slot as its field name. Empty for a
  * non-capturing chunk.
  */
+struct JitCtx;
 std::string disassemble(const Chunk &chunk, const std::string &title,
-                        const std::vector<std::string> &cap_names = {});
+                        const std::vector<std::string> &cap_names = {},
+                        const JitCtx *jc = nullptr);
 
 /*
  * Disassemble a whole program - 100% of what a serialized `.myv` file would
@@ -55,6 +53,135 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
 std::string disassemble_program(const Block *root);
 
 /*
+ * ====================  THE STRUCTURED DECODE  ====================
+ *
+ * ⛔ A TEST ASSERTS ON AN INSTRUCTION, NOT ON THE TEXT THAT RENDERS IT
+ * (maintainer, 2026-09-22). `-vdj`'s decoder knows every field - the
+ * base register, the index, the scale, the displacement, whether the
+ * memory operand resolves to a FRAME SLOT - and then threw all of it
+ * away into a string. A shape test that wanted one operand had to
+ * parse the rendering back, which is a second decoder in all but name:
+ * it re-derives what was already known, it is not the thing objdump
+ * cross-checks, and it cannot recover what the rendering COLLAPSED.
+ *
+ * The collapse is real and it is the reason this exists: the dump
+ * spells a scratch TEMP `rN`, which is also how it spells machine
+ * registers r8..r15, so `mov r10, rax` is ambiguous IN THE TEXT and
+ * not ambiguous at all in the decode. `DecOp::Slot` and `DecOp::Gpr`
+ * are different kinds here.
+ *
+ * So `decode_one` FILLS one of these and the dump is `render(it)` -
+ * one decoder still, the one `scripts/disasmcheck` verifies against
+ * objdump, and the text cannot disagree with the structure because it
+ * is derived from it.
+ *
+ * ⛔ WHAT THIS DOES NOT PROVE, and the sabotage that showed it:
+ * dropping the SIB byte from an `[r12+d]` encoding leaves a DIFFERENT,
+ * well-formed instruction - our decoder and objdump agreed on it
+ * perfectly over 235,639 instructions while `-rt` aborted and
+ * corpus_diff went 33/35. A decoder oracle proves the dump is honest
+ * about the BYTES; only the engine differential proves the bytes mean
+ * what the emitter intended.
+ */
+struct DecOp {
+    enum Kind : unsigned char {
+        None,
+        Gpr,        /* a 64-bit general register (`reg`)             */
+        Gpr32,      /* its 32-bit spelling, eNN                      */
+        Gpr8,       /* its low-byte spelling (`rex8`: dil/sil/...)   */
+        Xmm,        /* an SSE register (`reg`)                       */
+        Cl,         /* the ISA-fixed shift count                     */
+        Mem,        /* [base + index*scale + disp]; base < 0 = none  */
+        Slot,       /* a FRAME SLOT - [rbx+disp] the namer resolved  */
+        Imm,        /* `imm`, rendered through the tag symbolisation */
+        ImmDec,     /* `imm`, rendered as a plain decimal            */
+        Rel,        /* a branch target: `imm` = the FRAGMENT offset  */
+        CallRel     /* a rel32 call: `imm` = the raw displacement,
+                     * masked to <helper> unless MYLANG_VDJ_ADDRS     */
+    };
+    Kind kind = None;
+    int reg = -1;          /* Gpr/Gpr32/Gpr8/Xmm; Mem: the base      */
+    int index = -1;        /* Mem, -1 = none                         */
+    int scale = 1;         /* Mem                                    */
+    int disp = 0;          /* Mem                                    */
+    long long imm = 0;     /* Imm/ImmDec/Rel/CallRel                 */
+    int slot = -1;         /* Slot: the frame slot index             */
+    bool slot_type = false;/* Slot: the `.type` half of the slot     */
+    bool byte_ptr = false; /* Mem/Slot printed with a `byte` size    */
+    bool rex8 = false;     /* Gpr8: the uniform low-byte set         */
+    /* Gpr: the operand WIDTH the encoding selects (64, or 32/16/8 when
+     * neither REX.W nor a 64-bit default applies); Mem/Slot: 8 marks a
+     * byte memory operand the default dump does not mark. Only the
+     * MYLANG_VDJ_RAW rendering reads it - the default dump names every
+     * Gpr by its 64-bit register, and changing that text is a separate
+     * decision (it would move every vdjcmp baseline). rex8 picks the
+     * low-byte set when size == 8. */
+    unsigned char size = 64;
+    /* HOW the address was ENCODED, which the rendering differs on: a
+     * SIB form omits a zero displacement and carries the no-base
+     * absolute, a plain one always prints its disp. Recorded rather
+     * than re-derived, so render() stays a pure function of this. */
+    bool via_sib = false;  /* Mem                                    */
+    bool rip = false;      /* Mem: RIP-relative                      */
+};
+
+struct DecodedIns {
+    unsigned off = 0;      /* fragment-relative offset               */
+    unsigned len = 0;
+    std::string mn;        /* the mnemonic; empty when !ok           */
+    DecOp ops[3];
+    int n = 0;
+    bool ok = false;       /* false: the decoder does not know it    */
+};
+
+/* one collected fragment: which chunk section it belongs to, and its
+ * instructions in offset order */
+struct DecodedFrag {
+    std::string section;
+    std::vector<DecodedIns> ins;
+};
+
+/*
+ * When non-null, every native fragment `disassemble_program` renders is
+ * ALSO appended here. A collector rather than a second entry point
+ * because the dump walk already finds every fragment and names every
+ * section; duplicating that walk is how two answers start to differ.
+ */
+extern std::vector<DecodedFrag> *g_jit_decode_sink;
+
+/*
+ * Decode ONE instruction at code[p] (advancing p) into `out` - the
+ * same decoder `-vdj` renders and `scripts/disasmcheck` cross-checks
+ * against objdump. `out.ok` is false for a byte it does not know (p
+ * then advances by one).
+ *
+ * ⛔ `decoded_gp_writes` IS THE JIT REGISTER TRACKER's GROUND TRUTH
+ * (REGTRACK, 2026-10-02): the mask of general registers the
+ * instruction WRITES, explicit and implicit (cqo -> rdx; div/idiv/mul
+ * and one-operand imul -> rax+rdx). A `call` returns 0 - its clobber
+ * of the caller-saved set is the call bracket's business. It FAILS
+ * TOWARDS "writes": any mnemonic not known to leave its first operand
+ * alone is taken to write it, so a new non-writing form reads as an
+ * undeclared write (loud) and never as a silent pass.
+ */
+void decode_ins(const uint8_t *code, uint32_t n, uint32_t &p,
+                DecodedIns &out);
+uint32_t decoded_gp_writes(const DecodedIns &d);
+/* MYLANG_VDJ_RAW's instruction rendering, for -rt (see disasm.cpp) */
+/* -vdj's rendering of one instruction, no slot names (an -rt hook) */
+std::string render_ins_for_test(const DecodedIns &d);
+/* MYLANG_VDJ_RAW as read at load; -rt sets it in-process (save and
+ * restore it) */
+extern bool g_vdj_raw;
+
+/* The LOADED-IMAGE twin (plans/archived/myv-serializer.md): dump a VmProgram exactly
+ * as disassemble_program dumps a fresh compile - the ROUND-TRIP ORACLE
+ * (`-vd file.my` vs `-vd file.myv` must be byte-identical) and the everyday
+ * "what is in this file" answer. */
+struct VmProgram;
+std::string disassemble_image(const VmProgram &prog);
+
+/*
  * Colorize a plain disassembly (from `disassemble`/`disassemble_program`) with
  * 256-color ANSI syntax highlighting - a post-pass that tokenizes each line by
  * the disassembler's own shape (`<pc> <mnemonic> <operands> ; comment`) and
@@ -63,3 +190,34 @@ std::string disassemble_program(const Block *root);
  * piped, honoring NO_COLOR / --no-color), so a redirected dump stays plain.
  */
 std::string highlight_disasm(const std::string &plain);
+
+/* The bare enum NAME of an opcode ("CallV"), "?" for a value outside the
+ * enum: the ONE spelling - the -vd container plan, the JIT's
+ * delete-originals audit and the inline audit all read it. */
+const char *opcode_name(OpCode op);
+
+/*
+ * ⛔ THE JIT PROFILE MAP (`MYLANG_JIT_MAP=<path>`) - the instrument that
+ * answers "which EMITTED INSTRUCTION does the JIT spend its cycles on".
+ *
+ * Nothing in the repo could answer that. `-vdj` says what was emitted,
+ * `bench/run.py` says how long the whole program took, callgrind says
+ * how many instructions ran and which C++ FUNCTION they were in - but
+ * JIT code lives in an anonymous mapping with no symbols, so every
+ * emitted instruction lands in one nameless blob. The whole call-protocol
+ * arc was costed by COUNTING the emitted sequence by hand and hoping the
+ * hot path was the one being counted.
+ *
+ * This appends, per placed fragment, a header and one line per decoded
+ * instruction at its RUNTIME ADDRESS:
+ *
+ *     frag <abs-hex> <len> <chunk-name>#<frag-index>
+ *     i <abs-hex> <len> <mnemonic>
+ *
+ * `scripts/jitprofile.py` joins that against a callgrind
+ * `--dump-instr=yes` run, which records costs by absolute address, and
+ * prints per-instruction Ir. Written only when the env var is set (the
+ * decode is not free), and it FORCES `g_jit_annotate` on, because the
+ * per-fragment table it walks is built only under that flag.
+ */
+void jit_write_map(const Chunk &chunk, const std::string &name);

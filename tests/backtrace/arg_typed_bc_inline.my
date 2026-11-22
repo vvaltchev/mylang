@@ -1,0 +1,15 @@
+# THE ARGUMENT RULE through the BYTECODE INLINER: a direct call to a
+# TYPED callee whose body holds a loop is bytecode-inlined, its bind a
+# CoerceNumV - an uncaught misfit renders its caret on the argument and
+# no frame for the callee, exactly as the real call does
+func fscale(float x, int k) {
+    var r = 0.0;
+    for (var i = 0; i < k; i++) r += x;
+    return r;
+}
+func boom(dyn v) {
+    var y = fscale(1.0, v);
+    return y;
+}
+print(boom(runtime(4)));
+print(boom(runtime("x")));

@@ -1,0 +1,12 @@
+struct P { int x; dyn? nx; }
+var b = box(P(1, none))
+b.nx = b
+b
+print(b)
+str([b])
+var c = box(P(2, none))
+c.nx = [c, c, "a string long enough to push the echo past the width"]
+c
+(*b).nx = 5
+b.nx = none
+c.nx = none

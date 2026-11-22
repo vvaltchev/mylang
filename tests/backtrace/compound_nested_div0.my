@@ -1,0 +1,9 @@
+# a compound store's OPERATION error carets the whole expression, a
+# nested one included (it rendered no location at all in the VM)
+func g(m, z) { m[0][1] /= z; }
+func drive(int n) {
+    var m = [[1, 2], [3, 4]];
+    for (var i = 0; i < n; i++) g(m, i == 2 ? runtime(0) : 1);
+    return n;
+}
+print(drive(runtime(4)));

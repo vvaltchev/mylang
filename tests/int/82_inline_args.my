@@ -1,0 +1,81 @@
+# INT-ENGINES: tw default ni tw+ni nj
+#
+# INT unit (#107): THE ARGUMENT RULE of the AST inliner (CLAUDE.md,
+# arg_is_inert). A real call evaluates each argument ONCE, left to right,
+# BEFORE the body; an inlined call may paste an argument into the body
+# only when it is INERT (cannot throw, has no effect, reads nothing the
+# body changes). Every shape below is an argument the rule must bind to a
+# temp, or one it may paste - and the oracle is `-ni`: every engine must
+# print the same event log as the program with the inliner off.
+
+var evlog = [];
+func ev(str s) { append(evlog, s); }
+func tick(int v) { ev("tick" + str(v)); return v; }
+
+var g = 1;
+func addg(x) { g = 10; return x + g; }           # the body writes g
+func twice(x) => x + x;
+func cond_use(bool c, x) => c ? x : 0;
+func after(x) { ev("body"); return x; }
+func either(bool c, x, y) => c ? x : y;
+func neg(x) => 0 - x;
+func sq(x) => x * x;
+func apply(f, v) => f(v);
+func shifty(int x) => x + 1;
+
+func run(str what, dyn f) {
+    var r = "?";
+    try {
+        r = str(f());
+    } catch (DivisionByZeroEx) {
+        r = "DivisionByZeroEx";
+    } catch (InvalidValueEx) {
+        r = "InvalidValueEx";
+    } catch (OutOfBoundsEx) {
+        r = "OutOfBoundsEx";
+    }
+    ev(what + "=" + r);
+}
+
+func cases(int n, int z, float fz, bool t) {
+    ev("addg=" + str(addg(g)));                  # a global the body writes
+    g = 1;
+    ev("addg2=" + str(addg(g + 1)));
+    g = 1;
+    ev("twice=" + str(twice(tick(n))));          # an effect, used twice
+    ev("cond0=" + str(cond_use(false, tick(n + 1))));   # used nowhere
+    run("div0", func[n, z]() => cond_use(false, n / z));
+    run("div0b", func[n, z]() => after(n / z));
+    run("mod0", func[n, z, t]() => cond_use(t, n % z));
+    run("divm1", func[n]() => cond_use(false, (n - n - 9223372036854775807
+                                              - 1) / -1));
+    run("divlit", func[n]() => cond_use(true, n / 3 + n % 4));
+    run("fdiv0", func[fz]() => cond_use(false, 1.0 / fz));
+    run("fmod0", func[n, fz]() => cond_use(true, n % fz));
+    run("fdivlit", func[n]() => cond_use(true, n / 2.5));
+    run("shl", func[n, z]() => cond_use(false, n << (z - 1)));
+    run("shr", func[n]() => cond_use(true, n >> 1));
+    run("oob", func[n]() => cond_use(false, [1, 2][n]));
+    ev("unary=" + str(neg(-n) + neg(+n) + neg(~n)));
+    ev("not=" + str(cond_use(!t, n) + cond_use(!!t, n)));
+    ev("bits=" + str(sq(n & 3) + sq(n | 4) + sq(n ^ 5)));
+    ev("cmp=" + str(cond_use(n < 3, 7) + cond_use(n == 5 || t, 9)
+                    + cond_use(t && n > 1, 11)));
+    ev("either=" + str(either(t, tick(1), tick(2))));
+    ev("fn=" + str(apply(sq, n) + apply(neg, n)));
+    ev("arith=" + str(sq(n - 1) + sq(n * 2) + twice(n + n)));
+    ev("float=" + str(sq(fz + 1.5) + twice(-fz)));
+    ev("shifty=" + str(shifty(n >>> 1) + shifty(n << 2)));
+}
+# a global function name that the program REBINDS is not an inert value
+func one(x) => x + 1;
+func two(x) => x + 2;
+var pick = one;
+func apply_pick(v) { pick = two; return apply(pick, v); }
+ev("pick=" + str(apply_pick(int(runtime(3)))));
+
+cases(int(runtime(5)), int(runtime(0)), float(runtime(0.0)),
+      runtime(1) == 1);
+
+foreach (l in evlog)
+    print(l);

@@ -1,0 +1,112 @@
+# A TYPE ALIAS: `const T = S;` names the struct S, so T may stand for S
+# wherever a struct name may (README *Type aliases*): a construction,
+# positional or named, a `T.CONST`, a declaration's or a parameter's type,
+# an element type, a catch clause. A construction that ran at run time
+# used to fail with "Undefined variable 'T'": the declaration, holding a
+# simple value, was dropped like a scalar constant's, while every other
+# use of T was resolved while compiling.
+
+var bad = 0;
+func want(what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+struct S { int a; const K = 7; }
+struct P { int b; }
+class C { int v; }
+
+const T = S;
+want("a construction at run time", T(int(runtime(5))), S(5));
+want("...named", str(T(a: 6)), "S(a: 6)");
+want("...typed as the struct", typestr(T(1)), "S");
+want("a const member", T.K, 7);
+want("the alias is the struct", T == S, true);
+
+T t;
+want("a declaration's type", str(t), "S(a: 0)");
+func field(T p) { return p.a; }
+want("a parameter's type", field(S(4)), 4);
+array<T> arr = [];
+append(arr, T(3));
+want("an element type", str(arr), "[S(a: 3)]");
+want("...flat, as array<S>", array_storage(arr), "struct");
+
+/* a binding of the struct's own name does not hide the alias */
+func shadowed(S) { return T(S); }
+want("a parameter named like the struct", shadowed(8), S(8));
+
+func local() { const L = S; return L(2); }
+want("an alias declared in a function", local(), S(2));
+const T2 = T;
+want("an alias of an alias", T2(9), S(9));
+const A, B = [S, P];
+want("a multi-declaration", str([A(1), B(2)]), "[S(a: 1), P(b: 2)]");
+const A2, B2 = S;
+want("...spreading one struct", str([A2(1), B2(2)]), "[S(a: 1), S(a: 2)]");
+pure func both() => [S, P];
+const A3, B3 = both();
+want("...of a baked array", typestr(B3(3)), "P");
+const R, A4 = [[1], S];
+want("...beside a container", str([R, A4(4)]), "[[1], S(a: 4)]");
+pure func pick() => S;
+const PT = pick();
+want("an alias a pure call names", PT(3), S(3));
+const ct = T(10);
+want("a construction while compiling", ct, S(10));
+pure func mk(x) => T(x);
+const cm = mk(11);
+want("...through a function", cm, mk(int(runtime(11))));
+
+/* a struct field's type: the struct, not a `dyn` (its use in typed code
+ * was refused), and POD where the struct is */
+struct FW { T s; int n; C c; }
+const D0 = C;
+struct FD { D0 c; D0? oc; array<T> ts; }
+var fw = FW(T(int(runtime(1))), 2, D0(3));
+var fk = fw.s.a + fw.c.v;
+want("a field's type", fk, 4);
+want("...in the layout", layout(FW).fields[0].type, "S");
+var fd = FD(D0(5), none, [T(6)]);
+want("...of a class, and an optional one", str([fd.c.v, fd.oc, fd.ts]),
+     "[5, <none>, [S(a: 6)]]");
+struct FP { T s; int n; }
+want("...POD like the struct", array_storage([FP(T(1), 2)]), "struct");
+
+/* ...nor its zero value: `T t;` is the constructor call, and it names
+ * the alias where the struct's own name is hidden or not in scope */
+struct O { S s; int n; }
+const TO = O;
+func zero(S) { T t; t.a = S; box<T> b; b.a = S + 1; return [t, *b]; }
+want("a zero value under a hidden struct name", str(zero(5)),
+     "[S(a: 5), S(a: 6)]");
+func zero_nested(O) { TO o; o.n = O; return o; }
+want("...with a nested field", str(zero_nested(7)), "O(s: S(a: 0), n: 7)");
+pure func local_struct() { struct Q { int a; } return Q; }
+const QT = local_struct();
+QT q0;
+box<QT> bq;
+func bump(QT p) { QT z; z.a = p.a + 1; return z; }
+want("an alias of a struct declared in a function",
+     str([q0, *bq, bump(q0), QT(7)]), "[Q(a: 0), Q(a: 0), Q(a: 1), Q(a: 7)]");
+
+var cap = func [T] () => T(12);
+want("a captured alias", cap(), S(12));
+
+const D = C;
+var x = D(1);
+var y = x;
+y.v = 13;
+want("a class alias makes references", x.v, 13);
+
+var caught = 0;
+try { throw T(14); } catch (S as e) { caught += e.a; }
+try { throw S(15); } catch (T as e) { caught += e.a; }
+try { throw P(16); }
+catch (T) { caught = -1; }
+catch (P as e) { caught += e.b; }
+want("catch clauses", caught, 14 + 15 + 16);
+
+assert(bad == 0);

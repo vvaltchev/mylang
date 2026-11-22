@@ -1,0 +1,11 @@
+# INT-SOURCE: ../functional/08_dyn_dict_str.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/08_dyn_dict_str.my:
+# Boxed/dyn values, dict insert+update+read, and string building - the tiers
+# that stay helper-served, so their register discipline is exercised
+# alongside the inline ones.
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

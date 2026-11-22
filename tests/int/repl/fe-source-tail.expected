@@ -1,0 +1,36 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> >> >> SyntaxError at line 7, col 14:14
+
+        return x;
+                 ^
+Expected operator '}', got: ''
+>> => 1
+>> trace categories:
+  - infer       type inference: how each type is inferred
+  - inline      calls spliced in place
+  - specialize  const-arg calls redirected to a name$sN clone
+  - template    a template monomorphized to name$N per signature
+  - autoconst   a write-once scalar var folded to a constant
+  - autopure    a function proven effectively pure
+  - arrays      flat (unboxed) vs general array storage
+  - fold        const expressions / calls folded to literals
+  - all         every category at once
+usage: :trace <cat>... on|off   :trace off   :trace   (show active)
+tracing: off
+>> trace categories:
+  - infer       type inference: how each type is inferred
+  - inline      calls spliced in place
+  - specialize  const-arg calls redirected to a name$sN clone
+  - template    a template monomorphized to name$N per signature
+  - autoconst   a write-once scalar var folded to a constant
+  - autopure    a function proven effectively pure
+  - arrays      flat (unboxed) vs general array storage
+  - fold        const expressions / calls folded to literals
+  - all         every category at once
+usage: :trace <cat>... on|off   :trace off   :trace   (show active)
+tracing: off
+>> >> => 6
+>> pt     : pure func pt(x)   [func]
+pt$0   : pure func pt(int x) -> int   [func]
+src_ok : int   [var]
+>> 

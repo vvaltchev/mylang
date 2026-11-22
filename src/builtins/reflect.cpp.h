@@ -48,6 +48,7 @@ static const char *reflect_decl_type_kw(DeclType d)
         case DeclType::s:    return "str";
         case DeclType::arr:  return "array";
         case DeclType::dict: return "dict";
+        case DeclType::box:  return "box";
         default:             return nullptr;
     }
 }
@@ -67,14 +68,25 @@ static std::string reflect_annot_str(const TypeAnnot *ta)
         case DeclType::s:   s = "str";   break;
         case DeclType::dyn: s = "dyn";   break;
         case DeclType::strct:
-            s = ta->strct ? std::string(ta->strct->name->val) : "struct";
+            /* an image's annotation may name no struct */
+            s = "struct";
+            if (ta->strct)
+                s = ta->strct->name->val;
             break;
+        /* a generic component (`array<array>`) as it is written */
         case DeclType::arr:
-            s = "array<" + reflect_annot_str(ta->elem.get()) + ">";
+            s = "array";
+            if (ta->elem)
+                s += "<" + reflect_annot_str(ta->elem.get()) + ">";
             break;
         case DeclType::dict:
-            s = "dict<" + reflect_annot_str(ta->key.get()) + "," +
-                reflect_annot_str(ta->val.get()) + ">";
+            s = "dict";
+            if (ta->key)
+                s += "<" + reflect_annot_str(ta->key.get()) + "," +
+                     reflect_annot_str(ta->val.get()) + ">";
+            break;
+        case DeclType::box:
+            s = "box<" + reflect_annot_str(ta->elem.get()) + ">";
             break;
         default: s = "dyn";
     }
@@ -83,35 +95,53 @@ static std::string reflect_annot_str(const TypeAnnot *ta)
     return s;
 }
 
-static std::string reflect_field_type(const FieldDef &f)
+std::string reflect_field_type(const FieldDef &f)
 {
-    /* a parameterized container (`array<int>`, `dict<str,P>`): the annot
-     * carries the full element type (with its own `?` for nullability). */
-    if (f.annot && (f.kind == FieldKind::f_array ||
-                    f.kind == FieldKind::f_dict)) {
+    /* a parameterized container (`array<int>`, `dict<str,P>`) or a box:
+     * the annot carries the full type (with its own `?` for
+     * nullability). Such a field always has one - the parser refuses a
+     * bare `array` / `dict` field, the loader an image's (v46). */
+    if (f.annot) {
         std::string t = reflect_annot_str(f.annot.get());
-        if (f.is_opt && (t.empty() || t.back() != '?'))
+        if (f.is_opt && t.back() != '?')
             t += "?";
         return t;
     }
-
+    ML_CHECK(!field_kind_has_annot(f.kind));
     std::string s;
     if (f.is_opt)
         s += "opt ";
-    switch (f.kind) {
-        case FieldKind::f_bool:   s += "bool";  break;
-        case FieldKind::f_int:    s += "int";   break;
-        case FieldKind::f_float:  s += "float"; break;
-        case FieldKind::f_str:    s += "str";   break;
-        case FieldKind::f_array:  s += "array"; break;
-        case FieldKind::f_dict:   s += "dict";  break;
-        case FieldKind::f_dyn:    s += "dyn";   break;
-        case FieldKind::f_struct:
-            s += f.struct_ty ? std::string(f.struct_ty->val)
-                             : std::string("struct");
-            break;
+    if (f.kind == FieldKind::f_struct)
+        return s + (f.struct_ty ? std::string(f.struct_ty->val)
+                                : std::string("struct"));
+    static const char *const keyword[] = {
+        "bool", "int", "float", "str", "array", "dict", "dyn", "struct",
+        "box" };
+    static_assert(sizeof(keyword) / sizeof(keyword[0])
+                      == static_cast<size_t>(FieldKind::f_box) + 1,
+                  "a keyword per FieldKind");
+    return s + keyword[static_cast<size_t>(f.kind)];
+}
+
+std::string reflect_decl_annot(DeclType dt, const StructTypeDef *strct,
+                               const TypeAnnot *annot, bool opt)
+{
+    if (annot && (dt == DeclType::arr || dt == DeclType::dict ||
+                  dt == DeclType::box)) {
+        std::string t = reflect_annot_str(annot);
+        if (opt && (t.empty() || t.back() != '?'))
+            t += "?";
+        return t;
     }
-    return s;
+    const std::string o = opt ? "opt " : "";
+    if (dt == DeclType::strct)
+        return o + (strct ? std::string(strct->name->val)
+                          : std::string("struct"));
+    if (const char *kw = reflect_decl_type_kw(dt))
+        return o + kw;
+    if (dt == DeclType::dyn)
+        return o + "dyn";
+    return "";
 }
 
 /* One parameter's "[const] [opt] [TYPE|dyn] name" declared form. */
@@ -120,6 +150,13 @@ static std::string reflect_param_str(const FuncDescriptor::ParamDesc &p)
     std::string s;
     if (p.cnst)
         s += "const ";
+    if (p.sig_type) {
+        /* an annotation its keyword cannot say: `P p`, `array<int> a` */
+        s += p.sig_type->val;
+        s += " ";
+        s += std::string(p.name->val);
+        return s;
+    }
     if (p.opt)
         s += "opt ";
     if (const char *t = reflect_decl_type_kw(p.decl_type)) {
@@ -170,9 +207,43 @@ std::string reflect_struct_ctor(const StructTypeDef *def)
     return s;
 }
 
+static std::string reflect_typeof_rec(const EvalValue &e, CycStack &st);
+
+/* Do two array elements have one type, as far as an array's element type
+ * goes: the same value kind - and, for a struct, class or box<P>, the
+ * same type and the same box-ness; for a box of a scalar or a string, the
+ * same element kind (a box<int> and a box<float> are two types). */
+static bool reflect_same_kind(const EvalValue &a, const EvalValue &b)
+{
+    const int t = a.get_type()->t;
+    if (t != b.get_type()->t)
+        return false;
+    if (t == Type::t_struct) {
+        const StructObject &x = *a.get_ref<intrusive_ptr<StructObject>>();
+        const StructObject &y = *b.get_ref<intrusive_ptr<StructObject>>();
+        return x.def == y.def && x.boxed == y.boxed;
+    }
+    if (t == Type::t_box)
+        return a.get_ref<intrusive_ptr<BoxObj>>()->kind
+            == b.get_ref<intrusive_ptr<BoxObj>>()->kind;
+    return true;
+}
+
+/* The element type of a box of a scalar or a string, by its kind. */
+static const char *reflect_box_elem(char kind)
+{
+    switch (kind) {
+        case 'i': return "int";
+        case 'f': return "float";
+        case 'b': return "bool";
+        case 's': return "str";
+        default:  return "?";
+    }
+}
+
 /* The structural type of an array value, from its storage kind (probing a
  * general array's elements for a homogeneous element type). */
-static std::string reflect_array_type(const SharedArrayObj &a)
+static std::string reflect_array_type(const SharedArrayObj &a, CycStack &st)
 {
     switch (a.skind()) {
         case SharedArrayObj::Storage::ints:    return "array<int>";
@@ -191,26 +262,40 @@ static std::string reflect_array_type(const SharedArrayObj &a)
         return "array<dyn>";
 
     const EvalValue e0 = arr_elem_at(a, 0);
-    const int t0 = e0.get_type()->t;
     for (size_type i = 1; i < n; i++)
-        if (arr_elem_at(a, i).get_type()->t != t0)
+        if (!reflect_same_kind(arr_elem_at(a, i), e0))
             return "array<dyn>";                      /* heterogeneous */
-    return std::string("array<") + reflect_typeof(e0) + ">";
+    return std::string("array<") + reflect_typeof_rec(e0, st) + ">";
 }
 
 /* The structural type of a dict value, probing one entry for key/value. */
-static std::string reflect_dict_type(const DictObject &d)
+static std::string reflect_dict_type(const DictObject &d, CycStack &st)
 {
     const DictObject::inner_type &m = d.get_ref();
     if (m.empty())
         return "dict";
     const auto &kv = *m.begin();
-    return std::string("dict<") + reflect_typeof(kv.first) + "," +
-           reflect_typeof(kv.second.get()) + ">";
+    return std::string("dict<") + reflect_typeof_rec(kv.first, st) + "," +
+           reflect_typeof_rec(kv.second.get(), st) + ">";
 }
 
 std::string reflect_typeof(const EvalValue &e)
 {
+    CycStack st;
+    return reflect_typeof_rec(e, st);
+}
+
+/* A value may contain itself: a container already being described further
+ * up is a back edge, and its type is `dyn` - as the static type of such a
+ * constant is (cyclewalk.h). */
+static std::string reflect_typeof_rec(const EvalValue &e, CycStack &st)
+{
+    CycKey k;
+    const bool keyed = cyc_key(e, k);
+    if (keyed && st.contains(k))
+        return "dyn";
+    CycGuard g(st, k, keyed);
+
     switch (e.get_type()->t) {
         case Type::t_none:    return "none";
         case Type::t_int:     return "int";
@@ -224,45 +309,26 @@ std::string reflect_typeof(const EvalValue &e)
         case Type::t_structtype:
             return std::string("type ") +
                    std::string(e.get<StructTypeDef *>()->name->val);
-        case Type::t_struct:
-            return std::string(
-                e.get<intrusive_ptr<StructObject>>()->def->name->val);
+        case Type::t_struct: {
+            /* a box<P> is a StructObject too (`boxed`), README: box<P> */
+            const StructObject &o = *e.get_ref<intrusive_ptr<StructObject>>();
+            const std::string name(o.def->name->val);
+            return o.boxed ? "box<" + name + ">" : name;
+        }
+        case Type::t_box:
+            return std::string("box<") +
+                   reflect_box_elem(e.get_ref<intrusive_ptr<BoxObj>>()->kind) +
+                   ">";
         case Type::t_arr:
-            return reflect_array_type(e.get<SharedArrayObj>());
+            return reflect_array_type(e.get_ref<SharedArrayObj>(), st);
         case Type::t_dict:
-            return reflect_dict_type(*e.get<intrusive_ptr<DictObject>>());
+            return reflect_dict_type(*e.get_ref<intrusive_ptr<DictObject>>(),
+                                     st);
         default:
             /* the remaining TypeE values (t_lval/t_undefid) are internal
              * pseudo-types never seen on an RValue. */
             return "?";
     }
-}
-
-/* A struct type's full in-memory layout (POD offsets/sizes or boxed slots). */
-std::string reflect_layout(const StructTypeDef *def)
-{
-    std::string s(def->name ? std::string(def->name->val) : std::string("?"));
-    if (def->is_pod()) {
-        s += " - POD, size=" + std::to_string(def->size) +
-             " bytes, align=" + std::to_string(def->align) + "\n";
-        for (const auto &f : def->fields) {
-            int sz = 0, al = 0;
-            StructTypeDef::pod_field_metrics(f, sz, al);
-            s += "  " + std::string(f.name->val) + ": " +
-                 reflect_field_type(f) + " @" + std::to_string(f.offset) +
-                 " (" + std::to_string(sz) + " bytes)\n";
-        }
-    } else {
-        s += " - boxed, " + std::to_string(def->fields.size()) + " slot(s)\n";
-        for (const auto &f : def->fields)
-            s += "  " + std::string(f.name->val) + ": " +
-                 reflect_field_type(f) + " [slot " +
-                 std::to_string(f.slot) + "]\n";
-    }
-    for (const auto &c : def->consts)
-        s += "  const " + std::string(c.first->val) + " = " +
-             c.second.to_string() + "\n";
-    return s;
 }
 
 /* ------------------------------- builtins -------------------------------- */
@@ -309,8 +375,8 @@ EvalValue builtin_globals(EvalContext *ctx, const ArgLocs *exprList,
     SharedArrayObj::vec_type vec;
     vec.reserve(names.size());
     for (std::string &n : names)
-        vec.emplace_back(SharedStr(move(n)), false);
-    return SharedArrayObj(move(vec));
+        vec.emplace_back(SharedStr(std::move(n)), false);
+    return SharedArrayObj(std::move(vec));
 }
 
 /*
@@ -349,7 +415,7 @@ EvalValue builtin_signature(EvalContext *ctx, const ArgLocs *exprList,
 
 /*
  * Build a StructLayout reflection value (a native composite type, see
- * plans/reflection.md) describing `qdef`: name, size, align, pod, and an
+ * plans/archived/reflection.md) describing `qdef`: name, size, align, pod, and an
  * array<StructField> with each field's name/type/offset/size/align (the last
  * three are -1 for a boxed field, which has no byte layout).
  */
@@ -360,8 +426,12 @@ static EvalValue reflect_make_layout(const StructTypeDef *qdef)
 
     SharedArrayObj::vec_type fieldvec;
     for (const FieldDef &f : qdef->fields) {
+        /* a field of a BOXED struct is a slot, with no byte layout
+         * whatever its kind - an int or a POD struct included (README:
+         * its offset, size and align are -1) */
         int sz = 0, al = 0;
-        const bool pod = StructTypeDef::pod_field_metrics(f, sz, al);
+        const bool pod = qdef->is_pod()
+                         && StructTypeDef::pod_field_metrics(f, sz, al);
         auto fo = make_intrusive<StructObject>(sf);
         fo->fields.emplace_back(
             EvalValue(SharedStr(std::string(f.name->val))), false);
@@ -386,7 +456,12 @@ static EvalValue reflect_make_layout(const StructTypeDef *qdef)
     lo->fields.emplace_back(EvalValue(static_cast<int_type>(qdef->align)),
                             false);
     lo->fields.emplace_back(EvalValue(qdef->is_pod()), false);
-    lo->fields.emplace_back(EvalValue(SharedArrayObj(move(fieldvec))), false);
+    /* Q2: the array a typed name reaches (layout(S).fields is an
+     * array<StructField>) carries that type, in a typed run */
+    EvalValue fields{SharedArrayObj(std::move(fieldvec))};
+    if (g_ctype_adopt)
+        stamp_ctype(fields, annot_array_of_struct(sf));
+    lo->fields.emplace_back(std::move(fields), false);
     return EvalValue(intrusive_ptr<StructObject>(lo));
 }
 
@@ -394,8 +469,7 @@ static EvalValue reflect_make_layout(const StructTypeDef *qdef)
  * layout(S): a struct's in-memory layout as a structured `StructLayout` value -
  * `.name`, `.size`, `.align`, `.pod`, and `.fields` (an array<StructField> of
  * {name, type, offset, size, align}). Accepts a struct type descriptor or a
- * struct instance. (The legacy `reflect_layout` string renderer is kept for the
- * REPL `:layout`-style introspection.)
+ * struct instance.
  */
 EvalValue builtin_layout(EvalContext *ctx, const ArgLocs *exprList,
                          const EvalValue *args, size_t n)
@@ -416,7 +490,7 @@ EvalValue builtin_layout(EvalContext *ctx, const ArgLocs *exprList,
 }
 
 /*
- * specializations(f): the synthetic global names ($specN / $tmplN) of every
+ * specializations(f): the synthetic global names (name$sN / name$N) of every
  * specialization / template-instantiation clone derived from function `f`, as
  * an array<str> (empty when none). The clones are real globals (a clone is
  * inserted at the root block and binds its synthetic name), so this is purely
@@ -441,29 +515,41 @@ EvalValue builtin_specializations(EvalContext *ctx, const ArgLocs *exprList,
             ? f->display_name
             : (f->name ? std::string(f->name->val) : std::string());
 
+    EvalContext *root = get_root_ctx(ctx);
     std::vector<std::pair<const UniqueId *, const LValue *>> syms;
-    get_root_ctx(ctx)->collect_symbols(syms);
+    root->collect_symbols(syms);
 
     std::vector<std::string> out;
-    for (const auto &kv : syms) {
-        const EvalValue &v = kv.second->get();
+    auto consider = [&](const EvalValue &v) {
         if (!v.is<intrusive_ptr<FuncObject>>())
-            continue;
+            return;
         const FuncDescriptor *g = v.get<intrusive_ptr<FuncObject>>()->func;
         if (g == f || g->display_name != name)
-            continue;
-        /* a clone has a synthetic id ($specN/$tmplN) + the original name in
+            return;
+        /* a clone has a synthetic id (name$sN / name$N) + the original name in
          * display_name; the original itself has an empty display_name so it is
          * skipped by the display_name test above. */
         out.push_back(std::string(g->name->val));
+    };
+    for (const auto &kv : syms)
+        consider(kv.second->get());
+    /* A SCRIPT's clones are GLOBAL-table slots, not map entries - as its
+     * functions are for globals() above. Only the map was walked until
+     * 2026-11-07, so in a script this answered [] for every function. (In
+     * the REPL functions stay in the map and the table is empty.) */
+    if (root->gfuncs) {
+        const GlobalFuncTable &gt = *root->gfuncs;
+        for (size_t i = 0; i < gt.slots.size(); i++)
+            if (gt.defined[i])
+                consider(gt.slots[i].get());
     }
     std::sort(out.begin(), out.end());
 
     SharedArrayObj::vec_type vec;
     vec.reserve(out.size());
     for (std::string &n : out)
-        vec.emplace_back(SharedStr(move(n)), false);
-    return SharedArrayObj(move(vec));
+        vec.emplace_back(SharedStr(std::move(n)), false);
+    return SharedArrayObj(std::move(vec));
 }
 
 /*
@@ -484,7 +570,7 @@ EvalValue builtin_show(EvalContext *ctx, ExprList *exprList)
 
     /* A bare identifier bound to a function -> render the function's body.
      * (An Identifier eval is a side-effect-free scope lookup.) */
-    if (dynamic_cast<Identifier *>(arg)) {
+    if (node_cast<Identifier>(arg)) {
         const EvalValue lv = arg->eval(ctx);
         if (lv.is<LValue *>()) {
             const EvalValue &v = lv.get<LValue *>()->get();
@@ -548,6 +634,6 @@ EvalValue builtin_tracing(EvalContext *ctx, const ArgLocs *exprList,
     SharedArrayObj::vec_type vec;
     vec.reserve(active.size());
     for (std::string &n : active)
-        vec.emplace_back(SharedStr(move(n)), false);
-    return SharedArrayObj(move(vec));
+        vec.emplace_back(SharedStr(std::move(n)), false);
+    return SharedArrayObj(std::move(vec));
 }

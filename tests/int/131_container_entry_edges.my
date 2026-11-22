@@ -1,0 +1,131 @@
+# INT-ENGINES: default nj tw nbi
+#
+# INT unit (#107, Q2 increment 3): the edges of the entry check -
+#  - a TYPED container entering a typed place through `dyn` must carry
+#    the place's component types exactly: a component of another kind,
+#    another nullability, another struct, a dict of another key or
+#    value type, a typed element where the place's is a generic
+#    `array`, and a `dyn` element where the place types one are all
+#    refused; the same type enters;
+#  - none entering an `opt` array or dict place, and a constant
+#    entering a typed one, take no type (a constant is read-only);
+#  - a typed READ-ONLY dict (a frozen dict key) enters by what it holds;
+#  - a literal one function writes, baked once, in two instances of it
+#    at two types: the second instance types a COPY, cleared of what the
+#    first gave it, so a container its type reaches through `dyn` stays
+#    untyped, and a constant inside (a clone of a constant shares its
+#    read-only elements) stays untyped.
+#
+struct P { int x; }
+struct Q { int x; }
+
+var out = [];
+func note(str s) { append(out, s); }
+
+# a typed container entering a typed place through `dyn` must carry the
+# place's component types exactly
+func pf(array<array<float>> a) { return len(a); }
+func po(array<int?> a) { return len(a); }
+func pq(array<Q> a) { return len(a); }
+func pk(array<dict<str, int>> a) { return len(a); }
+func pv(array<dict<str, float>> a) { return len(a); }
+func pg(array<array> a) { return len(a); }
+func pi(array<array<int>> a) { return len(a); }
+
+func try_enter(str name, dyn f, dyn v) {
+    try { f(v); note(name + " ok"); }
+    catch (TypeErrorEx) { note(name + " no"); }
+}
+array<array<int>> ai = [[1]];
+array<int> fi = [1];
+array<P> ap = [P(1)];
+array<dict<int, int>> dki = [{1: 1}];
+array<dict<str, int>> dsi = [{"a": 1}];
+array<array<dyn>> ad = [[1]];
+try_enter("int-float", pf, ai);
+try_enter("int-opt", po, fi);
+try_enter("P-Q", pq, ap);
+try_enter("key", pk, dki);
+try_enter("val", pv, dsi);
+try_enter("generic", pg, ai);
+try_enter("dyn-int", pi, ad);
+try_enter("same", pi, ai);
+
+# none and a constant enter an opt / typed place and take no type
+func an(array<int>? a) { return a == none ? "none" : typestr(a); }
+func dn(dict<str, int>? d) { return d == none ? "none" : typestr(d); }
+const K = [1, 2];
+var dyn? dnone = runtime(none);
+note(an(dnone));
+note(dn(dnone));
+var dyn dk = K;
+note(an(dk) + " " + int_ctype(K));
+
+# a typed, read-only dict (a frozen key) enters by what it holds
+func dg(dict<str, int> d) { return d.a; }
+var kd = {"a": 7};
+var outer = {kd: 5};
+foreach (var k, v in outer) {
+    var dyn dkk = k;
+    note(str(dg(dkk)));
+}
+
+# one literal in two instances of a function, at two types: baked once
+# (every element written) and shared by the instances, the second copies
+# it and clears what the first gave it
+func mk(x) {
+    var a = [[1], [2]];
+    append(a, x);
+    return a;
+}
+func mb(x) {
+    var b = [{"z": 2}];
+    append(b, x);
+    return b;
+}
+func md(x) {
+    var d = {"a": [1]};
+    d["b"] = x;
+    return d;
+}
+const KK = [[5], [6]];
+const KDD = [{"z": 1}];
+func mcd(x) {
+    var c = clone(KDD);
+    append(c, x);
+    return c;
+}
+func mc(x) {
+    var c = clone(KK);
+    append(c, x);
+    return c;
+}
+var m1 = mk([3]);
+var m2 = mk(runtime([3]));
+note(int_ctype(m1) + " " + int_ctype(m1[0]));
+note(int_ctype(m2) + " " + int_ctype(m2[0]));
+var b1 = mb({"q": 1});
+var b2 = mb(runtime({"q": 1}));
+note(int_ctype(b1) + " " + int_ctype(b1[0]));
+note(int_ctype(b2) + " " + int_ctype(b2[0]));
+var d1 = md([3]);
+var d2 = md(runtime(4));
+note(int_ctype(d1) + " " + int_ctype(d1["a"]));
+note(int_ctype(d2) + " " + int_ctype(d2["a"]));
+var c1 = mc([3]);
+var c2 = mc(runtime([3]));
+note(int_ctype(c1) + " " + int_ctype(c1[0]));
+note(int_ctype(c2) + " " + int_ctype(c2[0]));
+var e1 = mcd({"q": 3});
+var e2 = mcd(runtime({"q": 3}));
+note(int_ctype(e1) + " " + int_ctype(e1[0]));
+note(int_ctype(e2) + " " + int_ctype(e2[0]));
+assert(out == ["int-float no", "int-opt no", "P-Q no", "key no",
+               "val no", "generic no", "dyn-int no", "same ok", "none",
+               "none", "array<int>? untyped", "7",
+               "array<array<int>> array<int>", "array<dyn> untyped",
+               "array<dict<str,int>> dict<str,int>", "array<dyn> untyped",
+               "dict<str,array<int>> array<int>", "dict<str,dyn> untyped",
+               "array<array<int>> untyped", "array<dyn> untyped",
+               "array<dict<str,int>> untyped", "array<dyn> untyped"]);
+print("ok");

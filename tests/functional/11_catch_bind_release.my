@@ -1,0 +1,62 @@
+# `catch (T as e)` binds a STRUCT INSTANCE - a reference - into a frame
+# slot. Since #78 step D that bind is done by the RAISE PATH
+# (vm_dispatch_exc_body), not by an opcode, so compute_ref_slots - which
+# derives ref_slots from instruction write-dsts - could not see it. The
+# slot was then skipped by pop_window's release scan and the hardened
+# re-scan aborted:
+#
+#   Assertion `rec.window[i].get().get_type()->t < Type::t_str' failed
+#
+# It fires only when a CALLER catches a CALLEE's throw with a bind (the
+# same-frame and top-level forms happen to release elsewhere), which is
+# why no corpus program had ever tripped it. Found by the Net 3
+# enumeration, 2026-08-13.
+
+struct Boom { int at; }
+struct Never { int x; }
+
+func thrower(int n) {
+    if (n < 0) { return 0; }      # never taken; gives the pair a value path
+    throw Boom(7);
+    var r = 0;
+    return r;
+}
+
+# the caller binds, and does NOT use, the caught instance
+func catches_unused(int n) {
+    var out = 0;
+    try { var r = thrower(n - 1); out = r + 1; } catch (Boom as e) { out = 9; }
+    return out;
+}
+
+# the caller binds and reads a field off it
+func catches_used(int n) {
+    var out = 0;
+    try { var r = thrower(n - 1); out = r + 1; }
+    catch (Boom as e) { out = e.at; }
+    return out;
+}
+
+# a non-matching inner catch the exception passes straight through
+func passes_through(int n) {
+    var out = 0;
+    try { var r = thrower(n - 1); out = r + 1; } catch (Never) { out = -1; }
+    return out;
+}
+
+func outer(int n) {
+    var out = 0;
+    try { var r = passes_through(n - 1); out = r + 1; }
+    catch (Boom as e) { out = e.at + 1; }
+    return out;
+}
+
+var a = 0;
+var b = 0;
+var c = 0;
+for (var k = 0; k < 4; k++) {
+    a += catches_unused(runtime(4));
+    b += catches_used(runtime(4));
+    c += outer(runtime(5));
+}
+print("catch-bind:", a, b, c);

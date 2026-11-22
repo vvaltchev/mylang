@@ -1,0 +1,87 @@
+# A struct declared INSIDE a function is ONE struct, whichever copy of
+# the function makes an instance: the typed copy the compiler runs for a
+# constant call (README *Calling functions during const-evaluation*), a
+# template's instances, an inlined body. A copy used to hold a
+# definition of its own, so:
+#  - a constant call's instance read a definition that died with the
+#    parse-time copy (a heap-use-after-free), and was of another struct
+#    than the same call made at run time;
+#  - a copy's own `Q q = Q(x);` was refused ("'q' is declared 'Q' but is
+#    assigned 'Q'");
+#  - two instances of one template made unequal values.
+# And a function LITERAL that declares a struct, written in a constant
+# expression, is kept when the folded value holds an instance (the
+# literal owns the definition): it was freed with the expression.
+
+var bad = 0;
+func want(what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+pure func mk(int x) { struct Q { int a; } return Q(x); }
+var v = mk(1);
+const c = mk(2);
+want("an instance bound to a var", str(v), "Q(a: 1)");
+want("...to a const", str(c), "Q(a: 2)");
+want("...is the run-time call's struct", v == mk(int(runtime(1))), true);
+
+pure func mka(int n) {
+    struct R { int b; float f; }
+    return [R(0, 0.0), R(n, n * 0.5)];
+}
+var arr = mka(3);
+want("an array of them", str(arr),
+     "[R(b: 0, f: 0.000000), R(b: 3, f: 1.500000)]");
+want("...its elements' field", arr[1].b + len(arr), 5);
+
+pure func mkd(str k) { struct S { str s; } return {k: S(k + "!")}; }
+const d = mkd("x");
+want("a dict of them", str(d), "{\"x\": S(s: \"x!\")}");
+
+# a struct-typed local in a function the compiler copies: a constant
+# call's typed copy, and a template's instance
+pure func pm(int x) { struct T { int a; } T t = T(x); return t; }
+var p1 = pm(1);
+want("a typed local in a constant call", p1 == pm(int(runtime(1))), true);
+func tq(x) { struct U { int a; } U u = U(1); return u; }
+var dyn u1 = tq(1);
+var dyn u2 = tq("s");
+want("a typed local in a template", u1.a, 1);
+want("one struct for every instance of a template", u1 == u2, true);
+
+# a struct type returned, a nested instance in a dyn field, a callback a
+# builtin calls while compiling, a const member holding a function
+pure func gt() { struct G { int a; } return G; }
+var dyn gty = gt();
+want("a struct type returned", gty(5) == gt()(5), true);
+struct Top { dyn d; }
+pure func nest(int x) { struct In { int a; } return Top(In(x)); }
+const n2 = nest(2);
+want("an instance in a dyn field", n2.d.a + nest(1).d.a, 3);
+want("...is the run-time call's", n2 == nest(int(runtime(2))), true);
+pure func mkw(int x) { struct W { int k; float h; } return W(x, x * 0.5); }
+const wc = map(mkw, [3, 1]);
+want("a callback's instances", str(wc),
+     "[W(k: 3, h: 1.500000), W(k: 1, h: 0.500000)]");
+want("...are the run-time ones", wc == map(mkw, [3, int(runtime(1))]), true);
+pure func cf(int x) {
+    struct F { const INC = pure func(a) => a + 1; int a; }
+    return F(F.INC(x));
+}
+const fc = cf(2);
+want("a const member function", fc == cf(int(runtime(2))), true);
+
+# a function literal that declares the struct, in a folded expression
+const K = [3, 1];
+const lc = map(pure func(x) { struct L { int a; } return L(x); }, K);
+var lv = map(pure func(x) { struct M { int a; } return [M(x)]; }, K);
+want("a literal's struct in a const", str(lc), "[L(a: 3), L(a: 1)]");
+want("...and in a var", str(lv), "[[M(a: 3)], [M(a: 1)]]");
+want("...a count over one",
+     len(map(pure func(x) { struct N { int a; } return N(x); }, K)), 2);
+
+assert(bad == 0);
+print("ok");

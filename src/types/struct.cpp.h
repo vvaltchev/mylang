@@ -18,7 +18,7 @@
  * The struct TYPE descriptor (t_structtype): a trivial value holding a raw
  * StructTypeDef*. It is a `const` value the `struct` decl binds in scope; it is
  * callable (construction, handled in CallExpr::do_eval) and supports `.CONST`
- * reads (handled in MemberExpr::do_eval). See plans/structs.md.
+ * reads (handled in MemberExpr::do_eval). See plans/archived/structs.md.
  */
 class TypeStructType : public Type {
 
@@ -50,9 +50,10 @@ void TypeStructType::noteq(EvalValue &a, const EvalValue &b)
 }
 
 /*
- * A struct INSTANCE (t_struct). COW value semantics like arrays/dicts. `==` is
- * structural field-wise between same-type instances (different types -> not
- * equal); not hashable (v1).
+ * A struct INSTANCE (t_struct): a value (copied at the write, struct_own).
+ * `==` is structural field-wise between same-type instances (different types
+ * -> not equal), and `hash` agrees with it; both, and printing, stop at a
+ * boxed instance already on the walk (cyclewalk.h).
  */
 class TypeStruct : public TypeImpl<intrusive_ptr<StructObject>> {
 
@@ -76,11 +77,21 @@ static bool struct_equal(const StructObject &x, const StructObject &y)
     if (x.def != y.def)
         return false;
 
+    /* a CLASS instance - or a box - is equal to itself only: == is
+     * identity */
+    if (x.is_ref() || y.is_ref())
+        return &x == &y;
+
     /* POD: same def -> same layout, so a raw byte compare is exact. */
     if (x.is_pod())
         return x.bytes == y.bytes;
 
-    /* boxed: field-wise EvalValue equality (recurses for nested structs) */
+    /* boxed: field-wise EvalValue equality (recurses for nested structs).
+     * A struct VALUE takes no place on the cycle guard's pair stack: a
+     * field leading back here passes through an array or a dict, which
+     * does - and copy-on-write may share one object between this side
+     * and a copy reached on the other, which read as a one-sided back
+     * edge and made two equal copies unequal (cyclewalk.h, cyc_key). */
     for (size_t i = 0; i < x.fields.size(); i++)
         if (!(x.fields[i].get() == y.fields[i].get()))
             return false;
@@ -114,21 +125,35 @@ void TypeStruct::noteq(EvalValue &a, const EvalValue &b)
 
 /*
  * Deep hash of a struct: combine the field hashes in declaration order (a
- * struct is a fixed sequence of fields), salted with the struct's def identity
- * so two different struct types with equal field values hash differently -
- * matching eq(), which only compares instances of the SAME def. Field-wise
- * (via pod_get / fields[i]) keeps it consistent with eq for both POD (a==b =>
- * equal field values => equal hash) and boxed instances, and avoids hashing
- * POD padding bytes.
+ * struct is a fixed sequence of fields), salted with the struct type's NAME
+ * so two struct types with equal field values usually hash differently -
+ * eq() only compares instances of the SAME def, so a collision between two
+ * types is a probe, never a wrong answer. NOT the def's address: a hash is
+ * observable (`hash()`, a dict's iteration order), and an address differs
+ * between runs, engines and a .myv load (it did until 2026-10-08).
+ * Field-wise (via pod_get / fields[i]) keeps it consistent with eq for both
+ * POD (a==b => equal field values => equal hash) and boxed instances, and
+ * avoids hashing POD padding bytes.
  */
 size_t TypeStruct::hash(const EvalValue &a)
 {
-    const StructObject &o = *a.get<intrusive_ptr<StructObject>>().get();
+    const StructObject &o = *a.get_ref<intrusive_ptr<StructObject>>().get();
     const StructTypeDef &def = *o.def;
 
     size_t seed = hash_salt_struct;
-    hash_combine(seed, std::hash<const void *>()(o.def));
+    hash_combine(seed, std::hash<std::string_view>()(def.name->val));
 
+    /* a CLASS instance hashes by IDENTITY, consistent with its == - its
+     * number, never its address (see g_class_ident) - so its hash does not
+     * change when its fields do, and it can be a dict key unfrozen. Its
+     * fields are never walked, so no cycle can pass through it here. */
+    if (o.is_ref()) {
+        hash_combine(seed, std::hash<uint64_t>()(o.ident));
+        return seed;
+    }
+
+    /* a struct VALUE is never a back edge (cyclewalk.h, cyc_key): a cycle
+     * through it is answered by the array or dict holding it */
     for (size_t i = 0; i < def.fields.size(); i++)
         hash_combine(seed, (o.is_pod() ? o.pod_get(static_cast<int>(i))
                                        : o.fields[i].get()).hash());
@@ -138,10 +163,21 @@ size_t TypeStruct::hash(const EvalValue &a)
 
 string TypeStruct::to_string(const EvalValue &a)
 {
-    const StructObject &o = *a.get<intrusive_ptr<StructObject>>().get();
+    const StructObject &o = *a.get_ref<intrusive_ptr<StructObject>>().get();
     const StructTypeDef &def = *o.def;
 
-    string res = string(def.name->val);
+    /* a box<P> prints as `box(P(...))` */
+    string res = o.boxed ? "box(" + string(def.name->val)
+                         : string(def.name->val);
+
+    /* a class instance or box<P> already being printed further up:
+     * `Name(...)`, or `box(Name(...))` */
+    CycKey k;
+    const bool keyed = cyc_key(a, k);
+    if (keyed && cyc_render().contains(k))
+        return res + (o.boxed ? "(...))" : "(...)");
+    CycGuard g(cyc_render(), k, keyed);
+
     res += "(";
 
     for (size_t i = 0; i < def.fields.size(); i++) {
@@ -155,20 +191,29 @@ string TypeStruct::to_string(const EvalValue &a)
             res += ", ";
     }
 
-    res += ")";
+    res += o.boxed ? "))" : ")";
     return res;
 }
 
 string TypeStruct::pretty(const EvalValue &a, int indent, int width)
 {
-    const string flat = to_string_repr(a);
-    const StructObject &o = *a.get<intrusive_ptr<StructObject>>().get();
+    const StructObject &o = *a.get_ref<intrusive_ptr<StructObject>>().get();
     const StructTypeDef &def = *o.def;
+
+    CycKey k;
+    const bool keyed = cyc_key(a, k);
+    if (keyed && cyc_render().contains(k))
+        return o.boxed ? "box(" + string(def.name->val) + "(...))"
+                       : string(def.name->val) + "(...)";
+
+    const string flat = to_string_repr(a);
 
     if (def.fields.empty() || indent + static_cast<int>(flat.size()) <= width)
         return flat;
 
-    string res = string(def.name->val);
+    CycGuard g(cyc_render(), k, keyed);   /* a field leading back: Name(...) */
+    string res = o.boxed ? "box(" + string(def.name->val)
+                         : string(def.name->val);
     res += "(\n";
     const string pad(indent + 2, ' ');
     for (size_t i = 0; i < def.fields.size(); i++) {
@@ -185,7 +230,7 @@ string TypeStruct::pretty(const EvalValue &a, int indent, int width)
         res += "\n";
     }
     res += string(indent, ' ');
-    res += ")";
+    res += o.boxed ? "))" : ")";
     return res;
 }
 

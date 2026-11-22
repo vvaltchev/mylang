@@ -1,0 +1,11 @@
+# INT-SOURCE: ../functional/107_foreach_dyn_string.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/107_foreach_dyn_string.my:
+# a foreach over a `dyn` string - its characters, an index,
+# `_`, and the unpack of a character (a TypeErrorEx) - in the VM's
+# dynamic-container loop and the JIT's.
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

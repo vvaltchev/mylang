@@ -33,7 +33,39 @@ else()
    set(_san_default OFF)
 endif()
 set(ASAN  ${_san_default} CACHE BOOL "AddressSanitizer (GCC/Clang)")
-set(UBSAN ${_san_default} CACHE BOOL "UndefinedBehaviorSanitizer (GCC/Clang)")
+# A COVERAGE build defaults UBSan OFF (the Makefile's twin): its checks
+# are branches gcov counts and no input can take.
+if (GCOV)
+   set(_ubsan_default OFF)
+else()
+   set(_ubsan_default ${_san_default})
+endif()
+set(UBSAN ${_ubsan_default} CACHE BOOL "UndefinedBehaviorSanitizer (GCC/Clang)")
+
+# DEBUG_INFO (default OFF, for EVERY build type - the Makefile's twin):
+# debug info multiplies the binary's size many times over and is unused
+# in most builds (maintainer-set, 2026-08-26 - disk wear). OFF strips
+# the -g/-Zi that CMake's own per-config defaults inject (Debug and
+# RelWithDebInfo carry it implicitly - stripping those is what makes
+# the default REALLY debug-info-free for all build types); ON adds
+# -ggdb (MSVC keeps its /Zi defaults). CI carries a DEBUG_INFO=ON lane
+# so the configuration cannot rot.
+set(DEBUG_INFO OFF CACHE BOOL "Emit debug info (-ggdb / MSVC /Zi)")
+if (NOT MSVC)
+   if (DEBUG_INFO)
+      add_compile_options(-ggdb)
+   else()
+      foreach(_cfg DEBUG RELWITHDEBINFO)
+         string(REGEX REPLACE "(^| )-g(gdb[0-9]*|[0-9])?( |$)" " "
+                CMAKE_CXX_FLAGS_${_cfg} "${CMAKE_CXX_FLAGS_${_cfg}}")
+      endforeach()
+   endif()
+elseif (NOT DEBUG_INFO)
+   foreach(_cfg DEBUG RELWITHDEBINFO)
+      string(REGEX REPLACE "(^| )[/-]Z[iI7]( |$)" " "
+             CMAKE_CXX_FLAGS_${_cfg} "${CMAKE_CXX_FLAGS_${_cfg}}")
+   endforeach()
+endif()
 
 file(GLOB SOURCES ${GLOB_CONF_DEP} "src/*.cpp")
 add_executable(mylang ${SOURCES})
@@ -53,8 +85,25 @@ if (MSVC)
    target_link_options(mylang PUBLIC "/STACK:8388608")
 endif()
 
-if (TESTS)
+# macOS: a 16 MB main-thread stack. The compile passes walk the tree
+# recursively, one call per level of nesting (up to the parser's 256-level
+# limit, #98), and an ASan build's frames on arm64 are about 1.6x Linux's:
+# an assignment chain at the limit needs ~6 MB in a Linux clang ASan build,
+# so ~9.6 MB there - past the default 8 MB.
+if (APPLE)
+   target_link_options(mylang PUBLIC "LINKER:-stack_size,0x1000000")
+endif()
+
+# INT_TESTS: the INTRUSIVE test build (#107, plans/intrusive-tests.md) -
+# heavy instrumentation at every pipeline stage, so never benchmarked
+# (`mylang -v` reports it, bench/run.py refuses it). Implies TESTS.
+# Parity with the Makefile's INT_TESTS=1.
+set(INT_TESTS OFF CACHE BOOL "Compile-in the intrusive test instrumentation")
+if (TESTS OR INT_TESTS)
    target_compile_definitions(mylang PUBLIC "TESTS")
+endif()
+if (INT_TESTS)
+   target_compile_definitions(mylang PUBLIC "INT_TESTS")
 endif()
 
 # ASSERTS: the defense-in-depth assertion net (C assert + ML_CHECK, defs.h).
@@ -117,7 +166,23 @@ endif()
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
    if (GCOV)
       target_compile_options(mylang PUBLIC -fprofile-arcs -ftest-coverage)
+      # the assertion macros check nothing (defs.h): their failure arms
+      # are branches no correct run may take (the Makefile's twin)
+      target_compile_definitions(mylang PUBLIC "ML_COVERAGE=1")
       target_link_options(mylang PUBLIC  -fprofile-arcs -ftest-coverage)
+      # MC/DC condition coverage where the compiler has it (GCC >= 14) - the
+      # intrusive suite's bar (plans/intrusive-tests.md section 9). Parity
+      # with the Makefile's GCOV=1.
+      include(CheckCXXCompilerFlag)
+      check_cxx_compiler_flag(-fcondition-coverage ML_HAS_MCDC)
+      if (ML_HAS_MCDC)
+         # GCC caps MC/DC at 64 conditions per decision (no parameter); the
+         # few vm.cpp decisions over it keep branch coverage and still WARN
+         # - not fatal, since it is a tool limit (see the Makefile note).
+         target_compile_options(mylang PUBLIC -fcondition-coverage
+                                -Wno-error=coverage-too-many-conditions)
+         target_link_options(mylang PUBLIC -fcondition-coverage)
+      endif()
    endif()
 endif()
 
@@ -128,14 +193,6 @@ endif()
 # -Wno override, then -Werror last.)
 if (NOT MSVC)
    target_compile_options(mylang PUBLIC -Wall -Wextra -Wno-unused-parameter)
-endif()
-
-# The codebase intentionally calls `move`/`forward` unqualified (see
-# `using std::move;` in defs.h), which recent clang reports under
-# -Wunqualified-std-cast-call. Silence it for clang only (AFTER -Wall/-Wextra
-# so the -Wno wins).
-if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-   target_compile_options(mylang PUBLIC -Wno-unqualified-std-cast-call)
 endif()
 
 # WERROR (default ON, EVERY build type + compiler): a warning FAILS the build,
@@ -178,6 +235,15 @@ if (NOT MSVC)
    endif()
 endif()
 
+# Tell `-v` whether UBSan is on, as ML_LTO below does for LTO: GCC defines
+# no macro for -fsanitize=undefined, so the binary cannot ask the compiler.
+# MSVC has no UBSan (the option has no effect there).
+if (UBSAN AND NOT MSVC)
+   target_compile_definitions(mylang PRIVATE ML_UBSAN=1)
+else()
+   target_compile_definitions(mylang PRIVATE ML_UBSAN=0)
+endif()
+
 # Whole-program (link-time) optimization for optimized configs, on by default:
 # ~7% smaller binary and ~8-9% faster on the bench suite. Configure with
 # -DLTO=OFF to disable. INTERPROCEDURAL_OPTIMIZATION abstracts over GCC/Clang
@@ -191,7 +257,25 @@ if (LTO AND NOT GCOV AND NOT CMAKE_VERSION VERSION_LESS "3.9")
                    PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
       set_property(TARGET mylang
                    PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
+      set(ml_lto_on TRUE)
    else()
       message(STATUS "LTO requested but not supported: ${ipo_msg}")
    endif()
+endif()
+
+# Tell the binary what actually happened, so `-v` can report it. The Makefile
+# has always defined ML_LTO; CMake did not, so a CMake build answered
+# `lto unknown` - and a CI lane cannot ASSERT a config it cannot read, which
+# is exactly what the non-LTO lane needs to do to avoid going vacuous.
+#
+# A generator expression, not a plain define, because IPO here is PER-CONFIG:
+# only Release and RelWithDebInfo get it, so a multi-config generator must
+# answer differently per config. `ml_lto_on` is false whenever LTO was off,
+# GCOV was on, CMake was too old, or check_ipo_supported said no - so the
+# macro tracks the OUTCOME, never the request.
+if (ml_lto_on)
+   target_compile_definitions(mylang PRIVATE
+      $<IF:$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>,ML_LTO=1,ML_LTO=0>)
+else()
+   target_compile_definitions(mylang PRIVATE ML_LTO=0)
 endif()

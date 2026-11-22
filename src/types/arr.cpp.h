@@ -12,7 +12,9 @@
 #include "evalvalue.h"
 #include "evaltypes.cpp.h"
 #include "structtype.h"
+#include <algorithm>
 #include <cstring>
+#include <vector>
 
 /* Materialize the POD-struct element at index `i` (already offset-adjusted)
  * flat struct array as a boxed StructObject EvalValue (a copy of its bytes). */
@@ -29,19 +31,78 @@ static EvalValue struct_elem_at(const SharedArrayObj &arr, size_type i)
     return intrusive_ptr<StructObject>(obj);
 }
 
+#ifdef TESTS
+uint32_t g_slice_group_limit = UINT32_MAX;
+#endif
+
+/* The flat CLASS storage's counts (sharedarray.h cannot see StructObject) */
+void sobj_retain(StructObject *p) noexcept
+{
+    if (p)
+        ++p->intr_refcount;
+}
+
+void sobj_release(StructObject *p) noexcept
+{
+    if (p) {
+        ML_CHECK(p->intr_refcount > 0);
+        if (--p->intr_refcount == 0)
+            destroy_counted(p);         /* bounded: intrusiveptr.h */
+    }
+}
+
+/*
+ * A fresh GENERAL array holding this array's elements (this handle's range),
+ * leaving the storage every handle shares untouched - for a READ-only walk
+ * that wants the general view of a flat struct/strs array (sum/min/max).
+ */
+template <class LValueT>
+SharedArrayObjTempl<LValueT> SharedArrayObjTempl<LValueT>::general_copy() const
+{
+    const size_type n = size();
+    vec_type nv;
+    nv.reserve(n);
+    for (size_type i = 0; i < n; i++)
+        nv.emplace_back(arr_elem_at(*this, i), false);
+    return SharedArrayObjTempl(std::move(nv));
+}
+
+/*
+ * #53b: the promotion is IN PLACE, on the storage every handle shares.
+ *
+ * It used to RESEAT this handle onto a fresh general copy - so a cold op
+ * (pop/erase/insert/sort/reverse) on a flat struct or strs array through
+ * one variable left every OTHER variable holding the old storage, and
+ * MyLang's reference semantics ("assignment aliases") silently broke:
+ * `var f = e; pop(f)` shrank f and not e, where the same program over an
+ * int or a general array shrinks both. Three sites had patched the NAMED
+ * variable back through its lvalue; an alias, a parameter or a container
+ * element still diverged.
+ *
+ * A SLICE handle is first materialized - the slice becomes an ordinary
+ * array, every handle of it at once (materialize_slice) - and that array
+ * is then promoted in place like any other, so every name sharing the
+ * slice sees the promotion too.
+ */
 template <class LValueT>
 void SharedArrayObjTempl<LValueT>::promote_structs_to_general()
 {
     if (shobj->kind != Storage::structs)
         return;
 
-    const size_type n = size();
+    if (slice)
+        materialize_slice();
+
+    const size_type n = size();         /* a non-slice: the whole storage */
     vec_type nv;
     nv.reserve(n);
     for (size_type i = 0; i < n; i++)
         nv.emplace_back(struct_elem_at(*this, i), false);
 
-    *this = SharedArrayObjTempl(move(nv));
+    shobj->svec.~svec_type();
+    shobj->kind = Storage::general;
+    new (&shobj->vec) vec_type(std::move(nv));
+    len = n;
 }
 
 template <class LValueT>
@@ -50,18 +111,53 @@ void SharedArrayObjTempl<LValueT>::promote_strs_to_general()
     if (shobj->kind != Storage::strs)
         return;
 
+    if (slice)
+        materialize_slice();            /* see promote_structs_to_general */
+
     const size_type n = size();
-    const size_type base = offset();
     vec_type nv;
     nv.reserve(n);
     for (size_type i = 0; i < n; i++)
-        nv.emplace_back(EvalValue(SharedStr(shobj->tvec[base + i])), false);
+        nv.emplace_back(EvalValue(SharedStr(shobj->tvec[i])), false);
 
-    *this = SharedArrayObjTempl(move(nv));
+    shobj->tvec.~tvec_type();
+    shobj->kind = Storage::general;
+    new (&shobj->vec) vec_type(std::move(nv));
+    len = n;
 }
 
 template <class LValueT>
+void SharedArrayObjTempl<LValueT>::promote_objs_to_general()
+{
+    if (shobj->kind != Storage::objs)
+        return;
+
+    if (slice)
+        materialize_slice();            /* see promote_structs_to_general */
+
+    const size_type n = size();
+    vec_type nv;
+    nv.reserve(n);
+    for (size_type i = 0; i < n; i++)
+        nv.emplace_back(obj_elem_value(shobj->ovec[i]), false);
+
+    shobj->ovec.~ovec_type();
+    shobj->kind = Storage::general;
+    new (&shobj->vec) vec_type(std::move(nv));
+    len = n;
+}
+
+/* Q2: a copy of an array is an array of the same type */
+template <class LValueT>
 void SharedArrayObjTempl<LValueT>::clone_internal_vec()
+{
+    const TypeAnnot *t = ctype();
+    clone_internal_vec_raw();
+    shobj->ctype = t;
+}
+
+template <class LValueT>
+void SharedArrayObjTempl<LValueT>::clone_internal_vec_raw()
 {
     /*
      * Use offset()/size(), not the raw off/len fields: for a non-slice, `len`
@@ -81,7 +177,7 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
                 shobj->ivec.cbegin() + offset(),
                 shobj->ivec.cbegin() + offset() + size()
             );
-            *this = SharedArrayObjTempl(move(nv));
+            *this = SharedArrayObjTempl(std::move(nv));
             return;
         }
 
@@ -90,7 +186,7 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
                 shobj->fvec.cbegin() + offset(),
                 shobj->fvec.cbegin() + offset() + size()
             );
-            *this = SharedArrayObjTempl(move(nv));
+            *this = SharedArrayObjTempl(std::move(nv));
             return;
         }
 
@@ -99,7 +195,7 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
                 shobj->bvec.cbegin() + offset(),
                 shobj->bvec.cbegin() + offset() + size()
             );
-            *this = SharedArrayObjTempl(move(nv));
+            *this = SharedArrayObjTempl(std::move(nv));
             return;
         }
 
@@ -110,7 +206,7 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
                 shobj->svec.buf.cbegin() + (offset() + size()) * stride
             );
             *this = SharedArrayObjTempl(
-                svec_type(move(nb), shobj->svec.def, stride));
+                svec_type(std::move(nb), shobj->svec.def, stride));
             return;
         }
 
@@ -119,9 +215,14 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
                 shobj->tvec.cbegin() + offset(),
                 shobj->tvec.cbegin() + offset() + size()
             );
-            *this = SharedArrayObjTempl(move(nv));
+            *this = SharedArrayObjTempl(std::move(nv));
             return;
         }
+
+        case Storage::objs:
+            *this = SharedArrayObjTempl(
+                shobj->ovec.copy_range(offset(), offset() + size()));
+            return;
 
         default:
             break;
@@ -132,43 +233,121 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
         shobj->vec.cbegin() + offset() + size()
     );
 
-    *this = SharedArrayObjTempl(move(new_vec));
+    *this = SharedArrayObjTempl(std::move(new_vec));
 }
 
+/*
+ * Question 3 (Python's rule): turn the slice THIS handle belongs to into
+ * an ordinary array - one fresh copy of the window, which every handle of
+ * the slice's group then holds. The handles are gathered from the
+ * storage's registry before any is reseated (reseating unregisters it);
+ * `this` is one of them, since a slice handle is always registered (a raw
+ * bit-copy of one, #94's borrow, is refused). Reseating drops the views'
+ * counts on the old storage, so nothing here touches it after the last
+ * reseat. The handles of a group agree on the window: the INT state
+ * checker (int_slice_fault) verifies it at every op of every INT run.
+ */
+template <class LValueT>
+void SharedArrayObjTempl<LValueT>::materialize_slice()
+{
+    if (!slice)
+        return;
+
+    SharedArrayObjTempl fresh(*this);   /* a sibling, for a moment */
+    fresh.clone_internal_vec();         /* now an ordinary array */
+    fresh.shobj->readonly = shobj->readonly; /* a view of a const stays one */
+
+    std::vector<SharedArrayObjTempl *> members;
+    auto r = shobj->slices.equal_range(group);
+    for (auto it = r.first; it != r.second; ++it)
+        members.push_back(it->second);
+
+    for (SharedArrayObjTempl *p : members)
+        *p = fresh;                     /* unregisters p; shares `fresh` */
+    ML_CHECK(!slice);   /* INT-COV-EXEMPT: `this` was registered */
+}
+
+/* The group numbers of this storage's live views, made dense again
+ * (1..n) before slice_groups would wrap - a group must never be handed
+ * out twice while a view holding it is alive. Cold: once per four
+ * billion slices of one storage. */
+template <class LValueT>
+void SharedArrayObjTempl<LValueT>::renumber_slice_groups()
+{
+    std::vector<std::pair<uint32_t, SharedArrayObjTempl *>> all(
+        shobj->slices.begin(), shobj->slices.end());
+    std::sort(all.begin(), all.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    shobj->slices.clear();
+    uint32_t n = 0, prev = 0;
+    for (size_t i = 0; i < all.size(); i++) {
+        if (i == 0 || all[i].first != prev)
+            n++;
+        prev = all[i].first;
+        all[i].second->group = n;
+        shobj->slices.emplace(n, all[i].second);
+    }
+    shobj->slice_groups = n;
+}
+
+/*
+ * A write to this storage at `index` (all_slices: anywhere): every slice
+ * whose window holds that index would show the write, so each is
+ * materialized first - ONE copy per slice, shared by all its handles.
+ * The overlapping groups are collected before any is materialized
+ * (materializing unregisters their handles), and `this`, a non-slice
+ * handle, keeps the storage alive throughout.
+ */
 template <class LValueT>
 void SharedArrayObjTempl<LValueT>::clone_aliased_slices(size_type index)
 {
-    auto &slices = shobj->slices;
-
-    for (auto it = slices.begin(); it != slices.end(); /* no inc */) {
-
-        auto obj = *it;
-
+    std::vector<std::pair<uint32_t, SharedArrayObjTempl *>> hit;
+    for (const auto &e : shobj->slices) {
+        const SharedArrayObjTempl *p = e.second;
         if (index == all_slices ||
-            (obj->off <= index && index < obj->off + obj->len))
-        {
-            /*
-             * Erase the object from here and get an iterator for the next
-             * object in the container.
-             */
-            it = shobj->slices.erase(it);
-            assert(obj->slice);
-
-            /*
-             * Clone the slice's range into its own vector. We leave obj->slice
-             * set so clone_internal_vec's offset()/size() report the slice
-             * range; the move-assign it does turns obj into a standalone
-             * non-slice, and obj was already removed from the slices set above,
-             * so nothing tries to erase it again.
-             */
-            obj->clone_internal_vec();
-
-        } else {
-
-            /* Just move to the next slice */
-            ++it;
-        }
+            (p->off <= index && index < p->off + p->len))
+            hit.push_back(e);
     }
+    std::sort(hit.begin(), hit.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    /* materialize_slice unregisters through the handles' assignment,
+     * which keeps the has_slices MIRROR true to the registry */
+    for (size_t i = 0; i < hit.size(); i++)
+        if (i == 0 || hit[i].first != hit[i - 1].first)
+            hit[i].second->materialize_slice();
+}
+
+/*
+ * A flat (unboxed) array<int>/array<float> holds exactly one scalar kind, fixed
+ * at creation from the proven static type. Storing a different type would need
+ * an in-place flat->general conversion (promotion), which mylang deliberately
+ * does NOT do - that is what type-driven representation buys (no GC-like
+ * latency spikes; the representation is decided once, at creation). This is
+ * reachable only by laundering a typed array through `dyn` and then mutating it
+ * (`var dyn d = int_array; append(d, "x")`): the shared storage stays int-typed
+ * even through the dyn alias, and an alias-affecting write can't change it.
+ * Declare the array `dyn` from the start for a (general) polymorphic array.
+ */
+static const char *const flat_array_violation_msg =
+    "Cannot store a value of a different type in a flat (typed) array; "
+    "declare the array dyn for a polymorphic array";
+
+/* builtins/arr.cpp.h: the append core TypeArr::add shares */
+static bool arr_elem_fits(const SharedArrayObj &arr, const EvalValue &elem);
+static bool arr_push_value(SharedArrayObj &arr, const EvalValue &elem,
+                           bool is_const);
+
+/* A NEW empty slice of `parent`: its own group over the shared empty
+ * storage (see TypeArr::slice) - or, for a parent with a type (Q2), a
+ * fresh empty array of that type: the shared storage takes none. */
+static EvalValue arr_empty_slice(const SharedArrayObj &parent)
+{
+    if (const TypeAnnot *t = parent.ctype()) {
+        SharedArrayObj r((SharedArrayObj::vec_type()));
+        r.set_ctype(t);
+        return r;
+    }
+    return SharedArrayObj(empty_arr.get_ref<SharedArrayObj>(), 0, 0);
 }
 
 /* Read element `i` (slice-relative) as a boxed EvalValue WITHOUT promoting flat
@@ -245,9 +424,72 @@ EvalValue TypeArr::intptr(const EvalValue &a)
             return reinterpret_cast<int_type>(&arr.flat_structs());
         case SharedArrayObj::Storage::strs:
             return reinterpret_cast<int_type>(&arr.flat_strs());
+        case SharedArrayObj::Storage::objs:
+            return reinterpret_cast<int_type>(&arr.flat_objs());
         default:
             return reinterpret_cast<int_type>(&arr.get_vec());
     }
+}
+
+/* `l` followed by `items`, in the storage they need together: flat ints
+ * or floats when every element is a number (a bool one as 0 / 1, an int
+ * one widened beside a float), general otherwise - a sum's copy that its
+ * right side does not fit (TypeArr::add) */
+static EvalValue arr_sum_join(const SharedArrayObj &l,
+                              const std::vector<EvalValue> &items)
+{
+    std::vector<EvalValue> all;
+    all.reserve(l.size() + items.size());
+    for (size_type i = 0; i < l.size(); i++)
+        all.push_back(arr_elem_at(l, i));
+    all.insert(all.end(), items.begin(), items.end());
+    bool nums = true, flt = false;
+    for (const EvalValue &e : all) {
+        if (e.is<float_type>())
+            flt = true;
+        else if (!e.is<int_type>() && !e.is<bool>())
+            nums = false;
+    }
+    const auto num = [](const EvalValue &e) -> float_type {
+        return e.is<float_type>() ? e.get<float_type>()
+             : e.is<int_type>() ? static_cast<float_type>(e.get<int_type>())
+             : (e.get<bool>() ? 1 : 0);
+    };
+    if (nums && flt) {
+        SharedArrayObj::fvec_type v;
+        v.reserve(all.size());
+        for (const EvalValue &e : all)
+            v.push_back(num(e));
+        return SharedArrayObj(std::move(v));
+    }
+    if (nums) {
+        SharedArrayObj::ivec_type v;
+        v.reserve(all.size());
+        for (const EvalValue &e : all)
+            v.push_back(e.is<int_type>() ? e.get<int_type>()
+                                         : (e.get<bool>() ? 1 : 0));
+        return SharedArrayObj(std::move(v));
+    }
+    SharedArrayObj::vec_type v;
+    v.reserve(all.size());
+    for (EvalValue &e : all)
+        v.emplace_back(std::move(e), false);
+    return SharedArrayObj(std::move(v));
+}
+
+/* `lv += rv[roff, roff + rn)` for one flat kind, in place. The range
+ * may lie in `lv` itself (`a += a`, `a += a[0:2]`): it is copied out
+ * first, since inserting a vector's own range into it is undefined. */
+template <class V>
+static void arr_concat_flat(V &lv, const V &rv, size_type roff, size_type rn)
+{
+    if (&lv == &rv) {
+        const V tmp(rv.cbegin() + roff, rv.cbegin() + roff + rn);
+        lv.insert(lv.end(), tmp.cbegin(), tmp.cend());
+        return;
+    }
+    lv.reserve(lv.size() + rn);
+    lv.insert(lv.end(), rv.cbegin() + roff, rv.cbegin() + roff + rn);
 }
 
 void TypeArr::add(EvalValue &a, const EvalValue &b)
@@ -260,133 +502,92 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
     if (!b.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array on the right side of +");
 
+    /* `s += x` on a slice grows the slice every name holding it shares
+     * (question 3): it becomes an ordinary array first, then grows in
+     * place like one. The rhs may be a handle of that same slice
+     * (`s += s`); it is materialized with it, and the in-place paths
+     * below read a copy of the elements before growing. */
+    lval.materialize_slice();
+
     lval.invalidate_hash();   /* += appends elements -> the hash changes */
 
     const SharedArrayObj &rhs = b.get<SharedArrayObj>();
 
     /*
-     * Flat homogeneous fast path: int+int / float+float concatenate in unboxed
-     * storage, with no promotion (8-byte appends). A mismatched or general
-     * operand falls through to the boxed path below, which reads both operands
-     * directly (arr_elem_at) and builds the result general - it never promotes
-     * an operand in place. A non-slice lhs appends in place (same alias
-     * semantics as before); a slice lhs builds a fresh flat array.
+     * Flat homogeneous fast path: int+int / float+float / bool+bool
+     * concatenate in unboxed storage, IN PLACE (every alias shares the
+     * grown array). A mismatched or general operand falls through to the
+     * element-by-element path below.
      */
     if (lval.skind() == rhs.skind() &&
-        lval.skind() == SharedArrayObj::Storage::ints)
-    {
-        const auto &rv = rhs.flat_ints();
-
-        if (!lval.is_slice()) {
-
-            auto &lv = lval.flat_ints();
-            lv.reserve(lval.size() + rhs.size());
-            lv.insert(lv.end(),
-                      rv.cbegin() + rhs.offset(),
-                      rv.cbegin() + rhs.offset() + rhs.size());
-
-        } else {
-
-            const auto &lv = lval.flat_ints();
-            SharedArrayObj::ivec_type nv;
-            nv.reserve(lval.size() + rhs.size());
-            nv.insert(nv.end(),
-                      lv.cbegin() + lval.offset(),
-                      lv.cbegin() + lval.offset() + lval.size());
-            nv.insert(nv.end(),
-                      rv.cbegin() + rhs.offset(),
-                      rv.cbegin() + rhs.offset() + rhs.size());
-            lval = SharedArrayObj(move(nv));
-        }
-
+        lval.skind() == SharedArrayObj::Storage::ints) {
+        arr_concat_flat(lval.flat_ints(), rhs.flat_ints(), rhs.offset(),
+                        rhs.size());
         return;
     }
-
     if (lval.skind() == rhs.skind() &&
-        lval.skind() == SharedArrayObj::Storage::floats)
-    {
-        const auto &rv = rhs.flat_floats();
-
-        if (!lval.is_slice()) {
-
-            auto &lv = lval.flat_floats();
-            lv.reserve(lval.size() + rhs.size());
-            lv.insert(lv.end(),
-                      rv.cbegin() + rhs.offset(),
-                      rv.cbegin() + rhs.offset() + rhs.size());
-
-        } else {
-
-            const auto &lv = lval.flat_floats();
-            SharedArrayObj::fvec_type nv;
-            nv.reserve(lval.size() + rhs.size());
-            nv.insert(nv.end(),
-                      lv.cbegin() + lval.offset(),
-                      lv.cbegin() + lval.offset() + lval.size());
-            nv.insert(nv.end(),
-                      rv.cbegin() + rhs.offset(),
-                      rv.cbegin() + rhs.offset() + rhs.size());
-            lval = SharedArrayObj(move(nv));
-        }
-
+        lval.skind() == SharedArrayObj::Storage::floats) {
+        arr_concat_flat(lval.flat_floats(), rhs.flat_floats(), rhs.offset(),
+                        rhs.size());
         return;
     }
-
     if (lval.skind() == rhs.skind() &&
-        lval.skind() == SharedArrayObj::Storage::bools)
-    {
-        const auto &rv = rhs.flat_bools();
-
-        if (!lval.is_slice()) {
-
-            auto &lv = lval.flat_bools();
-            lv.reserve(lval.size() + rhs.size());
-            lv.insert(lv.end(),
-                      rv.cbegin() + rhs.offset(),
-                      rv.cbegin() + rhs.offset() + rhs.size());
-
-        } else {
-
-            const auto &lv = lval.flat_bools();
-            SharedArrayObj::bvec_type nv;
-            nv.reserve(lval.size() + rhs.size());
-            nv.insert(nv.end(),
-                      lv.cbegin() + lval.offset(),
-                      lv.cbegin() + lval.offset() + lval.size());
-            nv.insert(nv.end(),
-                      rv.cbegin() + rhs.offset(),
-                      rv.cbegin() + rhs.offset() + rhs.size());
-            lval = SharedArrayObj(move(nv));
-        }
-
+        lval.skind() == SharedArrayObj::Storage::bools) {
+        arr_concat_flat(lval.flat_bools(), rhs.flat_bools(), rhs.offset(),
+                        rhs.size());
         return;
     }
 
     /*
-     * Mixed / general concat. The result is a general array. If lhs is already
-     * a general non-slice, append rhs's elements in place; otherwise build a
-     * fresh general array. Either way both operands are read via arr_elem_at,
-     * so a flat operand is read directly (its representation is never promoted).
+     * Every other pairing appends ELEMENT BY ELEMENT, IN PLACE, through
+     * the storage every alias shares - `var t = s; t += x` grows `s` too,
+     * whatever the storage kind (it used to build a fresh array whenever
+     * the lhs was not general, so a flat string or struct array lost its
+     * aliases). The elements are read first (`a += a` reads the array it
+     * grows), and each must fit the lhs storage before any is appended: a
+     * flat array through a `dyn` alias refuses a value of another type, as
+     * append does, and the array is left unchanged.
      */
     const size_type rn = rhs.size();
+    std::vector<EvalValue> items;
+    items.reserve(rn);
+    for (size_type i = 0; i < rn; i++)
+        items.push_back(arr_elem_at(rhs, i));
 
-    if (lval.skind() == SharedArrayObj::Storage::general && !lval.is_slice()) {
+    /* Q2: each element fits the array's OWN type, converted as a typed
+     * store converts it (an int into an array<float?> is a float) - the
+     * array keeps its type however `+=` reached it. Every engine runs
+     * this, so it needs no mark from the compiler. `a + b` builds its
+     * result from an untyped copy (ctype_sum_copy), so only `+=` is
+     * checked here. */
+    if (const TypeAnnot *ct = lval.ctype()) {
+        const TypeAnnot *ea = ct->elem.get();
+        for (EvalValue &e : items)
+            e = ct_fit(ea, std::move(e), false);
+    }
 
-        auto &v = lval.get_vec();   /* general: get_vec() doesn't promote */
-        v.reserve(lval.size() + rn);
-        for (size_type i = 0; i < rn; i++)
-            v.emplace_back(arr_elem_at(rhs, i), false);
+    /* the copy `a + b` builds (ArrSumScope) takes the storage both sides'
+     * elements need, as one literal of them would - nothing else holds
+     * it, and the sum takes its static type once built (StampTypeV) */
+    /* (that copy has no type of its own yet: ctype_sum_copy) */
+    if (&a == g_arr_sum_copy) {
+        bool fits = true;
+        for (const EvalValue &e : items)
+            fits = fits && arr_elem_fits(lval, e);
+        if (!fits) {
+            a = arr_sum_join(lval, items);
+            return;
+        }
+    }
 
-    } else {
+    for (const EvalValue &e : items)
+        if (!arr_elem_fits(lval, e))
+            throw TypeErrorEx(flat_array_violation_msg);
 
-        const size_type ln = lval.size();
-        SharedArrayObj::vec_type new_arr;
-        new_arr.reserve(ln + rn);
-        for (size_type i = 0; i < ln; i++)
-            new_arr.emplace_back(arr_elem_at(lval, i), false);
-        for (size_type i = 0; i < rn; i++)
-            new_arr.emplace_back(arr_elem_at(rhs, i), false);
-        lval = SharedArrayObj(move(new_arr));
+    for (const EvalValue &e : items) {
+        const bool ok = arr_push_value(lval, e, false);
+        ML_CHECK(ok);
+        (void)ok;
     }
 }
 
@@ -410,6 +611,8 @@ static EvalValue arr_elem_at(const SharedArrayObj &arr, size_type i)
             return struct_elem_at(arr, i);   /* materialize a StructObject */
         case SharedArrayObj::Storage::strs:
             return EvalValue(SharedStr(arr.flat_strs()[at]));
+        case SharedArrayObj::Storage::objs:
+            return obj_elem_value(arr.flat_objs()[at]);
         default:
             return arr.get_vec()[at].get();
     }
@@ -423,7 +626,7 @@ void TypeArr::eq(EvalValue &a, const EvalValue &b)
     }
 
     const SharedArrayObj &lhs = a.get<SharedArrayObj>();
-    const SharedArrayObj &rhs = b.get<SharedArrayObj>();
+    const SharedArrayObj &rhs = b.get_ref<SharedArrayObj>();
     const size_type n = lhs.size();
 
     if (n != rhs.size()) {
@@ -432,31 +635,56 @@ void TypeArr::eq(EvalValue &a, const EvalValue &b)
     }
 
     /*
-     * Identity shortcut: only safe (and only worth it) when both are general -
-     * the same vector AND same offset means the two views cover the exact same
-     * region, hence equal. Reading get_vec() here doesn't promote a general
-     * array. Flat arrays skip this and use the element loop below.
+     * Two GENERAL arrays may hold references, so the pair may be on a cycle:
+     * the comparison runs on the cycle guard's pair stack (cyclewalk.h). A
+     * flat side holds only scalars, so it is never on a stack and a cyclic
+     * general side differs from it at some element anyway - the plain walk
+     * answers that case, as it always did.
      */
-    if (lhs.skind() == SharedArrayObj::Storage::general &&
-        rhs.skind() == SharedArrayObj::Storage::general &&
-        &lhs.get_vec() == &rhs.get_vec() && lhs.offset() == rhs.offset())
-    {
-        a = true;
-        return;
-    }
+    const bool general = lhs.skind() == SharedArrayObj::Storage::general &&
+                         rhs.skind() == SharedArrayObj::Storage::general;
+    CycPairStack &st = cyc_eq();
+    CycKey kl, kr;
 
-    /* Element-wise compare, reading each side without promoting (so two flat
-     * arrays - or a flat and a general one - compare equal element by element,
-     * with the usual 1 == 1.0 numeric equality via EvalValue::operator!=). */
-    for (size_type i = 0; i < n; i++) {
+    if (general) {
+        cyc_key(a, kl);
+        cyc_key(b, kr);
 
-        if (arr_elem_at(lhs, i) != arr_elem_at(rhs, i)) {
-            a = false;
+        /*
+         * Identity shortcut: the same storage window on both sides covers the
+         * exact same elements, hence equal - when the guard says skipping the
+         * walk cannot change the answer (always at the top level; inside a
+         * comparison of two different containers, unless this one is on a
+         * cycle - see CycPairStack::identity_ok).
+         */
+        if (kl == kr && st.identity_ok(a, kl)) {
+            a = true;
+            return;
+        }
+
+        const int be = st.back_edge(kl, kr);
+        if (be >= 0) {
+            a = be == 1;
             return;
         }
     }
 
-    a = true;
+    /* Element-wise compare, reading each side without promoting (so two flat
+     * arrays - or a flat and a general one - compare equal element by element,
+     * with the usual 1 == 1.0 numeric equality via EvalValue::operator!=).
+     * ONE loop for both cases: a second copy of it cost the inlining of the
+     * element compare (+33% Ir on a walk over nested arrays). */
+    bool equal = true;
+    {
+        CycPairGuard g(st, kl, kr, general);
+        for (size_type i = 0; i < n; i++) {
+            if (arr_elem_at(lhs, i) != arr_elem_at(rhs, i)) {
+                equal = false;
+                break;
+            }
+        }
+    }
+    a = equal;
 }
 
 void TypeArr::noteq(EvalValue &a, const EvalValue &b)
@@ -473,13 +701,25 @@ void TypeArr::noteq(EvalValue &a, const EvalValue &b)
  */
 size_t TypeArr::hash(const EvalValue &a)
 {
-    const SharedArrayObj &arr = a.get<SharedArrayObj>();
+    const SharedArrayObj &arr = a.get_ref<SharedArrayObj>();
 
     if (arr.hash_is_cached())          /* a non-slice with a valid cache */
         return arr.get_cached_hash();
 
     const size_type n = arr.size();
     size_t seed = hash_salt_array;
+
+    /* A general array may be on a cycle: met again inside its own hash, it
+     * hashes as a back edge at its depth (cyclewalk.h). Never cached - only
+     * a flat array caches, and its hash does not depend on a walk. */
+    CycKey k;
+    const bool keyed = cyc_key(a, k);
+    if (keyed) {
+        const int d = cyc_hash().depth(k);
+        if (d >= 0)
+            return cyc_backedge_hash(d);
+    }
+    CycGuard g(cyc_hash(), k, keyed);
 
     for (size_type i = 0; i < n; i++)
         hash_combine(seed, arr_elem_at(arr, i).hash());
@@ -490,15 +730,15 @@ size_t TypeArr::hash(const EvalValue &a)
 
 string TypeArr::to_string(const EvalValue &a)
 {
-    const SharedArrayObj &arr = a.get<SharedArrayObj>();
+    const SharedArrayObj &arr = a.get_ref<SharedArrayObj>();
     const size_type n = arr.size();
     string res;
 
-    res.reserve(n * 32);
-    res += "[";
-
     /* Flat fast path: stringify the unboxed vector directly, no promotion. */
     if (arr.skind() != SharedArrayObj::Storage::general) {
+
+        res.reserve(n * 32);
+        res += "[";
 
         for (size_type i = 0; i < n; i++) {
             res += arr_elem_at(arr, i).to_string_repr();
@@ -509,6 +749,17 @@ string TypeArr::to_string(const EvalValue &a)
         res += "]";
         return res;
     }
+
+    /* A general array already being printed further up this walk is shown
+     * as `[...]` (cyclewalk.h, README *Values that contain themselves*). */
+    CycKey k;
+    cyc_key(a, k);
+    if (cyc_render().contains(k))
+        return "[...]";
+    CycGuard g(cyc_render(), k);
+
+    res.reserve(n * 32);
+    res += "[";
 
     const ArrayConstView &arr_view = arr.get_view();
 
@@ -527,15 +778,23 @@ string TypeArr::to_string(const EvalValue &a)
 
 string TypeArr::pretty(const EvalValue &a, int indent, int width)
 {
+    /* already being printed further up: `[...]`, like to_string */
+    CycKey k;
+    const bool keyed = cyc_key(a, k);
+    if (keyed && cyc_render().contains(k))
+        return "[...]";
+
     const string flat = to_string_repr(a);
-    const SharedArrayObj &arr = a.get<SharedArrayObj>();
+    const SharedArrayObj &arr = a.get_ref<SharedArrayObj>();
     const size_type n = arr.size();
 
     /* fits on one line (or empty) -> single line */
     if (n == 0 || indent + static_cast<int>(flat.size()) <= width)
         return flat;
 
-    /* otherwise expand one element per line, indented */
+    /* otherwise expand one element per line, indented - on the render
+     * stack, so an element that leads back here prints as `[...]` */
+    CycGuard g(cyc_render(), k, keyed);
     string res = "[\n";
     const string pad(indent + 2, ' ');
     for (size_type i = 0; i < n; i++) {
@@ -562,9 +821,19 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval,
         throw TypeErrorEx("Expected integer as subscript");
 
     const EvalValue &what = RValue(what_lval);
-    SharedArrayObj &&arr = what.get<SharedArrayObj>();
+    /*
+     * BORROW the array handle (get_ref, NOT get). `what` is const, so a
+     * get<SharedArrayObj>() would call the by-VALUE const overload and COPY the
+     * handle - an intrusive_ptr retain + later release on EVERY general/flat
+     * subscript READ (measured ~2.8% of a dict-word-count loop: the base array
+     * is re-read per iteration). `arr` is only READ here; the one mutable path
+     * (the LValue-array element back-pointer below) re-derives the array
+     * through the base LValue*, which is a ref, not a copy.
+     */
+    const SharedArrayObj &arr = what.get_ref<SharedArrayObj>();
     int_type idx = idx_val.get<int_type>();
 
+    ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
     if (idx < 0)
         idx += arr.size();
 
@@ -594,20 +863,23 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval,
     if (arr.skind() != SharedArrayObj::Storage::general)
         return arr_elem_at(arr, idx);
 
-    SharedArrayObj::vec_type &vec = arr.get_vec();
-    LValue *ret = &vec[arr.offset() + idx];
-
     if (!what_lval.is<LValue *>() || arr.is_readonly()) {
         /*
          * Return a simple RValue when the input array was not an LValue, or
          * when it is read-only (a `const` value): a read still works, but an
          * assignment target is an rvalue, so `a[i] = x` fails with NotLValueEx.
+         * const get_vec() - no handle copy (arr is borrowed).
          */
-        return ret->get();
+        return arr.get_vec()[arr.offset() + idx].get();
     }
 
-    /* We deferenced a LValue array, so return element's LValue */
-    ret->container = what_lval.get<LValue *>();
+    /* We dereferenced an LValue array, so return the element's LValue with its
+     * container back-pointer. Get the MUTABLE vec through the base LValue* (a
+     * ref, not a handle copy - the array is already general, so no promote). */
+    LValue *base = what_lval.get<LValue *>();
+    SharedArrayObj::vec_type &vec = base->getval<SharedArrayObj>().get_vec();
+    LValue *ret = &vec[arr.offset() + idx];
+    ret->container = base;
     ret->container_idx = arr.offset() + idx;
     return ret;
 }
@@ -617,7 +889,11 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
                          const EvalValue &end_val)
 {
     const EvalValue &what = RValue(what_lval);
-    const SharedArrayObj &arr = what.get<SharedArrayObj>();
+    /* Borrow (get_ref), not copy: `arr` is only read (size/offset) and the
+     * slice-view ctor below does its OWN shobj retain, so the extra handle
+     * copy a by-value get<> makes is pure churn. */
+    const SharedArrayObj &arr = what.get_ref<SharedArrayObj>();
+    ML_INT_ONLY(int_vc_slice_vals(false, start_val, end_val, arr.size());)
     int_type start = 0, end = arr.size();
 
     if (start_val.is<int_type>()) {
@@ -632,8 +908,13 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
                 start = 0;
         }
 
+        /* an EMPTY slice is still a new array of its own (question 3:
+         * a slice is separate the moment it is taken) - a fresh group
+         * over the shared empty storage, never empty_arr itself, whose
+         * every copy would be ONE array: appending to one empty slice
+         * would show in all of them */
         if (static_cast<size_t>(start) >= arr.size())
-            return empty_arr;
+            return arr_empty_slice(arr);
 
     } else if (!start_val.is<NoneVal>()) {
 
@@ -648,7 +929,7 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
             end += arr.size();
 
         if (end <= start)
-            return empty_arr;
+            return arr_empty_slice(arr);
 
         if (static_cast<size_t>(end) > arr.size())
             end = arr.size();

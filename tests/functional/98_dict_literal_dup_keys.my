@@ -1,0 +1,50 @@
+# A dict literal is built like successive stores: a key written twice
+# takes the LAST value, at the place of its FIRST occurrence, as Python
+# and dict(pairs) do (README, Dictionary; question 7 in
+# plans/open-language-questions.md, decision A). Every key and value is
+# evaluated, left to right. The constant literals fold at compile time,
+# the runtime ones are built by the engine, and both must agree.
+
+var d = {"a": 1, "b": 2, "a": 3};
+print(d);
+assert(len(d) == 2 && d.a == 3 && keys(d) == ["a", "b"]);
+
+const C = {"x": 1, "y": 2, "x": 5, "y": 6, "z": 7};
+print(C);
+assert(C.x == 5 && C.y == 6 && keys(C) == ["x", "y", "z"]);
+
+# a key known only at run time collides with a written one
+var k = str(runtime("a"));
+var e = {k: 1, "b": 0, "a": 2};
+print(e);
+assert(keys(e) == ["a", "b"] && e.a == 2);
+
+# an int and a float key that are equal are one key
+var f = {1: "x", 2: "q", 1.0: "y"};
+print(len(f), f[1]);
+assert(len(f) == 2 && f[1] == "y");
+
+# container values and keys: the later value replaces the earlier one
+var g = {[1, 2]: [0], "s": [], [1, 2]: [9, 9]};
+print(g);
+assert(g[[1, 2]] == [9, 9]);
+
+# every key and value runs, in order
+var seen = [];
+func t(x) { append(seen, x); return x; }
+var q = {t("p"): t(1), t("r"): t(2), t("p"): t(3)};
+print(q, seen);
+assert(seen == ["p", 1, "r", 2, "p", 3] && q.p == 3);
+
+# built in a loop, so a compiled loop body builds it too
+func build(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var m = {i % 3: i, 1: 7, i % 3: i + 100};
+        s += m[i % 3];
+        assert(len(m) == (i % 3 == 1 ? 1 : 2) && keys(m)[0] == i % 3);
+    }
+    return s;
+}
+print(build(runtime(50)));
+assert(build(runtime(50)) == 6225);

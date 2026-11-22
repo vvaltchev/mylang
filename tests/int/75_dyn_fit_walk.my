@@ -1,0 +1,450 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#49): value_fits (types/fit.cpp.h) walks a value against a
+# declared type - every annotation kind and every array storage, each
+# once fitting and once not, the dict keys, values and default, a
+# container met twice (walked once) and two slices of one storage (two
+# values, each walked). The parameters are reached through a dyn callee
+# (the generic call op checks every bind) and directly; the verdicts are
+# asserted, so a check that lets a misfit through, or refuses a value
+# that fits, fails the unit. Then the places #49 leaves to `*` (a box
+# stored through a dyn alias), which calls the inferencer marks for a
+# check (a construction, a builtin, a function value, a dyn callee), and
+# a store into each annotation kind. README, "A dyn value entering a
+# typed place".
+struct P { int x; }
+struct Q { int x; }
+struct Egg { int x; }
+struct Owl { int x; }
+struct Urn { int x; }
+class C { int n; }
+class D { int n; }
+
+var trail = [];
+func check(str name, dyn f, opt dyn v) {
+    try { f(v); append(trail, name + " ok"); }
+    catch (TypeErrorEx) { append(trail, name + " no"); }
+}
+
+func ai(array<int> a) => len(a);
+func af(array<float> a) => len(a);
+func ab(array<bool> a) => len(a);
+func astr(array<str> a) => len(a);
+func ap(array<P> a) => len(a);
+func ac(array<C> a) => len(a);
+func aoi(array<int?> a) => len(a);
+func aai(array<array<int>> a) => len(a);
+func adi(array<dict<str, int>> a) => len(a);
+func dsi(dict<str, int> d) => len(d);
+func dai(dict<array<int>, int> d) => len(d);
+func dsa(dict<str, array<int>> d) => len(d);
+func dsp(dict<str, P> d) => len(d);
+func dvi(dict<dyn, int> d) => len(d);
+func dki(dict<int, dyn> d) => len(d);
+func ddd(dict<dyn, dyn> d) => len(d);
+func sp(P p) => p.x;
+func osp(P? p) { if (p == none) return -1; return p.x; }
+func bi(box<int> b) => *b;
+func bp(box<P> b) => (*b).x;
+func sstr(str s) => len(s);
+func sbool(bool b) => b ? 1 : 0;
+func sc(C c) => c.n;
+func garr(array a) => len(a);
+func gdict(dict d) => len(d);
+func adyn(array<dyn> a) => len(a);
+func abox(array<box<int>> a) => len(a);
+
+# an UNTYPED general array holding a's elements: a literal nested in an
+# array<dyn> carries no type of its own, and a store through `dyn` into
+# an untyped array checks nothing
+func ug(dyn a) {
+    array<dyn> h = [[none]];
+    var dyn r = h[0];
+    pop(r);
+    foreach (e in a)
+        append(r, e);
+    return r;
+}
+
+# a container only `dyn` reaches - each one made as an element of an
+# array<dyn> - carries no type of its own, so it is walked by what it
+# holds (a TYPED one is checked by its own type, rule 1: a
+# cast<array<dyn>>'s array<dyn> enters no narrower place, "ai cast"
+# below; dict(5)'s key is unfilled - it holds no key yet - so it takes
+# the place's, "dsi dict default"). Each is used once: one that fits
+# takes the place's type as it enters
+array<dyn> U = [ug([1, 2]),
+                ug([1, "x"]),
+                ug([1, none]),
+                ug([1, none]),
+                dict(5),
+                dict("s"),
+                dict(P(1)),
+                dict(Q(1)),
+                ug([1.5]),
+                ug([1]),
+                ug([true]),
+                ug([1]),
+                ug(["a"]),
+                ug([1]),
+                ug([P(1)]),
+                ug([Q(1)]),
+                ug([box(P(1))]),
+                ug([box(1)]),
+                ug([box(1.5)]),
+                ug([5]),
+                ug([5]),
+                [1, 2],
+                [1, 2],
+                [1, 2],
+                [1, 2],
+                [1, 2],
+                [1.5],
+                [1.5],
+                [true],
+                [true],
+                split("a b", " "),
+                split("a b", " "),
+                [P(1), P(2)],
+                [Q(1)],
+                [P(1)],
+                [],
+                [C(1), C(2)],
+                [C(1), D(2)],
+                {"a": 1},
+                {"a": "s"},
+                {1: 1},
+                {[1]: 1},
+                {["x"]: 1},
+                {"k": [1]},
+                {"k": ["x"]},
+                {"a": 1},
+                {1: "s"},
+                {1: "s"},
+                {"a": 1},
+                {"a": [1, "x"]},
+                [1],
+                {"a": 1}];
+# flat storage is decided by its kind alone
+check("ai ints", ai, U[21]);
+check("af ints", af, U[22]);
+check("ab ints", ab, U[23]);
+check("astr ints", astr, U[24]);
+check("ap ints", ap, U[25]);
+check("af floats", af, U[26]);
+check("ai floats", ai, U[27]);
+check("ab bools", ab, U[28]);
+check("ai bools", ai, U[29]);
+check("astr strs", astr, U[30]);
+check("ai strs", ai, U[31]);
+check("ap structs", ap, U[32]);
+check("ap other", ap, U[33]);
+check("ai structs", ai, U[34]);
+check("ai empty", ai, U[35]);
+# a general array is walked element by element
+check("ai general", ai, U[0]);
+check("ai general bad", ai, U[1]);
+check("ai cast", ai, runtime(cast<array<dyn>>([1, 2])));
+check("aoi none", aoi, U[2]);
+check("ai none", ai, U[3]);
+check("ac objs", ac, U[36]);
+check("ac objs bad", ac, U[37]);
+# one inner array twice is walked once; two windows of one storage are
+# two values
+array<dyn> UI = [ug([1, 2]), ug([1, 2, "x"])];
+var dyn inner = UI[0];
+var dyn st = UI[1];
+array<dyn> UO = [[inner, inner], [st[0:2], st[1:3]], [st[0:2], st[0:2]]];
+check("aai shared", aai, UO[0]);
+check("aai windows", aai, UO[1]);
+check("aai window ok", aai, UO[2]);
+# dicts: keys, values, both, neither, a default, a shared dict
+check("dsi ok", dsi, U[38]);
+check("dsi value", dsi, U[39]);
+check("dsi key", dsi, U[40]);
+check("dai ok", dai, U[41]);
+check("dai key", dai, U[42]);
+check("dsa ok", dsa, U[43]);
+check("dsa value", dsa, U[44]);
+check("dsi default ok", dsi, U[4]);
+check("dsi default", dsi, U[5]);
+check("dsp default ok", dsp, U[6]);
+check("dsp default", dsp, U[7]);
+check("dsi dict default", dsi, runtime(dict(5)));
+check("dvi ok", dvi, U[45]);
+check("dvi value", dvi, U[46]);
+check("dki ok", dki, U[47]);
+check("dki key", dki, U[48]);
+check("ddd any", ddd, U[49]);
+array<dyn> UD = [{"a": 1}];
+var dyn dd = UD[0];
+array<dyn> UE = [[dd, dd], [dd, {"b": "s"}]];
+check("adi shared", adi, UE[0]);
+check("adi bad", adi, UE[1]);
+# structs, boxes, strings, bools, classes
+check("sp ok", sp, runtime(P(1)));
+check("sp other", sp, runtime(Q(1)));
+check("sp int", sp, runtime(5));
+check("sp boxed", sp, runtime(box(P(1))));
+check("sp egg", sp, runtime(Egg(1)));
+check("sp owl", sp, runtime(Owl(1)));
+check("sp urn", sp, runtime(Urn(1)));
+check("osp none", osp, runtime(none));
+check("bi ok", bi, runtime(box(1)));
+check("bi float", bi, runtime(box(1.5)));
+check("bi bool", bi, runtime(box(true)));
+check("bi str", bi, runtime(box("s")));
+check("bi struct", bi, runtime(box(P(1))));
+check("bi int", bi, runtime(1));
+check("bp ok", bp, runtime(box(P(1))));
+check("bp struct", bp, runtime(P(1)));
+check("bp int", bp, runtime(box(1)));
+check("sstr ok", sstr, runtime("a"));
+check("sstr int", sstr, runtime(5));
+check("sstr arr", sstr, U[50]);
+check("sstr dict", sstr, U[51]);
+check("sbool ok", sbool, runtime(true));
+check("sbool int", sbool, runtime(1));
+check("sc ok", sc, runtime(C(1)));
+check("sc other", sc, runtime(D(1)));
+check("sc int", sc, runtime(5));
+
+# inside a general array each element is checked as a value
+check("af elems", af, U[8]);
+check("af elems bad", af, U[9]);
+check("ab elems", ab, U[10]);
+check("ab elems bad", ab, U[11]);
+check("astr elems", astr, U[12]);
+check("astr elems bad", astr, U[13]);
+check("ap elems", ap, U[14]);
+check("ap elems other", ap, U[15]);
+check("ap elems boxed", ap, U[16]);
+check("abox elems", abox, U[17]);
+check("abox elems bad", abox, U[18]);
+check("aai elems bad", aai, U[19]);
+check("adi elems bad", adi, U[20]);
+# a TYPED container enters by its own type, exactly (rule 1: a `dyn`
+# part of the place is a type of its own, which an int or a str is not)
+array<int> ti = [1];
+array<int?> toi = [1];
+array<P> tp = [P(1)];
+array<Q> tq = [Q(1)];
+array<array<int>> tai = [[1]];
+array<array<int?>> taoi = [[1]];
+dict<str, int> tdsi = {"a": 1};
+dict<int, int> tdii = {1: 1};
+dict<str, float> tdsf = {"a": 1.5};
+check("t ai", ai, ti);
+check("t ai opt", ai, toi);
+check("t aoi", aoi, ti);
+check("t ap", ap, tp);
+check("t ap other", ap, tq);
+check("t aai", aai, tai);
+check("t aai opt", aai, taoi);
+check("t dsi", dsi, tdsi);
+check("t dsi key", dsi, tdii);
+check("t dsi value", dsi, tdsf);
+check("t dvi", dvi, tdsi);
+check("t ddd", ddd, tdsi);
+# not a container at all; a container with no element type
+check("ai int", ai, runtime(5));
+check("dsi int", dsi, runtime(5));
+check("garr any", garr, runtime(cast<array<dyn>>([1, "x"])));
+check("gdict any", gdict, runtime({1: "x"}));
+check("adyn any", adyn, runtime([1, "x"]));
+
+# a struct's dyn field takes anything; a typed one is checked
+struct W { dyn x; array<int> v; }
+func mkw(dyn x, dyn v) => W(x, v);
+try { mkw(runtime("s"), runtime([1])); append(trail, "W ok"); }
+catch (TypeErrorEx) { append(trail, "W no"); }
+try { mkw(runtime("s"), runtime(["x"])); append(trail, "W bad ok"); }
+catch (TypeErrorEx) { append(trail, "W bad no"); }
+
+# through a function VALUE whose type is known: its parameters are
+# checked as at a direct call
+func via_value(dyn x) {
+    var f = ai;
+    var g = sp;
+    var got = [];
+    try { f(x); append(got, "f ok"); } catch (TypeErrorEx) {
+        append(got, "f no"); }
+    try { g(x); append(got, "g ok"); } catch (TypeErrorEx) {
+        append(got, "g no"); }
+    return got;
+}
+assert(via_value(runtime([1])) == ["f ok", "g no"]);
+assert(via_value(runtime(P(1))) == ["f no", "g ok"]);
+
+# the same checks at a direct call
+func direct(dyn ints, dyn strs, dyn bools, dyn floats) {
+    var got = [];
+    try { ai(strs); append(got, "s ok"); } catch (TypeErrorEx) {
+        append(got, "s no"); }
+    try { ab(ints); append(got, "i ok"); } catch (TypeErrorEx) {
+        append(got, "i no"); }
+    try { af(bools); append(got, "b ok"); } catch (TypeErrorEx) {
+        append(got, "b no"); }
+    try { astr(floats); append(got, "f ok"); } catch (TypeErrorEx) {
+        append(got, "f no"); }
+    try { af(floats); append(got, "ff ok"); } catch (TypeErrorEx) {
+        append(got, "ff no"); }
+    return got;
+}
+var dgot = direct(runtime([1]), runtime(split("a", " ")),
+                  runtime([false]), runtime([2.5]));
+assert(dgot == ["s no", "i no", "b no", "f no", "ff ok"]);
+
+var want = ["ai ints ok", "af ints no", "ab ints no", "astr ints no",
+    "ap ints no", "af floats ok", "ai floats no", "ab bools ok",
+    "ai bools no", "astr strs ok", "ai strs no", "ap structs ok",
+    "ap other no", "ai structs no", "ai empty ok", "ai general ok",
+    "ai general bad no", "ai cast no", "aoi none ok", "ai none no",
+    "ac objs ok", "ac objs bad no", "aai shared ok", "aai windows no",
+    "aai window ok ok", "dsi ok ok", "dsi value no", "dsi key no",
+    "dai ok ok", "dai key no", "dsa ok ok", "dsa value no",
+    "dsi default ok ok", "dsi default no", "dsp default ok ok",
+    "dsp default no", "dsi dict default ok", "dvi ok ok", "dvi value no",
+    "dki ok ok", "dki key no", "ddd any ok", "adi shared ok", "adi bad no",
+    "sp ok ok", "sp other no", "sp int no", "sp boxed no", "sp egg no",
+    "sp owl no", "sp urn no", "osp none ok", "bi ok ok", "bi float no",
+    "bi bool no", "bi str no", "bi struct no", "bi int no", "bp ok ok",
+    "bp struct no", "bp int no", "sstr ok ok", "sstr int no", "sstr arr no",
+    "sstr dict no", "sbool ok ok", "sbool int no", "sc ok ok", "sc other no",
+    "sc int no", "af elems ok", "af elems bad no", "ab elems ok",
+    "ab elems bad no", "astr elems ok", "astr elems bad no", "ap elems ok",
+    "ap elems other no", "ap elems boxed no", "abox elems ok",
+    "abox elems bad no", "aai elems bad no", "adi elems bad no", "t ai ok",
+    "t ai opt no", "t aoi no", "t ap ok", "t ap other no", "t aai ok",
+    "t aai opt no", "t dsi ok", "t dsi key no", "t dsi value no", "t dvi no",
+    "t ddd no", "ai int no", "dsi int no", "garr any ok", "gdict any ok",
+    "adyn any ok", "W ok", "W bad no"];
+assert(trail == want);
+foreach (var t in trail)
+    print(t);
+var nos = 0;
+foreach (var t in trail)
+    if (endswith(t, " no"))
+        nos++;
+print(len(trail), nos);
+
+# a box stored through a dyn alias of a typed array<box<T>> is checked
+# against the array's own type where it is stored (Q2 decision A: the
+# declaration's literal, whose dyn element the fit check examined, takes
+# that type as it enters) - so `*` only ever reads the box kind its
+# static type names: an int box, a float, a bool, a str and a struct
+# one, each given every other kind, keep the last box that fitted
+array<box<int>> bxi = [runtime(box(1))];
+array<box<float>> bxf = [runtime(box(1.5))];
+array<box<bool>> bxb = [runtime(box(true))];
+array<box<str>> bxs = [runtime(box("s"))];
+array<box<P>> bxp = [runtime(box(P(1)))];
+var dyn dxi = bxi;
+var dyn dxf = bxf;
+var dyn dxb = bxb;
+var dyn dxs = bxs;
+var dyn dxp = bxp;
+var derefs = [];
+func put(dyn f) {
+    try { f(); }
+    catch (TypeErrorEx) { append(derefs, "no"); }
+}
+func deref(dyn f) {
+    try { append(derefs, str(f())); }
+    catch (TypeErrorEx) { append(derefs, "bad"); }
+}
+var kinds = [box(7), box(2.5), box(false), box("t"), box(P(4)),
+             box(Q(5)), P(6), 8];
+foreach (var k in kinds) {
+    put(func [k] () { dxi[0] = k; });
+    deref(func () => *bxi[0]);
+    put(func [k] () { dxf[0] = k; });
+    deref(func () => *bxf[0]);
+    put(func [k] () { dxb[0] = k; });
+    deref(func () => *bxb[0]);
+    put(func [k] () { dxs[0] = k; });
+    deref(func () => *bxs[0]);
+    put(func [k] () { dxp[0] = k; });
+    deref(func () => (*bxp[0]).x);
+}
+assert(derefs == ["7", "no", "1.500000", "no", "true", "no", "s", "no", "1",
+    "no", "7", "2.500000", "no", "true", "no", "s", "no", "1", "no", "7",
+    "no", "2.500000", "false", "no", "s", "no", "1", "no", "7", "no",
+    "2.500000", "no", "false", "t", "no", "1", "no", "7", "no", "2.500000",
+    "no", "false", "no", "t", "4", "no", "7", "no", "2.500000", "no", "false",
+    "no", "t", "no", "4", "no", "7", "no", "2.500000", "no", "false", "no",
+    "t", "no", "4", "no", "7", "no", "2.500000", "no", "false", "no", "t",
+    "no", "4"]);
+print(derefs);
+
+# which calls need a check (CallExpr::fit_args): a construction, a
+# builtin, a function VALUE of a known type, a dyn callee
+struct S { array<int> v; dyn any; dict<str, int> m; }
+func fa(array<int> a) => len(a);
+func fd(dict<str, dyn> d) => len(d);
+func fk(dict<dyn, int> d) => len(d);
+func fy(dyn x) => 1;
+var calls = [];
+func run(str name, dyn f) {
+    try { append(calls, name + "=" + str(f())); }
+    catch (TypeErrorEx) { append(calls, name + "=no"); }
+}
+func probes(dyn d, dyn k) {
+    run("s-dyn", func [d] () => len(S(d, 1, {}).v));
+    run("s-typed", func () => len(S([1, 2], 1, {"a": 1}).v));
+    run("s-dynm", func [d] () => len(S([1], 1, d).m));
+    run("len", func [d] () => len(d));
+    var fs = [fa];
+    run("fv-dyn", func [fs, d] () => fs[0](d));
+    run("fv-typed", func [fs] () => fs[0]([1, 2, 3]));
+    var gs = [fd];
+    run("fv-dict", func [gs, k] () => gs[0](k));
+    var ks = [fk];
+    run("fv-dkey", func [ks, k] () => ks[0](k));
+    var hs = [fy];
+    run("fv-anyp", func [hs, d] () => hs[0](d));
+    var dyn hh = fa;
+    run("dyncallee", func [hh, d] () => hh(d));
+    dict<str, int> si = {"a": 1};
+    dict<dyn, int> dk = {k: 1};
+    dict<str, dyn> dv = {"a": d};
+    run("dk-into", func [dk] () => fk(dk));
+    run("dv-into", func [dv] () => fd(dv));
+    var dyn sid = si;   # (rule 1: a compile error seen directly)
+    run("si-into", func [sid] () => fd(sid));
+}
+probes(runtime(["s"]), runtime({"a": 1}));
+probes(runtime([5]), runtime(5));
+# (rule 1: a dict<str, int> enters neither a dict<str, dyn> nor a
+# dict<dyn, int> parameter - "fv-dict", "fv-dkey", "si-into")
+assert(calls == ["s-dyn=no", "s-typed=2", "s-dynm=no", "len=1",
+    "fv-dyn=no", "fv-typed=3", "fv-dict=no", "fv-dkey=no", "fv-anyp=1",
+    "dyncallee=no", "dk-into=1", "dv-into=1", "si-into=no", "s-dyn=1",
+    "s-typed=2", "s-dynm=no", "len=1", "fv-dyn=1", "fv-typed=3",
+    "fv-dict=no", "fv-dkey=no", "fv-anyp=1", "dyncallee=1", "dk-into=1",
+    "dv-into=1", "si-into=no"]);
+print(calls);
+
+# a store into an element or a dict value of each annotation kind
+func store_kinds(dyn d) {
+    var r = [];
+    array<array<float>> af2 = [[1.5]];
+    try { af2[0] = d; append(r, "f"); } catch (TypeErrorEx) { }
+    array<array<bool>> ab2 = [[true]];
+    try { ab2[0] = d; append(r, "b"); } catch (TypeErrorEx) { }
+    dict<str, P> mp = {};
+    try { mp["k"] = d; append(r, "p"); } catch (TypeErrorEx) { }
+    array<box<int>> abx = [box(1)];
+    try { abx[0] = d; append(r, "x"); } catch (TypeErrorEx) { }
+    array<box<P>> abp = [box(P(1))];
+    try { abp[0] = d; append(r, "q"); } catch (TypeErrorEx) { }
+    array<array<dyn>> ad2 = [[1]];
+    try { ad2[0] = d; append(r, "d"); } catch (TypeErrorEx) { }
+    return r;
+}
+var sk = [store_kinds(runtime([1.5])), store_kinds(runtime([true])),
+          store_kinds(runtime(P(1))), store_kinds(runtime(box(1))),
+          store_kinds(runtime(box(P(2)))), store_kinds(runtime(5))];
+# (rule 1: neither an array<float> nor an array<bool> is an array<dyn>)
+assert(sk == [["f"], ["b"], ["p"], ["x"], ["q"], []]);
+print(sk);

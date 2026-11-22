@@ -1,0 +1,157 @@
+# INT-ENGINES: default nj tw
+#
+# INT unit (#107, Q2): edges of a container's own type -
+#  - a literal over 16 elements and a dict over 8 pairs (built through
+#    the heap buffer) carry their type like a short one, untyped where
+#    only `dyn` reaches them;
+#  - a copy made in a `dyn` place of an untyped dict, whose static type
+#    says nothing of its kind, stays untyped (its value is no array);
+#  - a literal holding a non-literal element still takes its type;
+#  - a member store `d.k = v` through dyn that adds a key checks the
+#    key and the value against the dict's own type;
+#  - a literal baked for a variable whose type inference WIDENS later
+#    (`var x = [1, 2]; x[0] = 2.5;` makes x an array<float>) is rebuilt
+#    at that type: its ints become floats, its bools ints - in an
+#    array and a dict, as README says ("a literal assigned to a variable
+#    whose type is INFERRED");
+#  - an append of a struct built in place into an array<P?> the
+#    compiler checked, and stores through `dyn` in a pure function the
+#    compiler runs while compiling a constant;
+#  - a program function named like a container builtin, a ?: or ?? into
+#    a `dyn` container, an over-arity call in a function nothing calls,
+#    and stores into an element nothing filled.
+var n = int(runtime(1));
+var big = [n, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+var dyn bd = big;
+var r = 0;
+try { append(bd, "s"); } catch (TypeErrorEx) { r++; }
+var bigd = {"a": n, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6, "g": 7,
+            "h": 8, "i": 9};
+var dyn bdd = bigd;
+try { bdd["z"] = "s"; } catch (TypeErrorEx) { r++; }
+array<dyn> nest = [[n, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                    16, 17], {"a": n, "b": 2, "c": 3, "d": 4, "e": 5,
+                    "f": 6, "g": 7, "h": 8, "i": 9}];
+var dyn u0 = nest[0];
+append(u0, 18);                 # untyped: its storage decides
+var dyn u1 = nest[1];
+u1["z"] = "s";                  # untyped general dict: anything
+assert(r == 2 && len(big) == 17 && len(u0) == 18 && len(u1) == 10);
+
+var dyn cl = clone(nest[1]);
+cl["y"] = [1];
+var row = [1, 2];
+var rows = [row, [3]];
+var dyn drows = rows;
+try { append(drows, "s"); } catch (TypeErrorEx) { r++; }
+assert(r == 3 && len(cl) == 11 && len(rows) == 2);
+
+dict<str, int> td = {"a": 1};
+var dyn dd = td;
+dd.b = 2;
+r = 0;
+try { dd.c = "s"; } catch (TypeErrorEx) { r++; }
+dict<int, int> ti = {1: 1};
+var dyn di = ti;
+try { di.s = 3; } catch (TypeErrorEx) { r++; }   # a str key for int keys
+assert(r == 2 && str(td) == "{\"a\": 1, \"b\": 2}" && len(ti) == 1);
+
+# a default dict's member read adds the key - checked against its key
+# type; a compound store into an untyped general array through dyn
+var dfd = dict(0);
+assert(dfd.k == 0 && len(dfd) == 1);
+array<dyn> gh = [[1, "a"]];
+var dyn gu = gh[0];
+gu[0] += 1;
+assert(str(gu) == "[2, \"a\"]");
+
+var wx = [1, 2];
+wx[0] = 2.5;
+assert(str(wx) == "[2.500000, 2.000000]");
+var wy = [true, false];
+wy[1] = 5;
+assert(str(wy) == "[1, 5]");
+var wd = {"a": 1};
+wd["b"] = 2.5;
+assert(str(wd) == "{\"a\": 1.000000, \"b\": 2.500000}");
+var wf = [true, 1];
+wf[0] = 0.5;
+assert(str(wf) == "[0.500000, 1.000000]");
+var wk = {1: "a"};
+wk[2.5] = "b";
+assert(str(wk) == "{1.000000: \"a\", 2.500000: \"b\"}");
+var we = {"a": true};
+we["b"] = 3;
+assert(str(we) == "{\"a\": 1, \"b\": 3}");
+
+# a struct built in place into a general array<P?> - typed, so its
+# append is checked by the compiler, not at run time
+struct P { int x; }
+array<P?> ps = [none];
+append(ps, P(int(runtime(4))));
+assert(len(ps) == 2 && ps[1]?.x == 4);
+
+# stores through `dyn` in a pure function the compiler runs: the
+# constant is computed while compiling, where no container is typed
+pure func pf() {
+    var dyn a = [1, 2];
+    a[0] = 5;
+    var dyn d = {"k": 1};
+    d.k = 3;
+    return a[0] + d.k;
+}
+const PF = pf();
+assert(PF == 8);
+
+# a function of the program named like a builtin that builds a container
+func reverse(a) => len(a);
+assert(reverse([1, 2, 3]) == 3);
+
+# the arms of a ?: and the sides of a ?? stored through `dyn` take no
+# type of their own: the container's is checked where they land
+var dyn dc = [[0]];
+append(dc, n > 0 ? [1] : [2]);
+array<int>? on = none;
+if (n > 5)
+    on = [9];
+append(dc, on ?? [3]);
+assert(str(dc) == "[[0], [1], [3]]");
+
+# a call with too many arguments in a function nothing calls is never
+# checked (a template base), and never run
+func g1(a) => a;
+func never_called(x) {
+    var p = P(x, 2);
+    return g1(x, 3);
+}
+
+# an unfilled element (question 9) takes what is stored into it
+var ua = [[]];
+append(ua[0], 5);
+var uc = [[none]];
+uc[0][0] = 3;
+assert(len(ua[0]) == 1 && str(uc) == "[[3]]");
+
+# a refusal into an element type that takes none (its message names it
+# `int?`, as a type is written)
+array<int?> ao = [1, none];
+var dyn dao = ao;
+r = 0;
+try { dao[0] = "s"; } catch (TypeErrorEx) { r++; }
+assert(r == 1 && ao[1] == none);
+
+# a flat array of struct values only `dyn` reaches: a compound store
+# and a box (a reference, never a value of P) are refused by its storage
+array<dyn> hs = [[P(1), P(2)]];
+var dyn us = hs[0];
+r = 0;
+try { us[0] += 1; } catch (TypeErrorEx) { r++; }
+try { us[0] = box(P(3)); } catch (TypeErrorEx) { r++; }
+try { append(us, box(P(3))); } catch (TypeErrorEx) { r++; }
+assert(r == 3 && array_storage(us) == "struct" && len(us) == 2);
+
+# a store through more keys than the VM's small key buffer holds
+var m10 = [[[[[[[[[[1]]]]]]]]]];
+m10[0][0][0][0][0][0][0][0][0][0] = 2;
+assert(m10[0][0][0][0][0][0][0][0][0][0] == 2);
+print("ok");

@@ -71,7 +71,7 @@ EvalValue builtin_split(EvalContext *ctx, const ArgLocs *exprList,
             vec.emplace_back(shared_str, i, 1);
     }
 
-    return SharedArrayObj(move(vec));
+    return SharedArrayObj(std::move(vec));
 }
 
 EvalValue builtin_join(EvalContext *ctx, const ArgLocs *exprList,
@@ -91,6 +91,8 @@ EvalValue builtin_join(EvalContext *ctx, const ArgLocs *exprList,
 
     if (!val_delim.is<SharedStr>())
         throw TypeErrorEx("Expected array", arg_delim->start, arg_delim->end);
+    ML_INT_ONLY(int_vc_size(IntVc::join_empty, IntVc::join_one,
+                            val_arr.get<SharedArrayObj>().size());)
 
     const string_view delim = val_delim.get<SharedStr>().get_view();
     const SharedArrayObj &arr = val_arr.get<SharedArrayObj>();
@@ -113,7 +115,7 @@ EvalValue builtin_join(EvalContext *ctx, const ArgLocs *exprList,
             if (i != n - 1)
                 result += delim;
         }
-        return SharedStr(move(result));
+        return SharedStr(std::move(result));
     }
 
     if (arr.skind() == SharedArrayObj::Storage::general) {
@@ -147,26 +149,16 @@ EvalValue builtin_join(EvalContext *ctx, const ArgLocs *exprList,
                 result += delim;
         }
 
-        return SharedStr(move(result));
+        return SharedStr(std::move(result));
     }
 
-    /* A FLAT (int/float/bool/struct) array: read kind-aware (arr_elem_at, no
-     * promotion) - its elements aren't strings, so each one is a clean
-     * TypeError below (an EMPTY flat array joins to ""). */
-    for (size_type i = 0; i < n; i++) {
-
-        const EvalValue val = arr_elem_at(arr, i);
-
-        if (!val.is<SharedStr>())
-            throw TypeErrorEx("Expected string", arg_arr->start, arg_arr->end);
-
-        result += val.get<SharedStr>().get_view();
-
-        if (i != n - 1)
-            result += delim;
-    }
-
-    return SharedStr(move(result));
+    /* Any other storage - a FLAT int/float/bool/struct/class array - holds
+     * no string: an EMPTY one joins to "", any other is the type error (it
+     * read each element to find that out, through an append no element
+     * could ever reach). */
+    if (n != 0)
+        throw TypeErrorEx("Expected string", arg_arr->start, arg_arr->end);
+    return SharedStr(std::move(result));
 }
 
 EvalValue builtin_splitlines(EvalContext *ctx, const ArgLocs *exprList,
@@ -210,7 +202,7 @@ EvalValue builtin_splitlines(EvalContext *ctx, const ArgLocs *exprList,
         vec.emplace_back(shared_str, start, i - start);
     }
 
-    return SharedArrayObj(move(vec));
+    return SharedArrayObj(std::move(vec));
 }
 
 EvalValue builtin_ord(EvalContext *ctx, const ArgLocs *exprList,
@@ -313,18 +305,22 @@ generic_pad(EvalContext *ctx, const ArgLocs *exprList,
 
     const size_t n = static_cast<size_t>(n_orig);
 
+    if (str.size() >= n)
+        return strval;
+
+    /* the padded string is reserved before it is built (reserve_or_oom) */
+    string out;
+    reserve_or_oom(out, static_cast<uint64_t>(n), arg1);
+
     if constexpr(leftpad) {
-
-        if (str.size() < n)
-            return SharedStr(string(n - str.size(), pad_char) + string(str));
-
+        out.append(n - str.size(), pad_char);
+        out.append(str);
     } else {
-
-        if (str.size() < n)
-            return SharedStr(string(str) + string(n - str.size(), pad_char));
+        out.append(str);
+        out.append(n - str.size(), pad_char);
     }
 
-    return strval;
+    return SharedStr(std::move(out));
 }
 
 EvalValue builtin_lpad(EvalContext *ctx, const ArgLocs *exprList,
@@ -337,6 +333,15 @@ EvalValue builtin_rpad(EvalContext *ctx, const ArgLocs *exprList,
                        const EvalValue *args, size_t n)
 {
     return generic_pad<false>(ctx, exprList, args, n);
+}
+
+/* The whitespace the strip family skips: space, \t \n \v \f \r - the C
+ * locale's whitespace, spelled out: the standard test is undefined for a
+ * plain `char` byte >= 0x80 (it is negative here), and a locale could
+ * change its answer; a byte is MyLang's character. */
+static inline bool strip_space(char c)
+{
+    return c == ' ' || (c >= '\t' && c <= '\r');
 }
 
 EvalValue builtin_lstrip(EvalContext *ctx, const ArgLocs *exprList,
@@ -359,7 +364,7 @@ EvalValue builtin_lstrip(EvalContext *ctx, const ArgLocs *exprList,
         return shared_str;
 
     for (s = 0; s < str.size(); s++) {
-        if (!isspace(str[s]))
+        if (!strip_space(str[s]))
             break;
     }
 
@@ -386,7 +391,7 @@ EvalValue builtin_rstrip(EvalContext *ctx, const ArgLocs *exprList,
         return shared_str;
 
     for (l = str.size(); l > 0; l--) {
-        if (!isspace(str[l-1]))
+        if (!strip_space(str[l-1]))
             break;
     }
 
@@ -413,12 +418,16 @@ EvalValue builtin_strip(EvalContext *ctx, const ArgLocs *exprList,
         return shared_str;
 
     for (s = 0; s < str.size(); s++) {
-        if (!isspace(str[s]))
+        if (!strip_space(str[s]))
             break;
     }
 
-    for (l = str.size(); l > 0; l--) {
-        if (!isspace(str[l-1]))
+    /* an all-whitespace string: the trailing scan stops at s (it must not
+     * pass it), so the window is empty - `l - s` used to WRAP, a window
+     * of 4 billion bytes past the buffer (an ML_CHECK abort, or a wild
+     * read where asserts are off) */
+    for (l = str.size(); l > s; l--) {
+        if (!strip_space(str[l-1]))
             break;
     }
 

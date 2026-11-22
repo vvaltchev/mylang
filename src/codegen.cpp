@@ -1,8 +1,16 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "codegen.h"
+#include "inttest.h"
+#ifdef TESTS
+unsigned long g_cg_minmax_lowered = 0;  /* #97 B2: emit-time (codegen) */
+#endif
+#include "env.h"
+#include "jit.h"
+#include "vm.h"      /* vm_aop_dispatchable - #137 tier 1 */
 #include "inferencer.h"
 #include "syntax.h"
+#include "disasm.h"     /* opcode_name - the one spelling of an op */
 
 /* eval.cpp's AST-shape purity check (see eval.h) - declared here to avoid
  * pulling the whole eval.h into the codegen TU. */
@@ -35,6 +43,42 @@ struct NotLoweredEx : public Exception {
 
 #include <vector>
 #include <algorithm>   /* std::count (peephole_chunk) */
+#include <map>         /* #97 increment 5 */
+#include <set>
+
+/* #97 E1: see codegen.h - the descriptors codegen may trust a stamp for. */
+static const std::unordered_set<const FuncDescriptor *> *g_live_descs
+    = nullptr;
+
+/* Declared in codegen.h: a stamp names a live descriptor - the pointer is
+ * in the live set (so it may be read) and holds the serial stamped (so it
+ * is the descriptor stamped, not a later one at a reused address). */
+bool codegen_desc_stamp_live(
+    const DescStamp &s,
+    const std::unordered_set<const FuncDescriptor *> *live)
+{
+    return s.desc && live && live->count(s.desc)
+           && s.desc->serial == s.serial;
+}
+
+CodegenLiveDescs::CodegenLiveDescs(
+    const std::vector<const FuncDeclStmt *> &funcs)
+{
+    live.reserve(funcs.size() * 2);
+    for (const FuncDeclStmt *fn : funcs)
+        live.insert(fn->desc);
+    g_live_descs = &live;
+}
+
+CodegenLiveDescs::~CodegenLiveDescs()
+{
+    g_live_descs = nullptr;
+}
+
+/* the pc-field table (defined with the peephole below) - the argument
+ * staging retarget asks it whether an element's code JOINS */
+template <typename F>
+static void visit_pc_fields(Instr &in, F f);
 
 namespace {
 
@@ -50,7 +94,8 @@ void collect_slot_names(const Construct *c, std::vector<std::string> &names)
 {
     if (!c)
         return;
-    if (auto *id = dynamic_cast<const Identifier *>(c)) {
+    if (ctag(c) == ConstructType::id) {
+        auto *id = static_cast<const Identifier *>(c);
         if (id->sym.kind == SymKind::local && id->sym.slot >= 0) {
             if (static_cast<size_t>(id->sym.slot) >= names.size())
                 names.resize(id->sym.slot + 1);
@@ -60,10 +105,10 @@ void collect_slot_names(const Construct *c, std::vector<std::string> &names)
         return;
     }
     auto rec = [&](const Construct *ch) { collect_slot_names(ch, names); };
-    if (auto *sc = dynamic_cast<const SingleChildConstruct *>(c)) {
+    if (auto *sc = node_cast<const SingleChildConstruct>(c)) {
         rec(sc->elem.get()); return;
     }
-    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
+    if (auto *mo = node_cast<const MultiOpConstruct>(c)) {
         for (auto &p : mo->elems) rec(p.second.get());
         return;
     }
@@ -71,37 +116,47 @@ void collect_slot_names(const Construct *c, std::vector<std::string> &names)
         for (auto &e : me->elems) rec(e.get());
         return;
     }
-    if (auto *e = dynamic_cast<const Expr14 *>(c)) {
+    if (ctag(c) == ConstructType::expr14) {
+        auto *e = static_cast<const Expr14 *>(c);
         rec(e->lvalue.get()); rec(e->rvalue.get()); return;
     }
-    if (auto *ce = dynamic_cast<const CallExpr *>(c)) {
+    if (ctag(c) == ConstructType::call) {
+        auto *ce = static_cast<const CallExpr *>(c);
         rec(ce->what.get()); rec(ce->args.get()); return;
     }
-    if (auto *sub = dynamic_cast<const Subscript *>(c)) {
+    if (ctag(c) == ConstructType::subscript) {
+        auto *sub = static_cast<const Subscript *>(c);
         rec(sub->what.get()); rec(sub->index.get()); return;
     }
-    if (auto *m = dynamic_cast<const MemberExpr *>(c)) {
+    if (ctag(c) == ConstructType::member) {
+        auto *m = static_cast<const MemberExpr *>(c);
         rec(m->what.get()); return;
     }
-    if (auto *iff = dynamic_cast<const IfStmt *>(c)) {
+    if (ctag(c) == ConstructType::if_stmt) {
+        auto *iff = static_cast<const IfStmt *>(c);
         rec(iff->condExpr.get()); rec(iff->thenBlock.get());
         rec(iff->elseBlock.get()); return;
     }
-    if (auto *w = dynamic_cast<const WhileStmt *>(c)) {
+    if (ctag(c) == ConstructType::while_stmt) {
+        auto *w = static_cast<const WhileStmt *>(c);
         rec(w->condExpr.get()); rec(w->body.get()); return;
     }
-    if (auto *f = dynamic_cast<const ForStmt *>(c)) {
+    if (ctag(c) == ConstructType::for_stmt) {
+        auto *f = static_cast<const ForStmt *>(c);
         rec(f->init.get()); rec(f->cond.get());
         rec(f->inc.get()); rec(f->body.get()); return;
     }
-    if (auto *fr = dynamic_cast<const ForRangeStmt *>(c)) {
+    if (ctag(c) == ConstructType::for_range) {
+        auto *fr = static_cast<const ForRangeStmt *>(c);
         rec(fr->init.get()); rec(fr->bound.get());
         rec(fr->step.get()); rec(fr->body.get()); return;
     }
-    if (auto *fe = dynamic_cast<const ForeachStmt *>(c)) {
+    if (ctag(c) == ConstructType::foreach_stmt) {
+        auto *fe = static_cast<const ForeachStmt *>(c);
         rec(fe->container.get()); rec(fe->body.get()); return;
     }
-    if (auto *te = dynamic_cast<const TernaryExpr *>(c)) {
+    if (ctag(c) == ConstructType::ternary) {
+        auto *te = static_cast<const TernaryExpr *>(c);
         rec(te->condExpr.get()); rec(te->thenExpr.get());
         rec(te->elseExpr.get()); return;
     }
@@ -123,10 +178,11 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
 {
     if (!c)
         return true;
-    if (auto *id = dynamic_cast<const Identifier *>(c))
+    if (auto *id = node_cast<const Identifier>(c))
         return !(id->sym.kind == SymKind::local && id->sym.slot == loop_slot);
-    if (auto *m = dynamic_cast<const MemberExpr *>(c)) {
-        auto *bid = dynamic_cast<const Identifier *>(m->what.get());
+    if (ctag(c) == ConstructType::member) {
+        auto *m = static_cast<const MemberExpr *>(c);
+        auto *bid = node_cast<const Identifier>(m->what.get());
         if (bid && bid->sym.kind == SymKind::local
             && bid->sym.slot == loop_slot) {
             if (lval)
@@ -134,16 +190,27 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
             const FieldDef *f = def->field_of(m->memUid);
             if (!f || f->offset < 0)
                 return false;
-            return f->kind == FieldKind::f_int
-                || f->kind == FieldKind::f_float
-                || f->kind == FieldKind::f_bool;
+            /* The direct read is emitted ONLY where the read compiles
+             * through the typed int / float path (try_sfe_field), so the
+             * node's own hint must send it there in EVERY context. A read
+             * with no scalar hint - `p.x` pasted from an inlined body
+             * whose parameter is `dyn` - and a BOOL field, which a value
+             * use lowers boxed (only a condition takes the typed path),
+             * compiled to a member read of the never-bound loop variable:
+             * "Expected dict object" in the VM where the tree-walker
+             * printed the field. Such a read binds `p` whole. */
+            if (f->kind == FieldKind::f_int)
+                return m->th == TypeHint::i && !m->th_bool;
+            if (f->kind == FieldKind::f_float)
+                return m->th == TypeHint::f;
+            return false;
         }
         return struct_fe_body_ok(m->what.get(), loop_slot, def, false);
     }
-    if (auto *e = dynamic_cast<const Expr14 *>(c))
+    if (auto *e = node_cast<const Expr14>(c))
         return struct_fe_body_ok(e->lvalue.get(), loop_slot, def, true)
             && struct_fe_body_ok(e->rvalue.get(), loop_slot, def, false);
-    if (auto *inc = dynamic_cast<const IncDecExpr *>(c))
+    if (auto *inc = node_cast<const IncDecExpr>(c))
         return struct_fe_body_ok(inc->lvalue.get(), loop_slot, def, true);
     auto all = [&](std::initializer_list<const Construct *> cs) {
         for (const Construct *ch : cs)
@@ -151,13 +218,14 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
                 return false;
         return true;
     };
-    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
+    if (auto *mo = node_cast<const MultiOpConstruct>(c)) {
         for (const auto &pr : mo->elems)
             if (!struct_fe_body_ok(pr.second.get(), loop_slot, def, false))
                 return false;
         return true;
     }
-    if (auto *ts = dynamic_cast<const TypedScalarExpr *>(c)) {
+    if (ctag(c) == ConstructType::typed_scalar) {
+        auto *ts = static_cast<const TypedScalarExpr *>(c);
         for (const auto &pr : ts->elems)
             if (!struct_fe_body_ok(pr.second.get(), loop_slot, def, false))
                 return false;
@@ -169,36 +237,172 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
                 return false;
         return true;
     }
-    if (auto *sc = dynamic_cast<const SingleChildConstruct *>(c))
+    if (auto *sc = node_cast<const SingleChildConstruct>(c))
         return struct_fe_body_ok(sc->elem.get(), loop_slot, def, false);
-    if (auto *ce = dynamic_cast<const CallExpr *>(c))
+    if (auto *ce = node_cast<const CallExpr>(c))
         return all({ce->what.get(), ce->args.get()});
-    if (auto *sub = dynamic_cast<const Subscript *>(c))
+    if (auto *sub = node_cast<const Subscript>(c))
         return all({sub->what.get(), sub->index.get()});
-    if (auto *iff = dynamic_cast<const IfStmt *>(c))
+    if (auto *iff = node_cast<const IfStmt>(c))
         return all({iff->condExpr.get(), iff->thenBlock.get(),
                     iff->elseBlock.get()});
-    if (auto *w = dynamic_cast<const WhileStmt *>(c))
+    if (auto *w = node_cast<const WhileStmt>(c))
         return all({w->condExpr.get(), w->body.get()});
-    if (auto *f = dynamic_cast<const ForStmt *>(c))
+    if (auto *f = node_cast<const ForStmt>(c))
         return all({f->init.get(), f->cond.get(), f->inc.get(),
                     f->body.get()});
-    if (auto *fr = dynamic_cast<const ForRangeStmt *>(c))
+    if (auto *fr = node_cast<const ForRangeStmt>(c))
         return all({fr->init.get(), fr->bound.get(), fr->step.get(),
                     fr->body.get()});
-    if (auto *fe2 = dynamic_cast<const ForeachStmt *>(c))
+    if (auto *fe2 = node_cast<const ForeachStmt>(c))
         return all({fe2->container.get(), fe2->body.get()});
-    if (auto *te = dynamic_cast<const TernaryExpr *>(c))
+    if (auto *te = node_cast<const TernaryExpr>(c))
         return all({te->condExpr.get(), te->thenExpr.get(),
                     te->elseExpr.get()});
-    if (auto *co = dynamic_cast<const CoalesceExpr *>(c))
+    if (auto *co = node_cast<const CoalesceExpr>(c))
         return all({co->lhs.get(), co->rhs.get()});
-    if (auto *ret = dynamic_cast<const ReturnStmt *>(c))
+    if (auto *ret = node_cast<const ReturnStmt>(c))
         return struct_fe_body_ok(ret->elem.get(), loop_slot, def, false);
     if (dynamic_cast<const Literal *>(c)
         || dynamic_cast<const ChildlessConstruct *>(c))
         return true;                             /* a childless leaf */
     return false;                                /* unrecognized -> bail */
+}
+
+/*
+ * #53: may the body of a foreach change ANY array - its length, its storage
+ * kind, an element - or run code that could? The struct-foreach DIRECT read
+ * (a `p.x` compiled to a read of the array bytes at EVERY use, the loop var
+ * never materialized) is sound only when it cannot: a body that pops the
+ * array leaves the read out of range, one that stores into the array makes
+ * `p.x` read the new element where the loop var - a COPY bound when its
+ * turn came, in every other engine - holds the old one. So the direct read
+ * requires an INERT body; any other body binds `p` whole (LoadStructElemV,
+ * bounds-checked). Conservative by construction: an unrecognized node, any
+ * store through a subscript or member, a compound store to a non-scalar,
+ * and any call except a short list of builtins that neither mutate an
+ * argument nor call back into the program are all "not inert".
+ *
+ * `shift_only` asks the WEAKER question the foreach SHIFT GUARD needs
+ * (#53 option 1, ArrEpochMark/Check): may the body MOVE an element of an
+ * array - pop, erase, an insert not at the end? Only a builtin call or
+ * user code can, so element stores, `+=` on an array (an append), and a
+ * short second list of builtins that grow or reorder but never move
+ * (append/push/sort/reverse and friends, callback-free by the
+ * callable_arg_mask test) are all fine, and a spliced InlinedCallExpr is
+ * just code to walk. A false "cannot shift" would drop the guard and let
+ * an element be SKIPPED silently, so this fails closed like the rest.
+ */
+static bool struct_fe_body_inert(const Construct *c,
+                                 bool shift_only = false)
+{
+    if (!c)
+        return true;
+    auto all = [shift_only](std::initializer_list<const Construct *> cs) {
+        for (const Construct *ch : cs)
+            if (!struct_fe_body_inert(ch, shift_only))
+                return false;
+        return true;
+    };
+    auto scalar_th = [](const Construct *e) {
+        return e->th == TypeHint::i || e->th == TypeHint::f;
+    };
+    if (node_cast<const Identifier>(c))
+        return true;
+    if (ctag(c) == ConstructType::member)
+        return struct_fe_body_inert(
+            static_cast<const MemberExpr *>(c)->what.get(), shift_only);
+    if (auto *e = node_cast<const Expr14>(c)) {
+        if (shift_only)                   /* a store moves no element */
+            return all({e->lvalue.get(), e->rvalue.get()});
+        if (!node_cast<const Identifier>(e->lvalue.get()))
+            return false;                 /* a store through [] or . */
+        if (e->op != Op::assign && !scalar_th(e->lvalue.get()))
+            return false;                 /* `a += [x]` appends in place */
+        return struct_fe_body_inert(e->rvalue.get());
+    }
+    if (auto *inc = node_cast<const IncDecExpr>(c)) {
+        if (shift_only)
+            return struct_fe_body_inert(inc->lvalue.get(), true);
+        return node_cast<const Identifier>(inc->lvalue.get()) != nullptr;
+    }
+    if (auto *bc = dynamic_cast<const DirectBuiltinCallExpr *>(c)) {
+        static const char *const ok[] = {
+            "print", "len", "str", "int", "float", "abs", "sqrt", "cbrt",
+            "min", "max", "pow", "exp", "exp2", "log", "log2", "floor",
+            "ceil", "round", "trunc", "ord", "chr", "typestr", "kindstr",
+            "hash", "assert", "isnan", "isinf", "isfinite", "isnormal",
+            "runtime", "sin", "cos", "tan", "asin", "acos", "atan",
+        };
+        /* grow or reorder IN PLACE, never move an element to another
+         * position: allowed by the shift guard, not by inertness */
+        static const char *const grow[] = {
+            "append", "push", "sort", "rev_sort", "reverse", "keys",
+            "values", "join", "split", "range", "clone", "deepclone",
+            "top", "sum", "array", "array_storage",
+        };
+        const auto *id = node_cast<const Identifier>(bc->what.get());
+        if (!id || bc->callable_arg_mask != 0)
+            return false;
+        bool listed = false;
+        for (const char *n : ok)
+            listed = listed || id->uid->val == n;
+        if (shift_only)
+            for (const char *n : grow)
+                listed = listed || id->uid->val == n;
+        return listed && all({bc->args.get()});
+    }
+    if (node_cast<const CallExpr>(c))
+        return false;                     /* user code, or a builtin that
+                                           * may mutate / call back */
+    if (auto *mo = node_cast<const MultiOpConstruct>(c)) {
+        for (const auto &pr : mo->elems)
+            if (!struct_fe_body_inert(pr.second.get(), shift_only))
+                return false;
+        return true;
+    }
+    if (ctag(c) == ConstructType::typed_scalar) {
+        for (const auto &pr : static_cast<const TypedScalarExpr *>(c)->elems)
+            if (!struct_fe_body_inert(pr.second.get(), shift_only))
+                return false;
+        return true;
+    }
+    if (auto *me = dynamic_cast<const MultiElemConstruct<> *>(c)) {
+        for (const auto &el : me->elems)
+            if (!struct_fe_body_inert(el.get(), shift_only))
+                return false;
+        return true;
+    }
+    if (node_cast<const InlinedCallExpr>(c) && !shift_only)
+        return false;                     /* a spliced body: not audited */
+    if (auto *sc = node_cast<const SingleChildConstruct>(c))
+        return struct_fe_body_inert(sc->elem.get(), shift_only);
+    if (auto *sub = node_cast<const Subscript>(c))
+        return all({sub->what.get(), sub->index.get()});
+    if (auto *iff = node_cast<const IfStmt>(c))
+        return all({iff->condExpr.get(), iff->thenBlock.get(),
+                    iff->elseBlock.get()});
+    if (auto *w = node_cast<const WhileStmt>(c))
+        return all({w->condExpr.get(), w->body.get()});
+    if (auto *f = node_cast<const ForStmt>(c))
+        return all({f->init.get(), f->cond.get(), f->inc.get(),
+                    f->body.get()});
+    if (auto *fr = node_cast<const ForRangeStmt>(c))
+        return all({fr->init.get(), fr->bound.get(), fr->step.get(),
+                    fr->body.get()});
+    if (auto *fe2 = node_cast<const ForeachStmt>(c))
+        return all({fe2->container.get(), fe2->body.get()});
+    if (auto *te = node_cast<const TernaryExpr>(c))
+        return all({te->condExpr.get(), te->thenExpr.get(),
+                    te->elseExpr.get()});
+    if (auto *co = node_cast<const CoalesceExpr>(c))
+        return all({co->lhs.get(), co->rhs.get()});
+    if (auto *ret = node_cast<const ReturnStmt>(c))
+        return struct_fe_body_inert(ret->elem.get(), shift_only);
+    if (dynamic_cast<const Literal *>(c)
+        || dynamic_cast<const ChildlessConstruct *>(c))
+        return true;                             /* a childless leaf */
+    return false;                                /* unrecognized */
 }
 
 /*
@@ -208,6 +412,37 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
  * single `<produce rD>` (see emit_args_range). Excludes a jump/branch (whose
  * `.target` is a code label), a store (writes memory), CompoundV (reads its
  * target), and the loop back-edges.
+ *
+ * MoveV is EXCLUDED (2026-07-26, a WRONG-CODE fix): the caller's soundness
+ * additionally requires ops.back() to be the SOLE producer of the temp,
+ * and every JOIN shape violates that through a trailing MoveV - a boxed
+ * ternary/coalesce compiles each arm into the join temp via its own MoveV
+ * (an InlinedCallExpr's return-redirects likewise), so retargeting only
+ * the LAST one strands the other arm's value in the dead temp. A ternary
+ * passed as a CALL ARGUMENT (`lf(c ? "ab" : "c")`) silently read an
+ * undefined slot when the then branch was taken. The single-producer ops
+ * below cannot be a join tail (codegen funnels every join through MoveV),
+ * and the E1 peephole's join-move rule - which checks EVERY predecessor -
+ * cleans the extra move correctly afterwards.
+ *
+ * LogV IS EXCLUDED FOR THE SAME REASON (2026-08-13, a WRONG-CODE fix) -
+ * and it is the same bug the MoveV paragraph above describes, arriving
+ * through a door that paragraph could not see. LogV used to be a safe
+ * single producer because a `&&`/`||` chain compiled to a STRAIGHT RUN of
+ * LogV ops. #138 gave the chain real SHORT-CIRCUIT branches, so
+ * emit_logical_chain now writes ONE dst from N arms - a join whose tail is
+ * a LogV, not a MoveV. Retargeting only the last arm left the
+ * short-circuit path writing the OLD temp while the consumer read the new
+ * one:
+ *
+ *     var dyn s = runtime(3);
+ *     print(s > 5 && s < 6);      # printed `3`, not `false`
+ *
+ * (the arg slot kept whatever it held - here the `3` staged for
+ * `runtime`). The tree-walker said `false`, so this was a RULE 2
+ * divergence as well as a wrong answer. EVERY LogV comes from
+ * emit_to_bool, i.e. from a logical chain, so there is no safe subset to
+ * keep. Pinned by `boxed && / || in an argument short-circuits`.
  */
 bool op_writes_pure_target(OpCode op)
 {
@@ -216,15 +451,18 @@ bool op_writes_pure_target(OpCode op)
     case OpCode::LoadLiteralObjV:
     case OpCode::LoadImmFloat: case OpCode::LoadGlobalV:
     case OpCode::LoadCaptureV: case OpCode::LoadBuiltinV:
-    case OpCode::MoveV:       case OpCode::BinOpV:
-    case OpCode::CmpV:        case OpCode::LogV:
+    case OpCode::BinOpV:
+    case OpCode::CmpV:
     case OpCode::IntBin:      case OpCode::FloatBin:
+    case OpCode::CmpIntV:     case OpCode::CmpFloatV:
     case OpCode::SubscriptV:  case OpCode::MemberV:
     case OpCode::SliceV:
     case OpCode::CallV:       case OpCode::CachedCallV:
     case OpCode::CallBuiltinV: case OpCode::CallBuiltinLV:
-    case OpCode::ArrLen:
+    case OpCode::ArrLen:      case OpCode::StrLen:
+    case OpCode::OrdCharV:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+    case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
     case OpCode::LoadElemValue: case OpCode::MakeArrayV:
     case OpCode::MakeDictV:      case OpCode::MakeClosureV:
     case OpCode::StructCtorV:
@@ -269,9 +507,9 @@ Operand slot_op(int slot)
 bool is_typed_scalar_arg(const Construct *a)
 {
     return a->th == TypeHint::i || a->th == TypeHint::f
-        || dynamic_cast<const LiteralInt *>(a)
-        || dynamic_cast<const LiteralFloat *>(a)
-        || dynamic_cast<const LiteralBool *>(a);
+        || ctag(a) == ConstructType::lit_int
+        || ctag(a) == ConstructType::lit_float
+        || ctag(a) == ConstructType::lit_bool;
 }
 
 /* A field arg for POD field `fd` that `coerce_struct_field` provably cannot
@@ -285,9 +523,12 @@ bool is_typed_scalar_arg(const Construct *a)
 bool pod_ctor_arg_safe(const Construct *a, const FieldDef &fd)
 {
     if (fd.kind == FieldKind::f_struct) {
-        const CallExpr *ce = dynamic_cast<const CallExpr *>(a);
+        const CallExpr *ce = node_cast<const CallExpr>(a);
+        /* by identity: a struct field of a POD struct is embedded, so
+         * the parser resolved its type (FieldDef::struct_def) - and the
+         * field's written name may be a TYPE ALIAS of that struct */
         return ce && ce->vm_struct_ctor_def
-            && ce->vm_struct_ctor_def->name == fd.struct_ty;
+            && ce->vm_struct_ctor_def == fd.struct_def;
     }
     return is_typed_scalar_arg(a);
 }
@@ -300,11 +541,11 @@ bool pod_ctor_arg_safe(const Construct *a, const FieldDef &fd)
  */
 bool as_int_operand(const Construct *e, Operand &out)
 {
-    if (const LiteralInt *li = dynamic_cast<const LiteralInt *>(e)) {
+    if (const LiteralInt *li = node_cast<const LiteralInt>(e)) {
         out = int_lit(li->ival());
         return true;
     }
-    if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+    if (const Identifier *id = node_cast<const Identifier>(e)) {
         if (id->sym.kind == SymKind::local && id->th == TypeHint::i) {
             out = slot_op(id->sym.slot);
             return true;
@@ -320,34 +561,22 @@ bool as_int_operand(const Construct *e, Operand &out)
  * scalar (local/global/capture; the slot itself), or a flat int/float subscript
  * whose index is an `as_int_operand` leaf (a local slot or int literal, so the
  * two evals agree). A dict/member/complex-index inc-dec-as-value falls back. */
-/* A mutating builtin that REQUIRES its arg0 to be an lvalue and throws
- * NotLValueEx on a value — append/push/pop/insert/erase/intptr. EXCLUDES
- * sort/rev_sort/reverse (also lvalue-arg builtins, but they ACCEPT a value arg0
- * — a const's copy — so a non-lvalue arg0 there is not an error). Used to decide
- * whether a provably-non-lvalue arg0 is an always-throw (ThrowRuntimeV). */
-bool builtin_requires_lvalue_arg0(std::string_view name)
-{
-    return name == "append" || name == "push" || name == "pop"
-        || name == "insert" || name == "erase" || name == "intptr";
-}
-
 bool incdec_lvalue_pure(const Construct *lv)
 {
-    if (const Identifier *id = dynamic_cast<const Identifier *>(lv))
-        return !id->is_const
-            && (id->sym.kind == SymKind::local
-                || id->sym.kind == SymKind::global
-                || id->sym.kind == SymKind::capture);
-    if (const Subscript *sub = dynamic_cast<const Subscript *>(lv)) {
+    if (const Identifier *id = node_cast<const Identifier>(lv))
+        return id->sym.kind == SymKind::local
+            || id->sym.kind == SymKind::global
+            || id->sym.kind == SymKind::capture;
+    if (const Subscript *sub = node_cast<const Subscript>(lv)) {
         Operand idx;
         /* A flat `a[i]` (slot base + immediate index), OR a NESTED `a[i][j]`
          * whose inner base `a[i]` is a Subscript over a slotted array with an
          * immediate index - both re-eval the same side-effect-free slot/index
          * in the read and the store. */
         if (const Subscript *inner =
-                dynamic_cast<const Subscript *>(sub->what.get())) {
+                node_cast<const Subscript>(sub->what.get())) {
             Operand k1, k2;
-            return dynamic_cast<const Identifier *>(inner->what.get())
+            return node_cast<const Identifier>(inner->what.get())
                 && as_int_operand(inner->index.get(), k1)
                 && as_int_operand(sub->index.get(), k2);
         }
@@ -359,8 +588,8 @@ bool incdec_lvalue_pure(const Construct *lv)
      * (MemberV) + the mutate (StoreMemberV/DictStore) both re-eval `p`, a
      * side-effect-free slot read. The emit_mut `th`-gate keeps a dyn field on
      * the fallback (inc-dec is int/float-only). */
-    if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(lv)) {
-        const Identifier *base = dynamic_cast<const Identifier *>(m->what.get());
+    if (const MemberExpr *m = node_cast<const MemberExpr>(lv)) {
+        const Identifier *base = node_cast<const Identifier>(m->what.get());
         return (m->base_struct || m->base_dict) && base
             && (base->sym.kind == SymKind::local
                 || base->sym.kind == SymKind::global
@@ -383,7 +612,7 @@ Operand float_lit(float_type v)
  * nested base (`a[i][j]`, `obj.arr[i]`) is not a bare local slot -> false. */
 bool as_array_slot(const Construct *e, int &slot)
 {
-    if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+    if (const Identifier *id = node_cast<const Identifier>(e)) {
         if (id->sym.kind == SymKind::local) {
             slot = id->sym.slot;
             return true;
@@ -403,7 +632,7 @@ bool as_array_slot(const Construct *e, int &slot)
  */
 bool as_container_base(const Construct *e, int &slot, int &kind)
 {
-    if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+    if (const Identifier *id = node_cast<const Identifier>(e)) {
         switch (id->sym.kind) {
         case SymKind::local:   kind = 0; slot = id->sym.slot; return true;
         case SymKind::global:  kind = 1; slot = id->sym.slot; return true;
@@ -422,15 +651,15 @@ bool as_container_base(const Construct *e, int &slot, int &kind)
  */
 bool as_float_operand(const Construct *e, Operand &out)
 {
-    if (const LiteralInt *li = dynamic_cast<const LiteralInt *>(e)) {
+    if (const LiteralInt *li = node_cast<const LiteralInt>(e)) {
         out = float_lit(static_cast<float_type>(li->ival()));
         return true;
     }
-    if (const LiteralFloat *lf = dynamic_cast<const LiteralFloat *>(e)) {
+    if (const LiteralFloat *lf = node_cast<const LiteralFloat>(e)) {
         out = float_lit(lf->fval());
         return true;
     }
-    if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+    if (const Identifier *id = node_cast<const Identifier>(e)) {
         if (id->sym.kind == SymKind::local
             && (id->th == TypeHint::f || id->th == TypeHint::i)) {
             out = slot_op(id->sym.slot);
@@ -451,9 +680,9 @@ bool as_float_operand(const Construct *e, Operand &out)
  */
 bool definitely_int(const Construct *e)
 {
-    if (dynamic_cast<const LiteralInt *>(e))
+    if (ctag(e) == ConstructType::lit_int)
         return true;
-    const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
+    const TypedScalarExpr *t = node_cast<const TypedScalarExpr>(e);
     return t && t->kind == TypeHint::i
         && (t->cat == TypedScalarExpr::Cat::arith
             || t->cat == TypedScalarExpr::Cat::neg);
@@ -491,37 +720,30 @@ bool is_boxed_cmp(Op op)
  * if `op` isn't a compound-assign the boxed CompoundV handles. */
 Op compound_base_op(Op op)
 {
-    switch (op) {
-        case Op::addeq: return Op::plus;
-        case Op::subeq: return Op::minus;
-        case Op::muleq: return Op::times;
-        case Op::diveq: return Op::div;
-        case Op::modeq: return Op::mod;
-        default:        return Op::invalid;
-    }
+    return compound_assign_base(op);    /* operators.h - the single map */
 }
 
 /* Bake a scalar/string literal into an EvalValue for the boxed const pool.
  * Returns false for a non-scalar literal (an array/dict LiteralObj) - later. */
 bool boxed_literal(const Construct *e, EvalValue &out)
 {
-    if (const LiteralInt *li = dynamic_cast<const LiteralInt *>(e)) {
+    if (const LiteralInt *li = node_cast<const LiteralInt>(e)) {
         out = EvalValue(li->ival());
         return true;
     }
-    if (const LiteralFloat *lf = dynamic_cast<const LiteralFloat *>(e)) {
+    if (const LiteralFloat *lf = node_cast<const LiteralFloat>(e)) {
         out = EvalValue(lf->fval());
         return true;
     }
-    if (const LiteralBool *lb = dynamic_cast<const LiteralBool *>(e)) {
+    if (const LiteralBool *lb = node_cast<const LiteralBool>(e)) {
         out = EvalValue(lb->bval());
         return true;
     }
-    if (const LiteralStr *ls = dynamic_cast<const LiteralStr *>(e)) {
+    if (const LiteralStr *ls = node_cast<const LiteralStr>(e)) {
         out = ls->strval();
         return true;
     }
-    if (dynamic_cast<const LiteralNone *>(e)) {
+    if (ctag(e) == ConstructType::lit_none) {
         out = EvalValue();   /* none */
         return true;
     }
@@ -533,9 +755,42 @@ bool boxed_literal(const Construct *e, EvalValue &out)
  * (Phase 1); a `while` whose condition + body are resolved-local int ops
  * compiles to the register machine (Phase 2), the VM's registers being the
  * frame slots. Nested int expressions use scratch TEMP slots laid out above the
- * resolved locals. See plans/bytecode-vm.md.
+ * resolved locals. See plans/archived/bytecode-vm.md.
  */
+/*
+ * Step 1b: what inference PROVED each argument of a call is, two bits per
+ * argument (1 = exactly an int - not a bool, 2 = a float, 0 = not
+ * proven), arguments 0..15. A bool is stamped `th == i` too, and binding
+ * one into an int parameter is a retag, not the identity, so it does not
+ * count. Read by the bytecode inliner to drop a typed parameter's
+ * conversion when it is the identity - at a direct call and a value call
+ * alike.
+ */
+static uint32_t proven_arg_kinds(const ExprList *args)
+{
+    uint32_t kinds = 0;
+    for (size_t i = 0; i < args->elems.size() && i < 16; i++) {
+        const Construct *ae = args->elems[i].get();
+        const uint32_t k = ae->th == TypeHint::f ? 2u
+            : (ae->th == TypeHint::i && !ae->th_bool) ? 1u : 0u;
+        kinds |= k << (2 * i);
+    }
+    return kinds;
+}
+
 struct Codegen {
+
+    /* The builtin names a lowering compares a callee with, interned once
+     * per Codegen. A function-local `static` would pay an initialization
+     * guard on every call, whose contended arm no single-threaded run can
+     * take - six coverage elements each that no test could reach. */
+    const UniqueId *const uid_abs = UniqueId::get("abs");
+    const UniqueId *const uid_min = UniqueId::get("min");
+    const UniqueId *const uid_max = UniqueId::get("max");
+    const UniqueId *const uid_len = UniqueId::get("len");
+    const UniqueId *const uid_ord = UniqueId::get("ord");
+    const UniqueId *const uid_append = UniqueId::get("append");
+    const UniqueId *const uid_push = UniqueId::get("push");
 
     /* The CODEGEN-side instruction vector (CgInstr = Instr + the transient
      * node_idx handle); codegen_chunk SLICES it into code at the end,
@@ -553,17 +808,380 @@ struct Codegen {
     int max_dict_iters = 0;   /* # native dict foreachs -> n_dict_iters */
     int max_dyn_iters = 0;    /* # native dyn foreachs -> n_dyn_iters */
 
-    /* Active struct-foreach direct-read mapping: while compiling a
-     * try_native_struct_foreach body, a MemberExpr reading `sfe_loop_slot`'s
-     * scalar field compiles to a LoadStructField* (a direct byte read of
-     * sfe_arr_slot[sfe_ctr_slot].field) instead of materializing the loop var.
-     * sfe_loop_slot == -1 when inactive. */
-    int sfe_loop_slot = -1;
-    int sfe_arr_slot = -1;
-    int sfe_ctr_slot = -1;
-    const StructTypeDef *sfe_def = nullptr;
+    /* Active struct-foreach direct-read mappings: while compiling a
+     * try_native_struct_foreach body, a MemberExpr reading an ACTIVE loop
+     * var's scalar field compiles to a LoadStructField* (a direct byte read
+     * of arr_slot[ctr_slot].field) instead of materializing the loop var.
+     * A STACK, one entry per enclosing struct foreach (2026-09-22): it was
+     * four scalars, so an INNER struct foreach overwrote the outer's
+     * mapping and then cleared it - `foreach (var a in pts) foreach (var b
+     * in pts) if (a.x < b.x)` compiled `a.x` as a member read of a slot
+     * nothing had ever written (the outer var is never materialized by
+     * design), and the VM threw where the tree-walker printed 255
+     * (tests/functional/27_struct_whole_p.my, case 4). */
+    struct SfeMap {
+        int loop_slot, arr_slot, ctr_slot;
+        const StructTypeDef *def;
+    };
+    std::vector<SfeMap> sfe_maps;
 
     int here() const { return static_cast<int>(code.size()); }
+
+    /*
+     * The INHERITED inlined-at chain (CgInstr::inl). The six compile_*
+     * dispatchers and gen_stmt wrap their _impl: every op the node's
+     * compilation appended that has no chain yet takes the node's. The
+     * innermost dispatcher returns first, so the innermost tagged node
+     * wins - the chain the tree-walker's Construct::eval flushes. An op
+     * whose carets live in a pool (StoreElem2V, StoreElemChainV, the
+     * member-key ops, ...) has no node of its own, and dropped every
+     * virtual frame of an inlined callee (a const dict written through
+     * a block-inlined function's parameter printed no backtrace at all).
+     */
+    static void inherit_inline(const Construct *n, std::vector<CgInstr> &ops,
+                               size_t mark)
+    {
+        if (!n || !n->inline_ctx)
+            return;
+        for (size_t i = mark; i < ops.size(); i++)
+            if (!ops[i].inl)
+                ops[i].inl = n->inline_ctx;
+    }
+
+    /* A struct construction through a TYPE ALIAS that is a GLOBAL
+     * (`const T = S;` then `T(1)` in a function): the ctor ops build S's
+     * instance from the stamped def and never read T, but T is a const
+     * that binds where its declaration runs. So T is read first - a
+     * LoadGlobalV, before the arguments, as the tree-walker evaluates the
+     * callee - and a construction that runs before the declaration did
+     * raises UnboundSymbolEx at the callee's caret in every engine (the
+     * VM built the instance until 2026-11-15, RULE 2). A struct's own
+     * name binds at scope entry, and a local or captured alias is read
+     * only after its declaration (the TDZ): neither needs it. */
+    void emit_ctor_guard(const Construct *e, std::vector<CgInstr> &ops)
+    {
+        const CallExpr *ce = node_cast<const CallExpr>(e);
+        if (!ce || !ce->ctor_alias)
+            return;
+        /* the inferencer stamps ctor_alias off the callee's symbol */
+        ML_CHECK(ctag(ce->what.get()) == ConstructType::id);
+        const Identifier *callee =
+            static_cast<const Identifier *>(ce->what.get());
+        if (callee->sym.kind != SymKind::global)
+            return;
+        int t;
+        const bool ok = compile_boxed_expr(callee, t, ops);
+        ML_CHECK(ok);       /* the read of a name always lowers */
+        (void)ok;
+    }
+
+    bool compile_boxed_expr(const Construct *e, int &out_slot,
+                            std::vector<CgInstr> &ops,
+                            bool allow_typed = true,
+                            bool truthy_only = false)
+    {
+        const size_t mark = ops.size();
+        /* (a guarded construction always lowers - the constructor ops
+         * take any argument that lowers at all - so no decline has a
+         * guard's read to take back) */
+        emit_ctor_guard(e, ops);
+        const bool ok = compile_boxed_expr_impl(e, out_slot, ops,
+                                                allow_typed, truthy_only);
+        if (ok)
+            inherit_inline(e, ops, mark);
+        return ok;
+    }
+
+    /* #75 follow-up: a numeric WIDENING the inferencer stamped, applied to
+     * a compiled value - a CoerceNumV into a FRESH temp (the value may sit
+     * in a named local's own slot, which must keep its value). */
+    void emit_widen(DeclType dt, int &slot, const Construct *node,
+                    std::vector<CgInstr> &ops)
+    {
+        if (dt != DeclType::i && dt != DeclType::f)
+            return;
+        CgInstr co;
+        co.op = OpCode::CoerceNumV;
+        co.node_idx = add_ast_node(node);
+        co.target = alloc_temp();
+        co.target2 = dt == DeclType::f ? 1 : 0;
+        co.set_a(slot_op(slot));
+        ops.push_back(co);
+        slot = co.target;
+    }
+
+    /* #49: a CheckFitV of `slot` against `spec` (null: none) - a stored
+     * value that may misfit its place's declared type, checked after its
+     * widening and before the store; `node` is the value (the caret) */
+    /* Q2: the ref a creation op names its container's type by (0: none,
+     * else the Chunk::ctypes index + 1; one entry per distinct type) */
+    unsigned ctype_pool_ref(const TypeAnnot *t)
+    {
+        if (!t)
+            return 0;
+        for (size_t i = 0; i < chunk.ctypes.size(); i++)
+            if (chunk.ctypes[i] == t)
+                return static_cast<unsigned>(i + 1);
+        chunk.ctypes.push_back(t);
+        ML_CHECK(chunk.ctypes.size() < (1u << 23));
+        return static_cast<unsigned>(chunk.ctypes.size());
+    }
+
+    void emit_fit(const std::shared_ptr<const FitSpec> &spec, int slot,
+                  const Construct *node, std::vector<CgInstr> &ops)
+    {
+        if (!spec)
+            return;
+        CgInstr ck;
+        ck.op = OpCode::CheckFitV;
+        ck.node_idx = add_ast_node(node);
+        ck.target2 = static_cast<int>(chunk.fit_specs.size());
+        ck.set_a(slot_op(slot));
+        chunk.fit_specs.push_back(*spec);
+        ops.push_back(ck);
+    }
+
+    /* A container store's KEY (a dict<float, _> stores an int key as a
+     * float - Subscript::key_coerce) and its VALUE (Expr14::rv_coerce),
+     * each checked where it may misfit (#49: key_fit / rv_fit). */
+    bool compile_key(const Subscript *sub, int &slot,
+                     std::vector<CgInstr> &ops)
+    {
+        if (!compile_boxed_expr(sub->index.get(), slot, ops))
+            return false;
+        emit_widen(sub->key_coerce, slot, sub, ops);
+        emit_fit(sub->key_fit, slot, sub->index.get(), ops);
+        return true;
+    }
+    bool compile_rvalue(const Expr14 *e, int &slot,
+                        std::vector<CgInstr> &ops)
+    {
+        if (!compile_boxed_expr(e->rvalue.get(), slot, ops))
+            return false;
+        emit_widen(e->rv_coerce, slot, e, ops);
+        emit_fit(e->rv_fit, slot, e->rvalue.get(), ops);
+        return true;
+    }
+    bool compile_key_to_run_slot(const Subscript *sub, int dst,
+                                 std::vector<CgInstr> &ops)
+    {
+        if (!compile_to_run_slot(sub->index.get(), dst, ops))
+            return false;
+        if (sub->key_coerce == DeclType::i
+            || sub->key_coerce == DeclType::f) {
+            CgInstr co;             /* the run slot is this key's own */
+            co.op = OpCode::CoerceNumV;
+            co.node_idx = add_ast_node(sub);
+            co.target = dst;
+            co.target2 = sub->key_coerce == DeclType::f ? 1 : 0;
+            co.set_a(slot_op(dst));
+            ops.push_back(co);
+        }
+        emit_fit(sub->key_fit, dst, sub->index.get(), ops);
+        return true;
+    }
+
+    /*
+     * BOXES (plans/class-and-box.md, step 3): `*b` - LoadBoxV / StoreBoxV.
+     * A load checks the box the inferencer proved (DerefExpr::want), so a
+     * typed consumer of its result reads what it was told it reads.
+     */
+    CgInstr box_load_instr(const DerefExpr *d, int dst, int bslot)
+    {
+        CgInstr in;
+        in.op = OpCode::LoadBoxV;
+        in.node_idx = add_ast_node(d);
+        in.target = dst;
+        in.set_a(slot_op(bslot));
+        in.set_b(int_lit(d->want));
+        in.target2 = d->want == 5 ? add_struct_def(d->want_def) : -1;
+        return in;
+    }
+
+    bool compile_box_load(const DerefExpr *d, int &out,
+                          std::vector<CgInstr> &ops)
+    {
+        int bslot;
+        if (!compile_boxed_expr(d->elem.get(), bslot, ops))
+            return false;
+        const int t = alloc_temp();
+        ops.push_back(box_load_instr(d, t, bslot));
+        out = t;
+        return true;
+    }
+
+    /* `cast<T>(x)`: CastV into a fresh temp - its slot is the result -
+     * its refusal carrying the argument's caret (plans/cast.md). Every
+     * expression a cast takes lowers boxed; one that did not could lower
+     * no other way, so it is the compile refusal here */
+    int compile_cast(const CastExpr *c, std::vector<CgInstr> &ops)
+    {
+        int src;
+        if (!compile_boxed_expr(c->elem.get(), src, ops)) /* INT-COV-EXEMPT */
+            throw_not_lowered(c);
+        size_t ti = 0;
+        while (ti < chunk.cast_types.size() && chunk.cast_types[ti] != c->to)
+            ti++;
+        if (ti == chunk.cast_types.size())
+            chunk.cast_types.push_back(c->to);
+        const int t = alloc_temp();
+        CgInstr in;
+        in.op = OpCode::CastV;
+        in.node_idx = add_ast_node(c);
+        in.loc_node_idx = add_ast_node(c->elem.get());
+        in.target = t;
+        in.set_a(slot_op(src));
+        in.target2 = static_cast<int>(ti);
+        ops.push_back(in);
+        return t;
+    }
+
+    /* `*b = v` / `*b OP= v`: the rvalue first, then the box once (a fresh
+     * temp holds the rvalue when evaluating the box could change the
+     * variable it was read from); a compound loads, applies the operator
+     * (its error carets the whole expression) and stores back. `out`: the
+     * value form - the box's value after the store. */
+    bool compile_deref_store(const Expr14 *e, std::vector<CgInstr> &ops,
+                             int *out)
+    {
+        const DerefExpr *d = static_cast<const DerefExpr *>(e->lvalue.get());
+        const bool is_assign = e->op == Op::assign;
+        const Op cbase = compound_base_op(e->op);
+        if (!is_assign && cbase == Op::invalid)
+            return false;
+        int rslot;
+        if (construct_no_side_effects(d->elem.get())) {
+            if (!compile_boxed_expr(e->rvalue.get(), rslot, ops))
+                return false;
+        } else {
+            rslot = alloc_temp();
+            if (!compile_to_run_slot(e->rvalue.get(), rslot, ops))
+                return false;
+        }
+        int bslot;
+        if (!compile_boxed_expr(d->elem.get(), bslot, ops))
+            return false;
+        int vslot = rslot;
+        if (!is_assign) {
+            const int t = alloc_temp();
+            ops.push_back(box_load_instr(d, t, bslot));
+            CgInstr c;
+            c.op = OpCode::CompoundV;
+            c.node_idx = add_ast_node(e);
+            c.target = t;
+            c.set_b(slot_op(rslot));
+            c.aop = cbase;
+            ops.push_back(c);
+            vslot = t;
+        }
+        CgInstr st;
+        st.op = OpCode::StoreBoxV;
+        st.node_idx = add_ast_node(d);
+        st.set_a(slot_op(bslot));
+        st.set_b(slot_op(vslot));
+        ops.push_back(st);
+        if (out) {
+            const int t = alloc_temp();
+            ops.push_back(box_load_instr(d, t, bslot));
+            *out = t;
+        }
+        return true;
+    }
+
+    /* `(*b)++` / `--*b`: the box once, its value loaded into a temp, the
+     * CHECKED inc-dec there (int/float only, caret: the inc-dec), stored
+     * back. `out`: the value form - the old value (postfix) or the new. */
+    bool compile_deref_incdec(const IncDecExpr *inc,
+                              std::vector<CgInstr> &ops, int *out)
+    {
+        const DerefExpr *d =
+            static_cast<const DerefExpr *>(inc->lvalue.get());
+        int bslot;
+        if (!compile_boxed_expr(d->elem.get(), bslot, ops))
+            return false;
+        const int t = alloc_temp();
+        ops.push_back(box_load_instr(d, t, bslot));
+        int old = -1;
+        if (out && !inc->is_prefix) {
+            old = alloc_temp();
+            CgInstr mv;
+            mv.op = OpCode::MoveV;
+            mv.node_idx = add_ast_node(inc);
+            mv.target = old;
+            mv.target2 = t;
+            ops.push_back(mv);
+        }
+        CgInstr in;
+        in.op = OpCode::IncDecCheckedV;
+        in.node_idx = add_ast_node(inc);
+        in.target = t;
+        in.target2 = 0;                     /* a frame slot */
+        in.set_a(int_lit(inc->is_inc ? 1 : 0));
+        ops.push_back(in);
+        CgInstr st;
+        st.op = OpCode::StoreBoxV;
+        st.node_idx = add_ast_node(d);
+        st.set_a(slot_op(bslot));
+        st.set_b(slot_op(t));
+        ops.push_back(st);
+        if (out)
+            *out = inc->is_prefix ? t : old;
+        return true;
+    }
+
+    bool compile_boxed_stmt(const Construct *s, std::vector<CgInstr> &ops)
+    {
+        const size_t mark = ops.size();
+        const bool ok = compile_boxed_stmt_impl(s, ops);
+        if (ok)
+            inherit_inline(s, ops, mark);
+        return ok;
+    }
+
+    bool compile_int_expr(const Construct *e, Operand &out,
+                          std::vector<CgInstr> &ops)
+    {
+        const size_t mark = ops.size();
+        const bool ok = compile_int_expr_impl(e, out, ops);
+        if (ok)
+            inherit_inline(e, ops, mark);
+        return ok;
+    }
+
+    bool compile_int_stmt(const Construct *s, std::vector<CgInstr> &ops)
+    {
+        const size_t mark = ops.size();
+        const bool ok = compile_int_stmt_impl(s, ops);
+        if (ok)
+            inherit_inline(s, ops, mark);
+        return ok;
+    }
+
+    bool compile_float_expr(const Construct *e, Operand &out,
+                            std::vector<CgInstr> &ops)
+    {
+        const size_t mark = ops.size();
+        const bool ok = compile_float_expr_impl(e, out, ops);
+        if (ok)
+            inherit_inline(e, ops, mark);
+        return ok;
+    }
+
+    bool compile_float_stmt(const Construct *s, std::vector<CgInstr> &ops)
+    {
+        const size_t mark = ops.size();
+        const bool ok = compile_float_stmt_impl(s, ops);
+        if (ok)
+            inherit_inline(s, ops, mark);
+        return ok;
+    }
+
+    void gen_stmt(const Construct *s)
+    {
+        const size_t mark = code.size();
+        gen_stmt_impl(s);
+        inherit_inline(s, code, mark);
+    }
 
     /* CODEGEN-SCRATCH node registry: `Instr::node_idx` indexes it - the
      * splice-stable handle an op uses to reach its node before its final pc
@@ -584,21 +1202,97 @@ struct Codegen {
         return static_cast<int>(ast_nodes.size()) - 1;
     }
 
+    /*
+     * #127: the handle for a container store's BASE caret (-> Chunk::base_locs,
+     * used by vm_store_base's unbound-global arm). `kind` and `base` come
+     * straight from as_container_base; only kind 1 (GLOBAL) can ever be
+     * unbound, so any other kind records nothing and the table stays sparse.
+     */
+    int add_base_node(int kind, const Construct *base)
+    {
+        return kind == 1 ? add_ast_node(base) : -1;
+    }
+
+    /*
+     * RULE 2: the handle for a store op's COMPOUND-OPERATION caret (->
+     * Chunk::op_locs): the whole `lv OP= rhs` / inc-dec node, the span the
+     * tree-walker gives an error raised by the operation step (div0, a
+     * negative shift count, a type error). `op` is the Expr14 op, or the
+     * aop an inc-dec synthesizes; a plain assignment has no operation step
+     * and records nothing, so the table stays sparse.
+     */
+    int add_op_node(Op op, const Construct *whole)
+    {
+        return op == Op::assign || op == Op::invalid ? -1
+                                                     : add_ast_node(whole);
+    }
+
+    /*
+     * #97 E1: the closure_defs index of the single function a call site can
+     * reach, from #116's callee-set answer - read as `CallExpr::callee_desc`,
+     * the program-lifetime DESCRIPTOR, never `callee_fn`, whose AST node the
+     * optimizers have freed by the time codegen runs (see syntax.h). -1 when
+     * the analysis could not NAME one (⊤, more than one candidate, an escaped
+     * function, or no inference at all under `-nti`).
+     *
+     * ⛔ THIS IS A PREDICTION, NOT A PROOF OBLIGATION. The JIT's baked arm
+     * compares the live callee's descriptor against the baked one and falls
+     * to the generic tier on a mismatch, so a wrong answer here costs a slow
+     * path and never a wrong result. That is why no gate beyond "the stamp
+     * exists and has a descriptor" is needed - and why `-nti`, which leaves
+     * every stamp null, simply gets the old code.
+     *
+     * The descriptor joins THIS chunk's closure_defs (deduped - a hot call
+     * in a loop is one site, but two sites may name one function), which is
+     * already the per-chunk, SERIALIZABLE pool of FuncDescriptor*.
+     */
+    int add_value_callee(const DescStamp &s)
+    {
+        if (!codegen_desc_stamp_live(s, g_live_descs))
+            return -1;            /* unstamped, or a stamp that dangles */
+        const FuncDescriptor *d = s.desc;
+        for (size_t i = 0; i < chunk.closure_defs.size(); i++)
+            if (chunk.closure_defs[i] == d)
+                return static_cast<int>(i);
+        chunk.closure_defs.push_back(d);
+        return static_cast<int>(chunk.closure_defs.size() - 1);
+    }
+
     /* Pool a value-ABI builtin call's AST-free data (the Builtin + the ArgLocs
      * carets/hint pulled off the DirectBuiltinCallExpr) and return its
      * Chunk::builtin_calls index - so CallBuiltinV carries a serializable index,
      * not a `node`. See Chunk::BuiltinCall. */
+    /*
+     * #38: a builtin-call op's carets live in the builtin_calls pool, so
+     * it carries no node - and extract_locs records an op's INLINED-AT
+     * chain only from its node. A builtin call spliced from an inlined
+     * body therefore had no inline_ctxs entry, and the VM dropped the
+     * inlined callee's virtual frame from any backtrace crossing it (a
+     * callback's throw, or the builtin's own error) - the tree-walker,
+     * whose DirectBuiltinCallExpr carries the chain, rendered it. Give
+     * the op its node exactly when there is a chain to record; the
+     * default arm of extract_locs' switch then drops it, so nothing else
+     * changes and no node survives codegen.
+     */
+    void note_builtin_inline(CgInstr &cv, const DirectBuiltinCallExpr *dc)
+    {
+        if (dc->inline_ctx)
+            cv.node_idx = add_ast_node(dc);
+    }
+
     int add_builtin_call(const DirectBuiltinCallExpr *dc)
     {
         Chunk::BuiltinCall bc;
         bc.builtin = dc->builtin;
         bc.name = nullptr;
         if (const Identifier *id =
-                dynamic_cast<const Identifier *>(dc->what.get()))
+                node_cast<const Identifier>(dc->what.get()))
             bc.name = id->uid;
         bc.start = dc->args->start;
         bc.end = dc->args->end;
         bc.arr_hint = dc->args->arr_hint;
+        bc.ctype = dc->args->ctype;
+        bc.ct_store = dc->args->ct_store;
         bc.args.reserve(dc->args->elems.size());
         for (const auto &el : dc->args->elems)
             bc.args.push_back(ArgLoc{el->start, el->end});
@@ -681,8 +1375,8 @@ struct Codegen {
      * function boundary (innermost last). A break/continue/return crossing them
      * must pop each handler + run each finally. `to_fin` collects the Jumps
      * that a return in this try routes to its finally (backpatched to Lfin);
-     * `in_catch` = we're compiling a catch body (this try's handler was already
-     * popped by the exception dispatch, so a return must NOT pop it again). */
+     * `in_catch` = we're compiling a catch body (a `rethrow` there re-raises
+     * this try's exception). */
     struct TryFrame {
         bool has_finally;
         std::vector<size_t> *to_fin;   /* normal/reraise exits -> shared Lfin */
@@ -690,8 +1384,19 @@ struct Codegen {
         /* the finally body (or null): a flow op crossing this try INLINES it at
          * the flow-op site (Inc 2c), so it needs the AST here. */
         const Construct *finally_body = nullptr;
+        /* #78: this try's chunk-static REGION ID - baked into its exception
+         * ops; keys the per-frame {exc, pend} slot (Chunk::n_trys). */
+        int region = 0;
+        /* does this try have a handler on the stack here - one a flow op
+         * crossing it must pop? Its own in the try body; in a catch body
+         * (the dispatch popped that one) only the catch GUARD of a try with
+         * a finally (compile_native_try). */
+        bool handler_live = true;
     };
     std::vector<TryFrame> trys;
+    /* #78: the monotonic try-region allocator (nested/sequential trys get
+     * distinct ids; each INLINED finally copy's nested trys re-allocate). */
+    int next_try_region = 0;
 
     /* An INLINED-CALL return boundary (InlinedCallExpr): the callee's body runs
      * with its OWN return scope - a `return v` inside it yields THIS expression's
@@ -730,6 +1435,36 @@ struct Codegen {
      * store) when it is a resolved-local scalar decl.
      * Native-izing the once-run init doesn't speed the loop, but it keeps the
      * `i = start` off the tree-walker and reads cleanly in the disassembly. */
+    /* THE DISCARD TIER: a statement whose value nobody reads. A bare INERT
+     * leaf - a scalar literal, or an id that is ALWAYS bound (local / param
+     * / capture / builtin) - is a no-op, as the tree-walker never RValue-s a
+     * discarded statement; any OTHER expression compiles into a scratch temp
+     * whose result is dropped (`s[3];`, `x + y;`, `map(f, a);`), so an error
+     * it raises still throws with its own caret. An UNRESOLVED id throws
+     * UndefinedVariableEx and a GLOBAL id throws iff not yet defined - both
+     * what compile_boxed_expr's leaf paths emit. Every place a statement can
+     * stand asks this last: gen_stmt, a loop / if body, and a `for`'s init
+     * and increment (which had no such tier until 2026-11-13, so
+     * `for (0; c; i++)` or a write-once `z` folded to its value there was a
+     * NotLoweredEx compile refusal while the tree-walker ran it). Returns
+     * false (nothing emitted, temps restored) when it cannot compile. */
+    bool compile_discarded(const Construct *s, std::vector<CgInstr> &ops)
+    {
+        const Identifier *bid = node_cast<const Identifier>(s);
+        if (dynamic_cast<const Literal *>(s)
+                || (bid && bid->sym.kind != SymKind::unresolved
+                        && bid->sym.kind != SymKind::global))
+            return true;
+        const size_t emark = ops.size();
+        const int st = next_temp;
+        int dst;
+        if (compile_boxed_expr(s, dst, ops))
+            return true;
+        ops.resize(emark);
+        next_temp = st;
+        return false;
+    }
+
     bool emit_init(const Construct *init)
     {
         reset_temps();
@@ -745,9 +1480,15 @@ struct Codegen {
         /* Boxed decl-init: `var k = i` (an int/bool leaf, or a dyn/string
          * value) - the int path rejects a bare identifier rhs (it can't prove
          * int-not-bool for a raw int store), but a boxed move preserves the
-         * rhs's real type. An UNCOMPILABLE init (exotic) fails the whole
-         * loop to a NotLoweredEx compile abort - no per-init fallback. */
+         * rhs's real type. Then the discard tier: an init that is a plain
+         * expression (`for (0; ...)`). An UNCOMPILABLE init (exotic) fails
+         * the whole loop to a NotLoweredEx compile abort - no per-init
+         * fallback. */
         if (compile_boxed_stmt(init, code))
+            return true;
+        code.resize(mark);
+        reset_temps();
+        if (compile_discarded(init, code))
             return true;
         code.resize(mark);
         return false;
@@ -765,21 +1506,37 @@ struct Codegen {
     {
         chunk.member_keys.push_back(
             {m->memId, m->memUid, m->optional,
-             m->start, m->end, m->what->start, m->what->end});
+             m->start, m->end, m->what->start, m->what->end,
+             m->field_slot >= 0 ? m->base_struct_def : nullptr,
+             m->field_slot});
         return static_cast<int>(chunk.member_keys.size()) - 1;
     }
 
-    /* Pool a checked inc-dec's dual carets (+ the member key for the member
-     * form): lvalue-child caret + the whole inc-dec caret. Returns the index
-     * (carried in Instr::b), so the op is AST-free. */
-    int add_incdec_site(const Construct *lchild, const IncDecExpr *inc,
-                        const MemberExpr *m = nullptr)
+    /* Pool a StructTypeDef (deduped by pointer identity) - the baked-def
+     * index the member-read fast path / ctor plan compare against. */
+    int add_struct_def(const StructTypeDef *sd)
+    {
+        for (size_t i = 0; i < chunk.struct_defs.size(); i++)
+            if (chunk.struct_defs[i] == sd)
+                return static_cast<int>(i);
+        chunk.struct_defs.push_back(sd);
+        return static_cast<int>(chunk.struct_defs.size()) - 1;
+    }
+
+    /* Pool a checked inc-dec's carets (+ the member key for the member
+     * form): the lvalue child's, the whole inc-dec's and the base's (`base`,
+     * the child's `what`). Returns the index (carried in Instr::b), so the
+     * op is AST-free. */
+    int add_incdec_site(const Construct *lchild, const Construct *base,
+                        const IncDecExpr *inc, const MemberExpr *m = nullptr)
     {
         Chunk::IncDecSite s;
         s.lstart = lchild->start;
         s.lend = lchild->end;
         s.istart = inc->start;
         s.iend = inc->end;
+        s.bstart = base->start;
+        s.bend = base->end;
         if (m) {
             s.memId = m->memId;
             s.memUid = m->memUid;
@@ -825,11 +1582,21 @@ struct Codegen {
                                std::vector<CgInstr> &ops)
     {
         const int n = static_cast<int>(la->elems.size());
-        if (n == 0)
+        /* #54: an EMPTY `[]` whose destination is array<PodStruct> must
+         * start flat too - the def comes from the inferencer's hint, there
+         * being no element to take it from. MakeArrayV carries no def, so
+         * it built a GENERAL array: `var pts = []` then appended structs
+         * was stored boxed under the VM while the tree-walker (and a
+         * folding parse, which bakes the `[]` into a flat LiteralObj) kept
+         * it flat - exposed by -nc. */
+        const StructTypeDef *sdef =
+            n == 0 && la->arr_hint_struct
+                && la->arr_hint_struct->layout == StructTypeDef::Layout::pod
+            ? la->arr_hint_struct : nullptr;
+        if (n == 0 && !sdef)
             return false;
-        const StructTypeDef *sdef = nullptr;
         for (const auto &el : la->elems) {
-            const CallExpr *ce = dynamic_cast<const CallExpr *>(el.get());
+            const CallExpr *ce = node_cast<const CallExpr>(el.get());
             if (!ce || !ce->vm_struct_ctor_def || !ce->args)
                 return false;
             if (!sdef)
@@ -855,6 +1622,8 @@ struct Codegen {
         for (int i = 0; i < n; i++) {
             const CallExpr *ce =
                 static_cast<const CallExpr *>(la->elems[i].get());
+            /* a global type alias is read before its element's fields */
+            emit_ctor_guard(ce, ops);
             for (int j = 0; j < M; j++)
                 if (!compile_to_run_slot(ce->args->elems[j].get(),
                                          base + i * M + j, ops)) {
@@ -868,7 +1637,8 @@ struct Codegen {
         const int dst = alloc_temp();
         CgInstr in;
         in.op = OpCode::MakeStructArrayV;
-        in.node_idx = add_ast_node(la->elems[0].get());   /* a ctor: defensive coerce loc (nulled) */
+        /* a ctor: defensive coerce loc (nulled) */
+        in.node_idx = add_ast_node(n ? la->elems[0].get() : la);
         in.target = dst;
         in.set_a(int_lit(base));
         in.set_b(int_lit(n));
@@ -879,9 +1649,40 @@ struct Codegen {
         return true;
     }
 
-    bool compile_boxed_expr(const Construct *e, int &out_slot,
-                            std::vector<CgInstr> &ops)
+    /*
+     * `allow_typed = false` SKIPS the typed-delegation preamble below and
+     * lowers `e` with the boxed cases only. Exactly one caller wants that:
+     * H4's try_call_leaf, which is reached FROM compile_int_expr and would
+     * otherwise re-enter it here - an infinite recursion (watched: an ASan
+     * stack overflow through try_call_leaf -> compile_boxed_expr ->
+     * compile_int_expr -> try_call_leaf). It needs the CALL lowered boxed
+     * into a slot, which is precisely what the preamble is trying to avoid
+     * doing - so skipping it is the intent, not a workaround.
+     */
+    bool compile_boxed_expr_impl(const Construct *e, int &out_slot,
+                            std::vector<CgInstr> &ops,
+                            bool allow_typed = true,
+                            bool truthy_only = false)
     {
+        if (ctag(e) == ConstructType::cast) {
+            out_slot = compile_cast(static_cast<const CastExpr *>(e), ops);
+            return true;
+        }
+        /* `*b`, and a store through a box used as a value */
+        if (ctag(e) == ConstructType::deref)
+            return compile_box_load(static_cast<const DerefExpr *>(e),
+                                    out_slot, ops);
+        if (ctag(e) == ConstructType::expr14
+                && ctag(static_cast<const Expr14 *>(e)->lvalue.get())
+                       == ConstructType::deref)
+            return compile_deref_store(static_cast<const Expr14 *>(e), ops,
+                                       &out_slot);
+        if (ctag(e) == ConstructType::incdec
+                && ctag(static_cast<const IncDecExpr *>(e)->lvalue.get())
+                       == ConstructType::deref)
+            return compile_deref_incdec(static_cast<const IncDecExpr *>(e),
+                                        ops, &out_slot);
+
         /*
          * Typed-arg lowering: a th==i/f node computes its int/float value via
          * the UNBOXED typed path (IntBin/FloatBin/CallV/LoadElem...), which
@@ -893,7 +1694,25 @@ struct Codegen {
          * fall through to the boxed cases below - so this only ever turns a
          * boxed op into the equivalent typed one, never changes behavior.
          */
-        if (e->th == TypeHint::i || e->th == TypeHint::f) {
+        /* ⛔ NOT for a BOOL (th_bool): the comment above is exactly
+         * right for an int and exactly wrong for a bool. The typed path
+         * writes an INT EvalValue, so a boxed consumer - print, a
+         * container element, str(), a dyn assignment - would see 1/0
+         * where the language (and the tree-walker) says true/false.
+         * A bool falls through to the boxed lowering below, which reads
+         * the real bool out of the array/field/dict.
+         *
+         * `truthy_only` is the EXEMPTION, and it is not a shortcut: a
+         * consumer that only asks is_true() cannot tell an int 0/1 from
+         * a bool, so the typed path stays. The four callers are the
+         * JumpUnlessTrueV feeders (if / while / for / ternary
+         * conditions). WITHOUT it this cost a real optimization rather
+         * than an answer: `if (a[k])` on an array<bool> stopped
+         * emitting LoadElemInt, so the E4 peephole that fuses it into
+         * JumpUnlessElemInt - 57_bool_reduce's whole hot loop - no
+         * longer matched, and the `-rt` hoist test caught it. */
+        if (allow_typed && (truthy_only || !e->th_bool)
+                && (e->th == TypeHint::i || e->th == TypeHint::f)) {
             const size_t omark = ops.size();
             const size_t cmark = chunk.consts.size();
             const int save_top = next_temp;
@@ -929,7 +1748,7 @@ struct Codegen {
          * free lvalue (incdec_lvalue_pure) so the read and the store's second
          * eval of the slot/index agree; a MoveV copies the scalar, so the
          * captured `dst` is unaffected by the mutation that follows. */
-        if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(e)) {
+        if (const IncDecExpr *inc = node_cast<const IncDecExpr>(e)) {
             if (!incdec_lvalue_pure(inc->lvalue.get()))
                 return try_incdec_chain(inc, out_slot, ops);
             const size_t omark = ops.size();
@@ -970,7 +1789,7 @@ struct Codegen {
          * can't lower (e.g. a try crossed inside the boundary) fails the whole
          * inline -> the tree-walker runs the InlinedCallExpr (byte-identical). */
         if (const InlinedCallExpr *ic =
-                dynamic_cast<const InlinedCallExpr *>(e)) {
+                node_cast<const InlinedCallExpr>(e)) {
             const size_t omark = ops.size();
             const size_t cmark = chunk.consts.size();
             const int st = next_temp;
@@ -1010,9 +1829,9 @@ struct Codegen {
          * UndefinedVariableEx when the callee evaluates — BEFORE the args (the
          * tree-walker's `what->eval` first). Native ThrowRuntimeV with the
          * callee's caret; the args are never compiled (never evaluated). */
-        if (const CallExpr *ce = dynamic_cast<const CallExpr *>(e)) {
+        if (const CallExpr *ce = node_cast<const CallExpr>(e)) {
             const Identifier *callee =
-                dynamic_cast<const Identifier *>(ce->what.get());
+                node_cast<const Identifier>(ce->what.get());
             if (callee && callee->sym.kind == SymKind::unresolved) {
                 emit_throw(Chunk::ThrowKind::undefined_var,
                            callee->start, callee->end, callee->uid, ops);
@@ -1021,7 +1840,7 @@ struct Codegen {
             }
         }
 
-        if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+        if (const Identifier *id = node_cast<const Identifier>(e)) {
             if (id->sym.kind == SymKind::local) {
                 out_slot = id->sym.slot;
                 return true;   /* the slot IS the operand - no op */
@@ -1073,16 +1892,15 @@ struct Codegen {
         /* A baked const array/dict/struct literal (LiteralObj) - what a
          * `var a = [1,2,3]` / `d = {}` const-literal rvalue folds to ->
          * LoadLiteralObjV materializes it from the pool (immutable share vs a
-         * fresh mutable clone, plus the general/flat_s cases). Node-free. */
-        if (const LiteralObj *lo = dynamic_cast<const LiteralObj *>(e)) {
+         * fresh mutable clone). Node-free. */
+        if (const LiteralObj *lo = node_cast<const LiteralObj>(e)) {
             const int t = alloc_temp();
             CgInstr in;
             in.op = OpCode::LoadLiteralObjV;
             in.target = t;
             in.target2 = static_cast<int>(chunk.literal_objs.size());
             chunk.literal_objs.push_back(
-                {lo->literal_value(), lo->is_immutable(), lo->arr_hint,
-                 lo->arr_hint_struct});
+                {lo->literal_value(), lo->is_immutable()});
             ops.push_back(in);
             out_slot = t;
             return true;
@@ -1092,7 +1910,7 @@ struct Codegen {
          * null - a named nested func decl is a statement) -> MakeClosureV: it
          * creates the FuncObject + snapshots captures from ctx, like
          * FuncDeclStmt::do_eval; the Instr carries only the pool index. */
-        if (const FuncDeclStmt *fd = dynamic_cast<const FuncDeclStmt *>(e)) {
+        if (const FuncDeclStmt *fd = node_cast<const FuncDeclStmt>(e)) {
             if (fd->id)
                 return false;
             const int t = alloc_temp();
@@ -1107,23 +1925,24 @@ struct Codegen {
         }
 
         /* A standalone POD struct construction `P(x, y)` -> StructCtorV:
-         * the field args into a register run, then coerce them into the POD
          * compile the field args into a register run, then coerce them into
          * the POD bytes. Gated on a POD ctor (vm_struct_ctor_def), nargs ==
-         * nfields (no
-         * skipped-opt fill - POD has no opt fields), a small field count, and
-         * EVERY arg a typed scalar (th==i/f). The typed-arg gate is what keeps
+         * nfields (no skipped-opt fill - POD has no opt fields), and EVERY
+         * arg a typed scalar (th==i/f). The typed-arg gate is what keeps
          * coerce from throwing (the inferencer already rejected a non-fitting
          * typed arg), so no per-arg loc is needed; a nested-struct-field arg (a
-         * `Q(..)`, th==none) or a dyn arg fails the gate and falls back to the
-         * tree-walker, which reports the exact arg loc. The append-fused
-         * ctor is
-         * EmplaceStruct. */
-        if (const CallExpr *ce = dynamic_cast<const CallExpr *>(e)) {
+         * `Q(..)`, th==none) or a dyn arg fails the gate and takes the checked
+         * constructor below, which reports the exact arg loc. The
+         * append-fused ctor is EmplaceStruct.
+         * NO field-count cap: every helper behind these ops takes any count
+         * (a heap buffer past its 16-value stack one). A `<= 16` here and on
+         * the checked/boxed ctor below made a 17-field construction a
+         * NotLoweredEx compile refusal in the VM while the tree-walker built
+         * it (2026-10-09). */
+        if (const CallExpr *ce = node_cast<const CallExpr>(e)) {
             const StructTypeDef *sdef = ce->vm_struct_ctor_def;
             if (sdef && ce->args
-                && ce->args->elems.size() == sdef->fields.size()
-                && ce->args->elems.size() <= 16) {
+                && ce->args->elems.size() == sdef->fields.size()) {
                 /* Every arg must be one coerce can't throw on
                  * (pod_ctor_arg_safe): a typed scalar for a scalar field, OR a
                  * NESTED POD-struct construction of the exact field type for an
@@ -1137,6 +1956,107 @@ struct Codegen {
                         break;
                     }
                 if (all_typed) {
+                    /* THE CTOR PLAN (the 64_struct_create fix): every arg
+                     * is compile-proven, so bake a per-field {offset, src
+                     * slot, act} list - the runtime does raw slot reads +
+                     * direct byte stores, ZERO coerce_struct_field calls,
+                     * and the planned op NEVER throws. THE src_slot
+                     * EXTENSION: a bare resolved-LOCAL id arg is read
+                     * straight from ITS OWN slot at ctor time (no staging
+                     * MoveV into a run) - sound only when EVERY arg is
+                     * side-effect-free (else a later arg's `x++` would
+                     * mutate the local before the deferred read; with any
+                     * impure arg ALL args stage in source order, exactly
+                     * the old run semantics). Computed args go to a
+                     * CONTIGUOUS temp mini-run recorded in a (DUAL: lo =
+                     * run base or -1, hi = count) for visit_use_def. A
+                     * nested-struct field arg gets NO plan (b_dual_hi
+                     * == -1 -> the generic run path below). */
+                    const size_t nf = sdef->fields.size();
+                    std::vector<uint8_t> acts;
+                    bool plannable = true;
+                    for (const FieldDef &fd : sdef->fields) {
+                        if (fd.kind == FieldKind::f_int)
+                            acts.push_back(0);
+                        else if (fd.kind == FieldKind::f_float)
+                            acts.push_back(1);
+                        else if (fd.kind == FieldKind::f_bool)
+                            acts.push_back(2);
+                        else {
+                            plannable = false;
+                            break;
+                        }
+                    }
+                    if (plannable) {
+                        bool args_pure = true;
+                        for (const auto &el : ce->args->elems)
+                            if (!construct_no_side_effects(el.get())) {
+                                args_pure = false;
+                                break;
+                            }
+                        const size_t mark = ops.size();
+                        const int save_top = next_temp;
+                        const size_t cmark = chunk.consts.size();
+                        std::vector<int32_t> srcs(nf, -1);
+                        std::vector<size_t> comp;
+                        for (size_t ai = 0; ai < nf; ai++) {
+                            const Identifier *aid =
+                                node_cast<const Identifier>(
+                                    ce->args->elems[ai].get());
+                            if (args_pure && aid
+                                && aid->sym.kind == SymKind::local)
+                                srcs[ai] =
+                                    static_cast<int32_t>(aid->sym.slot);
+                            else
+                                comp.push_back(ai);
+                        }
+                        const int cbase = next_temp;
+                        next_temp += static_cast<int>(comp.size());
+                        if (next_temp > max_temp)
+                            max_temp = next_temp;
+                        bool ok = true;
+                        for (size_t j = 0; j < comp.size(); j++) {
+                            srcs[comp[j]] =
+                                static_cast<int32_t>(cbase)
+                                + static_cast<int32_t>(j);
+                            if (!compile_to_run_slot(
+                                    ce->args->elems[comp[j]].get(),
+                                    cbase + static_cast<int>(j), ops)) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if (!ok) {
+                            ops.resize(mark);
+                            next_temp = save_top;
+                            chunk.consts.resize(cmark);
+                        } else {
+                            Chunk::CtorPlan cp;
+                            for (size_t ai = 0; ai < nf; ai++)
+                                cp.f.push_back(
+                                    {static_cast<int32_t>(
+                                         sdef->fields[ai].offset),
+                                     srcs[ai], acts[ai]});
+                            const int plan_idx = static_cast<int>(
+                                chunk.ctor_plans.size());
+                            chunk.ctor_plans.push_back(std::move(cp));
+                            const int dst = alloc_temp();
+                            CgInstr in;
+                            in.op = OpCode::StructCtorV;
+                            in.node_idx = add_ast_node(ce);
+                            in.target = dst;
+                            in.set_a_dual(
+                                comp.empty() ? -1 : cbase,
+                                static_cast<int>(comp.size()));
+                            in.set_b_dual(static_cast<int>(nf), plan_idx);
+                            in.target2 = add_struct_def(sdef);
+                            ops.push_back(in);
+                            out_slot = dst;
+                            return true;
+                        }
+                    }
+                    /* unplanned (nested-struct field / a computed arg that
+                     * failed to lower): the old contiguous-run form */
                     const size_t cmark = chunk.consts.size();
                     int base;
                     if (!emit_args_range(ce->args->elems, base, ops)) {
@@ -1146,13 +2066,12 @@ struct Codegen {
                     const int dst = alloc_temp();
                     CgInstr in;
                     in.op = OpCode::StructCtorV;
-                    in.node_idx = add_ast_node(ce);   /* loc for a defensive throw (nulled) */
+                    in.node_idx = add_ast_node(ce);   /* defensive-throw loc */
                     in.target = dst;
                     in.set_a(int_lit(base));
-                    in.set_b(int_lit(
-                        static_cast<int>(ce->args->elems.size())));
-                    in.target2 = static_cast<int>(chunk.struct_defs.size());
-                    chunk.struct_defs.push_back(sdef);
+                    in.set_b_dual(
+                        static_cast<int>(ce->args->elems.size()), -1);
+                    in.target2 = add_struct_def(sdef);
                     ops.push_back(in);
                     out_slot = dst;
                     return true;
@@ -1167,7 +2086,7 @@ struct Codegen {
          * dyn-laundered value, and must report the arg's caret). A const-arg
          * boxed ctor already folded to a LiteralObj, so only a runtime-arg one
          * reaches here. */
-        if (const CallExpr *ce = dynamic_cast<const CallExpr *>(e)) {
+        if (const CallExpr *ce = node_cast<const CallExpr>(e)) {
             /* ...and the CHECKED POD ctor: a POD construction whose typed
              * gate failed above (a dyn/general arg - the coerce CAN throw
              * and needs the arg's caret) takes the same pooled-caret op;
@@ -1178,7 +2097,7 @@ struct Codegen {
                        && ce->args->elems.size()
                               == ce->vm_struct_ctor_def->fields.size()
                        ? ce->vm_struct_ctor_def : nullptr);
-            if (bdef && ce->args && ce->args->elems.size() <= 16) {
+            if (bdef && ce->args) {
                 const size_t cmark = chunk.consts.size();
                 int base;
                 if (!emit_args_range(ce->args->elems, base, ops)) {
@@ -1187,6 +2106,7 @@ struct Codegen {
                 }
                 Chunk::BoxedCtor bc;
                 bc.def = bdef;
+                bc.fit = ce->fit_args;
                 for (const auto &a : ce->args->elems)
                     bc.arg_locs.push_back({ a->start, a->end });
                 const int dst = alloc_temp();
@@ -1209,7 +2129,7 @@ struct Codegen {
          * BEATS the tree-walker; try it before the per-element StructCtorV +
          * MakeArrayV path below (which stays the fallback for a mixed / nested /
          * non-scalar-arg literal). */
-        if (const LiteralArray *la = dynamic_cast<const LiteralArray *>(e))
+        if (const LiteralArray *la = node_cast<const LiteralArray>(e))
             if (la->arr_hint == ArrHint::flat_s) {
                 int r;
                 if (try_make_struct_array(la, r, ops)) {
@@ -1229,20 +2149,24 @@ struct Codegen {
          * mode-5 storage VALUE-DRIVEN (the def comes off the first element). If a
          * struct-ctor element can't lower either, emit_args_range fails and this
          * bails to the fallback. */
-        if (const LiteralArray *la = dynamic_cast<const LiteralArray *>(e)) {
+        if (const LiteralArray *la = node_cast<const LiteralArray>(e)) {
             const size_t cmark = chunk.consts.size();
             int base;
             if (!emit_args_range(la->elems, base, ops)) {
                 chunk.consts.resize(cmark);   /* emit_args_range won't undo */
                 return false;
             }
+            for (size_t i = 0; i < la->elems.size(); i++)
+                emit_literal_widen(la->elems[i].get(), la->elem_coerce,
+                                   base + static_cast<int>(i), la, ops);
             const int dst = alloc_temp();
             CgInstr in;
             in.op = OpCode::MakeArrayV;
             in.target = dst;
             in.set_a(int_lit(base));
             in.set_b(int_lit(static_cast<int>(la->elems.size())));
-            in.target2 = static_cast<int>(la->arr_hint);
+            in.target2 = static_cast<int>(la->arr_hint)
+                       | static_cast<int>(ctype_pool_ref(la->ctype) << 8);
             ops.push_back(in);
             out_slot = dst;
             return true;
@@ -1252,7 +2176,7 @@ struct Codegen {
          * compile the key/value pairs INTERLEAVED into a register run [base,
          * base + 2*npairs) (key at even, value at odd), then build. Same
          * const/LiteralObj caveat as the array case. */
-        if (const LiteralDict *ld = dynamic_cast<const LiteralDict *>(e)) {
+        if (const LiteralDict *ld = node_cast<const LiteralDict>(e)) {
             const size_t mark = ops.size();
             const size_t cmark = chunk.consts.size();
             const int save_top = next_temp;
@@ -1262,11 +2186,20 @@ struct Codegen {
             if (next_temp > max_temp)
                 max_temp = next_temp;
             bool ok = true;
-            for (int i = 0; i < npairs && ok; i++)
+            for (int i = 0; i < npairs && ok; i++) {
                 ok = compile_to_run_slot(ld->elems[i]->key.get(),
                                          base + 2 * i, ops)
                   && compile_to_run_slot(ld->elems[i]->value.get(),
                                          base + 2 * i + 1, ops);
+                if (ok) {
+                    emit_literal_widen(ld->elems[i]->key.get(),
+                                       ld->key_coerce, base + 2 * i,
+                                       ld, ops);
+                    emit_literal_widen(ld->elems[i]->value.get(),
+                                       ld->val_coerce, base + 2 * i + 1,
+                                       ld, ops);
+                }
+            }
             if (!ok) {
                 ops.resize(mark);
                 next_temp = save_top;
@@ -1279,6 +2212,14 @@ struct Codegen {
             in.target = dst;
             in.set_a(int_lit(base));
             in.set_b(int_lit(npairs));
+            in.target2 = static_cast<int>(ctype_pool_ref(ld->ctype));
+            /* The build FREEZES + HASHES each key, so an UNHASHABLE key (a
+             * function value laundered through `dyn`) throws TypeErrorEx from
+             * build_dict_from_pairs. Record the literal's span so extract_locs
+             * puts it in the loc side table and the throw carets the `{...}` -
+             * matching the tree-walker (LiteralDict::do_eval's Construct::eval
+             * stamp). Without this the VM reported the error with NO caret. */
+            in.node_idx = add_ast_node(ld);
             ops.push_back(in);
             out_slot = dst;
             return true;
@@ -1287,10 +2228,57 @@ struct Codegen {
         /* A subscript READ `a[i]` (general array / dict / string element) ->
          * SubscriptV via the runtime Type::subscript. (A slice is a separate
          * node, not handled here.) */
-        if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
+        if (const Subscript *sub = node_cast<const Subscript>(e)) {
+            /*
+             * H2 (2026-08-12): a PROVEN ARRAY base with an int index reads
+             * through LoadElemValue instead - the same value, a third of
+             * the work. SubscriptV goes through the runtime Type virtual
+             * `subscript(for_write=false)`, which for a general array with
+             * an LValue base builds the element's LVALUE (a get_vec() and
+             * two container back-pointer stores) - and jit_subscript then
+             * RValue()s all of it away, because this op wants a VALUE.
+             * LoadElemValue reads the element straight out of the storage
+             * (any kind, via arr_elem_at). Measured on the `ops[i % 2]`
+             * dispatch of 76_funcval_dispatch: ~173 Ir -> ~60.
+             *
+             * `base_array` is the inferencer's proof that the base is a
+             * non-opt array - the same proof LoadElemValue's existing
+             * caller relies on. The int index is required because the op
+             * reads an int operand; a dyn/str index keeps SubscriptV,
+             * whose TypeErrorEx("Expected integer as subscript") it is.
+             * A dict/string/dyn base is not base_array and is untouched.
+             */
+            if (sub->base_array) {
+                /* BOTH halves emit, so a half-succeeded attempt must be
+                 * rolled back whole - otherwise the base's ops survive
+                 * into the SubscriptV path below, which compiles the
+                 * base AGAIN (a duplicated evaluation, not just waste). */
+                const size_t smark = ops.size();
+                const size_t scmark = chunk.consts.size();
+                const int ssave = next_temp;
+                int aslot;
+                Operand aidx;
+                if (compile_array_base(sub->what.get(), aslot, ops)
+                        && compile_int_expr(sub->index.get(), aidx, ops)) {
+                    const int t = alloc_temp();
+                    CgInstr in;
+                    in.op = OpCode::LoadElemValue;
+                    in.node_idx = add_ast_node(sub);   /* the OOB caret */
+                    in.target = t;
+                    in.target2 = aslot;
+                    in.set_a(aidx);
+                    ops.push_back(in);
+                    out_slot = t;
+                    return true;
+                }
+                ops.resize(smark);
+                chunk.consts.resize(scmark);
+                next_temp = ssave;
+            }
+
             int base_slot, idx_slot;
             if (!compile_boxed_expr(sub->what.get(), base_slot, ops)
-                || !compile_boxed_expr(sub->index.get(), idx_slot, ops))
+                || !compile_key(sub, idx_slot, ops))
                 return false;
             const int t = alloc_temp();
             CgInstr in;
@@ -1305,7 +2293,7 @@ struct Codegen {
         }
 
         /* A member READ `obj.f` / `d.k` -> MemberV (shared member_read). */
-        if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
+        if (const MemberExpr *m = node_cast<const MemberExpr>(e)) {
             int base_slot;
             if (!compile_boxed_expr(m->what.get(), base_slot, ops))
                 return false;
@@ -1324,7 +2312,7 @@ struct Codegen {
         /* A slice READ `base[start:end]` -> SliceV. Compile base, then the
          * optional bounds (in eval order: what, start, end), each into a slot;
          * an absent bound is a slot of -1. The op calls the runtime slice(). */
-        if (const Slice *sl = dynamic_cast<const Slice *>(e)) {
+        if (const Slice *sl = node_cast<const Slice>(e)) {
             int base_slot;
             if (!compile_boxed_expr(sl->what.get(), base_slot, ops))
                 return false;
@@ -1376,13 +2364,19 @@ struct Codegen {
                 return true;
             if (try_native_map_filter(bc, out_slot, ops))
                 return true;
+            if (try_native_min_max_abs(bc, out_slot, ops))   /* #97 B2 */
+                return true;
+            if (try_native_len(bc, out_slot, ops))
+                return true;
+            if (try_native_ord(bc, out_slot, ops))
+                return true;
             if (try_native_builtin(bc, out_slot, ops))
                 return true;
         }
 
         /* An indirect call of a func VALUE (a closure / lambda / func var):
          * a plain CallExpr whose callee is Func-typed -> CallValueV. */
-        if (const CallExpr *call = dynamic_cast<const CallExpr *>(e))
+        if (const CallExpr *call = node_cast<const CallExpr>(e))
             if (try_native_value_call(call, out_slot, ops))
                 return true;
 
@@ -1391,18 +2385,24 @@ struct Codegen {
          * recursion-unroll return (fib: `return (n-1<2 ? .. : f(..)+f(..))..`)
          * go native - each arm's own calls become CallV. `dst` is reserved
          * BELOW the arms' scratch so neither arm clobbers it. */
-        if (const TernaryExpr *t = dynamic_cast<const TernaryExpr *>(e)) {
+        if (const TernaryExpr *t = node_cast<const TernaryExpr>(e)) {
             const size_t mark = ops.size();
             const int save_top = next_temp;
             const int dst = alloc_temp();
             const int scratch = next_temp;
 
             int cslot;
-            if (!compile_boxed_expr(t->condExpr.get(), cslot, ops)) {
+            if (!compile_boxed_expr(t->condExpr.get(), cslot, ops,
+                                    /*allow_typed=*/true,
+                                    /*truthy_only=*/true)) {
                 ops.resize(mark); next_temp = save_top; return false;
             }
             CgInstr jf;
             jf.op = OpCode::JumpUnlessTrueV;
+            /* is_true CAN throw (a builtin/other value with no bool
+             * conversion), so record the CONDITION's caret - the if/loop sites
+             * already do; without it the throw had no caret at all. */
+            jf.node_idx = add_ast_node(t);   /* the whole ternary */
             jf.target2 = cslot;
             const size_t jf_i = ops.size();
             ops.push_back(jf);
@@ -1432,6 +2432,7 @@ struct Codegen {
             next_temp = scratch;
 
             ops[jmp_i].target = static_cast<int>(ops.size());   /* merge */
+            emit_select_widen(t, dst, ops);
             out_slot = dst;
             return true;
         }
@@ -1442,7 +2443,7 @@ struct Codegen {
          * rhs never evaluated); else the rhs lands in `dst`. `dst` is
          * reserved below both sides' scratch, like the ternary.
          * JumpIfNotNoneV is a pure none test - no node, no loc. */
-        if (const CoalesceExpr *co = dynamic_cast<const CoalesceExpr *>(e)) {
+        if (const CoalesceExpr *co = node_cast<const CoalesceExpr>(e)) {
             const size_t mark = ops.size();
             const int save_top = next_temp;
             const int dst = alloc_temp();
@@ -1472,6 +2473,7 @@ struct Codegen {
             next_temp = scratch;
 
             ops[jn_i].target = static_cast<int>(ops.size());   /* merge */
+            emit_select_widen(co, dst, ops);
             out_slot = dst;
             return true;
         }
@@ -1481,34 +2483,35 @@ struct Codegen {
          * STATEMENT dispatch (int/float/boxed - the same three tiers
          * gen_stmt uses), then the expression's value is the target's stored
          * value: Expr14::do_eval returns the (coerced) rval, and after the
-         * store a LOCAL target's slot holds exactly that - the same handle
-         * for a container, so aliasing (`a = (b = [1,2])`, same intptr) is
-         * identical. Only a resolved-LOCAL identifier target; a global/
-         * capture/IdList target declines (the readback would need an extra
-         * load - rare shapes). */
-        if (const Expr14 *e14 = dynamic_cast<const Expr14 *>(e)) {
+         * store the variable holds exactly that - the same handle for a
+         * container, so aliasing (`a = (b = [1,2])`, same intptr) is
+         * identical. A local is its slot; a global or capture is read back
+         * (2026-10-05: those, an element / field target - try_value_store -
+         * and a const or builtin target, whose statement store throws, were
+         * a NotLoweredEx compile refusal until then, while the tree-walker
+         * ran them). A multi-assignment (an IdList target) has no value:
+         * the parser refuses one in a value position (question 11), so
+         * it never reaches here - and would decline below. */
+        if (const Expr14 *e14 = node_cast<const Expr14>(e)) {
+            if (e14->lvalue->is_subscript()
+                    || ctag(e14->lvalue.get()) == ConstructType::member)
+                return try_value_store(e14, out_slot, ops);
             const Identifier *lv =
-                dynamic_cast<const Identifier *>(e14->lvalue.get());
-            if (!lv || lv->sym.kind != SymKind::local || lv->is_const)
+                node_cast<const Identifier>(e14->lvalue.get());
+            if (!lv)
                 return false;
             const size_t mark = ops.size();
             const int save_top = next_temp;
-            if (compile_int_stmt(e14, ops)) {
-                out_slot = lv->sym.slot;
-                return true;
-            }
+            if (compile_int_stmt(e14, ops))
+                return compile_boxed_expr(lv, out_slot, ops);
             ops.resize(mark);
             next_temp = save_top;
-            if (compile_float_stmt(e14, ops)) {
-                out_slot = lv->sym.slot;
-                return true;
-            }
+            if (compile_float_stmt(e14, ops))
+                return compile_boxed_expr(lv, out_slot, ops);
             ops.resize(mark);
             next_temp = save_top;
-            if (compile_boxed_stmt(e14, ops)) {
-                out_slot = lv->sym.slot;
-                return true;
-            }
+            if (compile_boxed_stmt(e14, ops))
+                return compile_boxed_expr(lv, out_slot, ops);
             ops.resize(mark);
             next_temp = save_top;
             return false;
@@ -1519,13 +2522,24 @@ struct Codegen {
          * to a logical even when the comparisons are boxed over a dyn operand,
          * so both forms reach here. emit_boxed_chain handles both. */
         if (const TypedScalarExpr *t =
-                dynamic_cast<const TypedScalarExpr *>(e)) {
+                node_cast<const TypedScalarExpr>(e)) {
             /* A typed `!x` (Cat::lnot) as a VALUE boxes a real BOOL - the
              * boxed UnaryV (its !is_true == the typed eval's `!= 0` boxing).
              * Was undetected while expr-bodied functions had no chunks
              * (`func neg(bool b) => !b` never compiled); the no-fail contract
-             * flushed it out. */
-            if (t->cat == TypedScalarExpr::Cat::lnot && t->elems.size() == 1) {
+             * flushed it out.
+             * A typed `-x` (Cat::neg) whose operand the unboxed path
+             * declines - a GLOBAL (no typed leaf, unlike a capture or a
+             * call), or anything containing one - is the same boxed UnaryV:
+             * it negates by the value's own type (TypeFloat::opneg gives
+             * -0.0 for 0.0, TypeInt::opneg wraps INT_MIN), exactly what the
+             * typed `-0.0 - x` / `0 - x` compute. Until 2026-10-05 this
+             * returned false, so `func f() { return -g; }` with a global
+             * `g` was a NotLoweredEx compile refusal while the tree-walker
+             * printed the answer (RULE 2). */
+            if ((t->cat == TypedScalarExpr::Cat::lnot
+                    || t->cat == TypedScalarExpr::Cat::neg)
+                    && t->elems.size() == 1) {
                 int oslot;
                 if (!compile_boxed_expr(t->elems[0].second.get(), oslot, ops))
                     return false;
@@ -1535,7 +2549,8 @@ struct Codegen {
                 in.node_idx = add_ast_node(e);
                 in.target = dst;
                 in.set_a(slot_op(oslot));
-                in.aop = Op::lnot;
+                in.aop = t->cat == TypedScalarExpr::Cat::lnot ? Op::lnot
+                                                              : Op::minus;
                 ops.push_back(in);
                 out_slot = dst;
                 return true;
@@ -1544,6 +2559,11 @@ struct Codegen {
                          : t->cat == TypedScalarExpr::Cat::cmp     ? 'c'
                          : t->cat == TypedScalarExpr::Cat::logical ? 'l'
                                                                    : 0;
+            /* A typed int/float comparison AS A VALUE -> native CmpIntV/
+             * CmpFloatV (bool result, no box); falls through to the boxed CmpV
+             * for a dyn/string operand or a >2-operand chain. */
+            if (k == 'c' && try_native_cmp_value(e, out_slot, ops))
+                return true;
             return k && emit_boxed_chain(t->elems, k, e, out_slot, ops);
         }
         char k = 0;
@@ -1551,23 +2571,28 @@ struct Codegen {
          * (a typed int/float unary is the M8 path at the top). Expr02 is a
          * MultiOpConstruct with a single (op, operand): op==invalid is just the
          * operand (compile it), else the unary op. */
-        if (const Expr02 *u = dynamic_cast<const Expr02 *>(e)) {
-            if (u->elems.size() != 1)
-                return false;
+        if (const Expr02 *u = node_cast<const Expr02>(e)) {
+            /* the parser builds an Expr02 only for a written unary
+             * operator, one operand each */
+            ML_CHECK(u->elems.size() == 1);
             const Op op = u->elems[0].first;
             const Construct *operand = u->elems[0].second.get();
-            if (op == Op::invalid)
-                return compile_boxed_expr(operand, out_slot, ops);
-            if (op != Op::lnot && op != Op::minus && op != Op::bnot
-                && op != Op::plus)
-                return false;
+            ML_CHECK(op == Op::lnot || op == Op::minus || op == Op::bnot
+                     || op == Op::plus);
             int oslot;
             if (!compile_boxed_expr(operand, oslot, ops))
                 return false;
             const int t = alloc_temp();
             CgInstr in;
             in.op = OpCode::UnaryV;
-            in.node_idx = add_ast_node(e);   /* loc for a `-str`/`~str` error */
+            /* loc for a `-str`/`~str` error: the OPERAND, as the
+             * tree-walker's stamp_operand_loc and every binary op mark
+             * the operand whose type lacks the operator (it marked the
+             * whole `~d` until 2026-11-07, RULE 2); its chain the unary
+             * node's (#68: an inlined call as the operand lent the op its
+             * body's) */
+            in.node_idx = add_ast_node(e);
+            in.loc_node_idx = add_ast_node(operand);
             in.target = t;
             in.set_a(slot_op(oslot));
             in.aop = op;
@@ -1576,17 +2601,17 @@ struct Codegen {
             return true;
         }
 
-        if (dynamic_cast<const Expr03 *>(e) || dynamic_cast<const Expr04 *>(e)
-            || dynamic_cast<const Expr05 *>(e)
-            || dynamic_cast<const Expr08 *>(e)
-            || dynamic_cast<const Expr09 *>(e)
-            || dynamic_cast<const Expr10 *>(e))
+        if (ctag(e) == ConstructType::expr03 || ctag(e) == ConstructType::expr04
+            || ctag(e) == ConstructType::expr05
+            || ctag(e) == ConstructType::expr08
+            || ctag(e) == ConstructType::expr09
+            || ctag(e) == ConstructType::expr10)
             k = 'a';
-        else if (dynamic_cast<const Expr06 *>(e)
-                 || dynamic_cast<const Expr07 *>(e))
+        else if (ctag(e) == ConstructType::expr06
+                 || ctag(e) == ConstructType::expr07)
             k = 'c';
-        else if (dynamic_cast<const Expr11 *>(e)
-                 || dynamic_cast<const Expr12 *>(e))
+        else if (ctag(e) == ConstructType::expr11
+                 || ctag(e) == ConstructType::expr12)
             k = 'l';
         else
             return false;
@@ -1604,6 +2629,101 @@ struct Codegen {
      * has no error path. Returns false if an op isn't of the kind or an operand
      * can't compile. Used for both the raw ExprNN and TypedScalarExpr forms.
      */
+    /*
+     * #138: `dst = bool(v)`, as a LogV against ITSELF - `v && v` IS `bool(v)`.
+     * Reusing the op keeps the truthiness rules, the throw for a value with no
+     * bool conversion, and that throw's caret in ONE place instead of a second
+     * spelling that could drift. `is_true` is side-effect-free, so reading the
+     * operand twice costs a slot read.
+     */
+    void emit_to_bool(int dst, const Operand &v, const Construct *node,
+                      std::vector<CgInstr> &ops)
+    {
+        CgInstr in;
+        in.op = OpCode::LogV;
+        in.node_idx = add_ast_node(node);
+        in.target = dst;
+        in.set_a(v);
+        in.set_b(v);
+        in.aop = Op::land;
+        ops.push_back(in);
+    }
+
+    /*
+     * #138: a LOGICAL chain SHORT-CIRCUITS, so unlike an arith or compare
+     * chain it is NOT a straight run of ops - the operand that determines the
+     * result must jump over everything after it.
+     *
+     *     a && b     ->   dst = bool(a)
+     *                     JumpUnlessTrueV dst -> END     ; dst is already false
+     *                     dst = bool(b)
+     *                 END:
+     *
+     *     a || b     ->   dst = bool(a)
+     *                     JumpUnlessTrueV dst -> L       ; false: evaluate b
+     *                     Jump END                       ; true: dst is it
+     *                 L:  dst = bool(b)
+     *                 END:
+     *
+     * The `||` form needs the extra Jump because JumpUnlessTrueV is the only
+     * truthiness branch there is; `&&` gets the direct form because a false
+     * accumulator IS the answer, so the branch target needs no fixup work.
+     *
+     * EVERY path writes the SAME dst - the whole point of allocating it up
+     * front rather than a temp per step, since the ops after a branch may not
+     * run. Forward jumps are patched into `ops` before returning: `ops` is
+     * always the codegen's own `code` vector (every parameter is a reference
+     * to it), so an index recorded here stays valid.
+     *
+     * A mid-chain operand failure leaves the partial emission for the caller
+     * to roll back with `ops.resize(mark)` - the same contract the eager form
+     * had.
+     */
+    bool emit_logical_chain(
+        const std::vector<std::pair<Op, unique_ptr<Construct>>> &elems,
+        const Construct *node, int &out_slot, std::vector<CgInstr> &ops)
+    {
+        const int dst = alloc_temp();
+        std::vector<size_t> done_jumps;      /* all -> the shared exit */
+
+        Operand acc_op;
+        if (!boxed_operand(elems[0].second.get(), acc_op, ops))
+            return false;
+        emit_to_bool(dst, acc_op, node, ops);
+
+        for (size_t i = 1; i < elems.size(); i++) {
+
+            CgInstr j;
+            j.op = OpCode::JumpUnlessTrueV;
+            j.node_idx = add_ast_node(node);
+            j.target2 = dst;
+
+            if (elems[i].first == Op::land) {
+                done_jumps.push_back(ops.size());
+                ops.push_back(j);
+            } else {
+                const size_t to_rhs = ops.size();
+                ops.push_back(j);
+                CgInstr g;
+                g.op = OpCode::Jump;
+                done_jumps.push_back(ops.size());
+                ops.push_back(g);
+                ops[to_rhs].target = static_cast<int>(ops.size());
+            }
+
+            Operand rhs_op;
+            if (!boxed_operand(elems[i].second.get(), rhs_op, ops))
+                return false;
+            emit_to_bool(dst, rhs_op, node, ops);
+        }
+
+        for (size_t j : done_jumps)
+            ops[j].target = static_cast<int>(ops.size());
+
+        out_slot = dst;
+        return true;
+    }
+
     bool emit_boxed_chain(
         const std::vector<std::pair<Op, unique_ptr<Construct>>> &elems,
         char k, const Construct *node, int &out_slot, std::vector<CgInstr> &ops)
@@ -1618,6 +2738,8 @@ struct Codegen {
             if (!ok)
                 return false;
         }
+        if (k == 'l')                       /* #138: it branches - see above */
+            return emit_logical_chain(elems, node, out_slot, ops);
         Operand acc_op;
         if (!boxed_operand(elems[0].second.get(), acc_op, ops))
             return false;
@@ -1630,7 +2752,13 @@ struct Codegen {
             in.op = k == 'a' ? OpCode::BinOpV
                   : k == 'c' ? OpCode::CmpV
                              : OpCode::LogV;
-            in.node_idx = add_ast_node(k == 'l' ? node : elems[i].second.get());
+            /* the operand carets the op (the boxed ladder's operand-
+             * precise convention); the CHAIN node gives it its inlined-at
+             * chain - #68: an inlined call as the operand lent the op its
+             * body's chain (an extra frame) and its body's span. Both
+             * callers pass the chain node; a logical chain returned above */
+            in.node_idx = add_ast_node(node);
+            in.loc_node_idx = add_ast_node(elems[i].second.get());
             in.target = t;
             in.set_a(acc_op);
             in.set_b(rhs_op);
@@ -1639,6 +2767,15 @@ struct Codegen {
             acc_op = slot_op(t);   /* the result temp feeds the next op */
         }
         out_slot = acc_op.slot;
+        /* Q2: an array sum takes its static type (Construct::ctype; the
+         * BinOpV's copy starts untyped, ctype_sum_copy) */
+        if (k == 'a' && node->ctype) {
+            CgInstr st;
+            st.op = OpCode::StampTypeV;
+            st.set_a(slot_op(out_slot));
+            st.target2 = static_cast<int>(ctype_pool_ref(node->ctype));
+            ops.push_back(st);
+        }
         return true;
     }
 
@@ -1651,15 +2788,18 @@ struct Codegen {
     bool boxed_operand(const Construct *e, Operand &out,
                        std::vector<CgInstr> &ops)
     {
-        if (auto *li = dynamic_cast<const LiteralInt *>(e)) {
+        if (ctag(e) == ConstructType::lit_int) {
+            auto *li = static_cast<const LiteralInt *>(e);
             out = int_lit(li->ival());
             return true;
         }
-        if (auto *lf = dynamic_cast<const LiteralFloat *>(e)) {
+        if (ctag(e) == ConstructType::lit_float) {
+            auto *lf = static_cast<const LiteralFloat *>(e);
             out = float_lit(lf->fval());
             return true;
         }
-        if (auto *lb = dynamic_cast<const LiteralBool *>(e)) {
+        if (ctag(e) == ConstructType::lit_bool) {
+            auto *lb = static_cast<const LiteralBool *>(e);
             out = bool_lit(lb->bval());
             return true;
         }
@@ -1702,15 +2842,14 @@ struct Codegen {
                                  std::vector<CgInstr> &ops)
     {
         const LiteralArray *la =
-            dynamic_cast<const LiteralArray *>(e->rvalue.get());
-        if (!la)
+            node_cast<const LiteralArray>(e->rvalue.get());
+        if (!la || !il->fits.empty())   /* a checked target (#49) */
             return false;
         const int n = static_cast<int>(il->elems.size());
         if (n == 0 || static_cast<int>(la->elems.size()) != n)
             return false;
         for (const auto &t : il->elems) {
             if (t->is_underscore() || t->sym.kind != SymKind::local
-                || t->is_const
                 || (t->decl_type != DeclType::none
                     && t->decl_type != DeclType::dyn))
                 return false;
@@ -1759,14 +2898,13 @@ struct Codegen {
         const Construct *rv = e->rvalue.get();
         const bool scalar = rv->th == TypeHint::i || rv->th == TypeHint::f
                             || dynamic_cast<const Literal *>(rv);
-        if (!scalar)
+        if (!scalar || !il->fits.empty())   /* a checked target (#49) */
             return false;
         const int n = static_cast<int>(il->elems.size());
         if (n == 0)
             return false;
         for (const auto &t : il->elems) {
             if (t->is_underscore() || t->sym.kind != SymKind::local
-                || t->is_const
                 || (t->decl_type != DeclType::none
                     && t->decl_type != DeclType::dyn))
                 return false;
@@ -1802,6 +2940,214 @@ struct Codegen {
      * STRICT destructure (array -> length-checked distribute; else spread).
      * Every target must be a real or `_` slot, resolved-local, non-const,
      * non-typed (or dyn) - a typed/const/map target falls back. */
+    /*
+     * THE LOWERED STRICT UNPACK of the proven array in `arr` into
+     * `targets` (-1 = a `_`, which reads nothing) - shared by the
+     * multi-assign and the foreach unpack:
+     *
+     *     UnpackLenCheck f = len(arr) == N, flat kind?  (raises)
+     *     if (f != 1) goto boxed;
+     *     t0 = arr[0] ... (LoadElemInt/Float)  goto done;
+     *   boxed:
+     *     t0 = arr[0] ... (LoadElemValue: the ACTUAL element)
+     *   done:
+     *
+     * An untyped element (th none) needs no flag: LoadElemValue alone.
+     * The typed reads are taken only when the storage IS the proven flat
+     * kind, because a mixed literal built in an unhinted position (an
+     * append argument) can put an int in an array<float> - a typed read
+     * of it raises, where the ops this replaces bound the int.
+     */
+    void emit_lowered_unpack(const Construct *node, int arr,
+                             const std::vector<int32_t> &targets,
+                             TypeHint th, bool foreach,
+                             std::vector<CgInstr> &ops)
+    {
+        const int n = static_cast<int>(targets.size());
+        const bool typed = th == TypeHint::i || th == TypeHint::f;
+        const int nn = add_ast_node(node);
+        const int flag = typed ? alloc_temp() : -1;
+        CgInstr ck;
+        ck.op = OpCode::UnpackLenCheck;
+        ck.node_idx = nn;
+        ck.target = flag;
+        ck.target2 = arr;
+        ck.set_a(int_lit(n));
+        ck.set_b(int_lit((foreach ? 1 : 0)
+                         | (th == TypeHint::i ? 2 : 0)
+                         | (th == TypeHint::f ? 4 : 0)));
+        ops.push_back(ck);
+        const auto loads = [&](OpCode op) {
+            for (int k = 0; k < n; k++) {
+                if (targets[static_cast<size_t>(k)] < 0)
+                    continue;
+                CgInstr ld;
+                ld.op = op;
+                ld.node_idx = nn;
+                ld.target = targets[static_cast<size_t>(k)];
+                ld.target2 = arr;
+                ld.set_a(int_lit(k));
+                ops.push_back(ld);
+            }
+        };
+        if (!typed) {
+            loads(OpCode::LoadElemValue);
+            return;
+        }
+        CgInstr br;
+        br.op = OpCode::JumpUnlessIntCmp;
+        br.aop = Op::eq;
+        br.set_a(slot_op(flag));
+        br.set_b(int_lit(1));
+        const size_t j_boxed = ops.size();
+        ops.push_back(br);
+        loads(th == TypeHint::i ? OpCode::LoadElemInt
+                                : OpCode::LoadElemFloat);
+        CgInstr j;
+        j.op = OpCode::Jump;
+        const size_t j_done = ops.size();
+        ops.push_back(j);
+        ops[j_boxed].target = static_cast<int>(ops.size());
+        loads(OpCode::LoadElemValue);
+        ops[j_done].target = static_cast<int>(ops.size());
+    }
+
+    /* A container literal's element WIDENING (LiteralArray::elem_coerce,
+     * LiteralDict::val_coerce) - the tree-walker's literal_elem_widen: a
+     * CoerceNumV IN PLACE on the element's run slot (a temp this literal
+     * owns), skipped where the element is already of the literal's kind.
+     * CoerceNumV widens int/bool -> float and bool -> int and passes
+     * `none`; a non-numeric value - only a `dyn` element of a literal
+     * built for a typed place can be one (rule 1) - is refused there,
+     * while the literal is built. */
+    void emit_literal_widen(const Construct *elem, DeclType dt, int slot,
+                            const Construct *lit, std::vector<CgInstr> &ops)
+    {
+        if (dt != DeclType::i && dt != DeclType::f)
+            return;
+        if (dt == DeclType::f && elem->th == TypeHint::f)
+            return;
+        if (dt == DeclType::i && elem->th == TypeHint::i && !elem->th_bool)
+            return;
+        CgInstr co;
+        co.op = OpCode::CoerceNumV;
+        co.node_idx = add_ast_node(lit);
+        co.target = slot;
+        co.target2 = dt == DeclType::f ? 1 : 0;
+        co.set_a(slot_op(slot));
+        ops.push_back(co);
+    }
+
+    /* A value-selecting expression (a ternary, `??`) whose arms join to a
+     * numeric type widens the arm it picked - the tree-walker's
+     * select_widen (task #75): a CoerceNumV IN PLACE on the merge temp,
+     * after the join. */
+    void emit_select_widen(const Construct *sel, int dst,
+                           std::vector<CgInstr> &ops)
+    {
+        const bool f = sel->th == TypeHint::f;
+        const bool i = sel->th == TypeHint::i && !sel->th_bool;
+        if (!f && !i)
+            return;
+        CgInstr co;
+        co.op = OpCode::CoerceNumV;
+        co.node_idx = add_ast_node(sel);
+        co.target = dst;
+        co.target2 = f ? 1 : 0;
+        co.set_a(slot_op(dst));
+        ops.push_back(co);
+    }
+
+    /*
+     * A multi-assignment one of whose targets is not a plain local - a
+     * GLOBAL or a CAPTURE slot, or a const or builtin name whose store
+     * throws (an undeclared name is a compile error before codegen, and a
+     * const multi-declaration does not parse) - unpacks into TEMPS, the
+     * strict length check (or the spread of a non-array) first, and then
+     * stores each target in order, as handle_single_expr14 does for the
+     * tree-walker: a store that fails (a coercion, a const or builtin
+     * target) leaves the targets before it written. MultiUnpackV and the
+     * lowered unpack write frame slots only, which is why such a target
+     * declined until 2026-10-06: a NotLoweredEx in the VM while the
+     * tree-walker ran the statement.
+     */
+    void emit_multi_via_temps(const Expr14 *e, const IdList *il, int rslot,
+                              Op compound_op, std::vector<CgInstr> &ops)
+    {
+        std::vector<int32_t> temps;
+        temps.reserve(il->elems.size());
+        for (const auto &t : il->elems)
+            temps.push_back(t->is_underscore() ? -1 : alloc_temp());
+        if (e->unpack_rv_array) {
+            emit_lowered_unpack(e, rslot, temps, e->unpack_rv_th,
+                                /*foreach=*/false, ops);
+        } else {
+            CgInstr in;
+            in.op = OpCode::MultiUnpackV;
+            in.node_idx = add_ast_node(e);   /* the strict-length caret */
+            in.set_a(slot_op(rslot));
+            in.target = static_cast<int>(chunk.unpack_targets.size());
+            chunk.unpack_targets.push_back(temps);
+            ops.push_back(in);
+        }
+        for (size_t i = 0; i < temps.size(); i++) {
+            const int src = temps[i];
+            if (src < 0)
+                continue;                   /* `_` */
+            /* (a builtin or const target is a compile error, the
+             * resolver's check_rebind; a name the parser marked const and
+             * a parameter, capture or loop variable shadows is stored) */
+            const Identifier *t = il->elems[i].get();
+            /* a plain store into a typed int/float target coerces (a
+             * compound does not - handle_single_expr14) */
+            const bool coerce = compound_op == Op::invalid
+                                && (t->decl_type == DeclType::i
+                                    || t->decl_type == DeclType::f);
+            /* #49: what the target receives may misfit its declared type
+             * - checked before its store, the targets before it written */
+            emit_fit(il->fit_of(i), src, e->rvalue.get(), ops);
+            CgInstr st;
+            st.target = t->sym.slot;
+            if (t->sym.kind == SymKind::local) {
+                if (compound_op != Op::invalid) {
+                    st.op = OpCode::CompoundV;
+                    st.node_idx = add_ast_node(e);
+                    st.set_b(slot_op(src));
+                    st.aop = compound_op;
+                } else if (coerce) {
+                    st.op = OpCode::CoerceNumV;
+                    st.node_idx = add_ast_node(e);
+                    st.target2 = t->decl_type == DeclType::f ? 1 : 0;
+                    st.set_a(slot_op(src));
+                } else {
+                    st.op = OpCode::MoveV;
+                    st.target2 = src;
+                }
+                ops.push_back(st);
+                continue;
+            }
+            int v = src;
+            if (coerce) {
+                CgInstr co;
+                co.op = OpCode::CoerceNumV;
+                co.node_idx = add_ast_node(e);
+                co.target = alloc_temp();
+                co.target2 = t->decl_type == DeclType::f ? 1 : 0;
+                co.set_a(slot_op(src));
+                ops.push_back(co);
+                v = co.target;
+            }
+            st.op = t->sym.kind == SymKind::global ? OpCode::StoreGlobalV
+                                                   : OpCode::StoreCaptureV;
+            st.set_a(slot_op(v));
+            if (compound_op != Op::invalid) {
+                st.node_idx = add_ast_node(e);   /* the operation's caret */
+                st.aop = compound_op;
+            }
+            ops.push_back(st);
+        }
+    }
+
     bool try_multi_unpack(const Expr14 *e, const IdList *il,
                           std::vector<CgInstr> &ops,
                           Op compound_op = Op::invalid)
@@ -1810,11 +3156,16 @@ struct Codegen {
         if (n == 0)
             return false;
         bool any_coerce = false;
+        /* a target whose value is fit-checked (#49) stores through a temp
+         * too, so the check stands between the unpack and its store */
+        bool via_temps = !il->fits.empty();
         for (const auto &t : il->elems) {
             if (t->is_underscore())
                 continue;               /* `_` is a skipped slot */
-            if (t->sym.kind != SymKind::local || t->is_const)
-                return false;
+            if (t->sym.kind != SymKind::local) {
+                via_temps = true;           /* emit_multi_via_temps */
+                continue;
+            }
             /* A typed int/float target coerces per stored value on a PLAIN
              * assign (R5); every other declared type is a no-op coerce. A
              * COMPOUND doesn't coerce (op==assign only - measured), so its
@@ -1829,11 +3180,17 @@ struct Codegen {
         const size_t cmark = chunk.consts.size();
         const int save_top = next_temp;
         int rslot;
-        if (!compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+        if (!compile_rvalue(e, rslot, ops)) {
             ops.resize(omark);
             next_temp = save_top;
             chunk.consts.resize(cmark);
             return false;
+        }
+
+        if (via_temps) {
+            emit_multi_via_temps(e, il, rslot, compound_op, ops);
+            next_temp = save_top;
+            return true;
         }
 
         std::vector<int32_t> targets;
@@ -1841,6 +3198,36 @@ struct Codegen {
         for (const auto &t : il->elems)
             targets.push_back(t->is_underscore()
                                   ? -1 : static_cast<int32_t>(t->sym.slot));
+
+        /*
+         * A PROVEN-array rvalue (Expr14::unpack_rv_array): the strict
+         * unpack is a length test plus one element read per target -
+         *
+         *     UnpackLenCheck r, N     (the strict length error)
+         *     t0 = r[0]; t1 = r[1]; ...
+         *
+         * so the reads take the element tiers (unboxed for int/float) and
+         * the targets can be pinned, where MultiUnpackV went through a
+         * helper that boxed every element - and the check has an exact
+         * use/def row, where MultiUnpackV is a barrier that made every
+         * slot of the chunk reference-carrying. The length is checked
+         * BEFORE any target is written, as the op does, with the op's
+         * message and caret. Only a plain, non-coercing unpack whose
+         * targets do not include the rvalue's own slot (writing it
+         * would change what the next read sees).
+         */
+        bool lower = e->unpack_rv_array && compound_op == Op::invalid
+                     && !any_coerce;
+        for (int32_t t : targets)
+            if (t == rslot)
+                lower = false;
+        if (lower) {
+            emit_lowered_unpack(e, rslot, targets, e->unpack_rv_th,
+                                /*foreach=*/false, ops);
+            next_temp = save_top;
+            return true;
+        }
+
         CgInstr in;
         in.op = OpCode::MultiUnpackV;
         /* The strict-length caret matches the tree-walker: its IdList lvalue
@@ -1869,27 +3256,55 @@ struct Codegen {
         return true;
     }
 
-    bool compile_boxed_stmt(const Construct *s, std::vector<CgInstr> &ops)
+    bool compile_boxed_stmt_impl(const Construct *s,
+                                 std::vector<CgInstr> &ops)
     {
+        /* a store through a box (`*b = v`, `(*b)++`) */
+        if (ctag(s) == ConstructType::expr14
+                && ctag(static_cast<const Expr14 *>(s)->lvalue.get())
+                       == ConstructType::deref)
+            return compile_deref_store(static_cast<const Expr14 *>(s), ops,
+                                       nullptr);
+        if (ctag(s) == ConstructType::incdec
+                && ctag(static_cast<const IncDecExpr *>(s)->lvalue.get())
+                       == ConstructType::deref)
+            return compile_deref_incdec(static_cast<const IncDecExpr *>(s),
+                                        ops, nullptr);
+
         /* A global `g++`/`g--` or closure-capture `cap++`/`cap--` statement ->
          * a compound StoreGlobalV/StoreCaptureV (x += 1 / x -= 1). A LOCAL
          * inc-dec is handled earlier (compile_int/float_stmt); a subscript one
-         * in the store codegen; a global/capture id reaches here. A typed /
-         * const operand falls back. */
-        if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
+         * in the store codegen; a global/capture id reaches here. A typed
+         * operand with a numeric proof falls back. */
+        if (const IncDecExpr *inc = node_cast<const IncDecExpr>(s)) {
             const Identifier *id =
-                dynamic_cast<const Identifier *>(inc->lvalue.get());
-            if (id && !id->is_const
-                && (id->decl_type == DeclType::none
-                    || id->decl_type == DeclType::dyn)) {
+                node_cast<const Identifier>(inc->lvalue.get());
+            if (id) {
                 const bool numeric = inc->th == TypeHint::i
                                   || inc->th == TypeHint::f;
+                const bool untyped_decl = id->decl_type == DeclType::none
+                                       || id->decl_type == DeclType::dyn;
                 /* A PROVEN int/float global/capture -> StoreGlobalV/StoreCaptureV
                  * compound (`x += 1`; the operand is numeric so `+` == inc-dec).
                  * A proven int/float LOCAL was handled by compile_int/float_stmt
                  * (IntBin/FloatBin) before this. */
-                if (numeric && (id->sym.kind == SymKind::global
-                                || id->sym.kind == SymKind::capture)) {
+                if (numeric && untyped_decl
+                    && (id->sym.kind == SymKind::global
+                        || id->sym.kind == SymKind::capture)) {
+                    /* H1b: a PROVEN capture `cap++`/`cap--` recomposes
+                     * into read + IntBin + a plain (inline-emitted) store,
+                     * off the compound helper call. */
+                    const Op ibase = inc->is_inc ? Op::plus : Op::minus;
+                    if (typed_capture_update_ok(id, ibase)) {
+                        const bool flt = inc->th == TypeHint::f;
+                        Operand cur;
+                        if (try_capture_leaf(id, flt, cur, ops)) {
+                            emit_typed_capture_update(
+                                id, ibase, flt, cur,
+                                flt ? float_lit(1.0) : int_lit(1), ops);
+                            return true;
+                        }
+                    }
                     CgInstr in;
                     in.op = id->sym.kind == SymKind::global
                                 ? OpCode::StoreGlobalV : OpCode::StoreCaptureV;
@@ -1902,7 +3317,14 @@ struct Codegen {
                 }
                 /* A DYN/general scalar (local/global/capture) -> the int/float-
                  * CHECKED inc-dec: a compound `+= 1` would CONCAT a string, but
-                 * `d++` must THROW (inc-dec is int/float-only). */
+                 * `d++` must THROW (inc-dec is int/float-only). Whatever the
+                 * DECLARED type: with no numeric proof that is a variable
+                 * under -nti (`int n; n++`), which no other path lowered - a
+                 * NotLoweredEx compile refusal of a program the tree-walker
+                 * runs. A declared int/float variable holds its kind (every
+                 * store converts to it), and inc-dec keeps the kind, so the
+                 * value needs no conversion; any other declared type is the
+                 * TypeErrorEx this op raises. */
                 if (!numeric) {
                     int kind;
                     switch (id->sym.kind) {
@@ -1930,14 +3352,14 @@ struct Codegen {
              * walker's dyn path). Gating on `sub->th != i/f` is what excludes
              * the flat case (its element is proven numeric, handled earlier). */
             if (const Subscript *sub =
-                    dynamic_cast<const Subscript *>(inc->lvalue.get())) {
+                    node_cast<const Subscript>(inc->lvalue.get())) {
                 if (sub->th == TypeHint::i || sub->th == TypeHint::f)
                     return false;
                 int bslot, bkind;
                 if (!as_container_base(sub->what.get(), bslot, bkind))
                     return false;
                 int kslot;
-                if (!compile_boxed_expr(sub->index.get(), kslot, ops))
+                if (!compile_key(sub, kslot, ops))
                     return false;
                 CgInstr in;
                 in.op = OpCode::IncDecElemCheckedV;
@@ -1948,7 +3370,7 @@ struct Codegen {
                 in.target = bkind;               /* base kind: 0 loc/1 gbl/2 cap */
                 in.target2 = bslot;
                 in.set_a(slot_op(kslot));
-                in.set_b(int_lit(add_incdec_site(sub, inc)));   /* dual carets */
+                in.set_b(int_lit(add_incdec_site(sub, sub->what.get(), inc)));
                 in.aop = inc->is_inc ? Op::plus : Op::minus;
                 ops.push_back(in);
                 return true;
@@ -1961,7 +3383,7 @@ struct Codegen {
              * the tree-walker. Gated on `inc->th != i/f` (excludes the proven
              * numeric case), a slotted base, and a non-optional member. */
             if (const MemberExpr *m =
-                    dynamic_cast<const MemberExpr *>(inc->lvalue.get())) {
+                    node_cast<const MemberExpr>(inc->lvalue.get())) {
                 if (inc->th == TypeHint::i || inc->th == TypeHint::f
                         || m->optional)
                     return false;
@@ -1975,7 +3397,7 @@ struct Codegen {
                 in.node_idx = add_ast_node(m->what.get());
                 in.target = bkind;               /* base kind: 0 loc/1 gbl/2 cap */
                 in.target2 = bslot;
-                in.set_b(int_lit(add_incdec_site(m, inc, m)));  /* key + carets */
+                in.set_b(int_lit(add_incdec_site(m, m->what.get(), inc, m)));
                 in.aop = inc->is_inc ? Op::plus : Op::minus;
                 ops.push_back(in);
                 return true;
@@ -1983,7 +3405,7 @@ struct Codegen {
             return false;
         }
 
-        const Expr14 *e = dynamic_cast<const Expr14 *>(s);
+        const Expr14 *e = node_cast<const Expr14>(s);
         if (!e)
             return false;
         const bool is_assign = e->op == Op::assign;
@@ -1996,7 +3418,7 @@ struct Codegen {
          * SCALAR spreads to every target. A non-qualifying shape falls back. */
         if (is_assign) {
             if (const IdList *il =
-                    dynamic_cast<const IdList *>(e->lvalue.get())) {
+                    node_cast<const IdList>(e->lvalue.get())) {
                 if (try_multi_literal_store(e, il, ops))
                     return true;
                 if (try_multi_scalar_spread(e, il, ops))
@@ -2012,28 +3434,25 @@ struct Codegen {
          * base op. */
         if (!is_assign && cbase != Op::invalid) {
             if (const IdList *il =
-                    dynamic_cast<const IdList *>(e->lvalue.get()))
+                    node_cast<const IdList>(e->lvalue.get()))
                 return try_multi_unpack(e, il, ops, cbase);
         }
 
         /* An assignment whose TARGET is not an lvalue always throws (the tree-
          * walker evaluates the rhs first, then handle_single_expr14 rejects the
          * target): a scalar LITERAL target (`0 = 99`, `true = false`, or a
-         * const-inlined `K = 6`) -> NotLValueEx(lvalue loc); a BUILTIN-name
-         * target (`print = 5`) -> CannotRebindBuiltinEx(lvalue loc). Compile the
-         * rhs for its side effects (+ its own throw), THEN throw. Plain assign
-         * only; a compound rhs takes the compound store path. */
+         * const-inlined `K = 6`) -> NotLValueEx(lvalue loc). Compile the
+         * rhs for its side effects (+ its own throw), THEN throw. (A builtin
+         * or const name as the target is a compile error, the resolver's
+         * check_rebind.) */
         if (is_assign) {
             Chunk::ThrowKind tk = Chunk::ThrowKind::not_lvalue;
             const UniqueId *tname = nullptr;
             Loc tstart = e->lvalue->start, tend = e->lvalue->end;
             bool bad = dynamic_cast<const Literal *>(e->lvalue.get()) != nullptr;
             if (const Identifier *bl =
-                    dynamic_cast<const Identifier *>(e->lvalue.get())) {
-                if (bl->sym.kind == SymKind::builtin) {
-                    tk = Chunk::ThrowKind::rebind_builtin;
-                    bad = true;
-                } else if (bl->sym.kind == SymKind::unresolved) {
+                    node_cast<const Identifier>(e->lvalue.get())) {
+                if (bl->sym.kind == SymKind::unresolved) {
                     /* An assignment to an UNDECLARED name in a FUNCTION (a
                      * top-level one is an implicit-global DECL and never
                      * unresolved): the tree-walker evaluates the rhs FIRST
@@ -2052,7 +3471,7 @@ struct Codegen {
                 const size_t cm = chunk.consts.size();
                 const int st = next_temp;
                 int rslot;
-                if (compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+                if (compile_rvalue(e, rslot, ops)) {
                     emit_throw(tk, tstart, tend, tname, ops);
                     return true;
                 }
@@ -2064,7 +3483,7 @@ struct Codegen {
         }
 
         const Identifier *lv =
-            dynamic_cast<const Identifier *>(e->lvalue.get());
+            node_cast<const Identifier>(e->lvalue.get());
         if (!lv || (lv->sym.kind != SymKind::local
                     && lv->sym.kind != SymKind::global
                     && lv->sym.kind != SymKind::capture))
@@ -2096,7 +3515,7 @@ struct Codegen {
             const size_t cm = chunk.consts.size();
             const int st = next_temp;
             int rslot;
-            if (compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+            if (compile_rvalue(e, rslot, ops)) {
                 CgInstr in;
                 in.op = OpCode::DeclConstV;
                 in.target = lv->sym.slot;
@@ -2110,29 +3529,11 @@ struct Codegen {
             next_temp = st;
         }
 
-        /* A reassignment (plain OR compound) of a CONST runtime symbol (a
-         * func/array/dict kept in a slot; a const SCALAR is inlined + its
-         * reassign hits the bad-lvalue throw above) must throw
-         * CannotRebindConstEx. The tree-walker evaluates the RHS first, THEN
-         * throws, so compile the rhs (for its side effects + its own throw) and
-         * emit a native ThrowRuntimeV with the lvalue's caret - byte-identical.
-         * A `const` DECL (pInConstDecl) was already handled above (DeclConstV);
-         * this is only a REBIND. */
-        if (lv->is_const) {
-            const size_t om = ops.size();
-            const size_t cm = chunk.consts.size();
-            const int st = next_temp;
-            int rslot;
-            if (compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
-                emit_throw(Chunk::ThrowKind::rebind_const,
-                           e->lvalue->start, e->lvalue->end, nullptr, ops);
-                return true;
-            }
-            ops.resize(om);
-            chunk.consts.resize(cm);
-            next_temp = st;
-            return false;
-        }
+        /* (A reassignment of a CONST binding is a compile error, the
+         * resolver's check_rebind. `is_const` is the PARSER's mark - the
+         * name found in the const scope - which a parameter, a capture or
+         * a loop variable of the same name does not change, so it decides
+         * nothing about a store.) */
 
         const size_t omark = ops.size();
         const size_t cmark = chunk.consts.size();
@@ -2151,7 +3552,7 @@ struct Codegen {
                                         : OpCode::StoreCaptureV;
             if (is_assign) {
                 int rslot;
-                if (!compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+                if (!compile_rvalue(e, rslot, ops)) {
                     ops.resize(omark);
                     chunk.consts.resize(cmark);
                     return false;
@@ -2176,6 +3577,28 @@ struct Codegen {
                 in.set_a(slot_op(rslot));      /* aop invalid == plain assign */
                 ops.push_back(in);
                 return true;
+            }
+            /* H1b: a PROVEN int/float capture `cap OP= rhs` recomposes
+             * into read + IntBin/FloatBin + a plain store. The rhs must
+             * compile in the CAPTURE's OWN type - a float rhs into an
+             * int capture declines here and keeps the boxed compound,
+             * whose num_bin_op promotion is what that case needs. */
+            if (typed_capture_update_ok(lv, cbase)
+                    && (lv->th == TypeHint::i || lv->th == TypeHint::f)) {
+                const bool flt = lv->th == TypeHint::f;
+                const size_t tmark = ops.size();
+                const size_t tcmark = chunk.consts.size();
+                const int tsave = next_temp;
+                Operand cur, r;
+                if (try_capture_leaf(lv, flt, cur, ops)
+                        && (flt ? compile_float_expr(e->rvalue.get(), r, ops)
+                                : compile_int_expr(e->rvalue.get(), r, ops))) {
+                    emit_typed_capture_update(lv, cbase, flt, cur, r, ops);
+                    return true;
+                }
+                ops.resize(tmark);
+                chunk.consts.resize(tcmark);
+                next_temp = tsave;
             }
             /* Compound `x OP= rhs`: the rhs is a boxed operand (immediate or a
              * slot, like the local CompoundV); a complex rhs falls back. */
@@ -2216,7 +3639,7 @@ struct Codegen {
 
         /* Plain assign: compile the rvalue, then retarget/move it. */
         int rslot;
-        if (!compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+        if (!compile_rvalue(e, rslot, ops)) {
             ops.resize(omark);
             chunk.consts.resize(cmark);
             return false;
@@ -2287,12 +3710,64 @@ struct Codegen {
      * both indices native. READ path only - a 2-D WRITE via a temp would COW
      * the temp and never write back, so store codegen keeps as_array_slot.
      */
+    /*
+     * The NESTED-READ FUSION (plans/archived/unboxing.md option A): lower a scalar
+     * `base[i][j]` to ONE LoadElem2Int/Float instead of the
+     * `LoadElemValue t = base[i]` + `LoadElem*(t[j])` pair, so the row is
+     * BORROWED at run time rather than materialised into a temp slot.
+     *
+     * `sub` is the OUTER subscript (the scalar read); its base must itself
+     * be a proven-array subscript. A deeper chain `a[i][j][k]` still fuses
+     * its last TWO levels - compile_array_base materialises `a[i]` as
+     * before and the fused op reads `[j][k]` off it.
+     *
+     * Declines (each leaves the byte-identical unfused pair): a LITERAL
+     * outer index, which cannot ride the `a` dual the chain_locs index
+     * spends; an index neither level can compile as an int; a non-array
+     * level (a dict, a `dyn`).
+     */
+    bool try_load_elem2(const Subscript *sub, TypeHint th, int &out_slot,
+                        std::vector<CgInstr> &ops)
+    {
+        const Subscript *outer =
+            node_cast<const Subscript>(sub->what.get());
+        if (!outer || !outer->base_array)
+            return false;
+        const size_t nops = ops.size();
+        const int save_temp = next_temp;
+        int bslot;
+        Operand oidx, iidx;
+        if (!compile_array_base(outer->what.get(), bslot, ops)
+            || !compile_int_expr(outer->index.get(), oidx, ops)
+            || oidx.is_lit
+            || !compile_int_expr(sub->index.get(), iidx, ops)) {
+            ops.resize(nops);
+            next_temp = save_temp;
+            return false;
+        }
+        const int tt = alloc_temp();
+        CgInstr in;
+        in.op = th == TypeHint::i ? OpCode::LoadElem2Int
+                                  : OpCode::LoadElem2Float;
+        in.node_idx = add_ast_node(sub);
+        in.target = tt;
+        in.target2 = bslot;
+        /* DUAL: lo = the outer index slot, hi = the chain_locs idx - the
+         * per-level carets (outer = the `base[i]` span, inner = the whole
+         * `base[i][j]` span), exactly the store side's convention. */
+        in.set_a_dual(oidx.slot, add_chain_locs({ outer, sub }));
+        in.set_b(iidx);
+        ops.push_back(in);
+        out_slot = tt;
+        return true;
+    }
+
     bool compile_array_base(const Construct *e, int &out_slot,
                             std::vector<CgInstr> &ops)
     {
         if (as_array_slot(e, out_slot))
             return true;
-        const Subscript *sub = dynamic_cast<const Subscript *>(e);
+        const Subscript *sub = node_cast<const Subscript>(e);
         if (!sub || !sub->base_array)
             return false;
         int inner;
@@ -2335,12 +3810,34 @@ struct Codegen {
                              std::vector<CgInstr> &ops)
     {
         const int sub = next_temp;
+        const size_t start = ops.size();
         int out;
         if (!compile_boxed_expr(e, out, ops))
             return false;
+        /*
+         * ⛔ The retarget below rewrites the LAST producer on the premise
+         * that it is the value's ONLY one. A JOIN breaks that: when some
+         * branch of this element's code lands PAST the last op, another
+         * arm wrote `out` and skips the rewritten producer. The TYPED
+         * ternary ends its else arm on a LoadImm - a whitelisted op - so
+         * `g(1, i == 2 ? int(runtime(-5)) : 1)` staged the literal arm
+         * into the argument slot while the other arm kept writing the
+         * dead temp: the call saw the literal on BOTH paths (a wrong
+         * answer in the default engine; the tree-walker said -6, the VM
+         * 12). Table-free on purpose: the whitelist is an OPCODE fact,
+         * this is a CONTROL-FLOW one, and asking the code itself cannot
+         * go stale the way the MoveV / LogV exclusions each had to be
+         * learned (op_writes_pure_target's note).
+         */
+        bool joins = false;
+        for (size_t k = start; k < ops.size() && !joins; k++)
+            visit_pc_fields(ops[k], [&](int &t) {
+                if (t >= 0 && static_cast<size_t>(t) >= ops.size())
+                    joins = true;
+            });
         if (out == dst) {
             /* already in place */
-        } else if (out >= temp_base && !ops.empty()
+        } else if (!joins && out >= temp_base && !ops.empty()
                    && ops.back().target == out
                    && op_writes_pure_target(ops.back().op)) {
             ops.back().target = dst;
@@ -2355,8 +3852,32 @@ struct Codegen {
         return true;
     }
 
+    /* An in-place builtin's argument `i` of `al`, compiled into its run
+     * slot and widened as it will be stored (ExprList::arg_widen) */
+    bool compile_builtin_arg(const ExprList *al, size_t i, int slot,
+                             std::vector<CgInstr> &ops)
+    {
+        if (!compile_to_run_slot(al->elems[i].get(), slot, ops))
+            return false;
+        const DeclType w = al->widen_of(i);
+        if (w == DeclType::i || w == DeclType::f) {
+            CgInstr co;             /* the run slot is this argument's own */
+            co.op = OpCode::CoerceNumV;
+            co.node_idx = add_ast_node(al->elems[i].get());
+            co.target = slot;
+            co.target2 = w == DeclType::f ? 1 : 0;
+            co.set_a(slot_op(slot));
+            ops.push_back(co);
+        }
+        emit_fit(i < al->arg_fit.size() ? al->arg_fit[i] : nullptr, slot,
+                 al->elems[i].get(), ops);
+        return true;
+    }
+
+    /* `wl`: the builtin call's argument list, whose arg_widen applies */
     bool emit_args_range(const std::vector<unique_ptr<Construct>> &elems,
-                         int &argbase, std::vector<CgInstr> &ops, int start = 0)
+                         int &argbase, std::vector<CgInstr> &ops, int start = 0,
+                         const ExprList *wl = nullptr)
     {
         const size_t mark = ops.size();
         const int save_top = next_temp;
@@ -2368,8 +3889,11 @@ struct Codegen {
             max_temp = next_temp;
 
         for (int i = 0; i < n; i++) {
-            if (!compile_to_run_slot(elems[start + i].get(),
-                                     argbase + i, ops)) {
+            const bool ok = wl
+                ? compile_builtin_arg(wl, start + i, argbase + i, ops)
+                : compile_to_run_slot(elems[start + i].get(), argbase + i,
+                                      ops);
+            if (!ok) {
                 ops.resize(mark);
                 next_temp = save_top;
                 return false;
@@ -2378,15 +3902,72 @@ struct Codegen {
         return true;
     }
 
+    /*
+     * RULE 1: a call whose arguments may bind none to a non-opt parameter
+     * (CallExpr::none_arg_mask), or may misfit a typed one (#49,
+     * CallExpr::fit_args), gets a CheckNoneArgsV between its argument
+     * run and the call op - every argument evaluated, no frame yet, which
+     * is where a bind refuses. `kind` 0 = the callee value is in frame slot
+     * `callee` (a CallValueV), 1 = global slot `callee` (a CallV). Its
+     * carets are the call's: the argument list (base_locs) and each
+     * argument's span (arg_locs, read off the same node in extract_locs).
+     */
+    void emit_none_args_check(const CallExpr *call, int kind, int callee,
+                              int argbase, std::vector<CgInstr> &ops)
+    {
+        if (!call->check_args())
+            return;
+        CgInstr chk;
+        chk.op = OpCode::CheckNoneArgsV;
+        chk.node_idx = add_ast_node(call);
+        chk.base_node_idx = add_ast_node(call->args.get());
+        chk.target = kind;
+        chk.target2 = callee;
+        chk.set_a(int_lit(argbase));
+        chk.set_b(int_lit(static_cast<int>(call->args->elems.size())));
+        ops.push_back(chk);
+    }
+
+    /* A redirected lambda-template call reads its GLOBAL variable first
+     * (Identifier::bind_guard): a LoadGlobalV, whose unbound-name raise
+     * names the variable at the callee's caret, before the arguments -
+     * the order of the call through the variable. It is the read of a
+     * name, which always lowers (a name the resolver left unresolved -
+     * no script's live code holds one - lowers to the throw the
+     * tree-walker's read of it raises). */
+    void emit_bind_guard(const Construct *what, std::vector<CgInstr> &ops)
+    {
+        if (ctag(what) != ConstructType::id)
+            return;
+        const Identifier *g =
+            static_cast<const Identifier *>(what)->live_guard();
+        if (!g)
+            return;
+        int t;
+        const bool ok = compile_boxed_expr(g, t, ops);
+        ML_CHECK(ok);
+        (void)ok;
+    }
+
     bool try_native_call(const DirectCallExpr *dc, int &out_slot,
                          std::vector<CgInstr> &ops)
     {
         if (!dc->vm_direct_func || dc->direct_func_slot < 0 || !dc->args)
             return false;
 
+        const size_t mark = ops.size();
+        const int save_top = next_temp;
+        emit_bind_guard(dc->what.get(), ops);
+
         int argbase;
-        if (!emit_args_range(dc->args->elems, argbase, ops))
+        if (!emit_args_range(dc->args->elems, argbase, ops)) {
+            /* a decline leaves nothing behind: the guard's read goes
+             * too (emit_args_range undid only its own ops) */
+            ops.resize(mark);
+            next_temp = save_top;
             return false;
+        }
+        emit_none_args_check(dc, 1, dc->direct_func_slot, argbase, ops);
 
         const int dst = alloc_temp();
         CgInstr cv;
@@ -2395,10 +3976,34 @@ struct Codegen {
         cv.op = dynamic_cast<const CachedCallExpr *>(dc)
                     ? OpCode::CachedCallV : OpCode::CallV;
         cv.node_idx = add_ast_node(dc);
+        /* the ARGUMENT LIST's span, the op's second caret (base_locs): a
+         * loc-less error escaping the call's setup - an arity or a bind
+         * coercion throw - is what the tree-walker carets there
+         * (CallExpr::do_eval's catch), where `locs` holds the whole call
+         * for the callee-side errors */
+        cv.base_node_idx = add_ast_node(dc->args.get());
         cv.target = dst;
         cv.target2 = dc->direct_func_slot;
         cv.set_a(int_lit(argbase));
         cv.set_b(int_lit(static_cast<int>(dc->args->elems.size())));
+        /*
+         * #120: annotate_hints stamped `th` on this CallExpr from
+         * `type_of(call)` - which IS the callee's return type - and only
+         * for a settled, concrete, non-opt scalar. Carry that proof to
+         * compute_ref_slots, which otherwise must assume a call returns
+         * a reference. Set AFTER set_a/set_b: they mask only their own
+         * operand bits (0x07 / 0x38) and leave 0x80 alone, but the order
+         * says so without the reader having to check.
+         *
+         * SIBLING, NOT DONE: `CallBuiltinV` (built a few hundred lines
+         * below with an otherwise identical operand setup) has the same
+         * question and the same answer available - `len(a)` is an int by
+         * construction. Left alone here because a builtin's dst is
+         * usually consumed immediately and the reach is unmeasured.
+         */
+        if (dc->th == TypeHint::i || dc->th == TypeHint::f)
+            cv.set_ret_scalar();
+        cv.arg_kinds = proven_arg_kinds(dc->args.get());
         ops.push_back(cv);
         out_slot = dst;
         return true;
@@ -2423,7 +4028,7 @@ struct Codegen {
     bool compile_indirect_arg0(const Construct *e, int dst,
                                Chunk::CallSite &cs, std::vector<CgInstr> &ops)
     {
-        if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+        if (const Identifier *id = node_cast<const Identifier>(e)) {
             switch (id->sym.kind) {
             case SymKind::local:   cs.a0_kind = 0; break;
             case SymKind::global:  cs.a0_kind = 1; break;
@@ -2439,14 +4044,14 @@ struct Codegen {
             cs.a0_slot = id->sym.slot;
             return true;
         }
-        if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
+        if (const Subscript *sub = node_cast<const Subscript>(e)) {
             int bslot, bkind;
             if (as_container_base(sub->what.get(), bslot, bkind)) {
                 /* base value first, then the index - Subscript::do_eval's
                  * order; the index temp is re-read by the dispatch. */
                 int bval, kslot;
                 if (compile_boxed_expr(sub->what.get(), bval, ops)
-                    && compile_boxed_expr(sub->index.get(), kslot, ops)) {
+                    && compile_key(sub, kslot, ops)) {
                     CgInstr in;
                     in.op = OpCode::SubscriptV;
                     in.node_idx = add_ast_node(sub);   /* subscript caret */
@@ -2463,7 +4068,7 @@ struct Codegen {
             }
             /* an unsupported base/index: the plain value path below */
         }
-        if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
+        if (const MemberExpr *m = node_cast<const MemberExpr>(e)) {
             int bslot, bkind;
             if (as_container_base(m->what.get(), bslot, bkind)) {
                 int bval;
@@ -2483,6 +4088,73 @@ struct Codegen {
                 }
             }
         }
+        /* #32: a DEEPER access chain rooted at a variable (`o.i.a`,
+         * `m[0][1]`). Its value is read step by step into `dst` - each key
+         * into a temp at its turn, Subscript::do_eval's order - and the
+         * steps are kept (a0_steps), so the dispatch re-walks them for a
+         * func_lv callee: each struct it enters owned, as the tree-walker
+         * walks a variable-rooted chain for an in-place builtin. It was
+         * held as a VALUE here, so `f(m[0][1], 9)` with `f` holding
+         * append raised NotLValueEx while the tree-walker appended. An
+         * optional member (`a?.b`) is not a step the walk has. */
+        if (ctag(e) == ConstructType::member
+                || ctag(e) == ConstructType::subscript) {
+            std::vector<const Construct *> chain;   /* outermost-first */
+            const Construct *base = lvalue_chain(e, chain);
+            bool optional = false;
+            for (const Construct *c : chain)
+                if (ctag(c) == ConstructType::member
+                        && static_cast<const MemberExpr *>(c)->optional)
+                    optional = true;
+            int bslot, bkind;
+            if (chain.size() >= 2 && !optional
+                    && as_container_base(base, bslot, bkind)) {
+                const size_t omark = ops.size();
+                const size_t cmark = chunk.consts.size();
+                const int st = next_temp;
+                std::vector<Chunk::ChainStep> steps;
+                int cur;
+                bool ok = compile_boxed_expr(base, cur, ops);
+                const size_t n = chain.size();
+                for (size_t i = 0; ok && i < n; i++) {
+                    const Construct *c = chain[n - 1 - i];
+                    const int out = i + 1 == n ? dst : alloc_temp();
+                    CgInstr in;
+                    in.target = out;
+                    in.target2 = cur;
+                    if (ctag(c) == ConstructType::member) {
+                        const int mk = add_member_key(
+                            static_cast<const MemberExpr *>(c));
+                        in.op = OpCode::MemberV;
+                        in.set_a(int_lit(mk));
+                        steps.push_back({true, mk, c->start, c->end});
+                    } else {
+                        auto *sub = static_cast<const Subscript *>(c);
+                        int kslot;
+                        if (!compile_key(sub, kslot, ops)) {
+                            ok = false;
+                            break;
+                        }
+                        in.op = OpCode::SubscriptV;
+                        in.node_idx = add_ast_node(sub);  /* its caret */
+                        in.set_a(slot_op(kslot));
+                        steps.push_back({false, kslot, c->start, c->end});
+                    }
+                    ops.push_back(in);
+                    cur = out;
+                }
+                if (ok) {
+                    cs.a0_form = Chunk::CallSite::A0::chain;
+                    cs.a0_kind = static_cast<unsigned char>(bkind);
+                    cs.a0_slot = bslot;
+                    cs.a0_steps = std::move(steps);
+                    return true;
+                }
+                ops.resize(omark);
+                chunk.consts.resize(cmark);
+                next_temp = st;
+            }
+        }
         cs.a0_form = Chunk::CallSite::A0::none;
         return compile_to_run_slot(e, dst, ops);
     }
@@ -2490,8 +4162,15 @@ struct Codegen {
     bool try_native_value_call(const CallExpr *call, int &out_slot,
                                std::vector<CgInstr> &ops)
     {
+        /* A DirectCallExpr is CallV's (try_native_call) - unless nothing
+         * proved its callee a function (#51: -nti stamps every call a DYN
+         * callee), in which case the generic dispatch below is the only
+         * sound lowering: its callee is a global slot, which the boxed
+         * compile reads like any value. */
+        if (dynamic_cast<const DirectBuiltinCallExpr *>(call))
+            return false;
         if (dynamic_cast<const DirectCallExpr *>(call)
-            || dynamic_cast<const DirectBuiltinCallExpr *>(call))
+            && (call->vm_direct_func || !call->vm_dyn_callee))
             return false;
         if ((!call->vm_direct_func && !call->vm_dyn_callee) || !call->args)
             return false;
@@ -2500,6 +4179,7 @@ struct Codegen {
         const int save_top = next_temp;
 
         int callee_slot;
+        emit_bind_guard(call->what.get(), ops);
         if (!compile_boxed_expr(call->what.get(), callee_slot, ops)) {
             ops.resize(mark);
             next_temp = save_top;
@@ -2533,6 +4213,8 @@ struct Codegen {
             cs.start = call->args->start;
             cs.end = call->args->end;
             cs.arr_hint = call->args->arr_hint;
+            cs.ctype = call->args->ctype;
+            cs.ct_store = call->args->ct_store;
             cs.args.reserve(n);
             for (const auto &el : call->args->elems)
                 cs.args.push_back(ArgLoc{el->start, el->end});
@@ -2578,11 +4260,33 @@ struct Codegen {
             next_temp = save_top;
             return false;
         }
+        emit_none_args_check(call, 0, callee_slot, argbase, ops);
 
         const int dst = alloc_temp();
         CgInstr cv;
         cv.op = OpCode::CallValueV;
         cv.node_idx = add_ast_node(call);
+        cv.base_node_idx = add_ast_node(call->args.get());  /* the args
+                                             * caret - see try_native_call */
+        cv.callee_def_idx = add_value_callee(call->callee_desc);  /* #97 E1 */
+        /* #97 E3: a two-way site's second candidate - BOTH or neither,
+         * so the pool never names one half of a pair as a single callee */
+        if (cv.callee_def_idx >= 0 && call->callee_desc2) {
+            cv.callee_def_idx2 = add_value_callee(call->callee_desc2);
+            if (cv.callee_def_idx2 < 0)
+                cv.callee_def_idx = -1;
+            /* #72: the rest of a guard-chain site - ALL or none, too */
+            for (size_t k = 0; k < call->callee_desc_more.size()
+                                && k < static_cast<size_t>(
+                                           ML_VALUE_CANDS_HARD - 2)
+                               && cv.callee_def_idx >= 0; k++) {
+                cv.callee_def_more[k] =
+                    add_value_callee(call->callee_desc_more[k]);
+                if (cv.callee_def_more[k] < 0)
+                    cv.callee_def_idx = -1;
+            }
+        }
+        cv.arg_kinds = proven_arg_kinds(call->args.get());
         cv.target = dst;
         cv.target2 = callee_slot;
         cv.set_a(int_lit(argbase));
@@ -2605,13 +4309,18 @@ struct Codegen {
     bool try_native_defined_global(const DirectBuiltinCallExpr *dc,
                                    int &out_slot, std::vector<CgInstr> &ops)
     {
-        const Identifier *callee = dynamic_cast<Identifier *>(dc->what.get());
-        if (!callee || callee->get_str() != "defined")
+        const Identifier *callee = node_cast<Identifier>(dc->what.get());
+        /* `isbound` (step 6) is the OTHER owner of this op - and now the only
+         * one a script reaches, since `defined` of a declared global folds to
+         * `true` at resolve time. Both are lowered identically: the op reads
+         * gfuncs->defined[slot], which IS the has-it-been-bound question. */
+        if (!callee || (callee->get_str() != "defined"
+                        && callee->get_str() != "isbound"))
             return false;
         if (!dc->args || dc->args->elems.size() != 1)
             return false;
         const Identifier *arg =
-            dynamic_cast<Identifier *>(dc->args->elems[0].get());
+            node_cast<Identifier>(dc->args->elems[0].get());
         if (!arg || arg->sym.kind != SymKind::global)
             return false;
         const int dst = alloc_temp();
@@ -2637,7 +4346,7 @@ struct Codegen {
     bool try_native_defined_expr(const DirectBuiltinCallExpr *dc,
                                  int &out_slot, std::vector<CgInstr> &ops)
     {
-        const Identifier *callee = dynamic_cast<Identifier *>(dc->what.get());
+        const Identifier *callee = node_cast<Identifier>(dc->what.get());
         if (!callee || callee->get_str() != "defined" || !dc->args)
             return false;
         if (dc->args->elems.size() != 1) {
@@ -2646,7 +4355,7 @@ struct Codegen {
             out_slot = alloc_temp();   /* dead: the op always throws */
             return true;
         }
-        if (dynamic_cast<const Identifier *>(dc->args->elems[0].get()))
+        if (node_cast<const Identifier>(dc->args->elems[0].get()))
             return false;              /* id forms: fold / DefinedGlobalV */
         const size_t mark = ops.size();
         const int save_top = next_temp;
@@ -2705,7 +4414,7 @@ struct Codegen {
             return false;
 
         const Identifier *bid =
-            dynamic_cast<const Identifier *>(dc->what.get());
+            node_cast<const Identifier>(dc->what.get());
         if (!bid)
             return false;
 
@@ -2740,6 +4449,216 @@ struct Codegen {
         return false;
     }
 
+    /*
+     * #97 B2: `abs(x)`, `min(a, b)`, `max(a, b)` on PROVEN INTS lower to a
+     * compare-and-branch over existing int ops, not the CallBuiltinV marshal
+     * (~200 Ir of argument boxing plus the boxed comparison, per call - the
+     * whole of 94_builtin_in_helper's cost after H1). Exactly the builtins'
+     * semantics (builtins/num.cpp.h):
+     *   abs(x)    = x >= 0 ? x : -x       (-x as x * -1: the SAME wrapping
+     *                                      negation, so abs(INT_MIN) stays
+     *                                      INT_MIN, as `-val` does there)
+     *   min(a, b) = b < a ? b : a         (the FIRST argument wins a tie)
+     *   max(a, b) = b > a ? b : a
+     * Each argument is compiled ONCE, in order, before the branch. "Proven
+     * int" is `th == i && !th_bool`: a bool is stamped `i` too, and the
+     * builtin converts a selected bool to the int 0/1 when an int is among
+     * the arguments (`min(true, 5)` is 1) - the arms below would store the
+     * bool as it is. Any other shape - a float, a
+     * dyn, one array argument, three arguments - keeps the generic call
+     * and its throws. The tree-walker still calls the builtin, so the
+     * engine differential is this lowering's oracle.
+     */
+    bool try_native_min_max_abs(const DirectBuiltinCallExpr *dc,
+                                int &out_slot, std::vector<CgInstr> &ops)
+    {
+        if (!dc->args || dc->lvalue_arg0 || dc->th != TypeHint::i
+                || dc->th_bool)
+            return false;
+        const Identifier *bid =
+            node_cast<const Identifier>(dc->what.get());
+        if (!bid)
+            return false;
+        const bool is_abs = bid->uid == uid_abs;
+        const bool is_min = bid->uid == uid_min;
+        const bool is_max = bid->uid == uid_max;
+        const size_t want = is_abs ? 1 : 2;
+        if (!(is_abs || is_min || is_max)
+                || dc->args->elems.size() != want)
+            return false;
+        for (const auto &a : dc->args->elems)
+            if (!a || a->th != TypeHint::i || a->th_bool)
+                return false;
+        const size_t mark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int save_top = next_temp;
+        const auto fail = [&]() {
+            ops.resize(mark);
+            chunk.consts.resize(cmark);
+            next_temp = save_top;
+            return false;
+        };
+        const int dst = alloc_temp();        /* reserved BELOW the scratch */
+        Operand a, b;
+        if (!compile_int_expr(dc->args->elems[0].get(), a, ops))
+            return fail();
+        if (!is_abs && !compile_int_expr(dc->args->elems[1].get(), b, ops))
+            return fail();
+        const auto store = [&](const Operand &o) {
+            CgInstr in;
+            if (o.is_lit) {
+                in.op = OpCode::LoadImmInt;
+                in.target = dst;
+                in.set_a(o);
+            } else {
+                in.op = OpCode::MoveV;
+                in.target = dst;
+                in.target2 = static_cast<int>(o.slot);
+            }
+            ops.push_back(in);
+        };
+        /* the branch to the OTHER arm: abs - unless x >= 0; min - unless
+         * b < a; max - unless b > a */
+        CgInstr br;
+        br.op = OpCode::JumpUnlessIntCmp;
+        if (is_abs) {
+            Operand zero;
+            zero.is_lit = true;
+            zero.lit = 0;
+            br.aop = Op::ge;
+            br.set_a(a);
+            br.set_b(zero);
+        } else {
+            br.aop = is_min ? Op::lt : Op::gt;
+            br.set_a(b);
+            br.set_b(a);
+        }
+        const size_t cj = ops.size();
+        ops.push_back(br);
+        store(is_abs ? a : b);                /* the taken arm */
+        const size_t jmp_i = ops.size();
+        {
+            CgInstr j;
+            j.op = OpCode::Jump;
+            ops.push_back(j);
+        }
+        ops[cj].target = static_cast<int>(ops.size());
+        if (is_abs) {
+            /* t = x * -1; dst = t. ⛔ NOT `dst = x * -1` directly: the
+             * lowering must END on an arm store (MoveV/LoadImm), like the
+             * typed ternary. The ARGUMENT-STAGING retarget
+             * (op_writes_pure_target: `<produce t>; MoveV rArg = t` ->
+             * produce into rArg) rewrites the LAST producer on the premise
+             * that it is the result's ONLY one - here it is one of two
+             * joining arms, so the other arm's move kept writing the dead
+             * temp (watched: `print(g1(5))` with `g1` = `return abs(a-1)`
+             * inlined printed `<function>`, a stale slot). MoveV is kept
+             * out of that table for exactly this join shape (CLAUDE.md,
+             * the third audit-table shape - #138's LogV chain). E1 fuses
+             * this pair later, after staging. */
+            Operand m1;
+            m1.is_lit = true;
+            m1.lit = -1;
+            const int neg = alloc_temp();
+            CgInstr in;
+            in.op = OpCode::IntBin;
+            in.node_idx = add_ast_node(dc);
+            in.target = neg;
+            in.set_a(a);
+            in.set_b(m1);
+            in.aop = Op::times;
+            ops.push_back(in);
+            store(slot_op(neg));
+        } else {
+            store(a);
+        }
+        ops[jmp_i].target = static_cast<int>(ops.size());
+        out_slot = dst;
+#ifdef TESTS
+        g_cg_minmax_lowered++;
+#endif
+        return true;
+    }
+
+    /* Lever 4b: `len(x)` whose arg the inferencer proved a non-opt ARRAY or
+     * STRING (CallExpr::vm_len_kind; the DirectBuiltinCallExpr node itself
+     * proves the callee is the unshadowed builtin) lowers to the existing
+     * ArrLen/StrLen op - size() / get_view().size(), exactly TypeArr::len /
+     * TypeStr::len - instead of the whole CallBuiltinV marshal. Wrong arity
+     * / an unproven or opt arg keeps the generic path (its throws). */
+    bool try_native_len(const DirectBuiltinCallExpr *dc, int &out_slot,
+                        std::vector<CgInstr> &ops)
+    {
+        if (dc->vm_len_kind == 0 || !dc->args || dc->lvalue_arg0
+            || dc->args->elems.size() != 1)
+            return false;
+        const Identifier *bid =
+            node_cast<const Identifier>(dc->what.get());
+        if (!bid || bid->uid != uid_len)
+            return false;
+        const size_t mark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int save_top = next_temp;
+        int base;
+        if (!compile_boxed_expr(dc->args->elems[0].get(), base, ops)) {
+            ops.resize(mark);
+            chunk.consts.resize(cmark);
+            next_temp = save_top;
+            return false;
+        }
+        const int dst = alloc_temp();
+        CgInstr in;
+        in.op = dc->vm_len_kind == 1 ? OpCode::ArrLen : OpCode::StrLen;
+        in.target = dst;
+        in.target2 = base;
+        ops.push_back(in);
+        out_slot = dst;
+        return true;
+    }
+
+    /* Lever 4b: `ord(s[i])` with a statically-proven non-opt STRING base
+     * (Subscript::base_str) and an int-compilable index fuses to OrdCharV -
+     * the byte read straight off the view (TypeStr::subscript's wrap +
+     * bounds, OOB caret = the subscript's), no 1-char SharedStr, no builtin
+     * call. builtin_ord's arity/type/1-char throws are compile-excluded
+     * (exact arity gated here; a subscript of a string is always 1 char). */
+    bool try_native_ord(const DirectBuiltinCallExpr *dc, int &out_slot,
+                        std::vector<CgInstr> &ops)
+    {
+        if (!dc->args || dc->lvalue_arg0 || dc->args->elems.size() != 1)
+            return false;
+        const Identifier *bid =
+            node_cast<const Identifier>(dc->what.get());
+        if (!bid || bid->uid != uid_ord)
+            return false;
+        const Subscript *sub =
+            node_cast<const Subscript>(dc->args->elems[0].get());
+        if (!sub || !sub->base_str)
+            return false;
+        const size_t mark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int save_top = next_temp;
+        int base;
+        Operand idx;
+        if (!compile_boxed_expr(sub->what.get(), base, ops)
+            || !compile_int_expr(sub->index.get(), idx, ops)) {
+            ops.resize(mark);
+            chunk.consts.resize(cmark);
+            next_temp = save_top;
+            return false;
+        }
+        const int dst = alloc_temp();
+        CgInstr in;
+        in.op = OpCode::OrdCharV;
+        in.node_idx = add_ast_node(sub);   /* the subscript's OOB caret */
+        in.target = dst;
+        in.target2 = base;
+        in.set_a(idx);
+        ops.push_back(in);
+        out_slot = dst;
+        return true;
+    }
+
     bool try_native_builtin(const DirectBuiltinCallExpr *dc, int &out_slot,
                             std::vector<CgInstr> &ops)
     {
@@ -2761,6 +4680,7 @@ struct Codegen {
         /* AST-free: the builtin + its arg carets live in the builtin_calls pool
          * (index in target2), so no node. */
         cv.target2 = add_builtin_call(dc);
+        note_builtin_inline(cv, dc);
         cv.target = dst;
         cv.set_a(int_lit(argbase));
         cv.set_b(int_lit(static_cast<int>(dc->args->elems.size())));
@@ -2810,11 +4730,110 @@ struct Codegen {
         CgInstr in;
         in.op = OpCode::MapFilterV;
         in.node_idx = add_ast_node(dc->args->elems[1].get());    /* arg1's caret (container) */
+        /* the ARGUMENT LIST, its second caret (base_locs): a loc-less
+         * escape - a callback's bind refusing an element (a coercion, a
+         * none into a non-opt parameter) - takes the list, as the
+         * tree-walker's builtin-call catch stamps it */
+        in.base_node_idx = add_ast_node(dc->args.get());
         in.target = dst;
-        in.target2 = dc->map_filter_kind == 2 ? 1 : 0;   /* is_filter */
+        /* bit 0 = is_filter; bits 1-2 = the flat result kind (#97 CB3,
+         * map_filter_flat_hint) */
+        in.target2 = (dc->map_filter_kind == 2 ? 1 : 0)
+                   | (map_filter_flat_hint(dc->args->arr_hint) << 1)
+                   | static_cast<int>(ctype_pool_ref(dc->args->ctype) << 3);
         in.set_a(slot_op(t0));
         in.set_b(slot_op(t1));
         ops.push_back(in);
+        out_slot = dst;
+        return true;
+    }
+
+    /*
+     * #32: CallBuiltinLVMember's CHAIN form for an in-place builtin whose
+     * arg0 is an access chain - see the call site. The tree-walker's
+     * store_base_value decides what is a location, and this follows it
+     * exactly: a chain with a member step is walked from its root, a root
+     * that is not a variable held first (hold_store_base); a chain of
+     * subscripts only is a location only when its root is a variable (else
+     * its value is held by the caller below, as Subscript::do_eval of a
+     * temporary's element gives a value). An optional member (`a?.b`) is
+     * not a step the walk has: declined, as the store chains decline it.
+     * Evaluation order: the root, each key inside-out, then the values -
+     * the tree-walker evaluates arg0 whole before the other arguments.
+     */
+    bool emit_builtin_chain_target(const DirectBuiltinCallExpr *dc,
+                                   const Construct *a0, int &out_slot,
+                                   std::vector<CgInstr> &ops)
+    {
+        if (ctag(a0) != ConstructType::member
+                && ctag(a0) != ConstructType::subscript)
+            return false;
+        std::vector<const Construct *> chain;    /* outermost-first */
+        const Construct *base = lvalue_chain(a0, chain);
+        bool has_member = false;
+        for (const Construct *c : chain) {
+            if (ctag(c) != ConstructType::member)
+                continue;
+            if (static_cast<const MemberExpr *>(c)->optional)
+                return false;
+            has_member = true;
+        }
+        int bslot, bkind;
+        const bool hold = !as_container_base(base, bslot, bkind);
+        if (hold && !has_member)
+            return false;
+
+        const size_t omark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int st = next_temp;
+        auto fail = [&]() {
+            ops.resize(omark);
+            chunk.consts.resize(cmark);
+            next_temp = st;
+            return false;
+        };
+        if (hold) {
+            if (!hold_store_base(base, bslot, ops))
+                return fail();
+            bkind = 0;
+        }
+        const int nsteps = static_cast<int>(chain.size());
+        std::vector<Chunk::ChainStep> steps;
+        steps.reserve(static_cast<size_t>(nsteps));
+        for (int i = 0; i < nsteps; i++) {
+            const Construct *c = chain[nsteps - 1 - i];
+            if (ctag(c) == ConstructType::member) {
+                auto *m = static_cast<const MemberExpr *>(c);
+                steps.push_back({true, add_member_key(m), c->start, c->end});
+            } else {
+                int kslot;
+                if (!compile_key(static_cast<const Subscript *>(c), kslot,
+                                 ops))
+                    return fail();
+                steps.push_back({false, kslot, c->start, c->end});
+            }
+        }
+        /* the value args into a run, as the one-member form's */
+        const int nvals = static_cast<int>(dc->args->elems.size()) - 1;
+        const int runbase = next_temp;
+        next_temp += nvals;
+        if (next_temp > max_temp)
+            max_temp = next_temp;
+        for (int i = 0; i < nvals; i++)
+            if (!compile_builtin_arg(dc->args.get(), 1 + i, runbase + i, ops))
+                return fail();
+        const int dst = alloc_temp();
+        CgInstr cv;
+        cv.op = OpCode::CallBuiltinLVMember;
+        cv.base_node_idx = add_base_node(bkind, base);
+        cv.target = dst;
+        cv.target2 = bslot;
+        const int bc = add_builtin_call(dc);
+        cv.set_a_dual(bc, bkind);
+        note_builtin_inline(cv, dc);
+        chunk.builtin_calls[bc].steps = std::move(steps);
+        cv.set_b(int_lit(runbase));
+        ops.push_back(cv);
         out_slot = dst;
         return true;
     }
@@ -2852,7 +4871,8 @@ struct Codegen {
          * args to lower; a nested base / non-lowerable arg declines (the
          * statement falls back whole). */
         if (!dc->lvalue_rest_native && !a0->is_id()) {
-            if (auto *sub = dynamic_cast<const Subscript *>(a0)) {
+            if (ctag(a0) == ConstructType::subscript) {
+                auto *sub = static_cast<const Subscript *>(a0);
                 const Construct *base = sub->what.get();
                 int bkind = -1;
                 if (base->is_id())
@@ -2872,21 +4892,22 @@ struct Codegen {
                     if (next_temp > max_temp)
                         max_temp = next_temp;
                     bool ok =
-                        compile_to_run_slot(sub->index.get(), runbase, ops);
+                        compile_key_to_run_slot(sub, runbase, ops);
                     for (int i = 0; ok && i < nvals; i++)
-                        ok = compile_to_run_slot(
-                            dc->args->elems[1 + i].get(),
-                            runbase + 1 + i, ops);
+                        ok = compile_builtin_arg(dc->args.get(), 1 + i,
+                                                 runbase + 1 + i, ops);
                     if (ok) {
                         const int dst = alloc_temp();
                         CgInstr cv;
                         cv.op = OpCode::CallBuiltinLVElem;
                         /* AST-free: builtin + carets in the pool (a.slot); a.lit
                          * = the base slot kind, b = the run base. */
+                        cv.base_node_idx = add_base_node(bkind, base);
                         cv.target = dst;
                         cv.target2 =
                             static_cast<const Identifier *>(base)->sym.slot;
                         cv.set_a_dual(add_builtin_call(dc), bkind);
+                        note_builtin_inline(cv, dc);
                         cv.set_b(int_lit(runbase));
                         ops.push_back(cv);
                         out_slot = dst;
@@ -2905,7 +4926,8 @@ struct Codegen {
          * member / POD field / non-slotted base falls through (a POD field has no
          * LValue; the runtime check throws the tree-walker's exact error). */
         if (!a0->is_id()) {
-            if (auto *m = dynamic_cast<const MemberExpr *>(a0)) {
+            if (ctag(a0) == ConstructType::member) {
+                auto *m = static_cast<const MemberExpr *>(a0);
                 const Construct *base = m->what.get();
                 int bkind = -1;
                 if (m->base_struct && base->is_id())
@@ -2926,17 +4948,19 @@ struct Codegen {
                         max_temp = next_temp;
                     bool ok = true;
                     for (int i = 0; ok && i < nvals; i++)
-                        ok = compile_to_run_slot(dc->args->elems[1 + i].get(),
+                        ok = compile_builtin_arg(dc->args.get(), 1 + i,
                                                  runbase + i, ops);
                     if (ok) {
                         const int dst = alloc_temp();
                         CgInstr cv;
                         cv.op = OpCode::CallBuiltinLVMember;
+                        cv.base_node_idx = add_base_node(bkind, base);
                         cv.target = dst;
                         cv.target2 =
                             static_cast<const Identifier *>(base)->sym.slot;
                         const int bc = add_builtin_call(dc);
                         cv.set_a_dual(bc, bkind);
+                        note_builtin_inline(cv, dc);
                         chunk.builtin_calls[bc].member = m->memUid;
                         cv.set_b(int_lit(runbase));
                         ops.push_back(cv);
@@ -2949,55 +4973,38 @@ struct Codegen {
             }
         }
 
+        /* #32: any other ACCESS CHAIN arg0 that is a location - deeper
+         * than one step (`append(o.i.a, x)`, `append(m[0][1], x)`), a
+         * member of a base not proven a struct (`append(dv.a, x)`), any
+         * chain with a member step - is walked at run time to the
+         * location, the way a store's base is (vm_chain_walk: each struct
+         * it steps into owned), and the builtin works THERE, as the
+         * tree-walker's store_base_value. Held as a value (below) it
+         * worked on a COPY of the handle: a slice's detach, which reseats
+         * the handle, was lost (2026-10-08). */
+        if (!a0->is_id()) {
+            int cslot;
+            if (emit_builtin_chain_target(dc, a0, cslot, ops)) {
+                out_slot = cslot;
+                return true;
+            }
+        }
+
         int kind = -1;
         int a0slot = -1;
         if (!a0->is_id()) {
-            /* arg0 is not a slotted id. A SUBSCRIPT/MEMBER target was handled
-             * above; anything ELSE (a literal, a call/arith result — the
-             * only lvalues in MyLang are id / subscript / member) is PROVABLY
-             * not an lvalue, so a REQUIRES-lvalue builtin always throws
-             * NotLValueEx(arg0 loc) after evaluating its args -> a native
-             * ThrowRuntimeV; the sort family (value-arg0-accepting) instead
-             * materializes arg0 into a temp below. */
-            const Identifier *cid =
-                dynamic_cast<const Identifier *>(dc->what.get());
-            if (cid && builtin_requires_lvalue_arg0(cid->get_str())
-                && !dynamic_cast<const Subscript *>(a0)
-                && !dynamic_cast<const MemberExpr *>(a0)) {
-                const size_t om = ops.size();
-                const size_t cm = chunk.consts.size();
-                const int st = next_temp;
-                bool ok = true;
-                for (const auto &a : dc->args->elems) {   /* side effects */
-                    int tmp;
-                    if (!compile_boxed_expr(a.get(), tmp, ops)) {
-                        ok = false;
-                        break;
-                    }
-                }
-                if (ok) {
-                    emit_throw(Chunk::ThrowKind::not_lvalue,
-                               a0->start, a0->end, nullptr, ops);
-                    out_slot = alloc_temp();   /* dead: always throws */
-                    return true;
-                }
-                ops.resize(om);
-                chunk.consts.resize(cm);
-                next_temp = st;
+            /* arg0 is not a slotted id, and a SUBSCRIPT/MEMBER target was
+             * not handled above: a VALUE (a call result, a literal, an
+             * element of one). The builtin works on that value, as
+             * `{ var t = f(); append(t, x); }` does (README, *Storing
+             * through a value*): it is held in a FRESH temp - the temp IS
+             * the target (kind 0), evaluated before the other arguments as
+             * the tree-walker evaluates arg0 first. */
+            int vslot;
+            if (!hold_store_base(a0, vslot, ops))
                 return false;
-            }
-            /* sort/rev_sort/reverse ACCEPT a VALUE arg0 (a fresh clone / a
-             * call result: the tree-walker sorts that unaliased value in
-             * place and returns it). Materialize it into a TEMP slot - the
-             * temp IS the "lvalue" (kind 0), invisible to the script, so
-             * func_lv sorts the same fresh value the tree-walker does. */
-            {
-                int vslot;
-                if (!compile_boxed_expr(a0, vslot, ops))
-                    return false;
-                kind = 0;
-                a0slot = vslot;
-            }
+            kind = 0;
+            a0slot = vslot;
         } else {
             switch (static_cast<const Identifier *>(a0)->sym.kind) {
             case SymKind::local:   kind = 0; break;
@@ -3017,9 +5024,14 @@ struct Codegen {
          * insert/erase are rest-native, so this shape is append/push only. */
         if (!dc->lvalue_rest_native && dc->args->elems.size() == 2) {
             auto *ctor =
-                dynamic_cast<const CallExpr *>(dc->args->elems[1].get());
+                node_cast<const CallExpr>(dc->args->elems[1].get());
             if (ctor && ctor->vm_struct_ctor_def && ctor->args) {
                 int fieldbase;
+                /* a global type alias is read before the fields; a
+                 * decline below takes the read back */
+                const size_t gmark = ops.size();
+                const int gtop = next_temp;
+                emit_ctor_guard(ctor, ops);
                 if (emit_args_range(ctor->args->elems, fieldbase, ops)) {
                     /* Pool the ctor def + carets (AST-free op): the container
                      * arg's caret, the per-field coerce carets, the callee
@@ -3030,10 +5042,11 @@ struct Codegen {
                     site.def = ctor->vm_struct_ctor_def;
                     site.bname = nullptr;
                     if (const Identifier *cid =
-                            dynamic_cast<const Identifier *>(dc->what.get()))
+                            node_cast<const Identifier>(dc->what.get()))
                         site.bname = cid->uid;
                     site.a0_start = a0->start;
                     site.a0_end = a0->end;
+                    site.ct_store = dc->args->ct_store;
                     site.field_locs.reserve(ctor->args->elems.size());
                     for (const auto &fe : ctor->args->elems)
                         site.field_locs.push_back(
@@ -3046,9 +5059,13 @@ struct Codegen {
                     CgInstr cv;
                     cv.op = OpCode::EmplaceStruct;
                     cv.node_idx = add_ast_node(dc);
+                    cv.base_node_idx = add_base_node(kind, a0);
                     cv.target = dst;
-                    cv.target2 =
-                        static_cast<const Identifier *>(a0)->sym.slot;
+                    /* arg0's slot: the variable's, or the temp holding
+                     * a value arg0 (`append(f(), P(1, 2))`) - read off
+                     * a0 itself until 2026-10-08, a cast of a call node
+                     * to an Identifier (UBSan; a wild slot in release) */
+                    cv.target2 = a0slot;
                     cv.set_a(int_lit(kind | (sidx << 2)));
                     cv.set_b(int_lit(fieldbase));
                     ops.push_back(cv);
@@ -3057,6 +5074,8 @@ struct Codegen {
                 }
                 /* a field arg didn't lower -> fall through to CallBuiltinLV
                  * (append self-evals the ctor node = construct-in-place). */
+                ops.resize(gmark);
+                next_temp = gtop;
             }
         }
 
@@ -3076,7 +5095,8 @@ struct Codegen {
         int restbase = 0;
         bool rest_op = false;
         if (dc->lvalue_rest_native) {
-            if (!emit_args_range(dc->args->elems, restbase, ops, 1))
+            if (!emit_args_range(dc->args->elems, restbase, ops, 1,
+                                 dc->args.get()))
                 return false;   /* a rest arg didn't lower -> fall back */
             rest_op = true;
         } else if (dc->lvalue_rest_capable) {
@@ -3093,7 +5113,8 @@ struct Codegen {
              * the rest run via the checked ctor op: observably identical to
              * append_tw's construct-in-place, incl. the throw-before-append
              * ordering.) */
-            if (!emit_args_range(dc->args->elems, restbase, ops, 1))
+            if (!emit_args_range(dc->args->elems, restbase, ops, 1,
+                                 dc->args.get()))
                 return false;   /* didn't lower -> tree-walker (no self-eval) */
             rest_op = true;
         }
@@ -3109,19 +5130,20 @@ struct Codegen {
          * to DirectBuiltinCallExpr). */
         if (rest_op && dc->args->elems.size() == 2) {
             if (const Identifier *bid =
-                    dynamic_cast<const Identifier *>(dc->what.get())) {
-                static const UniqueId *const uid_append =
-                    UniqueId::get("append");
-                static const UniqueId *const uid_push = UniqueId::get("push");
+                    node_cast<const Identifier>(dc->what.get())) {
                 if (bid->uid == uid_append || bid->uid == uid_push)
                     cv.op = OpCode::AppendV;
             }
         }
         /* AST-free: the Builtin + arg carets live in the builtin_calls pool
-         * (index in a.slot; a.lit carries the arg0 slot kind). */
+         * (index in a.slot; a.lit carries the arg0 slot kind). An unbound
+         * global arg0 raises UnboundSymbolEx at its own caret, as reading
+         * it does (base_locs). */
+        cv.base_node_idx = add_base_node(kind, a0);
         cv.target = dst;
         cv.target2 = a0slot;
         cv.set_a_dual(add_builtin_call(dc), kind);
+        note_builtin_inline(cv, dc);
         if (rest_op)
             cv.set_b(int_lit(restbase));
         ops.push_back(cv);
@@ -3156,13 +5178,20 @@ struct Codegen {
         for (size_t j = 0; j < crossed; j++) {
             const size_t ti = total - 1 - j;        /* innermost first */
             const TryFrame &tf = saved[ti];
-            /* pop this try's handler, unless the flow op is in the INNERMOST
-             * try's catch body (the dispatch already popped it there). */
-            if (!(j == 0 && tf.in_catch)) {
+            /* pop this try's live handler - none in a catch body of a try
+             * with no finally (the dispatch popped it), at ANY depth: a
+             * flow op in a try nested in a catch body crosses the outer
+             * try too, and popping there took a handler the frame did
+             * not own (codegen's handler-balance check refused it) */
+            if (tf.handler_live) {
                 CgInstr ph;
                 ph.op = OpCode::PopHandler;
                 code.push_back(ph);
             }
+            /* leaving a catch body: free the exception it caught, as its
+             * normal exit does (question 12) */
+            if (tf.in_catch)
+                emit_setpend(tf.region, Pend::normal, true);
             if (tf.finally_body) {
                 trys.resize(ti);                    /* active trys = [0, T_i) */
                 const bool ok =
@@ -3211,6 +5240,9 @@ struct Codegen {
                 next_temp = save_top;
                 return false;
             }
+            /* #75 follow-up: the value widens to the function's return
+             * type (ReturnStmt::ret_coerce) */
+            emit_widen(ret->ret_coerce, vslot, ret, ops);
         } else {
             vslot = alloc_temp();
             CgInstr ld;
@@ -3342,11 +5374,21 @@ struct Codegen {
     }
 
     /* P8 Inc 2a: `rethrow` (only in a catch body) -> a native Rethrow op
-     * (re-raise vm_exc with the rethrow-site loc). Always succeeds. */
+     * (re-raise the caught exception with the rethrow-site loc). #78: bakes
+     * the region id of the try whose CATCH BODY lexically contains the
+     * rethrow (the innermost in_catch entry) - that region's slot holds the
+     * exception being handled, immune to inner regions' traffic. */
     void emit_rethrow(const RethrowStmt *rt, std::vector<CgInstr> &ops)
     {
+        int region = -1;
+        for (size_t i = trys.size(); i-- > 0; )
+            if (trys[i].in_catch) { region = trys[i].region; break; }
+        /* the parser gates `rethrow` to catch bodies, so an enclosing
+         * in_catch try must exist here */
+        ML_CHECK(region >= 0);
         CgInstr in;
         in.op = OpCode::Rethrow;
+        in.set_a(int_lit(region));
         in.node_idx = add_ast_node(rt);                 /* rethrow-site loc (extract_locs) */
         ops.push_back(in);
     }
@@ -3362,7 +5404,7 @@ struct Codegen {
     {
         if (e->th != th)
             return false;
-        if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
+        if (const MemberExpr *m = node_cast<const MemberExpr>(e)) {
             int dslot;
             if (!m->base_dict || !as_array_slot(m->what.get(), dslot))
                 return false;
@@ -3379,10 +5421,10 @@ struct Codegen {
             ops.push_back(in);
             return true;
         }
-        if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
+        if (const Subscript *sub = node_cast<const Subscript>(e)) {
             int dslot, kslot;
             if (!sub->base_dict || !as_array_slot(sub->what.get(), dslot)
-                || !compile_boxed_expr(sub->index.get(), kslot, ops))
+                || !compile_key(sub, kslot, ops))
                 return false;
             tt = alloc_temp();
             CgInstr in;
@@ -3397,32 +5439,101 @@ struct Codegen {
         return false;
     }
 
-    /* Struct-foreach direct read: if `m` reads the ACTIVE loop var's scalar
+    /* Struct-foreach direct read: if `m` reads an ACTIVE loop var's scalar
      * field (`p.x`), emit LoadStructField{Int,Float} - a direct byte read of
-     * sfe_arr_slot[sfe_ctr_slot].field - into a temp (out). The body analysis
+     * arr_slot[ctr_slot].field - into a temp (out). The body analysis
      * (struct_fe_body_ok) already proved the base is the loop var + the field a
-     * scalar, so this can't misfire. */
+     * scalar, so this can't misfire. Every enclosing struct foreach is a
+     * candidate (the stack), since an outer var's field is read inside an
+     * inner loop's body too. */
     bool try_sfe_field(const MemberExpr *m, Operand &out,
                        std::vector<CgInstr> &ops, OpCode fieldop)
     {
-        if (sfe_loop_slot < 0)
+        if (sfe_maps.empty())
             return false;
         const Identifier *bid =
-            dynamic_cast<const Identifier *>(m->what.get());
-        if (!bid || bid->sym.kind != SymKind::local
-            || bid->sym.slot != sfe_loop_slot)
+            node_cast<const Identifier>(m->what.get());
+        if (!bid || bid->sym.kind != SymKind::local)
             return false;
-        const FieldDef *f = sfe_def->field_of(m->memUid);
+        const SfeMap *sm = nullptr;
+        for (const SfeMap &e : sfe_maps)
+            if (e.loop_slot == bid->sym.slot)
+                sm = &e;             /* innermost wins, if ever shadowed */
+        if (!sm)
+            return false;
+        const FieldDef *f = sm->def->field_of(m->memUid);
         if (!f || f->offset < 0)
             return false;
-        const int fidx = static_cast<int>(f - sfe_def->fields.data());
+        const int fidx = static_cast<int>(f - sm->def->fields.data());
         const int tt = alloc_temp();
         CgInstr in;
         in.op = fieldop;
         in.target = tt;
-        in.target2 = sfe_arr_slot;
-        in.set_a(slot_op(sfe_ctr_slot));
+        in.target2 = sm->arr_slot;
+        in.set_a(slot_op(sm->ctr_slot));
         in.set_b(int_lit(fidx));
+        ops.push_back(in);
+        out = slot_op(tt);
+        return true;
+    }
+
+    /*
+     * G4: `a[i].f` - the SUBSCRIPT form of the struct-field read.
+     * try_sfe_field covers a struct-FOREACH loop var and try_member_scalar a
+     * plain local struct base; nothing covered a SUBSCRIPT base, so
+     * `row[0].x` lowered to a boxed subscript (materialising a whole
+     * StructObject per read) plus a boxed member read.
+     *
+     * The op is the same LoadStructFieldInt/Float with `struct_checked` set:
+     * unlike the foreach form, a subscript proves neither the storage kind
+     * (a flat array<PodStruct> auto-promotes to general on any cold op) nor
+     * the index, so the runtime does the wrap + bounds check and serves both
+     * storages. The caret is the SUBSCRIPT's node, which is the span the
+     * boxed pair reported - so the default engine's OOB message does not
+     * move (task #125 tracks the pre-existing tree-walker divergence).
+     */
+    bool try_struct_elem_field(const MemberExpr *m, Operand &out,
+                               std::vector<CgInstr> &ops, OpCode op)
+    {
+        /* an element that is a box<P> is a reference in an array<C>-style
+         * vector, never the struct's bytes in a flat array */
+        if (m->optional || !m->base_struct || m->base_boxed)
+            return false;
+        const Subscript *sub =
+            node_cast<const Subscript>(m->what.get());
+        if (!sub || !sub->base_array || sub->base_dict || sub->base_str)
+            return false;
+        const StructTypeDef *sd = m->base_struct_def;
+        if (!sd || !sd->is_pod())
+            return false;
+        const int fs = sd->slot_of(m->memUid);
+        if (fs < 0)
+            return false;
+        if (sd->fields[static_cast<size_t>(fs)].offset < 0)
+            return false;   /* a non-POD (boxed) field */
+        /* The base must be a resolved LOCAL slot: the op reads it directly,
+         * so it is evaluated exactly once and cannot re-run a side effect. */
+        const Identifier *bid =
+            node_cast<const Identifier>(sub->what.get());
+        if (!bid || bid->sym.kind != SymKind::local)
+            return false;
+        const size_t mark = ops.size();
+        const int save_top = next_temp;
+        Operand idx;
+        if (!compile_int_expr(sub->index.get(), idx, ops)) {
+            ops.resize(mark);
+            next_temp = save_top;
+            return false;
+        }
+        const int tt = alloc_temp();
+        CgInstr in;
+        in.op = op;
+        in.node_idx = add_ast_node(sub);   /* the OOB caret: the SUBSCRIPT */
+        in.target = tt;
+        in.target2 = bid->sym.slot;
+        in.set_a(idx);
+        in.set_b(int_lit(fs));
+        in.set_struct_checked();
         ops.push_back(in);
         out = slot_op(tt);
         return true;
@@ -3443,7 +5554,7 @@ struct Codegen {
         if (!m->base_struct || m->optional)
             return false;
         const Identifier *bid =
-            dynamic_cast<const Identifier *>(m->what.get());
+            node_cast<const Identifier>(m->what.get());
         if (!bid || bid->sym.kind != SymKind::local)
             return false;
         const int tt = alloc_temp();
@@ -3452,6 +5563,44 @@ struct Codegen {
         in.target = tt;
         in.target2 = bid->sym.slot;
         in.set_a(int_lit(add_member_key(m)));
+        /* THE COMPILE-TIME FIELD RESOLUTION (the 64_struct_create fix,
+         * 2026-07-26): base_struct is PROVEN, so the field's byte offset
+         * and kind are static facts - resolve them HERE, once, and bake
+         * them into the op (b dual: lo = offset, hi = struct_defs idx << 2
+         * | kind 0 int/1 float/2 bool). The runtime fast path is then a
+         * def-identity check + a direct byte read - NO name scan
+         * (StructTypeDef::slot_of ran per READ before). lo == -1 -> the
+         * generic path (a const member / non-POD / unresolved field). */
+        int32_t off = -1, hi = -1;
+        const StructTypeDef *sd = m->base_struct_def;
+        if (sd && sd->is_pod()) {
+            const int fs = sd->slot_of(m->memUid);
+            if (fs >= 0) {
+                const FieldDef &fd = sd->fields[static_cast<size_t>(fs)];
+                /* The 2-bit LOAD FORM = (op x field kind), so the runtime
+                 * needs no op/kind dispatch at all: 0 = int read, 1 = float
+                 * read, 2 = bool read as 0/1, 3 = int read promoted to
+                 * float (matching vm_load_member_scalar's arms). */
+                int form = -1;
+                if (op == OpCode::LoadMemberInt) {
+                    if (fd.kind == FieldKind::f_int)
+                        form = 0;
+                    else if (fd.kind == FieldKind::f_bool)
+                        form = 2;
+                } else {
+                    if (fd.kind == FieldKind::f_float)
+                        form = 1;
+                    else if (fd.kind == FieldKind::f_int)
+                        form = 3;
+                }
+                if (form >= 0) {
+                    off = static_cast<int32_t>(fd.offset);
+                    hi = static_cast<int32_t>(add_struct_def(sd)) << 2
+                       | form;
+                }
+            }
+        }
+        in.set_b_dual(off, hi);
         ops.push_back(in);
         out = slot_op(tt);
         return true;
@@ -3459,7 +5608,7 @@ struct Codegen {
 
     /*
      * A TYPED ternary VALUE `cond ? a : b` with th==i/f (F-class follow-up
-     * from plans/vm-peephole.md): a typed-compare condition emits ONE native
+     * from plans/archived/vm-peephole.md): a typed-compare condition emits ONE native
      * JumpUnless{Int,Float}Cmp to the else arm (any other condition boxes to
      * a JumpUnlessTrueV - same shape as the boxed ternary's, arms still
      * typed); each arm compiles through the TYPED compilers and lands in a
@@ -3471,7 +5620,7 @@ struct Codegen {
     bool try_typed_ternary(const Construct *e, Operand &out,
                            std::vector<CgInstr> &ops, bool flt)
     {
-        const TernaryExpr *t = dynamic_cast<const TernaryExpr *>(e);
+        const TernaryExpr *t = node_cast<const TernaryExpr>(e);
         if (!t)
             return false;
 
@@ -3485,7 +5634,7 @@ struct Codegen {
         size_t cj = ops.size();
         bool emitted = false;
         if (const TypedScalarExpr *c =
-                dynamic_cast<const TypedScalarExpr *>(t->condExpr.get())) {
+                node_cast<const TypedScalarExpr>(t->condExpr.get())) {
             if (c->cat == TypedScalarExpr::Cat::cmp) {
                 Operand a, b;
                 Op cmp;
@@ -3516,25 +5665,41 @@ struct Codegen {
         }
         if (!emitted) {
             int cslot;
-            if (!compile_boxed_expr(t->condExpr.get(), cslot, ops)) {
+            if (!compile_boxed_expr(t->condExpr.get(), cslot, ops,
+                                    /*allow_typed=*/true,
+                                    /*truthy_only=*/true)) {
                 ops.resize(mark);
                 next_temp = save_top;
                 return false;
             }
             CgInstr in;
             in.op = OpCode::JumpUnlessTrueV;
+            in.node_idx = add_ast_node(t);   /* the whole ternary */
             in.target2 = cslot;
             cj = ops.size();
             ops.push_back(in);
         }
         next_temp = scratch;
 
-        /* dst = <operand>: a lit -> LoadImm, a slot -> MoveV (E1 retargets). */
-        const auto store_arm = [&](const Operand &o) {
+        /* dst = <operand>: a lit -> LoadImm, a slot -> MoveV (E1 retargets).
+         * An arm NOT of the ternary's kind (an int arm of a float ternary,
+         * a bool arm of an int one) is WIDENED into dst - the operand
+         * compilers hand its raw slot back, and a MoveV would leave the
+         * int in a float-typed result (task #75). */
+        const auto store_arm = [&](const Operand &o, const Construct *arm) {
             CgInstr in;
+            const bool widen = flt ? arm->th != TypeHint::f
+                                   : (arm->th != TypeHint::i
+                                      || arm->th_bool);
             if (o.is_lit) {
                 in.op = flt ? OpCode::LoadImmFloat : OpCode::LoadImmInt;
                 in.target = dst;
+                in.set_a(o);
+            } else if (widen) {
+                in.op = OpCode::CoerceNumV;
+                in.node_idx = add_ast_node(t);
+                in.target = dst;
+                in.target2 = flt ? 1 : 0;
                 in.set_a(o);
             } else {
                 in.op = OpCode::MoveV;
@@ -3551,7 +5716,7 @@ struct Codegen {
             next_temp = save_top;
             return false;
         }
-        store_arm(a1);
+        store_arm(a1, t->thenExpr.get());
         const size_t jmp_i = ops.size();
         {
             CgInstr j;
@@ -3569,25 +5734,227 @@ struct Codegen {
             next_temp = save_top;
             return false;
         }
-        store_arm(a2);
+        store_arm(a2, t->elseExpr.get());
         next_temp = scratch;
         ops[jmp_i].target = static_cast<int>(ops.size());  /* merge */
         out = slot_op(dst);
         return true;
     }
 
-    bool compile_int_expr(const Construct *e, Operand &out,
+    /*
+     * H1 (2026-08-12): a CLOSURE-CAPTURE leaf inside a typed expression.
+     *
+     * A capture is not a frame slot - it lives in the called closure's own
+     * `ctx->captures` vector - so it can never BE an Operand (which is a
+     * literal or a frame slot). `as_int_operand`/`as_float_operand`
+     * therefore decline it, and before this the decline propagated: ONE
+     * capture operand made the whole TypedScalarExpr fall to the boxed
+     * tier, so `func [base] (int k) { return base + k; }` - fully proven
+     * int by inference - compiled to `load.capture` + a BOXED `bin.v`
+     * (num_bin_op's PMF dispatch + promotion check, ~137 Ir per call on
+     * 78_typed_param_call, where C++ pays one `add`).
+     *
+     * The fix needs no new opcode: MATERIALIZE the capture with the
+     * existing boxed LoadCaptureV into a temp, and hand back that temp.
+     * A temp holding a boxed int IS an int frame slot - `read_int_slot`
+     * reads it by tag exactly as it reads any other typed slot (and its
+     * bool -> 0/1 arm matches Identifier::eval_int's capture path
+     * byte-for-byte, so a captured bool behaves as it always did). Only
+     * the ARITHMETIC changes tier: the load was there before and is
+     * unchanged, including its JIT inline copy.
+     *
+     * The dedicated typed load (a raw int read instead of the 32-byte
+     * EvalValue copy, ~6 more instructions per read) is a separate,
+     * later question - the arithmetic is where the cost was.
+     */
+    bool try_capture_leaf(const Construct *e, bool flt, Operand &out,
+                          std::vector<CgInstr> &ops)
+    {
+        const Identifier *id = node_cast<const Identifier>(e);
+        if (!id || id->sym.kind != SymKind::capture)
+            return false;
+        /* int wants `i`; float accepts `f` OR `i` (read_float_slot
+         * promotes an int/bool slot) - the as_*_operand rule for a local,
+         * applied to the other table. */
+        if (!(id->th == TypeHint::i || (flt && id->th == TypeHint::f)))
+            return false;
+        const int t = alloc_temp();
+        CgInstr in;
+        in.op = OpCode::LoadCaptureV;
+        in.target = t;
+        in.target2 = id->sym.slot;
+        /* #111: the guard above already proved `id->th` is i (or f, for
+         * the float caller), so the captured variable can only ever hold
+         * that scalar - the JIT may skip the boxed copy's reference
+         * checks and move 8 payload bytes instead of 24. */
+        in.set_cap_scalar();
+        ops.push_back(in);
+        out = slot_op(t);
+        return true;
+    }
+
+    /*
+     * H4 (2026-08-12): a CALL RESULT is a typed leaf.
+     *
+     * `s = s + q` lowered to an unboxed `i.bin`, but `s = s + f(i)` fell
+     * to the boxed `bin.v` for the WHOLE expression - one call operand
+     * defeated the typed lowering of everything around it, though
+     * inference had proved every part of it (`-dti`: `f : func(int)->int`,
+     * `s : int`, and M8 built `TypedScalarExpr<arith,i>(CallExpr)`). On
+     * 78_typed_param_call that cost a 190 Ir/iteration helper chain
+     * (jit_boxed_binop -> vm_num_binop -> num_bin_op -> TypeFloat::add)
+     * for one float addition.
+     *
+     * Same shape as try_capture_leaf above, one level up: materialize the
+     * result with the EXISTING call lowering into a temp, and the temp IS
+     * an int/float frame slot the typed ops read by tag. No new opcode.
+     *
+     * NO RUNTIME GUARD, and that is a LANGUAGE property, not an
+     * assumption: function subtyping compares the whole SIGNATURE
+     * (statictype.cpp, option B), so a call whose static return type is a
+     * concrete int/float really does return that type. Before that
+     * change, `var g = a; g = b;` with a differently-returning `b` was
+     * ACCEPTED and this tier would have read a float (or a str) through
+     * an int tag - RULE 1 and RULE 2 both. If that rule is ever loosened,
+     * THIS TIER IS THE FIRST THING THAT BREAKS, silently.
+     *
+     * Conditional positions stay conditional: compile_int_expr refuses
+     * cmp/logical chains outright (they yield bool), a condition lowers
+     * one compare-branch per conjunct, and the typed ternary emits its
+     * branch BEFORE the arms - so a call materialized here lands inside
+     * the region that owns it. Pinned by the short-circuit tests.
+     */
+    bool try_call_leaf(const Construct *e, bool flt, Operand &out,
+                       std::vector<CgInstr> &ops)
+    {
+        /* A PLAIN (indirect) call only. The Direct* forms have their own
+         * typed paths ABOVE the hook, so this exclusion is DEFENSIVE, not
+         * load-bearing: removing it keeps the suite green today (watched),
+         * because the placement already gives those paths first refusal.
+         * It is kept so the leaf cannot start second-guessing a Direct*
+         * path that deliberately declined if the hook ever moves - which
+         * is exactly the mistake the placement note below records. */
+        if (ctag(e) != ConstructType::call
+                || dynamic_cast<const DirectCallExpr *>(e)
+                || dynamic_cast<const DirectBuiltinCallExpr *>(e))
+            return false;
+        /* int wants `i`; float accepts `f` OR `i` (read_float_slot
+         * promotes an int/bool slot) - try_capture_leaf's rule. */
+        if (!(e->th == TypeHint::i || (flt && e->th == TypeHint::f)))
+            return false;
+        /* A half-emitted attempt must leave NOTHING behind: the caller
+         * falls back to the boxed lowering, which compiles this same call
+         * again - leaked ops would evaluate it TWICE. */
+        const size_t mark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int save_top = next_temp;
+        int t;
+        if (!compile_boxed_expr(e, t, ops, /*allow_typed=*/false)) {
+            ops.resize(mark);
+            chunk.consts.resize(cmark);
+            next_temp = save_top;
+            return false;
+        }
+        out = slot_op(t);
+        return true;
+    }
+
+    /*
+     * H1b: may `cap OP= v` / `cap++` be RECOMPOSED into the typed tier -
+     * read + IntBin/FloatBin + a PLAIN capture store - instead of the
+     * compound StoreCaptureV (a copy-modify-store through num_bin_op,
+     * and the ONE capture form the JIT still serves with a helper call:
+     * the plain store has an inline tier, the compound never did)?
+     *
+     * `+ - *` ONLY, and that restriction is the whole soundness
+     * argument: for PROVEN int/float operands those three cannot throw
+     * (`-fwrapv` makes int overflow defined; float arithmetic raises
+     * nothing in-language), so the recomposed sequence has no error path
+     * and therefore no caret to keep identical. `/` and `%` are excluded
+     * on exactly that ground - IntBin carets the DIVISOR operand (#76)
+     * where the compound store carets the whole statement, and a caret
+     * that moves is a RULE 2 violation, not a cosmetic difference.
+     *
+     * CAPTURES only, not globals: a capture is always bound (snapshot at
+     * closure creation), so the read cannot raise; a global read can
+     * (UnboundSymbolEx, the TDZ), and the compound op's undefined-global
+     * bail would have to be reproduced exactly.
+     */
+    bool typed_capture_update_ok(const Identifier *id, Op base) const
+    {
+        return id
+            && id->sym.kind == SymKind::capture
+            && (base == Op::plus || base == Op::minus || base == Op::times);
+    }
+
+    /* Emit `cap = cap <base> rhs` given the ALREADY-compiled current
+     * value and rhs operands. The store is a PLAIN StoreCaptureV
+     * (aop invalid), whose value is an int/float the typed op produced -
+     * the same type num_bin_op's promotion yields for these operands
+     * (a bool capture promotes to int either way). */
+    void emit_typed_capture_update(const Identifier *id, Op base, bool flt,
+                                   Operand cur, Operand rhs,
+                                   std::vector<CgInstr> &ops)
+    {
+        const int t = alloc_temp();
+        CgInstr bin;
+        bin.op = flt ? OpCode::FloatBin : OpCode::IntBin;
+        bin.target = t;
+        bin.set_a(cur);
+        bin.set_b(rhs);
+        bin.aop = base;
+        ops.push_back(bin);
+
+        CgInstr st;
+        st.op = OpCode::StoreCaptureV;
+        st.target = id->sym.slot;
+        st.set_a(slot_op(t));        /* aop invalid == a PLAIN assign */
+        /* #111: `t` is the int/float the typed op above produced, and
+         * the capture is the same variable `try_capture_leaf` proved
+         * scalar - so neither the source gate nor the capture's own
+         * current-value reference check can fail. AFTER set_a, which
+         * masks only bits 0x07. */
+        st.set_cap_scalar();
+        ops.push_back(st);
+    }
+
+    bool compile_int_expr_impl(const Construct *e, Operand &out,
                           std::vector<CgInstr> &ops)
     {
         if (as_int_operand(e, out))
             return true;
 
+        if (e->th == TypeHint::i && try_capture_leaf(e, false, out, ops))
+            return true;
+
         if (e->th == TypeHint::i && try_typed_ternary(e, out, ops, false))
             return true;
 
+        /* `cast<int>(x)` / `cast<bool>(x)`: the result is exactly that
+         * (a bool reads as its 0 / 1 payload) */
+        if (e->th == TypeHint::i && ctag(e) == ConstructType::cast) {
+            out = slot_op(compile_cast(static_cast<const CastExpr *>(e),
+                                       ops));
+            return true;
+        }
+
+        /* `*b` of a proven box<int>: the load checks the element */
+        if (e->th == TypeHint::i && !e->th_bool
+                && ctag(e) == ConstructType::deref
+                && static_cast<const DerefExpr *>(e)->want == 1) {
+            int t;
+            if (!compile_box_load(static_cast<const DerefExpr *>(e), t, ops))
+                return false;
+            out = slot_op(t);
+            return true;
+        }
+
         if (e->th == TypeHint::i)
-            if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
+            if (const MemberExpr *m = node_cast<const MemberExpr>(e)) {
                 if (try_sfe_field(m, out, ops, OpCode::LoadStructFieldInt))
+                    return true;
+                if (try_struct_elem_field(m, out, ops,
+                                          OpCode::LoadStructFieldInt))
                     return true;
                 if (try_member_scalar(m, out, ops, OpCode::LoadMemberInt))
                     return true;
@@ -3603,9 +5970,14 @@ struct Codegen {
         /* Array element read `a[i]` -> LoadElemInt into a temp (arrays only; a
          * dict subscript stays fallback - see Subscript::base_array). A nested
          * base `a[i][k]` loads `a[i]` via compile_array_base first. */
-        if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
+        if (const Subscript *sub = node_cast<const Subscript>(e)) {
             if (e->th != TypeHint::i || !sub->base_array)
                 return false;
+            int fused;
+            if (try_load_elem2(sub, TypeHint::i, fused, ops)) {
+                out = slot_op(fused);
+                return true;
+            }
             int aslot;
             Operand idx;
             if (!compile_array_base(sub->what.get(), aslot, ops)
@@ -3618,6 +5990,8 @@ struct Codegen {
             in.target = tt;
             in.target2 = aslot;
             in.set_a(idx);
+            if (sub->elem_bool)          /* C1c: the read-side hint */
+                in.set_elem_bool_hint();
             ops.push_back(in);
             out = slot_op(tt);
             return true;
@@ -3635,6 +6009,9 @@ struct Codegen {
                 int t;
                 if (try_native_defined_global(bc, t, ops)   /* defined(global) */
                         || try_native_defined_expr(bc, t, ops)
+                        || try_native_min_max_abs(bc, t, ops) /* B2 */
+                        || try_native_len(bc, t, ops)      /* lever 4b */
+                        || try_native_ord(bc, t, ops)
                         || try_native_builtin(bc, t, ops)) { /* value ABI */
                     out = slot_op(t);
                     return true;
@@ -3658,7 +6035,18 @@ struct Codegen {
                 }
             }
 
-        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
+        /* H4: the INDIRECT sibling of the DirectCallExpr case above -
+         * a call through a func VALUE (`add(i)` where `add` is a
+         * variable). The direct form has been a typed leaf all along;
+         * the indirect one fell to the boxed tier and dragged the WHOLE
+         * surrounding expression with it. Placed HERE, after every
+         * specialized path: an earlier placement swallowed `sqrt(i)`
+         * from the typed MathFnV into the generic CallBuiltinV marshal
+         * (watched: vm_codegen_shapes case 14 failed). */
+        if (e->th == TypeHint::i && try_call_leaf(e, false, out, ops))
+            return true;
+
+        const TypedScalarExpr *t = node_cast<const TypedScalarExpr>(e);
         if (!t || t->kind != TypeHint::i)
             return false;
 
@@ -3673,7 +6061,16 @@ struct Codegen {
                 const int tt = alloc_temp();
                 CgInstr in;
                 in.op = OpCode::IntBin;
+                /* div/mod's div0 carets the DIVISOR operand (#76 - the
+                 * boxed ladder's operand-precise convention, matching the
+                 * tree-walker's typed throw). The op NODE stays the chain
+                 * (its inlined-at ctx; a substituted-arg divisor can carry
+                 * a shallower chain); only the LOC comes from the divisor. */
                 in.node_idx = add_ast_node(e);
+                if (t->elems[i].first == Op::div
+                        || t->elems[i].first == Op::mod)
+                    in.loc_node_idx =
+                        add_ast_node(t->elems[i].second.get());
                 in.target = tt;
                 in.set_a(acc);
                 in.set_b(rhs);
@@ -3719,30 +6116,12 @@ struct Codegen {
      */
     bool try_native_chain_store(const Expr14 *e, std::vector<CgInstr> &ops)
     {
-        switch (e->op) {
-        case Op::assign: case Op::addeq: case Op::subeq:
-        case Op::muleq:  case Op::diveq: case Op::modeq: break;
-        default: return false;
-        }
-        /* Decompose the lvalue OUTSIDE-IN into member/subscript steps down to a
-         * base. `chain` is outermost-first; reverse for inside-out. */
         std::vector<const Construct *> chain;   /* outermost-first */
-        const Construct *cur = e->lvalue.get();
-        for (;;) {
-            if (dynamic_cast<const MemberExpr *>(cur)) {
-                chain.push_back(cur);
-                cur = static_cast<const MemberExpr *>(cur)->what.get();
-            } else if (dynamic_cast<const Subscript *>(cur)) {
-                chain.push_back(cur);
-                cur = static_cast<const Subscript *>(cur)->what.get();
-            } else {
-                break;
-            }
-        }
+        const Construct *base = lvalue_chain(e->lvalue.get(), chain);
         const int nsteps = static_cast<int>(chain.size());
         int nmember = 0;
         for (const Construct *c : chain)
-            if (dynamic_cast<const MemberExpr *>(c))
+            if (ctag(c) == ConstructType::member)
                 nmember++;
         /* A single-SUBSCRIPT step is StoreElemValue's job (the universal
          * store, incl. a dyn base); a single MEMBER step reaches here only
@@ -3763,68 +6142,209 @@ struct Codegen {
             if (m1->base_struct || m1->base_dict)
                 return false;
         }
-        /* An OPTIONAL member (`a?.b`) short-circuits a none base - not handled
-         * by the chain walk; leave it to the tree-walker. */
-        for (const Construct *c : chain)
-            if (auto *m = dynamic_cast<const MemberExpr *>(c))
-                if (m->optional)
-                    return false;
-        int bslot, bkind;
-        if (!as_container_base(cur, bslot, bkind))
+        int vslot, bslot, steps_idx;
+        return emit_chain_store(e, chain, base, vslot, bslot, steps_idx, ops);
+    }
+
+    /* A store's lvalue decomposed OUTSIDE-IN into its member / subscript
+     * steps (`chain`, outermost first); returns the base under them. */
+    static const Construct *
+    lvalue_chain(const Construct *lv, std::vector<const Construct *> &chain)
+    {
+        for (;;) {
+            if (ctag(lv) == ConstructType::member) {
+                chain.push_back(lv);
+                lv = static_cast<const MemberExpr *>(lv)->what.get();
+            } else if (ctag(lv) == ConstructType::subscript) {
+                chain.push_back(lv);
+                lv = static_cast<const Subscript *>(lv)->what.get();
+            } else {
+                return lv;
+            }
+        }
+    }
+
+    /*
+     * HOLD a store's root that is not a variable - a call's result, a
+     * literal, a ternary (`f()[0]`, `mk().x.y`): compile it into a fresh
+     * temp, which the store then names as a LOCAL base. Every statement
+     * store compiler declines such a root (as_container_base), so the
+     * statement reaches gen_stmt's discarded-expression fallback and with
+     * it try_value_store / try_incdec_chain, the two users of this; a
+     * routing of the statement form straight to them was watched to change
+     * nothing but an unused value. A store through a value goes into it,
+     * as if it were first bound to a fresh variable - `f()[0] = v` is
+     * `{ var t = f(); t[0] = v; }` (README, "Storing through a value");
+     * the tree-walker's twin is hold_store_base (eval.cpp). A FRESH temp,
+     * never a named local the expression left its value in (`(t = g)[0]`):
+     * a COW of a slice base rewrites the hold, and only the hold.
+     */
+    bool hold_store_base(const Construct *root, int &slot,
+                         std::vector<CgInstr> &ops)
+    {
+        const int fresh = next_temp;
+        int s = -1;
+        if (!compile_boxed_expr(root, s, ops))
             return false;
+        if (s < fresh) {
+            CgInstr mv;
+            mv.op = OpCode::MoveV;
+            mv.target = alloc_temp();
+            mv.target2 = s;
+            ops.push_back(mv);
+            s = mv.target;
+        }
+        slot = s;
+        return true;
+    }
+
+    /*
+     * StoreLValueChainV for `e`, its lvalue decomposed into `chain` over
+     * `base`: the rvalue into a temp (`vslot`), then each subscript step's
+     * key into a temp (INSIDE-OUT, matching the tree-walker's chained
+     * lvalue eval), the chain_steps entry (`steps_idx`), the op. False,
+     * nothing emitted, for an OPTIONAL member (`a?.b` short-circuits a none
+     * base - not a step the walk has; compile-refused upstream anyway) or a
+     * part that does not compile. A base that is not a variable is HELD
+     * (hold_store_base) after the rvalue and before the keys: the
+     * tree-walker evaluates the rhs, then the base, then each key.
+     * `held`, when given, says which. The runtime walk uses the same
+     * Type::subscript / member-lvalue / vm_member_store /
+     * vm_subscript_store the tree-walker's stores do.
+     */
+    bool emit_chain_store(const Expr14 *e,
+                          const std::vector<const Construct *> &chain,
+                          const Construct *base, int &vslot, int &bslot,
+                          int &steps_idx, std::vector<CgInstr> &ops,
+                          bool *held = nullptr)
+    {
+        for (const Construct *c : chain)
+            if (ctag(c) == ConstructType::member &&
+                    static_cast<const MemberExpr *>(c)->optional)
+                return false;
+        int bkind;
+        const bool hold = !as_container_base(base, bslot, bkind);
+        if (held)
+            *held = hold;
 
         const size_t omark = ops.size();
         const size_t cmark = chunk.consts.size();
         const int st = next_temp;
-
-        int vslot;
-        if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)) {
+        auto fail = [&]() {
             ops.resize(omark);
             chunk.consts.resize(cmark);
             next_temp = st;
             return false;
+        };
+
+        if (!compile_rvalue(e, vslot, ops))
+            return fail();
+        if (hold) {
+            if (!hold_store_base(base, bslot, ops))
+                return fail();
+            bkind = 0;
         }
 
         /* Build the steps INSIDE-OUT (base -> final): chain[nsteps-1-i]. A
-         * subscript step compiles its key into a temp NOW (matching the
-         * tree-walker's key eval order: innermost first); a member step records
-         * its member-key pool index. */
+         * subscript step compiles its key into a temp NOW; a member step
+         * records its member-key pool index. */
+        const int nsteps = static_cast<int>(chain.size());
         std::vector<Chunk::ChainStep> steps;
         steps.reserve(static_cast<size_t>(nsteps));
-        bool ok = true;
-        for (int i = 0; i < nsteps && ok; i++) {
+        for (int i = 0; i < nsteps; i++) {
             const Construct *c = chain[nsteps - 1 - i];
-            if (auto *m = dynamic_cast<const MemberExpr *>(c)) {
+            if (ctag(c) == ConstructType::member) {
+                auto *m = static_cast<const MemberExpr *>(c);
                 steps.push_back({true, add_member_key(m), c->start, c->end});
             } else {
-                const Subscript *sub = static_cast<const Subscript *>(c);
                 int kslot;
-                if (!compile_boxed_expr(sub->index.get(), kslot, ops)) {
-                    ok = false;
-                    break;
-                }
+                if (!compile_key(static_cast<const Subscript *>(c), kslot,
+                                 ops))
+                    return fail();
                 steps.push_back({false, kslot, c->start, c->end});
             }
         }
-        if (!ok) {
-            ops.resize(omark);
-            chunk.consts.resize(cmark);
-            next_temp = st;
-            return false;
-        }
 
-        const int steps_idx = static_cast<int>(chunk.chain_steps.size());
+        steps_idx = static_cast<int>(chunk.chain_steps.size());
         chunk.chain_steps.push_back(std::move(steps));
 
         CgInstr in;
         in.op = OpCode::StoreLValueChainV;
         in.node_idx = add_ast_node(e->lvalue.get());   /* outer lvalue loc */
+        in.base_node_idx = add_base_node(bkind, base); /* #127: base caret */
         in.target = vslot;                             /* value temp */
         in.target2 = bslot;                            /* base slot */
         /* DUAL operand: lo = the chain_steps pool idx, hi = the base kind */
         in.set_a_dual(steps_idx, bkind);
         in.aop = e->op;
+        if (e->lvalue->ct_store)      /* Q2: a store through `dyn` */
+            in.set_ct_checked();
+        in.op_node_idx = add_op_node(e->op, e);
         ops.push_back(in);
+        return true;
+    }
+
+    /*
+     * A STORE used as a VALUE (`var z = (a[i] += 5)`, `print(d["k"] = 3)`,
+     * `var w = (p.x = 7)`, `100 + (s.f -= 1) * 2`) into an element, a field
+     * or any chain of them - a NotLoweredEx compile refusal until
+     * 2026-10-05, while the tree-walker ran it (RULE 2). Lowered through
+     * the generic StoreLValueChainV whatever the shape (the statement
+     * stores keep their tuned ops; this form is rare), as
+     * try_native_chain_store emits it, then the value. A plain `=`'s value
+     * is the rvalue converted to the target's STATIC type (Expr14::
+     * val_widen; a dict target's rv_coerce already widened `vslot`) - the
+     * tree-walker's rule, see Expr14::do_eval. A compound's is the value it
+     * stored: read back through the same base and the same key temps, so
+     * nothing is evaluated twice, and a read of the location a store just
+     * wrote cannot fail. A base that is not a variable (a call's result)
+     * is the HELD temp, read back as it is, never evaluated again.
+     */
+    bool try_value_store(const Expr14 *e, int &out_slot,
+                         std::vector<CgInstr> &ops)
+    {
+        std::vector<const Construct *> chain;   /* outermost-first */
+        const Construct *base = lvalue_chain(e->lvalue.get(), chain);
+        int vslot, bslot, steps_idx;
+        bool held;
+        if (!emit_chain_store(e, chain, base, vslot, bslot, steps_idx, ops,
+                              &held))
+            return false;
+
+        if (e->op == Op::assign) {
+            out_slot = vslot;
+            emit_widen(e->val_widen, out_slot, e, ops);
+            return true;
+        }
+
+        /* the compound's stored value, read back from the base variable (a
+         * local is its slot; a global / capture is loaded; a held value is
+         * its temp) */
+        int rs = bslot;
+        if (!held)
+            compile_boxed_expr(base, rs, ops);
+        const int nsteps = static_cast<int>(chain.size());
+        for (int i = 0; i < nsteps; i++) {
+            const Construct *c = chain[nsteps - 1 - i];
+            const Chunk::ChainStep step =
+                chunk.chain_steps[static_cast<size_t>(steps_idx)]
+                                 [static_cast<size_t>(i)];
+            const int t = alloc_temp();
+            CgInstr rd;
+            rd.node_idx = add_ast_node(c);
+            rd.target = t;
+            rd.target2 = rs;
+            if (step.is_member) {
+                rd.op = OpCode::MemberV;
+                rd.set_a(int_lit(step.operand));
+            } else {
+                rd.op = OpCode::SubscriptV;
+                rd.set_a(slot_op(step.operand));
+            }
+            ops.push_back(rd);
+            rs = t;
+        }
+        out_slot = rs;
         return true;
     }
 
@@ -3837,11 +6357,11 @@ struct Codegen {
      * temp ONCE, in the tree-walker's eval order: root first, then keys
      * inside-out), pools the steps + tier/flags/carets in `incdec_chains`, and
      * emits ONE IncDecChainV. The runtime walk + final-step semantics
-     * (vm_incdec_final) mirror IncDecExpr::do_eval's tiers byte-identically -
-     * including the AST-shape-dependent flat/POD gates (`allow_flat`/
-     * `allow_pod` = no_side_effects(final base), try_flat/try_pod's own gate)
-     * and a compiled RVALUE root's rvalue-ness (kind 3 seeds the walk with a
-     * VALUE, so `mk()[0]++` still throws NotLValueEx).
+     * (vm_incdec_final) mirror IncDecExpr::do_eval's tiers byte-identically.
+     * A root that is not a variable (`mk()[0]++`) is HELD in a temp and
+     * named as a local, so the inc-dec goes into the value it evaluated to
+     * (it was an rvalue root, "kind 3", raising NotLValueEx, until
+     * 2026-10-06).
      */
     bool try_incdec_chain(const IncDecExpr *inc, int &out_slot,
                           std::vector<CgInstr> &ops)
@@ -3850,12 +6370,13 @@ struct Codegen {
         std::vector<const Construct *> chain;   /* outermost-first */
         const Construct *root = inc->lvalue.get();
         for (;;) {
-            if (auto *m = dynamic_cast<const MemberExpr *>(root)) {
+            if (ctag(root) == ConstructType::member) {
+                auto *m = static_cast<const MemberExpr *>(root);
                 if (m->optional)
                     return false;   /* d?.f++ is compile-rejected anyway */
                 chain.push_back(root);
                 root = m->what.get();
-            } else if (dynamic_cast<const Subscript *>(root)) {
+            } else if (ctag(root) == ConstructType::subscript) {
                 chain.push_back(root);
                 root = static_cast<const Subscript *>(root)->what.get();
             } else {
@@ -3869,19 +6390,18 @@ struct Codegen {
         const size_t cmark = chunk.consts.size();
         const int st = next_temp;
 
-        /* The ROOT: a container slot (kind 0/1/2), else compile the expression
-         * into a temp (kind 3 - an RVALUE root; the walk seeds a VALUE from it,
-         * reproducing the tree-walker's non-lvalue base semantics). Compiled
-         * FIRST, before any key - the tree-walker's eval order. */
+        /* The ROOT: a container slot (kind 0/1/2), else the expression HELD
+         * in a temp (kind 0). Compiled FIRST, before any key - the
+         * tree-walker's eval order. */
         int bslot, bkind;
         if (!as_container_base(root, bslot, bkind)) {
-            if (!compile_boxed_expr(root, bslot, ops)) {
+            if (!hold_store_base(root, bslot, ops)) {
                 ops.resize(omark);
                 chunk.consts.resize(cmark);
                 next_temp = st;
                 return false;
             }
-            bkind = 3;
+            bkind = 0;
         }
 
         /* Steps INSIDE-OUT; a subscript key compiles into a temp NOW (once). */
@@ -3890,12 +6410,13 @@ struct Codegen {
         const size_t nsteps = chain.size();
         for (size_t i = 0; i < nsteps; i++) {
             const Construct *cn = chain[nsteps - 1 - i];
-            if (auto *m = dynamic_cast<const MemberExpr *>(cn)) {
+            if (ctag(cn) == ConstructType::member) {
+                auto *m = static_cast<const MemberExpr *>(cn);
                 steps.push_back({true, add_member_key(m), cn->start, cn->end});
             } else {
                 const Subscript *sub = static_cast<const Subscript *>(cn);
                 int kslot;
-                if (!compile_boxed_expr(sub->index.get(), kslot, ops)) {
+                if (!compile_key(sub, kslot, ops)) {
                     ops.resize(omark);
                     chunk.consts.resize(cmark);
                     next_temp = st;
@@ -3905,18 +6426,15 @@ struct Codegen {
             }
         }
 
-        /* The site: tier + the AST-shape flat/POD gates + carets. */
+        /* The site: tier + carets. */
         Chunk::IncDecChain site;
         const Construct *fin = chain[0];        /* outermost == final step */
         site.tier2 = inc->th == TypeHint::i || inc->th == TypeHint::f;
         site.is_prefix = inc->is_prefix;
-        if (auto *fsub = dynamic_cast<const Subscript *>(fin)) {
-            site.allow_flat = construct_no_side_effects(fsub->what.get());
+        if (ctag(fin) == ConstructType::subscript) {
+            auto *fsub = static_cast<const Subscript *>(fin);
             site.kstart = fsub->index->start;
             site.kend = fsub->index->end;
-        } else {
-            auto *fmem = static_cast<const MemberExpr *>(fin);
-            site.allow_pod = construct_no_side_effects(fmem->what.get());
         }
         site.id_start = inc->start;
         site.id_end = inc->end;
@@ -3931,9 +6449,10 @@ struct Codegen {
         /* extract_locs: the inc-dec span -> the loc side table (the
          * undefined-global-root caret) + inline_ctx; then node-free. */
         in.node_idx = add_ast_node(inc);
+        in.base_node_idx = add_base_node(bkind, root); /* #127: base caret */
         in.target = dst;
         in.target2 = bslot;
-        in.set_a(int_lit(bkind));          /* root kind: 0/1/2, 3 = rvalue temp */
+        in.set_a(int_lit(bkind));          /* root kind: 0 local/1 gbl/2 cap */
         in.set_b(int_lit(site_idx));       /* incdec_chains pool idx */
         in.aop = inc->is_inc ? Op::plus : Op::minus;
         ops.push_back(in);
@@ -3947,9 +6466,10 @@ struct Codegen {
      * `x = <definitely-int expr>`. Returns false otherwise (a plain assign of a
      * bare/ bool rhs, a decl, a call, ...) so the loop falls back.
      */
-    bool compile_int_stmt(const Construct *s, std::vector<CgInstr> &ops)
+    bool compile_int_stmt_impl(const Construct *s,
+                               std::vector<CgInstr> &ops)
     {
-        if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
+        if (const IncDecExpr *inc = node_cast<const IncDecExpr>(s)) {
             Operand dst;
             if (inc->th == TypeHint::i && as_int_operand(inc->lvalue.get(), dst)
                 && !dst.is_lit) {
@@ -3967,7 +6487,7 @@ struct Codegen {
              * the base op + a constant 1 (`a[i] += 1`). StoreElemInt's loc is
              * node->start/end (generic - works for an IncDecExpr node). */
             if (const Subscript *sub =
-                    dynamic_cast<const Subscript *>(inc->lvalue.get())) {
+                    node_cast<const Subscript>(inc->lvalue.get())) {
                 /* A NESTED subscript `a[i][j]++`/`--` -> StoreElem2V compound
                  * (== `a[i][j] += 1`), with a synthesized boxed 1. Checked
                  * FIRST: `a[i][j]` is base_array too, but its base `a[i]` is a
@@ -3975,7 +6495,7 @@ struct Codegen {
                  * The inner base is a Subscript over a slotted array; matches
                  * the Expr14 nested-store path (value first, then k1, then k2). */
                 if (const Subscript *inner =
-                        dynamic_cast<const Subscript *>(sub->what.get())) {
+                        node_cast<const Subscript>(sub->what.get())) {
                     /* int/float-ONLY (like all inc-dec): a dyn element must fall
                      * back (`+= 1` would concat a string; `++` throws). */
                     if (inc->th != TypeHint::i && inc->th != TypeHint::f)
@@ -3990,8 +6510,8 @@ struct Codegen {
                     ld.target2 = add_const(EvalValue((int_type)1));
                     ops.push_back(ld);
                     int k1slot, k2slot;
-                    if (!compile_boxed_expr(inner->index.get(), k1slot, ops)
-                        || !compile_boxed_expr(sub->index.get(), k2slot, ops))
+                    if (!compile_key(inner, k1slot, ops)
+                        || !compile_key(sub, k2slot, ops))
                         return false;
                     CgInstr in;
                     in.op = OpCode::StoreElem2V;
@@ -4003,6 +6523,7 @@ struct Codegen {
                     in.set_a_dual(k1slot, add_chain_locs({inner, sub}));
                     in.set_b(slot_op(k2slot));
                     in.aop = inc->is_inc ? Op::addeq : Op::subeq;
+                    in.op_node_idx = add_op_node(in.aop, s);
                     ops.push_back(in);
                     return true;
                 }
@@ -4015,11 +6536,14 @@ struct Codegen {
                     CgInstr in;
                     in.op = OpCode::StoreElemInt;
                     in.node_idx = add_ast_node(sub);   /* subscript loc for OOB (matches TW) */
+                    in.base_node_idx =             /* #127: the base caret */
+                        add_base_node(akind, sub->what.get());
                     in.target = akind;   /* base kind: 0 loc / 1 gbl / 2 cap */
                     in.target2 = aslot;
                     in.set_a(idx);
                     in.set_b(int_lit(1));
                     in.aop = inc->is_inc ? Op::plus : Op::minus;
+                    in.op_node_idx = add_op_node(in.aop, s);
                     ops.push_back(in);
                     return true;
                 }
@@ -4041,16 +6565,19 @@ struct Codegen {
                     ld.target2 = add_const(EvalValue((int_type)1));
                     ops.push_back(ld);
                     int kslot;
-                    if (!compile_boxed_expr(sub->index.get(), kslot, ops))
+                    if (!compile_key(sub, kslot, ops))
                         return false;
                     CgInstr in;
                     in.op = OpCode::DictStore;
                     in.node_idx = add_ast_node(sub);
+                    in.base_node_idx =             /* #127: the base caret */
+                        add_base_node(dkind, sub->what.get());
                     in.target = dkind;   /* base kind: 0 loc / 1 gbl / 2 cap */
                     in.target2 = dslot;
                     in.set_a(slot_op(kslot));
                     in.set_b(slot_op(vtemp));
                     in.aop = inc->is_inc ? Op::addeq : Op::subeq;
+                    in.op_node_idx = add_op_node(in.aop, s);
                     ops.push_back(in);
                     return true;
                 }
@@ -4066,7 +6593,7 @@ struct Codegen {
             if (inc->th != TypeHint::i && inc->th != TypeHint::f)
                 return false;
             if (const MemberExpr *m =
-                    dynamic_cast<const MemberExpr *>(inc->lvalue.get())) {
+                    node_cast<const MemberExpr>(inc->lvalue.get())) {
                 if (!m->base_struct && !m->base_dict)
                     return false;
                 int bslot, bkind;
@@ -4080,6 +6607,9 @@ struct Codegen {
                 ops.push_back(ld);
                 const Op cop = inc->is_inc ? Op::addeq : Op::subeq;
                 CgInstr in;
+                in.op_node_idx = add_op_node(cop, s);
+                in.base_node_idx =                 /* #127: the base caret */
+                    add_base_node(bkind, m->what.get());
                 if (m->base_dict) {
                     CgInstr kin;               /* the member name as a string key */
                     kin.op = OpCode::LoadConstV;
@@ -4108,7 +6638,7 @@ struct Codegen {
             return false;
         }
 
-        const Expr14 *e = dynamic_cast<const Expr14 *>(s);
+        const Expr14 *e = node_cast<const Expr14>(s);
         if (!e)
             return false;
 
@@ -4123,7 +6653,7 @@ struct Codegen {
          * The value is compiled BEFORE the index (tree-walker: rhs then index).
          * A subscript lvalue can't be a scalar slot, so this always returns. */
         if (const Subscript *sub =
-                dynamic_cast<const Subscript *>(e->lvalue.get())) {
+                node_cast<const Subscript>(e->lvalue.get())) {
 
             /* NESTED store `a[k0][k1]...[kn] = v` / `OP= v`: the base is another
              * Subscript. Collect the whole chain (outermost-first) down to a
@@ -4131,15 +6661,13 @@ struct Codegen {
              * StoreElem2V (value, k1, k2); anything deeper (or a global/capture
              * base) -> the GENERIC StoreElemChainV (value, then keys base-to-
              * innermost). Matches the tree-walker's rhs-then-lvalue eval order. */
-            if (dynamic_cast<const Subscript *>(sub->what.get())) {
-                switch (e->op) {
-                case Op::assign: case Op::addeq: case Op::subeq:
-                case Op::muleq:  case Op::diveq: case Op::modeq: break;
-                default: return false;
-                }
+            if (node_cast<const Subscript>(sub->what.get())) {
+                if (e->op != Op::assign
+                        && compound_assign_base(e->op) == Op::invalid)
+                    return false;
                 std::vector<const Subscript *> chain;   /* outermost-first */
                 const Construct *cur = sub;
-                while (auto *s = dynamic_cast<const Subscript *>(cur)) {
+                while (auto *s = node_cast<const Subscript>(cur)) {
                     chain.push_back(s);
                     cur = s->what.get();
                 }
@@ -4150,9 +6678,9 @@ struct Codegen {
                 if (nkeys == 2 && as_array_slot(cur, aslot)) {
                     const Subscript *inner = chain[1];
                     int vslot, k1slot, k2slot;
-                    if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
-                        || !compile_boxed_expr(inner->index.get(), k1slot, ops)
-                        || !compile_boxed_expr(sub->index.get(), k2slot, ops))
+                    if (!compile_rvalue(e, vslot, ops)
+                        || !compile_key(inner, k1slot, ops)
+                        || !compile_key(sub, k2slot, ops))
                         return false;
                     CgInstr in;
                     in.op = OpCode::StoreElem2V;
@@ -4162,6 +6690,9 @@ struct Codegen {
                     in.set_a_dual(k1slot, add_chain_locs({inner, sub}));
                     in.set_b(slot_op(k2slot));
                     in.aop = e->op;
+                    if (e->lvalue->ct_store)      /* Q2: a store through `dyn` */
+                        in.set_ct_checked();
+                    in.op_node_idx = add_op_node(e->op, e);
                     ops.push_back(in);
                     return true;
                 }
@@ -4174,7 +6705,7 @@ struct Codegen {
                 const size_t cmark = chunk.consts.size();
                 const int st = next_temp;
                 int vslot;
-                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)) {
+                if (!compile_rvalue(e, vslot, ops)) {
                     ops.resize(omark);
                     chunk.consts.resize(cmark);
                     next_temp = st;
@@ -4188,7 +6719,7 @@ struct Codegen {
                 for (int k = 0; k < nkeys && ok; k++)
                     /* base-to-innermost: chain is outermost-first, so index k
                      * (from the base) is chain[nkeys-1-k]'s index. */
-                    ok = compile_to_run_slot(chain[nkeys - 1 - k]->index.get(),
+                    ok = compile_key_to_run_slot(chain[nkeys - 1 - k],
                                              keybase + k, ops);
                 if (!ok) {
                     ops.resize(omark);
@@ -4205,6 +6736,10 @@ struct Codegen {
                     locnodes.push_back(chain[nkeys - 1 - k]);
                 CgInstr in;
                 in.op = OpCode::StoreElemChainV;
+                /* #127: this op records NO `locs` entry (its per-step carets
+                 * live in chain_locs), so without this an unbound-global base
+                 * threw with NO location at all - "line 0" in the backtrace. */
+                in.base_node_idx = add_base_node(bkind, cur);
                 in.target = vslot;
                 in.target2 = bslot;
                 /* DUAL: lo = the chain_locs idx (nkeys = entry size), hi =
@@ -4212,6 +6747,9 @@ struct Codegen {
                 in.set_a_dual(add_chain_locs(locnodes), bkind);
                 in.set_b(int_lit(keybase));
                 in.aop = e->op;
+                if (e->lvalue->ct_store)      /* Q2: a store through `dyn` */
+                    in.set_ct_checked();
+                in.op_node_idx = add_op_node(e->op, e);
                 ops.push_back(in);
                 return true;
             }
@@ -4223,25 +6761,28 @@ struct Codegen {
              * runtime Type::subscript(for_write) + slot_rmw do the store. */
             if (sub->base_dict) {
                 int dslot, dkind;
-                switch (e->op) {
-                case Op::assign: case Op::addeq: case Op::subeq:
-                case Op::muleq:  case Op::diveq: case Op::modeq: break;
-                default: return false;
-                }
+                if (e->op != Op::assign
+                        && compound_assign_base(e->op) == Op::invalid)
+                    return false;
                 if (!as_container_base(sub->what.get(), dslot, dkind))
                     return false;
                 int vslot, kslot;
-                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
-                    || !compile_boxed_expr(sub->index.get(), kslot, ops))
+                if (!compile_rvalue(e, vslot, ops)
+                    || !compile_key(sub, kslot, ops))
                     return false;
                 CgInstr in;
                 in.op = OpCode::DictStore;
                 in.node_idx = add_ast_node(sub);   /* the subscript, for its loc (extract_locs) */
+                in.base_node_idx =                 /* #127: the base caret */
+                    add_base_node(dkind, sub->what.get());
                 in.target = dkind;   /* base kind: 0 local / 1 global / 2 cap */
                 in.target2 = dslot;
                 in.set_a(slot_op(kslot));
                 in.set_b(slot_op(vslot));
                 in.aop = e->op;
+                if (e->lvalue->ct_store)      /* Q2: a store through `dyn` */
+                    in.set_ct_checked();
+                in.op_node_idx = add_op_node(e->op, e);
                 ops.push_back(in);
                 return true;
             }
@@ -4255,16 +6796,15 @@ struct Codegen {
              * StoreElemFloat (excluded from the catch-all). */
             if (sub->th == TypeHint::i && sub->base_array) {
                 const size_t mark = ops.size();
+                /* EVERY compound maps (the shared table): the flat store
+                 * body dispatches all eleven bases - the shift arms check
+                 * the negative count BEFORE the COW clone via the
+                 * loc-stamped vm_store_throw_negshift, like div0. */
                 Op aop = Op::invalid;
                 bool ok = true;
-                switch (e->op) {
-                    case Op::assign: aop = Op::invalid; break;
-                    case Op::addeq:  aop = Op::plus;    break;
-                    case Op::subeq:  aop = Op::minus;   break;
-                    case Op::muleq:  aop = Op::times;   break;
-                    case Op::diveq:  aop = Op::div;     break;
-                    case Op::modeq:  aop = Op::mod;     break;
-                    default: ok = false; break;
+                if (e->op != Op::assign) {
+                    aop = compound_assign_base(e->op);
+                    ok = aop != Op::invalid;
                 }
                 int aslot, akind;
                 Operand val, idx;
@@ -4276,7 +6816,7 @@ struct Codegen {
                      * expr (th==i). rhs-before-index order is preserved. */
                     bool vok;
                     if (const LiteralBool *lb =
-                            dynamic_cast<const LiteralBool *>(e->rvalue.get())) {
+                            node_cast<const LiteralBool>(e->rvalue.get())) {
                         val = int_lit(lb->bval() ? 1 : 0);
                         vok = true;
                     } else {
@@ -4286,21 +6826,32 @@ struct Codegen {
                         CgInstr in;
                         in.op = OpCode::StoreElemInt;
                         /* OOB/type errors carry the SUBSCRIPT loc (matching the
-                         * tree-walker's flat_store_core), a COMPOUND div0 the
-                         * Expr14 loc (stamped by Construct::eval). A PLAIN assign
-                         * can't div0, so the subscript loc is fully correct;
-                         * only a compound needs the Expr14 (its OOB then trails
-                         * the tree-walker by the `OP= rhs` width - a rare edge). */
-                        in.node_idx = add_ast_node(
-                            aop == Op::invalid ? static_cast<const Construct *>(
-                                                     sub)
-                                               : static_cast<const Construct *>(
-                                                     s));
+                         * tree-walker's flat_store_core); a COMPOUND's
+                         * operation errors (div0, a negative shift count,
+                         * an overflow) the whole Expr14's, through op_locs -
+                         * the tree-walker's Construct::eval stamp. It used to
+                         * be ONE caret, the Expr14's for any compound, so a
+                         * compound OOB carried the whole `a[5] += 1` where
+                         * the tree-walker marks `a[5]` (RULE 2). */
+                        in.node_idx = add_ast_node(sub);
+                        in.op_node_idx = add_op_node(aop, s);
+                        in.base_node_idx =         /* #127: the base caret */
+                            add_base_node(akind, sub->what.get());
                         in.target = akind;   /* 0 local / 1 global / 2 cap */
                         in.target2 = aslot;
                         in.set_a(idx);
                         in.set_b(val);
                         in.aop = aop;
+                        /* C1c: the ELEM-BOOL hint, from the BASE's
+                         * static type (the inferencer's Subscript stamp)
+                         * - the first version keyed on a bool-literal
+                         * VALUE, which mislabeled #96's bool-into-an-
+                         * int-joined-array shape; the base type is the
+                         * truth, for stores and reads alike. Advisory:
+                         * a wrong hint fails the JIT's runtime kind
+                         * guard and the loop runs its cold twin. */
+                        if (sub->elem_bool)
+                            in.set_elem_bool_hint();
                         ops.push_back(in);
                         return true;
                     }
@@ -4310,35 +6861,13 @@ struct Codegen {
 
             /* UNIVERSAL store (catch-all): ANY container-slot base -> Store
              * ElemValue, whose vm_subscript_store dispatches at runtime (flat /
-             * general / dict, matching the tree-walker's try_flat->general).
+             * general / dict, matching the tree-walker's subscript_store).
              * Covers a proven GENERAL array, a DYN / captured / unproven base,
              * AND a flat int array with a non-int-compilable index (fell through
              * above). EXCLUDES a proven flat FLOAT array (th==f && base_array),
              * left to compile_float_stmt's fast unboxed StoreElemFloat. */
-            if (!(sub->th == TypeHint::f && sub->base_array)) {
-                int aslot, akind;
-                switch (e->op) {
-                case Op::assign: case Op::addeq: case Op::subeq:
-                case Op::muleq:  case Op::diveq: case Op::modeq: break;
-                default: return false;
-                }
-                if (!as_container_base(sub->what.get(), aslot, akind))
-                    return false;
-                int vslot, kslot;
-                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
-                    || !compile_boxed_expr(sub->index.get(), kslot, ops))
-                    return false;
-                CgInstr in;
-                in.op = OpCode::StoreElemValue;
-                in.node_idx = add_ast_node(sub);   /* the subscript, for its loc (extract_locs) */
-                in.target = akind;   /* base kind: 0 local / 1 global / 2 cap */
-                in.target2 = aslot;
-                in.set_a(slot_op(kslot));
-                in.set_b(slot_op(vslot));
-                in.aop = e->op;
-                ops.push_back(in);
-                return true;
-            }
+            if (!(sub->th == TypeHint::f && sub->base_array))
+                return emit_universal_store(e, sub, ops);
 
             return false;   /* proven flat float -> compile_float_stmt */
         }
@@ -4348,18 +6877,16 @@ struct Codegen {
          * pool, loaded to a temp). base_dict is set by the inferencer for a dict
          * base; a STRUCT member store falls through (a separate op). */
         if (const MemberExpr *m =
-                dynamic_cast<const MemberExpr *>(e->lvalue.get())) {
+                node_cast<const MemberExpr>(e->lvalue.get())) {
             if (m->base_dict) {
                 int dslot, dkind;
-                switch (e->op) {
-                case Op::assign: case Op::addeq: case Op::subeq:
-                case Op::muleq:  case Op::diveq: case Op::modeq: break;
-                default: return false;
-                }
+                if (e->op != Op::assign
+                        && compound_assign_base(e->op) == Op::invalid)
+                    return false;
                 if (!as_container_base(m->what.get(), dslot, dkind))
                     return false;
                 int vslot;
-                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops))
+                if (!compile_rvalue(e, vslot, ops))
                     return false;
                 CgInstr kin;               /* the member name as a string key */
                 kin.op = OpCode::LoadConstV;
@@ -4370,11 +6897,16 @@ struct Codegen {
                 CgInstr in;
                 in.op = OpCode::DictStore;
                 in.node_idx = add_ast_node(m);             /* for its loc (extract_locs) */
+                in.base_node_idx =                 /* #127: the base caret */
+                    add_base_node(dkind, m->what.get());
                 in.target = dkind;       /* base kind: 0 local / 1 gbl / 2 cap */
                 in.target2 = dslot;
                 in.set_a(slot_op(kin.target));
                 in.set_b(slot_op(vslot));
                 in.aop = e->op;
+                if (e->lvalue->ct_store)      /* Q2: a store through `dyn` */
+                    in.set_ct_checked();
+                in.op_node_idx = add_op_node(e->op, e);
                 ops.push_back(in);
                 return true;
             }
@@ -4384,23 +6916,24 @@ struct Codegen {
              * The member uid + carets ride in the member-key pool (AST-free). */
             if (m->base_struct) {
                 int sslot, skind;
-                switch (e->op) {
-                case Op::assign: case Op::addeq: case Op::subeq:
-                case Op::muleq:  case Op::diveq: case Op::modeq: break;
-                default: return false;
-                }
+                if (e->op != Op::assign
+                        && compound_assign_base(e->op) == Op::invalid)
+                    return false;
                 if (!as_container_base(m->what.get(), sslot, skind))
                     return false;
                 int vslot;
-                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops))
+                if (!compile_rvalue(e, vslot, ops))
                     return false;
                 CgInstr in;
                 in.op = OpCode::StoreMemberV;
+                in.base_node_idx =                 /* #127: the base caret */
+                    add_base_node(skind, m->what.get());
                 in.target = skind;       /* base kind: 0 local / 1 gbl / 2 cap */
                 in.target2 = sslot;
                 in.set_a(int_lit(add_member_key(m)));   /* AST-free: pool index */
                 in.set_b(slot_op(vslot));
                 in.aop = e->op;
+                in.op_node_idx = add_op_node(e->op, e);
                 ops.push_back(in);
                 return true;
             }
@@ -4413,13 +6946,20 @@ struct Codegen {
         if (e->op == Op::assign) {
             if (!definitely_int(e->rvalue.get()))
                 return false;
+            const size_t rmark = ops.size();
             Operand r;
             if (!compile_int_expr(e->rvalue.get(), r, ops))
                 return false;
             /* Peephole: if the last op produced `r` in a temp, retarget it to
              * write `dst` directly; a constant -> a clean LoadImmInt; else a
-             * slot-to-slot copy (dst = r + 0). */
-            if (!r.is_lit && !ops.empty() && ops.back().op == OpCode::IntBin
+             * slot-to-slot copy (dst = r + 0). The retarget is sound only
+             * for an op THIS rvalue emitted (ops grew past rmark) writing a
+             * scratch TEMP (r.slot >= temp_base) - compile_to_run_slot's
+             * rule: a bare local `r` emits nothing, so ops.back() is the
+             * PREVIOUS statement's producer of that local, and stealing it
+             * left the local unwritten (`var x = v;` after `v = ...`). */
+            if (!r.is_lit && ops.size() > rmark && r.slot >= temp_base
+                && ops.back().op == OpCode::IntBin
                 && ops.back().target == r.slot) {
                 ops.back().target = dst.slot;
             } else if (r.is_lit) {
@@ -4442,15 +6982,12 @@ struct Codegen {
             return true;
         }
 
-        Op arith;
-        switch (e->op) {
-            case Op::addeq: arith = Op::plus;  break;
-            case Op::subeq: arith = Op::minus; break;
-            case Op::muleq: arith = Op::times; break;
-            case Op::diveq: arith = Op::div;   break;
-            case Op::modeq: arith = Op::mod;   break;
-            default: return false;
-        }
+        /* Every compound maps here (shifts/bitwise included): IntBin
+         * dispatches the base op via vm_num_binop and the JIT emits all
+         * eleven (the shift arms via the reg-count shift core). */
+        const Op arith = compound_assign_base(e->op);
+        if (arith == Op::invalid)
+            return false;
 
         Operand rhs;                     /* dst = dst <arith> rhs (rhs nested) */
         if (!compile_int_expr(e->rvalue.get(), rhs, ops))
@@ -4474,7 +7011,7 @@ struct Codegen {
     bool compile_int_cond(const Construct *cond, std::vector<CgInstr> &ops,
                           Operand &a, Op &cmp, Operand &b)
     {
-        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(cond);
+        const TypedScalarExpr *t = node_cast<const TypedScalarExpr>(cond);
         if (!t || t->cat != TypedScalarExpr::Cat::cmp
             || t->kind != TypeHint::i || t->elems.size() != 2)
             return false;
@@ -4488,18 +7025,42 @@ struct Codegen {
      * FloatBin writes a float slot. No bool-safety concern - a float
      * destination is never a bool slot. */
 
-    bool compile_float_expr(const Construct *e, Operand &out,
+    bool compile_float_expr_impl(const Construct *e, Operand &out,
                             std::vector<CgInstr> &ops)
     {
         if (as_float_operand(e, out))
             return true;
 
+        if ((e->th == TypeHint::f || e->th == TypeHint::i)
+                && try_capture_leaf(e, true, out, ops))
+            return true;
+
         if (e->th == TypeHint::f && try_typed_ternary(e, out, ops, true))
             return true;
 
+        /* `cast<float>(x)`: the result is exactly a float */
+        if (e->th == TypeHint::f && ctag(e) == ConstructType::cast) {
+            out = slot_op(compile_cast(static_cast<const CastExpr *>(e),
+                                       ops));
+            return true;
+        }
+
+        /* `*b` of a proven box<float>: the load checks the element */
+        if (e->th == TypeHint::f && ctag(e) == ConstructType::deref
+                && static_cast<const DerefExpr *>(e)->want == 2) {
+            int t;
+            if (!compile_box_load(static_cast<const DerefExpr *>(e), t, ops))
+                return false;
+            out = slot_op(t);
+            return true;
+        }
+
         if (e->th == TypeHint::f)
-            if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
+            if (const MemberExpr *m = node_cast<const MemberExpr>(e)) {
                 if (try_sfe_field(m, out, ops, OpCode::LoadStructFieldFloat))
+                    return true;
+                if (try_struct_elem_field(m, out, ops,
+                                          OpCode::LoadStructFieldFloat))
                     return true;
                 if (try_member_scalar(m, out, ops, OpCode::LoadMemberFloat))
                     return true;
@@ -4514,9 +7075,14 @@ struct Codegen {
 
         /* Array element read `a[i]` (float element) -> LoadElemFloat; the index
          * is still an int expression. */
-        if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
+        if (const Subscript *sub = node_cast<const Subscript>(e)) {
             if (e->th != TypeHint::f || !sub->base_array)
                 return false;
+            int fused;
+            if (try_load_elem2(sub, TypeHint::f, fused, ops)) {
+                out = slot_op(fused);
+                return true;
+            }
             int aslot;
             Operand idx;
             if (!compile_array_base(sub->what.get(), aslot, ops)
@@ -4561,7 +7127,45 @@ struct Codegen {
                 }
             }
 
-        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
+        /*
+         * A DEFINITELY-int SUBEXPRESSION - the `(j + 1)` in
+         * `(j + 1) * 1.5`. as_float_operand admits int LEAVES (a slot,
+         * a literal) but an int CHAIN had no arm, so any mixed float
+         * expression with a computed int subterm REFUSED - and since
+         * the boxed catch-all deliberately leaves a proven-float flat
+         * store to compile_float_stmt, the refusal escalated into a
+         * NotLoweredEx on the WHOLE enclosing loop: a legal program the
+         * compiler rejected (found building #95's float matrix test).
+         * Compile it as an int; every float reader (read_float_operand,
+         * the JIT's emit_float_load) PROMOTES an int slot at runtime.
+         * definitely_int (never bool) is the gate: a bool payload is
+         * not a valid float operand. A literal result folds to a
+         * float literal (belt - const-folding already ate those).
+         */
+        if (definitely_int(e)) {
+            Operand iop;
+            if (compile_int_expr(e, iop, ops)) {
+                out = iop.is_lit
+                    ? float_lit(static_cast<float_type>(iop.lit))
+                    : iop;
+                return true;
+            }
+            return false;
+        }
+
+        /* H4: the INDIRECT sibling of the DirectCallExpr case above -
+         * a call through a func VALUE (`add(i)` where `add` is a
+         * variable). The direct form has been a typed leaf all along;
+         * the indirect one fell to the boxed tier and dragged the WHOLE
+         * surrounding expression with it. Placed HERE, after every
+         * specialized path: an earlier placement swallowed `sqrt(i)`
+         * from the typed MathFnV into the generic CallBuiltinV marshal
+         * (watched: vm_codegen_shapes case 14 failed). */
+        if ((e->th == TypeHint::f || e->th == TypeHint::i)
+                && try_call_leaf(e, true, out, ops))
+            return true;
+
+        const TypedScalarExpr *t = node_cast<const TypedScalarExpr>(e);
         if (!t || t->kind != TypeHint::f)
             return false;
 
@@ -4577,6 +7181,10 @@ struct Codegen {
                 CgInstr in;
                 in.op = OpCode::FloatBin;
                 in.node_idx = add_ast_node(e);
+                if (t->elems[i].first == Op::div
+                        || t->elems[i].first == Op::mod)   /* #76 */
+                    in.loc_node_idx =
+                        add_ast_node(t->elems[i].second.get());
                 in.target = tt;
                 in.set_a(acc);
                 in.set_b(rhs);
@@ -4593,11 +7201,16 @@ struct Codegen {
             if (!compile_float_expr(t->elems[0].second.get(), op, ops))
                 return false;
             const int tt = alloc_temp();
-            CgInstr in;                    /* tt = 0.0 - op */
+            /* tt = -0.0 - op, which IS IEEE negation for every operand:
+             * `0.0 - op` turned a +0.0 into +0.0, while `-x` (the tree-
+             * walker, TypeFloat::opneg) gives -0.0 - a RULE 2 divergence
+             * printing `0.000000` against `-0.000000`. A NaN keeps its
+             * sign this way, and a NaN's sign is never shown (`nan`). */
+            CgInstr in;
             in.op = OpCode::FloatBin;
             in.node_idx = add_ast_node(e);
             in.target = tt;
-            in.set_a(float_lit(0));
+            in.set_a(float_lit(-0.0));
             in.set_b(op);
             in.aop = Op::minus;
             ops.push_back(in);
@@ -4608,11 +7221,54 @@ struct Codegen {
         return false;
     }
 
-    bool compile_float_stmt(const Construct *s, std::vector<CgInstr> &ops)
+    /*
+     * The UNIVERSAL element store: any container-slot base -> StoreElemValue,
+     * whose vm_subscript_store dispatches at run time (flat / general / dict,
+     * matching the tree-walker's subscript_store). compile_int_stmt's
+     * catch-all, and compile_float_stmt's decline: a proven flat FLOAT
+     * element whose value compile_float_expr cannot lower unboxed. That
+     * never happens after M8 (the value is a typed node), which is why it
+     * went unnoticed - `--no-opt typed` leaves `a[i] = i * 1.5` an untyped
+     * chain, and the statement was refused (NotLoweredEx) where the
+     * tree-walker ran it (#54's audit; a RULE 2 violation of the switch).
+     */
+    bool emit_universal_store(const Expr14 *e, const Subscript *sub,
+                              std::vector<CgInstr> &ops)
     {
-        if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
+        int aslot, akind;
+        if (e->op != Op::assign
+                && compound_assign_base(e->op) == Op::invalid)
+            return false;
+        if (!as_container_base(sub->what.get(), aslot, akind))
+            return false;
+        int vslot, kslot;
+        if (!compile_rvalue(e, vslot, ops)
+            || !compile_key(sub, kslot, ops))
+            return false;
+        CgInstr in;
+        in.op = OpCode::StoreElemValue;
+        /* the subscript, for its loc (extract_locs) */
+        in.node_idx = add_ast_node(sub);
+        in.base_node_idx =                 /* #127: the base caret */
+            add_base_node(akind, sub->what.get());
+        in.target = akind;   /* base kind: 0 local / 1 global / 2 cap */
+        in.target2 = aslot;
+        in.set_a(slot_op(kslot));
+        in.set_b(slot_op(vslot));
+        in.aop = e->op;
+        if (e->lvalue->ct_store)      /* Q2: a store through `dyn` */
+            in.set_ct_checked();
+        in.op_node_idx = add_op_node(e->op, e);
+        ops.push_back(in);
+        return true;
+    }
+
+    bool compile_float_stmt_impl(const Construct *s,
+                                 std::vector<CgInstr> &ops)
+    {
+        if (const IncDecExpr *inc = node_cast<const IncDecExpr>(s)) {
             const Identifier *id =
-                dynamic_cast<const Identifier *>(inc->lvalue.get());
+                node_cast<const Identifier>(inc->lvalue.get());
             if (inc->th == TypeHint::f && id
                 && id->sym.kind == SymKind::local && id->th == TypeHint::f) {
                 CgInstr in;
@@ -4628,7 +7284,7 @@ struct Codegen {
             /* A flat-FLOAT array element `a[i]++` / `a[i]--` -> StoreElemFloat
              * (== `a[i] += 1.0`); loc is node->start/end (generic). */
             if (const Subscript *sub =
-                    dynamic_cast<const Subscript *>(inc->lvalue.get())) {
+                    node_cast<const Subscript>(inc->lvalue.get())) {
                 if (sub->th == TypeHint::f && sub->base_array) {
                     int aslot;
                     Operand idx;
@@ -4642,6 +7298,7 @@ struct Codegen {
                     in.set_a(idx);
                     in.set_b(float_lit(1));
                     in.aop = inc->is_inc ? Op::plus : Op::minus;
+                    in.op_node_idx = add_op_node(in.aop, s);
                     ops.push_back(in);
                     return true;
                 }
@@ -4649,14 +7306,14 @@ struct Codegen {
             return false;
         }
 
-        const Expr14 *e = dynamic_cast<const Expr14 *>(s);
+        const Expr14 *e = node_cast<const Expr14>(s);
         if (!e)
             return false;
 
         /* Native array-element store `a[i] = v` / `a[i] OP= v` (float element);
          * value before index, like compile_int_stmt. */
         if (const Subscript *sub =
-                dynamic_cast<const Subscript *>(e->lvalue.get())) {
+                node_cast<const Subscript>(e->lvalue.get())) {
             if (sub->th != TypeHint::f || !sub->base_array)
                 return false;
             Op aop;
@@ -4667,23 +7324,31 @@ struct Codegen {
                 case Op::muleq:  aop = Op::times;   break;
                 case Op::diveq:  aop = Op::div;     break;
                 case Op::modeq:  aop = Op::mod;     break;
+                /* shift/bitwise compounds: int-only, so a proven-float
+                 * element never sees one (compile-rejected upstream) */
                 default: return false;
             }
             int aslot, akind;
             if (!as_container_base(sub->what.get(), aslot, akind))
                 return false;
             Operand val, idx;
+            const size_t vmark = ops.size();
+            const int vtop = next_temp;
             if (!compile_float_expr(e->rvalue.get(), val, ops)
-                || !compile_int_expr(sub->index.get(), idx, ops))
-                return false;
+                || !compile_int_expr(sub->index.get(), idx, ops)) {
+                ops.resize(vmark);
+                next_temp = vtop;
+                return emit_universal_store(e, sub, ops);
+            }
             CgInstr in;
             in.op = OpCode::StoreElemFloat;
-            /* PLAIN assign -> the SUBSCRIPT loc (OOB/type, matching the tree-
-             * walker); a COMPOUND -> the Expr14 loc (for its div0). See the
-             * StoreElemInt note. */
-            in.node_idx = add_ast_node(
-                aop == Op::invalid ? static_cast<const Construct *>(sub)
-                                   : static_cast<const Construct *>(s));
+            /* the SUBSCRIPT loc (OOB/type, matching the tree-walker); a
+             * COMPOUND's operation errors the Expr14's, via op_locs. See
+             * the StoreElemInt note. */
+            in.node_idx = add_ast_node(sub);
+            in.op_node_idx = add_op_node(aop, s);
+            in.base_node_idx =                 /* #127: the base caret */
+                add_base_node(akind, sub->what.get());
             in.target = akind;   /* base kind: 0 local / 1 global / 2 cap */
             in.target2 = aslot;
             in.set_a(idx);
@@ -4696,16 +7361,23 @@ struct Codegen {
         /* The destination must be a genuine FLOAT slot (int dst -> compile_int_
          * stmt handles it; a float result can't narrow into an int/bool). */
         const Identifier *dst =
-            dynamic_cast<const Identifier *>(e->lvalue.get());
+            node_cast<const Identifier>(e->lvalue.get());
         if (!dst || dst->sym.kind != SymKind::local || dst->th != TypeHint::f)
             return false;
         const int dslot = dst->sym.slot;
 
         if (e->op == Op::assign) {
+            const size_t rmark = ops.size();
             Operand r;
             if (!compile_float_expr(e->rvalue.get(), r, ops))
                 return false;
-            if (!r.is_lit && !ops.empty() && ops.back().op == OpCode::FloatBin
+            /* Retarget the producer of `r` to write dst - only one THIS
+             * rvalue emitted, into a scratch TEMP (the int twin's rule,
+             * above). `var v = f(); var x = v;` used to rename the previous
+             * statement's `v = r3 + 0.0` to write x: v was never written
+             * (`<none>` under the JIT, an assertion under -nj). */
+            if (!r.is_lit && ops.size() > rmark && r.slot >= temp_base
+                && ops.back().op == OpCode::FloatBin
                 && ops.back().target == r.slot) {
                 ops.back().target = dslot;
             } else if (r.is_lit) {
@@ -4716,27 +7388,25 @@ struct Codegen {
                 in.set_a(r);
                 ops.push_back(in);
             } else {
-                CgInstr in;                /* dst = r + 0.0 (slot copy) */
+                /* dst = r + -0.0, the slot copy: -0.0 is the IEEE identity
+                 * of `+` for EVERY value. `+ 0.0` turned a -0.0 into +0.0,
+                 * so `var b = vals[k]` lost the sign the tree-walker keeps
+                 * (RULE 2; until 2026-10-05). */
+                CgInstr in;
                 in.op = OpCode::FloatBin;
                 in.node_idx = add_ast_node(s);
                 in.target = dslot;
                 in.set_a(r);
-                in.set_b(float_lit(0));
+                in.set_b(float_lit(-0.0));
                 in.aop = Op::plus;
                 ops.push_back(in);
             }
             return true;
         }
 
-        Op arith;
-        switch (e->op) {
-            case Op::addeq: arith = Op::plus;  break;
-            case Op::subeq: arith = Op::minus; break;
-            case Op::muleq: arith = Op::times; break;
-            case Op::diveq: arith = Op::div;   break;
-            case Op::modeq: arith = Op::mod;   break;
-            default: return false;
-        }
+        const Op arith = compound_assign_base(e->op);
+        if (arith == Op::invalid)
+            return false;
 
         Operand rhs;                     /* dst = dst <arith> rhs */
         if (!compile_float_expr(e->rvalue.get(), rhs, ops))
@@ -4755,13 +7425,63 @@ struct Codegen {
     bool compile_float_cond(const Construct *cond, std::vector<CgInstr> &ops,
                             Operand &a, Op &cmp, Operand &b)
     {
-        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(cond);
+        const TypedScalarExpr *t = node_cast<const TypedScalarExpr>(cond);
         if (!t || t->cat != TypedScalarExpr::Cat::cmp
             || t->kind != TypeHint::f || t->elems.size() != 2)
             return false;
         cmp = t->elems[1].first;
         return compile_float_expr(t->elems[0].second.get(), a, ops)
             && compile_float_expr(t->elems[1].second.get(), b, ops);
+    }
+
+    /*
+     * A typed comparison used as a VALUE (`x % 3 == 0` in a return / expression
+     * position) -> a native CmpIntV/CmpFloatV producing a bool, instead of the
+     * boxed CmpV (num_bin_op + is_true). Reuses compile_int_cond/float_cond to
+     * read the two operands + the cmp Op (so a 2-operand int/float compare with
+     * side-effect-free operands lowers; anything else - a chain, a dyn/string
+     * operand - returns false for the boxed path). The op never throws, so it
+     * needs no node/loc. On a failed attempt the partial ops + temps are rolled
+     * back (like compile_boxed_expr's int/float/boxed cascade).
+     */
+    bool try_native_cmp_value(const Construct *node, int &out_slot,
+                              std::vector<CgInstr> &ops)
+    {
+        const TypedScalarExpr *t = node_cast<const TypedScalarExpr>(node);
+        if (!t || t->cat != TypedScalarExpr::Cat::cmp || t->elems.size() != 2)
+            return false;
+        Operand a, b;
+        Op cmp;
+        const int save_top = next_temp;
+        const size_t mark = ops.size();
+        if (compile_int_cond(node, ops, a, cmp, b)) {
+            emit_cmp_value(OpCode::CmpIntV, cmp, a, b, out_slot, ops);
+            return true;
+        }
+        ops.resize(mark);
+        next_temp = save_top;
+        if (compile_float_cond(node, ops, a, cmp, b)) {
+            emit_cmp_value(OpCode::CmpFloatV, cmp, a, b, out_slot, ops);
+            return true;
+        }
+        ops.resize(mark);
+        next_temp = save_top;
+        return false;
+    }
+
+    /* Emit `dst = (a <cmp> b)` (a bool) into a fresh temp (CmpIntV/CmpFloatV). */
+    void emit_cmp_value(OpCode opc, Op cmp, const Operand &a, const Operand &b,
+                        int &out_slot, std::vector<CgInstr> &ops)
+    {
+        const int dst = alloc_temp();
+        CgInstr in;
+        in.op = opc;
+        in.target = dst;
+        in.aop = cmp;
+        in.set_a(a);
+        in.set_b(b);
+        ops.push_back(in);
+        out_slot = dst;
     }
 
     /*
@@ -4778,10 +7498,17 @@ struct Codegen {
      * a false return. This is what makes `while (it < MAXIT && zr*zr+zi*zi <=
      * 4.0)` (mandelbrot) go native instead of falling back whole.
      */
+    /* `loc_node` is the ENCLOSING statement (the while/for), used as the caret
+     * for a boxed condition whose is_true throws: the tree-walker stamps the
+     * whole statement there (the exception escapes the condition's eval with no
+     * loc and IfStmt/WhileStmt::do_eval's Construct::eval wrapper stamps it), so
+     * recording the condition alone would DIVERGE from the oracle. Threaded
+     * through the &&-conjunct recursion for the same reason. */
     bool emit_cond_jumps(const Construct *cond,
-                         std::vector<size_t> &exit_jumps)
+                         std::vector<size_t> &exit_jumps,
+                         const Construct *loc_node = nullptr)
     {
-        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(cond);
+        const TypedScalarExpr *t = node_cast<const TypedScalarExpr>(cond);
 
         /* A typed int/float comparison -> one native compare-branch to the
          * exit. On failure, fall through to the boxed path (don't bail). */
@@ -4820,7 +7547,7 @@ struct Codegen {
                 const size_t nexit = exit_jumps.size();
                 bool ok = true;
                 for (const auto &pr : t->elems)
-                    if (!emit_cond_jumps(pr.second.get(), exit_jumps)) {
+                    if (!emit_cond_jumps(pr.second.get(), exit_jumps, loc_node)) {
                         ok = false;
                         break;
                     }
@@ -4840,10 +7567,11 @@ struct Codegen {
         int cslot;
         reset_temps();
         const size_t mark = code.size();
-        if (compile_boxed_expr(cond, cslot, code)) {
+        if (compile_boxed_expr(cond, cslot, code, /*allow_typed=*/true,
+                               /*truthy_only=*/true)) {
             CgInstr in;
             in.op = OpCode::JumpUnlessTrueV;
-            in.node_idx = add_ast_node(cond);
+            in.node_idx = add_ast_node(loc_node ? loc_node : cond);
             in.target2 = cslot;
             exit_jumps.push_back(code.size());
             code.push_back(in);
@@ -4858,7 +7586,7 @@ struct Codegen {
     {
         std::vector<const Construct *> stmts;
         if (body) {
-            if (const Block *b = dynamic_cast<const Block *>(body))
+            if (const Block *b = node_cast<const Block>(body))
                 for (const auto &e : b->elems)
                     stmts.push_back(e.get());
             else
@@ -4961,28 +7689,28 @@ struct Codegen {
 
             /* Nested native control flow. Each is itself self-truncating, so on
              * failure code is already back at `mark`. */
-            if (const ForRangeStmt *fr = dynamic_cast<const ForRangeStmt *>(s)) {
+            if (const ForRangeStmt *fr = node_cast<const ForRangeStmt>(s)) {
                 if (try_native_for_range(fr)) {
                     any_native = true;
                     continue;
                 }
-            } else if (const WhileStmt *w = dynamic_cast<const WhileStmt *>(s)) {
+            } else if (const WhileStmt *w = node_cast<const WhileStmt>(s)) {
                 if (try_native_scalar_while(w)) {
                     any_native = true;
                     continue;
                 }
-            } else if (const IfStmt *iff = dynamic_cast<const IfStmt *>(s)) {
+            } else if (const IfStmt *iff = node_cast<const IfStmt>(s)) {
                 if (compile_native_if(iff)) {
                     any_native = true;
                     continue;
                 }
-            } else if (const ForStmt *fs = dynamic_cast<const ForStmt *>(s)) {
+            } else if (const ForStmt *fs = node_cast<const ForStmt>(s)) {
                 if (try_native_for(fs)) {
                     any_native = true;
                     continue;
                 }
             } else if (const ForeachStmt *fe =
-                           dynamic_cast<const ForeachStmt *>(s)) {
+                           node_cast<const ForeachStmt>(s)) {
                 if (try_native_foreach(fe) || try_native_foreach_str(fe)
                     || try_native_foreach_unpack(fe)
                     || try_native_struct_foreach(fe)
@@ -4992,12 +7720,12 @@ struct Codegen {
                     continue;
                 }
             } else if (const TryCatchStmt *tc =
-                           dynamic_cast<const TryCatchStmt *>(s)) {
+                           node_cast<const TryCatchStmt>(s)) {
                 if (compile_native_try(tc)) {   /* native handler region (P8) */
                     any_native = true;
                     continue;
                 }
-            } else if (const Block *blk = dynamic_cast<const Block *>(s)) {
+            } else if (const Block *blk = node_cast<const Block>(s)) {
                 /* A bare nested block `{ ... }` - what a const-folded
                  * `if (true) { ... }` leaves behind (a const condition drops
                  * the if but keeps its braced body), or an explicit block. A
@@ -5019,7 +7747,7 @@ struct Codegen {
              * its handler + runs its finally first (Inc 2c step 3); crossing
              * nested trys (emit_break_cont returns false) fails the body so the
              * region tree-walks. */
-            if (dynamic_cast<const BreakStmt *>(s)) {
+            if (ctag(s) == ConstructType::brk) {
                 if (loops.empty() || !emit_break_cont(/*is_break=*/true)) {
                     code.resize(start);
                     return false;
@@ -5027,7 +7755,7 @@ struct Codegen {
                 any_native = true;
                 continue;
             }
-            if (dynamic_cast<const ContinueStmt *>(s)) {
+            if (ctag(s) == ConstructType::cont) {
                 if (loops.empty() || !emit_break_cont(/*is_break=*/false)) {
                     code.resize(start);
                     return false;
@@ -5062,7 +7790,7 @@ struct Codegen {
             }
             /* A func-VALUE call statement -> CallValueV (result discarded);
              * rejects a Direct{Call,BuiltinCall}Expr internally (F-3). */
-            if (const CallExpr *call = dynamic_cast<const CallExpr *>(s)) {
+            if (const CallExpr *call = node_cast<const CallExpr>(s)) {
                 int dst;
                 if (try_native_value_call(call, dst, code)) {
                     any_native = true;
@@ -5070,7 +7798,7 @@ struct Codegen {
                 }
             }
             /* `return <expr>;` -> ReturnV / SetPend-to-finally (Inc 2c). */
-            if (const ReturnStmt *ret = dynamic_cast<const ReturnStmt *>(s)) {
+            if (const ReturnStmt *ret = node_cast<const ReturnStmt>(s)) {
                 if (try_native_return(ret, code)) {
                     any_native = true;
                     continue;
@@ -5099,14 +7827,14 @@ struct Codegen {
                     }
             }
             /* `throw <expr>;` -> a native Throw op (P8 Inc 1). */
-            if (const ThrowStmt *th = dynamic_cast<const ThrowStmt *>(s)) {
+            if (const ThrowStmt *th = node_cast<const ThrowStmt>(s)) {
                 if (try_native_throw(th, code)) {
                     any_native = true;
                     continue;
                 }
             }
             /* `rethrow;` (in a catch body) -> a native Rethrow op (P8 Inc 2a). */
-            if (const RethrowStmt *rt = dynamic_cast<const RethrowStmt *>(s)) {
+            if (const RethrowStmt *rt = node_cast<const RethrowStmt>(s)) {
                 emit_rethrow(rt, code);
                 any_native = true;
                 continue;
@@ -5119,7 +7847,7 @@ struct Codegen {
              * top-level/function-body decls; the loop/if body compiler did
              * not). */
             if (const FuncDeclStmt *fdd =
-                    dynamic_cast<const FuncDeclStmt *>(s)) {
+                    node_cast<const FuncDeclStmt>(s)) {
                 if (fdd->id) {
                     emit_func_decl(fdd, code);
                     any_native = true;
@@ -5127,7 +7855,7 @@ struct Codegen {
                 }
             }
             if (const StructDeclStmt *sdd =
-                    dynamic_cast<const StructDeclStmt *>(s)) {
+                    node_cast<const StructDeclStmt>(s)) {
                 if (sdd->id) {
                     emit_struct_decl(sdd, code);
                     any_native = true;
@@ -5135,34 +7863,13 @@ struct Codegen {
                 }
             }
 
-            /* The DISCARD tier (mirrors gen_stmt's tail): a bare leaf
-             * (Identifier / scalar literal) statement is a deliberate no-op
-             * (the tree-walker never RValue-s a discarded statement); any
-             * OTHER expression statement compiles into a scratch temp and
-             * drops the result - `map(f, a);` in a loop body, a discarded
-             * ctor, `s[k];` - with the byte-identical throw carets. This is
-             * the terminal tier: what it can't compile fails the whole
-             * body (-> the enclosing statement's not-lowered abort). */
-            {
-                /* Same inert-leaf rule as gen_stmt's tail: always-bound ids /
-                 * literals are no-ops; an unresolved or global id compiles
-                 * (throw / defined-checked load), result discarded. */
-                const Identifier *bid = dynamic_cast<const Identifier *>(s);
-                const bool inert =
-                    dynamic_cast<const Literal *>(s)
-                    || (bid && bid->sym.kind != SymKind::unresolved
-                            && bid->sym.kind != SymKind::global);
-                if (inert)
-                    continue;
-                const size_t emark = code.size();
-                const int st2 = next_temp;
-                int dst;
-                if (compile_boxed_expr(s, dst, code)) {
-                    any_native = true;
-                    continue;
-                }
-                code.resize(emark);
-                next_temp = st2;
+            /* The DISCARD tier (compile_discarded, shared with gen_stmt and
+             * a `for`'s init / increment): the terminal tier - what it can't
+             * compile fails the whole body (-> the enclosing statement's
+             * not-lowered abort). */
+            if (compile_discarded(s, code)) {
+                any_native = true;
+                continue;
             }
 
             code.resize(start);
@@ -5208,10 +7915,13 @@ struct Codegen {
                 int cslot;
                 /* BOXED condition -> compute a bool slot + branch-unless-
                  * true; the last resort before failing the whole `if`. */
-                if (compile_boxed_expr(f->condExpr.get(), cslot, code)) {
+                if (compile_boxed_expr(f->condExpr.get(), cslot, code,
+                                   /*allow_typed=*/true,
+                                   /*truthy_only=*/true)) {
                     CgInstr in;
                     in.op = OpCode::JumpUnlessTrueV;
-                    in.node_idx = add_ast_node(f->condExpr.get());
+                    in.node_idx = add_ast_node(f);   /* the IfStmt: the caret
+                                                      * the tree-walker stamps */
                     in.target2 = cslot;
                     jf = code.size();
                     code.push_back(in);
@@ -5263,12 +7973,19 @@ struct Codegen {
      *   Lcb: <catch B> ; Jump Lend
      *   Lend:
      */
-    /* Emit SetPend <p> (Inc 2b): the pending action a following finally runs. */
-    void emit_setpend(Pend p)
+    /* Emit SetPend <p> (Inc 2b): the pending action a following finally
+     * runs, in try region `region`'s slot (#78). `drop` (target2 = 1):
+     * also free the exception the dispatch parked there - a catch body is
+     * done with it (question 12: it is parked for as long as the body
+     * runs, and freed when the tree-walker frees its copy). */
+    void emit_setpend(int region, Pend p, bool drop = false)
     {
         CgInstr in;
         in.op = OpCode::SetPend;
+        in.set_a(int_lit(region));
         in.target = static_cast<int>(p);
+        if (drop)
+            in.target2 = 1;
         code.push_back(in);
     }
 
@@ -5285,83 +8002,215 @@ struct Codegen {
         const size_t start = code.size();
         const size_t ct_start = chunk.catch_types.size();
         const size_t trys_depth = trys.size();
+        /* #78: this try's region id. NOT rolled back by bail() - a bailed
+         * try leaves a hole in the id space, which only costs an unused
+         * pends slot (self-consistent either way). */
+        const int region = next_try_region++;
 
         /* Jumps to the finally block / to Lend, backpatched at the end. With a
          * finally, every exit path sets the pending action + jumps to Lfin
          * (EndFinally resumes it); without, exits jump straight to Lend. */
         std::vector<size_t> to_fin, to_end;
-        auto exit_to = [&](Pend p) {
+        /* the catch bodies' GUARD region (below), or -1 */
+        int guard = -1;
+        /* the guard and the finally MARKERS - regions this try adds beyond
+         * its own, reset by bail() */
+        std::vector<int> extra;
+        /*
+         * #78 step D: the only remaining exit kind is a NORMAL one (the try
+         * body ran to the end, a catch body finished). The "no clause
+         * matched" exit is GONE from the bytecode: vm_dispatch_exc reads
+         * that decision off the handler table - it parks a `reraise` and
+         * resumes at fin_pc itself, or returns false to the frame walk.
+         */
+        /* `drop`: a catch body's exit, which frees the parked exception */
+        auto exit_to = [&](bool drop) {
             if (has_fin) {
-                emit_setpend(p);
+                emit_setpend(region, Pend::normal, drop);
                 to_fin.push_back(emit(OpCode::Jump));
-            } else if (p == Pend::reraise) {
-                emit(OpCode::Reraise);
             } else {
+                if (drop)
+                    emit_setpend(region, Pend::normal, true);
                 to_end.push_back(emit(OpCode::Jump));
             }
         };
         auto bail = [&]() {
             code.resize(start);
             chunk.catch_types.resize(ct_start);
+            chunk.catch_keys.resize(ct_start);
             trys.resize(trys_depth);
+            /* #78: drop this region's half-built site (the region ID is not
+             * reclaimed - a hole costs one unused table + pends slot) */
+            if (static_cast<size_t>(region) < chunk.handler_sites.size())
+                chunk.handler_sites[region] = Chunk::HandlerSite();
+            for (const int r : extra)
+                chunk.handler_sites[static_cast<size_t>(r)] =
+                    Chunk::HandlerSite();
             return false;
         };
+        /*
+         * Question 12: a region whose body HANDLES the exception parked in
+         * region `chain` - an exception leaving that body remembers it
+         * (Chunk::HandlerSite::chain). No clause and, unless the caller
+         * adds one, no finally: the dispatch only reads it as it pops it.
+         */
+        auto new_marker = [&](int chain) {
+            const int r = next_try_region++;
+            if (static_cast<size_t>(r) >= chunk.handler_sites.size())
+                chunk.handler_sites.resize(static_cast<size_t>(r) + 1);
+            Chunk::HandlerSite &ms =
+                chunk.handler_sites[static_cast<size_t>(r)];
+            ms = Chunk::HandlerSite();
+            ms.chain = chain;
+            extra.push_back(r);
+            return r;
+        };
+        /*
+         * The RERAISE copy of the finally - the one the dispatch enters,
+         * with the exception it propagates parked in region `parked` - and
+         * its EndFinally. It runs under a marker chaining there, so an
+         * exception the finally throws remembers the propagating one. The
+         * marker is a try frame of its own for the flow ops (it is pushed:
+         * a break/continue/return leaving the finally pops it). Returns
+         * the copy's pc, or -1 when the body fails to compile.
+         */
+        auto compile_reraise_finally = [&](int parked) -> int {
+            const int at = static_cast<int>(here());
+            const int m = new_marker(parked);
+            const size_t mp = emit(OpCode::PushHandler);
+            code[mp].set_a(int_lit(m));
+            trys.push_back({ false, nullptr, false, nullptr, m, true });
+            const bool ok =
+                compile_scalar_body(body_stmts(t->finallyBody.get()), false);
+            trys.pop_back();
+            if (!ok)
+                return -1;
+            emit(OpCode::PopHandler);
+            const size_t ef = emit(OpCode::EndFinally);
+            code[ef].set_a(int_lit(parked));           /* #78: whose pend */
+            return at;
+        };
 
-        const size_t ph = emit(OpCode::PushHandler);   /* target=catch_pc (patch) */
+        /* #78 step D: PushHandler carries ONLY the region id - the pushed
+         * handler names its table entry, and the dispatch reads the clause
+         * pcs from there. It has no target pc (hence it is no longer in
+         * visit_pc_fields). */
+        const size_t ph = emit(OpCode::PushHandler);
+        code[ph].set_a(int_lit(region));               /* #78: the region id */
         /* Register this try so a flow op in the body/catch (Inc 2c) can inline
          * this finally + pop this handler. `in_catch` starts false (the body's
          * handler is live); flipped true before the catch bodies. */
         trys.push_back({ has_fin, has_fin ? &to_fin : nullptr, false,
-                         t->finallyBody.get() });
+                         t->finallyBody.get(), region });
         if (!compile_scalar_body(body_stmts(t->tryBody.get()), false))
             return bail();
         emit(OpCode::PopHandler);
-        exit_to(Pend::normal);                         /* normal try exit */
+        exit_to(false);                                /* normal try exit */
 
-        code[ph].target = static_cast<int>(here());   /* Lcatch */
+        /* #78 step D: the site IS the dispatch data now - no chain is
+         * emitted, so the catch bodies follow the try body directly. */
+        if (static_cast<size_t>(region) >= chunk.handler_sites.size())
+            chunk.handler_sites.resize(static_cast<size_t>(region) + 1);
+        /* (indexed, never held by reference: a try nested in a catch body
+         * grows handler_sites while this one is being filled) */
+        auto site = [&]() -> Chunk::HandlerSite & {
+            return chunk.handler_sites[static_cast<size_t>(region)];
+        };
+        site().clauses.clear();
+        site().fin_pc = -1;
 
-        std::vector<size_t> tests;
         for (const auto &cs : t->catchStmts) {
             int types_idx = -1;
             if (cs.first.exList) {
                 std::vector<std::string> names;
-                for (const auto &id : cs.first.exList->elems)
-                    names.push_back(std::string(id->get_str()));
+                std::vector<Chunk::CatchKey> keys;
+                const auto &ids = cs.first.exList->elems;
+                /* one def per name; none at all for a tree no inference
+                 * walked (a test compiling a parsed block), padded here */
+                std::vector<const StructTypeDef *> defs = cs.first.defs;
+                defs.resize(ids.size());
+                for (size_t k = 0; k < ids.size(); k++) {
+                    names.push_back(std::string(ids[k]->get_str()));
+                    Chunk::CatchKey key;
+                    key.uid = ids[k]->uid;
+                    key.def = defs[k];
+                    key.builtin = is_catchable_ex_name(names.back());
+                    keys.push_back(key);
+                }
                 types_idx = static_cast<int>(chunk.catch_types.size());
                 chunk.catch_types.push_back(std::move(names));
+                chunk.catch_keys.push_back(std::move(keys));
             }
             const Identifier *asId = cs.first.asId.get();
-            CgInstr in;
-            in.op = OpCode::CatchTest;
-            in.set_a(int_lit(types_idx));
-            in.target2 = asId ? asId->sym.slot : -1;   /* bind slot / -1 */
-            tests.push_back(code.size());         /* patch .target below */
-            code.push_back(in);
+            site().clauses.push_back({ types_idx,
+                                       asId ? asId->sym.slot : -1,
+                                       -1 });      /* body_pc patched below */
         }
-        exit_to(Pend::reraise);                        /* no clause matched */
 
-        /* Catch bodies run with THIS try's handler already popped (the
-         * dispatch popped it), so a return here must not re-pop it. */
+        /*
+         * Catch bodies run with THIS try's handler already popped (the
+         * dispatch popped it), under a GUARD: a second region with no
+         * clause, chaining to this one (question 12) - so an exception
+         * leaving a catch body (a rethrow, a throw, an error) remembers the
+         * caught one. With a finally the guard's fin_pc is a copy of it,
+         * so that exception runs the finally before it propagates, as the
+         * tree-walker's scope guard does. A flow op out of a catch body
+         * pops the guard and inlines the finally once (handler_live).
+         */
+        if (!t->catchStmts.empty())
+            guard = new_marker(region);
         trys.back().in_catch = true;
+        trys.back().handler_live = guard >= 0;
         size_t ci = 0;
         for (const auto &cs : t->catchStmts) {
-            code[tests[ci]].target = static_cast<int>(here());  /* body_pc */
+            site().clauses[ci].body_pc = static_cast<int32_t>(here());
+            if (guard >= 0) {
+                const size_t gp = emit(OpCode::PushHandler);
+                code[gp].set_a(int_lit(guard));
+            }
             if (!compile_scalar_body(body_stmts(cs.second.get()), false))
                 return bail();
-            exit_to(Pend::normal);                     /* catch body done */
+            if (guard >= 0)
+                emit(OpCode::PopHandler);
+            exit_to(true);                             /* catch body done */
             ci++;
         }
         trys.pop_back();                               /* body + catches done */
 
         if (has_fin) {
-            /* The SHARED finally block, reached by the NORMAL and RERAISE exits
-             * only (flow ops inline their own copy - Inc 2c). */
-            const int lfin = static_cast<int>(here());
-            for (size_t j : to_fin)
-                code[j].target = lfin;
-            if (!compile_scalar_body(body_stmts(t->finallyBody.get()), false))
+            /* The NORMAL finally block, reached by the normal exits only
+             * (flow ops inline their own copy - Inc 2c): nothing propagates
+             * there, so it runs under no marker, and the path that throws
+             * nothing pays nothing for the chain (question 12). With no
+             * normal exit (the body always returns) it is not emitted. */
+            if (!to_fin.empty()) {
+                const int lfin = static_cast<int>(here());
+                for (size_t j : to_fin)
+                    code[j].target = lfin;
+                if (!compile_scalar_body(body_stmts(t->finallyBody.get()),
+                                         false))
+                    return bail();
+                const size_t ef = emit(OpCode::EndFinally);
+                code[ef].set_a(int_lit(region));       /* #78: whose pend */
+                to_end.push_back(emit(OpCode::Jump));
+            }
+            /* The RERAISE copies, entered only by the dispatch with a
+             * re-raise parked: the try's (no clause matched), then the
+             * catch GUARD's (an exception left a catch body). Their
+             * EndFinally re-raises; the jump between them is reached only
+             * when nothing was parked (a corrupt image) */
+            const int lrr = compile_reraise_finally(region);
+            if (lrr < 0)
                 return bail();
-            emit(OpCode::EndFinally);
+            site().fin_pc = static_cast<int32_t>(lrr);
+            if (guard >= 0) {
+                to_end.push_back(emit(OpCode::Jump));
+                const int lg = compile_reraise_finally(guard);
+                if (lg < 0)
+                    return bail();
+                chunk.handler_sites[static_cast<size_t>(guard)].fin_pc =
+                    static_cast<int32_t>(lg);
+            }
         }
 
         const int lend = static_cast<int>(here());
@@ -5403,7 +8252,7 @@ struct Codegen {
         /* The condition -> native compare-branch(es) to the exit; a compound
          * `A && B` becomes one branch per conjunct (see emit_cond_jumps). */
         std::vector<size_t> exit_jumps;
-        if (!emit_cond_jumps(w->condExpr.get(), exit_jumps)) {
+        if (!emit_cond_jumps(w->condExpr.get(), exit_jumps, w)) {
             code.resize(start);
             return false;
         }
@@ -5556,7 +8405,7 @@ struct Codegen {
          * break / return / throw in the body (or genuinely runs forever),
          * exactly like the tree-walker's missing-cond ForStmt. */
         std::vector<size_t> exit_jumps;
-        if (f->cond && !emit_cond_jumps(f->cond.get(), exit_jumps)) {
+        if (f->cond && !emit_cond_jumps(f->cond.get(), exit_jumps, f)) {
             code.resize(start);
             return false;
         }
@@ -5583,9 +8432,13 @@ struct Codegen {
                     code.resize(imark);
                     reset_temps();
                     if (!compile_boxed_stmt(f->inc.get(), code)) {
-                        loops.pop_back();
-                        code.resize(start);
-                        return false;
+                        code.resize(imark);
+                        reset_temps();
+                        if (!compile_discarded(f->inc.get(), code)) {
+                            loops.pop_back();
+                            code.resize(start);
+                            return false;
+                        }
                     }
                 }
             }
@@ -5597,6 +8450,42 @@ struct Codegen {
             code[j].target = lend;
         pop_loop(lend, lcont);
         return true;
+    }
+
+    /*
+     * #53 option 1 - THE FOREACH SHIFT GUARD (see ArrEpochMark in
+     * bytecode.h). Called right after the loop's ArrLen, while the loop's
+     * temps are still being reserved: records the container temp `c`'s
+     * shift epoch into a fresh temp and returns it - or -1, emitting
+     * nothing, when the body PROVABLY cannot move an element (every
+     * foreach bench body), so a proven loop pays zero.
+     */
+    int emit_foreach_epoch_mark(const ForeachStmt *fe, int c)
+    {
+        if (struct_fe_body_inert(fe->body.get(), /*shift_only=*/true))
+            return -1;
+        const int m = alloc_temp();
+        CgInstr mk;
+        mk.op = OpCode::ArrEpochMark;
+        mk.target = m;
+        mk.target2 = c;
+        code.push_back(mk);
+        return m;
+    }
+
+    /* ... and its per-iteration test, at the loop head BEFORE the element
+     * load (a moved element must never be bound first). The caret is the
+     * container's, like the loads' own OutOfBoundsEx. */
+    void emit_foreach_epoch_check(const ForeachStmt *fe, int c, int m)
+    {
+        if (m < 0)
+            return;
+        CgInstr ck;
+        ck.op = OpCode::ArrEpochCheck;
+        ck.node_idx = add_ast_node(fe->container.get());
+        ck.target2 = c;
+        ck.set_a(slot_op(m));
+        code.push_back(ck);
     }
 
     /*
@@ -5624,14 +8513,14 @@ struct Codegen {
          * element in ids[0]. */
         const int elem_id = fe->indexed ? 1 : 0;
         const Identifier *id =
-            dynamic_cast<const Identifier *>(fe->ids->elems[elem_id].get());
+            node_cast<const Identifier>(fe->ids->elems[elem_id].get());
         if (!id || id->sym.kind != SymKind::local)
             return false;
         const int x_slot = id->sym.slot;
         int idx_slot = -1;
         if (fe->indexed) {
             const Identifier *ix =
-                dynamic_cast<const Identifier *>(fe->ids->elems[0].get());
+                node_cast<const Identifier>(fe->ids->elems[0].get());
             if (!ix || ix->sym.kind != SymKind::local)
                 return false;
             idx_slot = ix->sym.slot;
@@ -5662,6 +8551,7 @@ struct Codegen {
         ln.target = n;
         ln.target2 = c;
         code.push_back(ln);
+        const int m = emit_foreach_epoch_mark(fe, c);     /* #53 */
 
         /* The counter: for an indexed foreach it IS the index var (ids[0], read
          * by the body); otherwise a fresh temp. Either way it starts at 0 and
@@ -5684,6 +8574,7 @@ struct Codegen {
                                    slot_op(i), slot_op(n));
 
         const int lbody = here();
+        emit_foreach_epoch_check(fe, c, m);
 
         /* x = c[i] : a direct flat int/float element load into the loop var,
          * re-run at the top of every iteration (the ForLoopStep re-enters
@@ -5745,14 +8636,14 @@ struct Codegen {
 
         const int elem_id = fe->indexed ? 1 : 0;
         const Identifier *id =
-            dynamic_cast<const Identifier *>(fe->ids->elems[elem_id].get());
+            node_cast<const Identifier>(fe->ids->elems[elem_id].get());
         if (!id || id->sym.kind != SymKind::local)
             return false;
         const int x_slot = id->sym.slot;
         int idx_slot = -1;
         if (fe->indexed) {
             const Identifier *ix =
-                dynamic_cast<const Identifier *>(fe->ids->elems[0].get());
+                node_cast<const Identifier>(fe->ids->elems[0].get());
             if (!ix || ix->sym.kind != SymKind::local)
                 return false;
             idx_slot = ix->sym.slot;
@@ -5846,7 +8737,7 @@ struct Codegen {
             || fe->ids->elems.size() != 1)
             return false;
         const Identifier *id =
-            dynamic_cast<const Identifier *>(fe->ids->elems[0].get());
+            node_cast<const Identifier>(fe->ids->elems[0].get());
         if (!id || id->sym.kind != SymKind::local)
             return false;
         const int x_slot = id->sym.slot;
@@ -5856,7 +8747,8 @@ struct Codegen {
          * MATERIALIZE a fresh StructObject per iteration (LoadStructElemV) into
          * `p`'s slot and compile the body normally. */
         const bool whole_p = !struct_fe_body_ok(fe->body.get(), x_slot,
-                                                fe->container_struct_def, false);
+                                                fe->container_struct_def, false)
+                          || !struct_fe_body_inert(fe->body.get());   /* #53 */
 
         const size_t start = code.size();
         reset_temps();
@@ -5880,6 +8772,10 @@ struct Codegen {
         ln.target = n;
         ln.target2 = c;
         code.push_back(ln);
+        /* #53: a DIRECT read needs an inert body, which cannot shift -
+         * so only the whole-`p` bind can carry a guard */
+        const int m = emit_foreach_epoch_mark(fe, c);
+        ML_CHECK(whole_p || m < 0);
 
         const int i = alloc_temp();
         CgInstr z;
@@ -5897,29 +8793,31 @@ struct Codegen {
         const int lbody = here();
 
         if (whole_p) {
+            emit_foreach_epoch_check(fe, c, m);
             /* Materialize p = c[i] (a fresh StructObject) at the top of each
              * iteration; the body reads p's slot normally (no sfe mapping). */
             CgInstr ld;
             ld.op = OpCode::LoadStructElemV;
+            /* #53: it can raise - the body may have shrunk the array -
+             * with the container's caret, like the other foreach loads */
+            ld.node_idx = add_ast_node(fe->container.get());
             ld.target = x_slot;
             ld.target2 = c;
             ld.set_a(slot_op(i));
             code.push_back(ld);
         } else {
-            /* No element load - p is never materialized. Activate the direct-
-             * read mapping so a p.field read -> LoadStructField*(c[i].fld). */
-            sfe_loop_slot = x_slot;
-            sfe_arr_slot = c;
-            sfe_ctr_slot = i;
-            sfe_def = fe->container_struct_def;
+            /* No element load - p is never materialized. Push the direct-
+             * read mapping so a p.field read -> LoadStructField*(c[i].fld),
+             * ABOVE any enclosing loop's (which stays active: its var is
+             * read in this body too). */
+            sfe_maps.push_back({ x_slot, c, i, fe->container_struct_def });
         }
 
         push_loop();
         const bool body_ok = compile_scalar_body(body_stmts(fe->body.get()));
 
-        sfe_loop_slot = -1;   /* deactivate (success AND failure path) */
-        sfe_arr_slot = sfe_ctr_slot = -1;
-        sfe_def = nullptr;
+        if (!whole_p)
+            sfe_maps.pop_back();  /* deactivate (success AND failure path) */
 
         if (!body_ok) {
             loops.pop_back();
@@ -5980,7 +8878,7 @@ struct Codegen {
         bool consecutive = true;
         for (int k = 0; k < N; k++) {
             const Identifier *id =
-                dynamic_cast<const Identifier *>(fe->ids->elems[k].get());
+                node_cast<const Identifier>(fe->ids->elems[k].get());
             if (!id)
                 return false;
             if (k < first) {                 /* the index var: real local */
@@ -6028,6 +8926,7 @@ struct Codegen {
         ln.target = n;
         ln.target2 = c;
         code.push_back(ln);
+        const int m = emit_foreach_epoch_mark(fe, c);     /* #53 */
 
         /* The counter: for an indexed loop it IS the index var (base, read by
          * the body); otherwise a fresh temp. */
@@ -6037,39 +8936,72 @@ struct Codegen {
         z.target = i;
         z.set_a(int_lit(0));
         code.push_back(z);
+        /* the current ROW (the lowered general-row unpack reads it) */
+        const int row = flat || consecutive ? -1 : alloc_temp();
 
         const int saved_base = temp_base;
-        temp_base = next_temp;   /* reserve c/n/(i) */
+        temp_base = next_temp;   /* reserve c/n/(i)/row */
 
         const size_t jt = emit_cmp(OpCode::JumpUnlessIntCmp,
                                    fe->container.get(), Op::lt,
                                    slot_op(i), slot_op(n));
 
         const int lbody = here();
+        emit_foreach_epoch_check(fe, c, m);
 
-        /* Per element: read pairs[i] (a sub-array), strict-check its length ==
-         * nunpack, and write its scalars into unpack_base..+nunpack-1 - box-free
-         * raw for a flat int/float sub-array (UnpackElemInt/Float), else each
-         * element's boxed value (UnpackElemValue, for a general/dyn/str/mixed
-         * sub-array like shopping's [str, float]). */
-        CgInstr up;
-        if (consecutive) {
-            up.op = fe->unpack_elem_th == TypeHint::i ? OpCode::UnpackElemInt
-                  : fe->unpack_elem_th == TypeHint::f ? OpCode::UnpackElemFloat
-                                                      : OpCode::UnpackElemValue;
-            up.target = unpack_base;
+        /*
+         * Per element. A flat int/float row (unpack_elem_th) keeps the ONE
+         * op that binds the scalars (UnpackElemInt/Float, or the targets
+         * pool for a `_` / non-consecutive layout): lowering it measured
+         * -2% on 20_foreach_unpack. A GENERAL row (unpack_elem_value -
+         * strings, mixed, 75_indexed_unpack's shape) with CONSECUTIVE
+         * targets is UnpackElemValue, whose JIT tier borrows the row and
+         * binds every element inline (#74); one with a `_` is LOWERED,
+         * since the op's helper (~180 Ir per row) is all it has there:
+         *
+         *     row = c[i]                     LoadElemValue (the OOB of a
+         *                                    shrunk container, #53)
+         *     <emit_lowered_unpack of row>   (the foreach's strict error,
+         *                                    then one LoadElemValue each)
+         *
+         * All carets are the container's, as the op's were.
+         */
+        if (flat || consecutive) {
+            CgInstr up;
+            if (consecutive) {
+                /* #74: a GENERAL row whose targets are consecutive takes
+                 * the one op too - its JIT tier borrows the row from
+                 * c[i] and copies each element straight into its target
+                 * (no row temp to retain, release and re-navigate per
+                 * element, which the lowering below pays) */
+                up.op = !flat ? OpCode::UnpackElemValue
+                      : fe->unpack_elem_th == TypeHint::i
+                            ? OpCode::UnpackElemInt
+                            : OpCode::UnpackElemFloat;
+                up.target = unpack_base;
+            } else {
+                /* A `_` (or non-consecutive layout): per-position
+                 * targets pool, each element bound box-free. */
+                up.op = OpCode::UnpackElemTargets;
+                up.target = static_cast<int>(chunk.unpack_targets.size());
+                chunk.unpack_targets.push_back(targets);
+            }
+            up.node_idx = add_ast_node(fe->container.get());
+            up.target2 = c;
+            up.set_a(slot_op(i));
+            up.set_b(int_lit(nunpack));
+            code.push_back(up);
         } else {
-            /* A `_` (or non-consecutive layout): per-position targets pool,
-             * each element bound box-free (vm_arr_elem, flat or general). */
-            up.op = OpCode::UnpackElemTargets;
-            up.target = static_cast<int>(chunk.unpack_targets.size());
-            chunk.unpack_targets.push_back(targets);
+            CgInstr lr;
+            lr.op = OpCode::LoadElemValue;
+            lr.node_idx = add_ast_node(fe->container.get());
+            lr.target = row;
+            lr.target2 = c;
+            lr.set_a(slot_op(i));
+            code.push_back(lr);
+            emit_lowered_unpack(fe->container.get(), row, targets,
+                                TypeHint::none, /*foreach=*/true, code);
         }
-        up.node_idx = add_ast_node(fe->container.get());
-        up.target2 = c;
-        up.set_a(slot_op(i));
-        up.set_b(int_lit(nunpack));
-        code.push_back(up);
 
         push_loop();
         if (!compile_scalar_body(body_stmts(fe->body.get()))) {
@@ -6123,7 +9055,7 @@ struct Codegen {
          * non-local target -> bail (leave to the tree-walker). */
         auto slot_of = [&](size_t i, int &out) -> bool {
             const Identifier *id =
-                dynamic_cast<const Identifier *>(fe->ids->elems[i].get());
+                node_cast<const Identifier>(fe->ids->elems[i].get());
             if (!id)
                 return false;
             if (id->is_underscore()) { out = -1; return true; }
@@ -6136,7 +9068,7 @@ struct Codegen {
         int idx_slot = -1;
         if (off) {
             const Identifier *id0 =
-                dynamic_cast<const Identifier *>(fe->ids->elems[0].get());
+                node_cast<const Identifier>(fe->ids->elems[0].get());
             if (!id0 || id0->is_underscore()
                 || id0->sym.kind != SymKind::local)
                 return false;
@@ -6234,10 +9166,10 @@ struct Codegen {
     {
         /* No container_is_dyn gate: ForeachDynInit/Next RUNTIME-dispatch
          * array|dict and mirror do_iter's bind rules for ANY id list (any
-         * var count, `indexed`, `_`, dict none-padding), so this is the
+         * var count, `indexed`, `_`, a dict's arity error), so this is the
          * UNIVERSAL foreach - tried LAST, after the specific fast forms, it
          * also covers the residual proven shapes (a lone `_`, a 1-var
-         * indexed array, a >2-var dict with none-pad, ...). A non-iterable
+         * indexed array, a >2-var dict (an error), ...). A non-iterable
          * container throws the tree-walker's TypeErrorEx from Init. */
         if (!fe->ids || fe->ids->elems.empty())
             return false;
@@ -6250,7 +9182,7 @@ struct Codegen {
         targets.reserve(fe->ids->elems.size());
         for (const auto &el : fe->ids->elems) {
             const Identifier *id =
-                dynamic_cast<const Identifier *>(el.get());
+                node_cast<const Identifier>(el.get());
             if (!id)
                 return false;
             if (id->is_underscore()) {
@@ -6292,10 +9224,11 @@ struct Codegen {
         CgInstr nx;
         nx.op = OpCode::ForeachDynNext;
         nx.target2 = iter_id;              /* targets ride the iterator state */
-        /* A multi-var array element is strict-unpacked, so Next can throw;
-         * record the container caret (do_iter uses container->start/end). */
-        if (nvars - (fe->indexed ? 1 : 0) >= 2)
-            nx.node_idx = add_ast_node(fe->container.get());
+        /* A multi-var array element is strict-unpacked, and any array
+         * element may be GONE (#53: the body shrank the array), so Next can
+         * throw; record the container caret (do_iter uses
+         * container->start/end). */
+        nx.node_idx = add_ast_node(fe->container.get());
         const size_t nx_i = code.size();
         code.push_back(nx);          /* .target (end_pc) backpatched */
 
@@ -6320,13 +9253,53 @@ struct Codegen {
         return true;
     }
 
-    void gen_stmts(const std::vector<unique_ptr<Construct>> &elems)
+    /*
+     * A NAMED func/struct declaration binds at SCOPE ENTRY, not where the
+     * statement sits (#134) - so a call to a function declared BELOW the call
+     * works, at every scope. Sound because such a declaration cannot depend on
+     * the enclosing frame: the grammar REJECTS a capture list on a named func
+     * (`func f[a](x)` is a SyntaxError - captures are for closure EXPRESSIONS
+     * only) and a named func's body is parented to the program root, so it
+     * cannot read an enclosing local either.
+     *
+     * A LAMBDA is NOT one of these: `var f = func(x) {...}` is an Expr14 var
+     * declaration, so it keeps its declaration-point binding and its temporal
+     * dead zone - its capture snapshot must happen where it is written.
+     *
+     * The tree-walker twin is bind_hoistable_decls (eval.cpp); the two must
+     * stay in lockstep or the engines diverge on WHEN a name becomes callable.
+     */
+    static bool is_hoistable_decl(const Construct *c)
     {
-        for (const auto &e : elems)
-            gen_stmt(e.get());
+        if (const auto *fd = node_cast<const FuncDeclStmt>(c))
+            return fd->id != nullptr;
+        if (const auto *sd = node_cast<const StructDeclStmt>(c))
+            return sd->id != nullptr;
+        return false;
     }
 
-    void gen_stmt(const Construct *s)
+    void gen_stmts(const std::vector<unique_ptr<Construct>> &elems)
+    {
+        /* Emit the block's named func/struct decls FIRST (see above), then
+         * everything else in source order. Re-entering the block (a loop body)
+         * re-runs them, exactly as the statement position used to. */
+        for (const auto &e : elems)
+            if (is_hoistable_decl(e.get()))
+                gen_stmt(e.get());
+
+        for (const auto &e : elems)
+            if (!is_hoistable_decl(e.get()))
+                gen_stmt(e.get());
+    }
+
+    /* Refuse a statement whose lowering failed (NotLoweredEx). */
+    void require_lowered(bool ok, const Construct *s)
+    {
+        if (!ok)
+            throw_not_lowered(s);
+    }
+
+    void gen_stmt_impl(const Construct *s)
     {
         /* Native-first: the register machine applies to top-level AND
          * function-body statements, not only loop bodies. A resolved-local
@@ -6352,36 +9325,27 @@ struct Codegen {
             return;
         code.resize(mark);
 
-        if (const IfStmt *f = dynamic_cast<const IfStmt *>(s)) {
-            if (!compile_native_if(f))
-                throw_not_lowered(s);
-            return;
-        }
-        if (const WhileStmt *w = dynamic_cast<const WhileStmt *>(s)) {
-            if (!try_native_scalar_while(w))
-                throw_not_lowered(s);
-            return;
-        }
-        if (const ForRangeStmt *fr = dynamic_cast<const ForRangeStmt *>(s)) {
-            if (!try_native_for_range(fr))
-                throw_not_lowered(s);
-            return;
-        }
-        if (const ForStmt *fs = dynamic_cast<const ForStmt *>(s)) {
-            if (!try_native_for(fs))           /* general (non-range) for */
-                throw_not_lowered(s);
-            return;
-        }
-        if (const ForeachStmt *fe = dynamic_cast<const ForeachStmt *>(s)) {
-            if (!try_native_foreach(fe)         /* flat/general array */
-                && !try_native_foreach_str(fe)  /* string chars */
-                && !try_native_foreach_unpack(fe) /* strict array destructure */
-                && !try_native_struct_foreach(fe) /* flat struct fields */
-                && !try_native_dict_foreach(fe)   /* live dict iterator */
-                && !try_native_dyn_foreach(fe))   /* runtime array|dict */
-                throw_not_lowered(s);
-            return;
-        }
+        /* A statement kind with ONE lowering (its compiler, or a chain of
+         * them) is refused at once when that fails - require_lowered, the
+         * one place the refusal is decided: no later tier takes a loop, an
+         * `if`, a `return`, a `try` or a `throw`. */
+        if (const IfStmt *f = node_cast<const IfStmt>(s))
+            return require_lowered(compile_native_if(f), s);
+        if (const WhileStmt *w = node_cast<const WhileStmt>(s))
+            return require_lowered(try_native_scalar_while(w), s);
+        if (const ForRangeStmt *fr = node_cast<const ForRangeStmt>(s))
+            return require_lowered(try_native_for_range(fr), s);
+        if (const ForStmt *fs = node_cast<const ForStmt>(s))
+            return require_lowered(try_native_for(fs), s);
+        if (const ForeachStmt *fe = node_cast<const ForeachStmt>(s))
+            return require_lowered(
+                try_native_foreach(fe)         /* flat/general array */
+                || try_native_foreach_str(fe)  /* string chars */
+                || try_native_foreach_unpack(fe) /* strict array destructure */
+                || try_native_struct_foreach(fe) /* flat struct fields */
+                || try_native_dict_foreach(fe)   /* live dict iterator */
+                || try_native_dyn_foreach(fe),   /* runtime array|dict */
+                s);
         /* A user-function call statement (result discarded) -> CallV. */
         if (const DirectCallExpr *dc =
                 dynamic_cast<const DirectCallExpr *>(s)) {
@@ -6400,16 +9364,14 @@ struct Codegen {
          * result discarded) -> CallValueV (F-3, phonebook's `cmdfunc(data)`).
          * try_native_value_call rejects a Direct{Call,BuiltinCall}Expr, so this
          * only catches a plain CallExpr the two handlers above didn't. */
-        if (const CallExpr *call = dynamic_cast<const CallExpr *>(s)) {
+        if (const CallExpr *call = node_cast<const CallExpr>(s)) {
             int dst;
             if (try_native_value_call(call, dst, code))
                 return;
         }
         /* `return <expr>;` -> ReturnV (its expr compiled natively). */
-        if (const ReturnStmt *ret = dynamic_cast<const ReturnStmt *>(s)) {
-            if (try_native_return(ret, code))
-                return;
-        }
+        if (const ReturnStmt *ret = node_cast<const ReturnStmt>(s))
+            return require_lowered(try_native_return(ret, code), s);
         /* A `func f(..) {..}` decl statement bound into a GLOBAL slot (a
          * hoisted top-level / scoped function) -> MakeClosureV (create the
          * FuncObject, snapshotting captures) + StoreGlobalV (write the slot +
@@ -6421,7 +9383,7 @@ struct Codegen {
          * (parser.cpp) - so a non-global named decl is provably impossible
          * here (the REPL, whose names ARE map-resident, never runs codegen);
          * ML_CHECK guards the invariant. */
-        if (const FuncDeclStmt *fd = dynamic_cast<const FuncDeclStmt *>(s)) {
+        if (const FuncDeclStmt *fd = node_cast<const FuncDeclStmt>(s)) {
             if (fd->id) {
                 emit_func_decl(fd, code);
                 return;
@@ -6435,23 +9397,17 @@ struct Codegen {
          * `isconst` folds), so a plain StoreGlobalV is differential-identical.
          * Like a func decl, a SCRIPT struct decl is always global (structs
          * never capture; pWrapDeclBody closed the brace-less-body route). */
-        const StructDeclStmt *sd = dynamic_cast<const StructDeclStmt *>(s);
-        if (sd) {
-            if (sd->id) {
-                emit_struct_decl(sd, code);
-                return;
-            }
+        if (const StructDeclStmt *sd = node_cast<const StructDeclStmt>(s)) {
+            ML_CHECK(sd->id);          /* the grammar names every struct */
+            emit_struct_decl(sd, code);
+            return;
         }
         /* A `try/catch` -> a native handler region (P8 Inc 0). */
-        if (const TryCatchStmt *tc = dynamic_cast<const TryCatchStmt *>(s)) {
-            if (compile_native_try(tc))
-                return;
-        }
+        if (const TryCatchStmt *tc = node_cast<const TryCatchStmt>(s))
+            return require_lowered(compile_native_try(tc), s);
         /* `throw <expr>;` -> a native Throw op (P8 Inc 1). */
-        if (const ThrowStmt *th = dynamic_cast<const ThrowStmt *>(s)) {
-            if (try_native_throw(th, code))
-                return;
-        }
+        if (const ThrowStmt *th = node_cast<const ThrowStmt>(s))
+            return require_lowered(try_native_throw(th, code), s);
         /* A standalone braced block `{ ... }` statement: a SCOPE-FREE block runs
          * its statements directly in the current context (no child EvalContext -
          * every decl is a frame slot), exactly like an if/loop body, so compile
@@ -6459,7 +9415,7 @@ struct Codegen {
          * A non-scope-free block (a capture / nested func / slot-overflow decl)
          * needs its own context, which vm_run_chunk doesn't build, so it falls
          * back. Matches the tree-walker's Block::do_eval scope-free path. */
-        if (const Block *blk = dynamic_cast<const Block *>(s)) {
+        if (const Block *blk = node_cast<const Block>(s)) {
             if (blk->scope_free) {
                 gen_stmts(blk->elems);
                 return;
@@ -6467,37 +9423,9 @@ struct Codegen {
         }
 
         /* A bare EXPRESSION statement whose value is discarded (`s[3];`,
-         * `a[i:j];`, `x + y;`, `flag ? f() : g();`): compile it into a scratch
-         * temp and drop the result - evaluating for value then discarding is the
-         * same as evaluating for effect, so any error (OOB / missing-key / type)
-         * still throws natively with the right caret. SKIP a bare leaf
-         * (Identifier / scalar Literal): it has no side effect, and the
-         * tree-walker never RValue-s a discarded statement - so an undefined
-         * name must stay its harmless no-op (an UndefinedId sentinel), NOT a
-         * LoadGlobalV that would throw. A non-liftable expr (an AST/dev builtin,
-         * an inc-dec, an unresolved name) compiles or aborts below. */
-        {
-            /* A discarded INERT leaf - a scalar literal, or an id that is
-             * ALWAYS bound (local/param/capture/builtin) - is a no-op, as
-             * Block::do_eval (it never RValue-s the result). An UNRESOLVED
-             * id must throw UndefinedVariableEx and a GLOBAL id throws iff
-             * not yet defined - both exactly what compile_boxed_expr's leaf
-             * paths emit (ThrowRuntimeV / LoadGlobalV), result discarded. */
-            const Identifier *bid = dynamic_cast<const Identifier *>(s);
-            const bool inert =
-                dynamic_cast<const Literal *>(s)
-                || (bid && bid->sym.kind != SymKind::unresolved
-                        && bid->sym.kind != SymKind::global);
-            if (inert)
-                return;
-            const size_t emark = code.size();
-            const int st = next_temp;
-            int dst;
-            if (compile_boxed_expr(s, dst, code))
-                return;
-            code.resize(emark);
-            next_temp = st;
-        }
+         * `a[i:j];`, `x + y;`, `flag ? f() : g();`): compile_discarded. */
+        if (compile_discarded(s, code))
+            return;
 
         throw_not_lowered(s);
     }
@@ -6547,17 +9475,126 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
     for (size_t pc = 0; pc < code.size(); pc++) {
         CgInstr &in = code[pc];
         const Construct *node = node_at(in.node_idx);
+        /* #76: read + clear the loc twin UNCONDITIONALLY - a peephole
+         * FUSION copies the source Instr struct (IntAddModRI from an
+         * IntBin mod, ...), so the field can ride into an op whose branch
+         * below never touches it (a fuzzer-caught verify_ast_free abort). */
+        const Construct *locnode = node_at(in.loc_node_idx);
+        in.loc_node_idx = -1;
+        /*
+         * P8 Inc 4 + #38: an op spliced from an INLINED body records that
+         * body's inlined-at chain (FLATTENED into inline_frames), so a
+         * backtrace crossing it shows the virtual frames. The op's OWN
+         * node's chain when it has one, else the chain INHERITED from the
+         * innermost compiled node it was emitted for (CgInstr::inl) - an
+         * op whose carets live in a pool carries no node, and the
+         * tree-walker reaches the frames through any tagged ancestor.
+         * Read + cleared UNCONDITIONALLY, before any bail; pc-ascending,
+         * so inline_ctxs stays sorted.
+         */
+        {
+            const InlineCtx *ic =
+                (node && node->inline_ctx) ? node->inline_ctx : in.inl;
+            in.inl = nullptr;
+            if (ic)
+                chunk.inline_ctxs.push_back(
+                    {static_cast<uint32_t>(pc),
+                     intern_inline_ctx(ic, chunk, inline_memo)});
+        }
+        /*
+         * #127: the store BASE's caret -> base_locs. Read + cleared
+         * UNCONDITIONALLY and BEFORE the `!node` bail, for the same reason the
+         * loc twin above is: a peephole fusion copies the source struct, and a
+         * chain store records a base node with NO node_idx at all. The loop is
+         * pc-ascending, so base_locs comes out sorted.
+         */
+        if (const Construct *bn = node_at(in.base_node_idx)) {
+            chunk.base_locs.push_back(
+                {static_cast<uint32_t>(pc), bn->start, bn->end});
+            /*
+             * RULE 2 (2026-09-20): a USER CALL op's base node IS its
+             * argument list (the ExprList the emit sites record), so the
+             * op's THIRD caret - one span per argument, for a bind
+             * coercion to name the argument it rejected - is read off the
+             * same node here: `arg_locs` + `arg_loc_pool` (bytecode.h).
+             * Gated on the OPCODE, not the node kind alone: a peephole
+             * fusion copies a source struct, and only these three ops
+             * mean "argument list" by their base node.
+             */
+            if ((in.op == OpCode::CallV || in.op == OpCode::CachedCallV
+                 || in.op == OpCode::CallValueV
+                 || in.op == OpCode::CheckNoneArgsV)
+                    && ctag(bn) == ConstructType::expr_list) {
+                const auto *el = static_cast<const ExprList *>(bn);
+                Chunk::ArgLocEntry ae;
+                ae.pc = static_cast<uint32_t>(pc);
+                ae.first = static_cast<uint32_t>(chunk.arg_loc_pool.size());
+                ae.n = static_cast<uint32_t>(el->elems.size());
+                /* an argument with NO span of its own (a const-folded
+                 * literal carries none) takes the list's, so every
+                 * engine renders the same thing for it - the tree-walker
+                 * (stamp_args_loc) makes the same substitution */
+                for (const auto &a : el->elems)
+                    chunk.arg_loc_pool.push_back(
+                        a->start ? ArgLoc{a->start, a->end}
+                                 : ArgLoc{bn->start, bn->end});
+                chunk.arg_locs.push_back(ae);
+            }
+        }
+        in.base_node_idx = -1;
+        /* RULE 2: the compound-operation caret -> op_locs, on the same
+         * terms as the base caret (read + cleared before the `!node`
+         * bail; pc-ascending, so the table comes out sorted). */
+        if (const Construct *on = node_at(in.op_node_idx))
+            chunk.op_locs.push_back(
+                {static_cast<uint32_t>(pc), on->start, on->end});
+        in.op_node_idx = -1;
+        /*
+         * #97 E1: the named callee -> value_callees, on exactly the same
+         * terms and for the same reason (the pc is only known here, and a
+         * peephole fusion can copy the source struct into an op that never
+         * had one). pc-ascending, so the table comes out sorted.
+         */
+        /* step 1b: a direct CallV's too - the bytecode inliner reads it
+         * for a typed parameter of either kind of call */
+        if (in.arg_kinds)
+            chunk.call_arg_kinds.push_back(
+                {static_cast<uint32_t>(pc), in.arg_kinds});
+        if (in.callee_def_idx >= 0) {
+            chunk.value_callees.push_back(
+                {static_cast<uint32_t>(pc), in.callee_def_idx});
+            if (in.callee_def_idx2 >= 0)          /* #97 E3: the pair */
+                chunk.value_callees.push_back(
+                    {static_cast<uint32_t>(pc), in.callee_def_idx2});
+            for (const int32_t m : in.callee_def_more)   /* #72 */
+                if (in.callee_def_idx2 >= 0 && m >= 0)
+                    chunk.value_callees.push_back(
+                        {static_cast<uint32_t>(pc), m});
+            in.callee_def_idx = -1;
+        }
+        in.callee_def_idx2 = -1;
+        for (int32_t &m : in.callee_def_more)
+            m = -1;
+        in.arg_kinds = 0;
         if (!node)
             continue;
-        /* P8 Inc 4: an op spliced from an INLINED body records that body's
-         * inlined-at chain (FLATTENED into inline_frames), so a backtrace
-         * crossing it shows the virtual frames. Recorded BEFORE the switch nulls
-         * the node; pc-ascending, so inline_ctxs stays sorted. (Rare - only
-         * inlined ops have one.) */
-        if (node->inline_ctx)
-            chunk.inline_ctxs.push_back(
-                {static_cast<uint32_t>(pc),
-                 intern_inline_ctx(node->inline_ctx, chunk, inline_memo)});
+        /*
+         * G4: the CHECKED `a[i].f` form is the ONE faultable use of
+         * LoadStructFieldInt/Float, so it needs a caret while the
+         * struct-foreach form (proven no-fault) still records none - a
+         * distinction the per-opcode switch below cannot express, since
+         * both share an opcode. Recorded here, from the SUBSCRIPT node the
+         * gate stamped, so an index OOB reports the span the boxed pair
+         * reported before.
+         */
+        if ((in.op == OpCode::LoadStructFieldInt
+             || in.op == OpCode::LoadStructFieldFloat)
+            && in.struct_checked()) {
+            chunk.locs.push_back(
+                {static_cast<uint32_t>(pc), node->start, node->end});
+            in.node_idx = -1;
+            continue;
+        }
         switch (in.op) {
         case OpCode::IntBin:
         case OpCode::FloatBin:
@@ -6583,16 +9620,39 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         case OpCode::IncDecCheckedV:  /* node = the inc-dec (TypeError caret) */
         case OpCode::StructCtorV:    /* node = ctor (defensive coerce loc) */
         case OpCode::MakeStructArrayV: /* node = a ctor (defensive coerce loc) */
+        case OpCode::MakeDictV:      /* node = the {..} literal: an UNHASHABLE
+                                      * key (a dyn-laundered func) throws from
+                                      * build_dict_from_pairs' key freeze/hash */
+        case OpCode::JumpUnlessTrueV: /* node = the enclosing if/while/ternary:
+                                       * is_true's base Type op throws for a
+                                       * value with no bool conversion */
+        case OpCode::LogV:           /* node = the &&/|| expr: same is_true
+                                      * throw (it used to be assumed no-throw,
+                                      * which made the JIT std::terminate) */
         case OpCode::ForeachDynInit: /* node = container (unsupported caret) */
-        case OpCode::ForeachDynNext: /* node set only for a 2-var unpack caret */
+        case OpCode::ForeachDynNext: /* node = container: an unpack caret,
+                                      * or a GONE element's (#53) */
         case OpCode::JumpUnlessElemInt:  /* E4 fusion - keeps the load's
                                           * OOB caret */
         case OpCode::ForStepElemInt:     /* #9 fusion - the embedded back-edge
                                           * load's OOB caret */
+        case OpCode::OrdCharV:       /* node = the s[i] subscript (OOB caret) */
         case OpCode::LoadElemInt:    /* node = the a[i] / container (OOB caret) */
         case OpCode::LoadElemFloat:
+        /* the fused a[i][j]: the per-LEVEL carets come from chain_locs (one
+         * loc entry cannot hold two), so this records the whole-expression
+         * span only as the inlined-at anchor + a belt on the stamp. */
+        case OpCode::LoadElem2Int:
+        case OpCode::LoadElem2Float:
         case OpCode::LoadElemValue:
+        /* #53: the foreach binds whose element may be GONE (the body shrank
+         * the array) - node = the container (the OOB caret) */
+        case OpCode::LoadElemBool:
+        case OpCode::LoadStructElemV:
+        /* #53 option 1: the shift guard - node = the container */
+        case OpCode::ArrEpochCheck:
         case OpCode::MultiUnpackV:   /* node = the Expr14 (unpack-length caret) */
+        case OpCode::UnpackLenCheck: /* node = the Expr14 (the same caret) */
         case OpCode::StoreElemInt:   /* node = the SUBSCRIPT (plain: OOB/type) or
                                       * the Expr14 (compound: its div0 caret) */
         case OpCode::StoreElemFloat:
@@ -6602,6 +9662,12 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         case OpCode::Rethrow:        /* node = RethrowStmt (rethrow-site loc) */
         case OpCode::CoerceNumV:    /* node = the Expr14 (narrow-throw caret) */
         case OpCode::CheckCallableV: /* node = the callee (NotCallable caret) */
+        case OpCode::CheckNoneArgsV: /* node = the CallExpr (its argument
+                                      * carets ride base_locs / arg_locs) */
+        case OpCode::LoadBoxV:       /* node = the `*b` (its TypeErrorEx) */
+        case OpCode::StoreBoxV:      /* node = the `*b` (a misfit, const) */
+        case OpCode::CheckFitV:      /* node = the stored value (#49) */
+        case OpCode::CastV:          /* node = the cast; loc = its argument */
         case OpCode::CallValueGenericV: /* node = the CallExpr: the CALL-SITE
                                      * loc (a FuncObject callee's backtrace via
                                      * do_func_call's loc_at); the op is now
@@ -6617,21 +9683,44 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
              * KeyNotFoundEx; a subscript OOB/key/type error; a boxed
              * arith/compound/compare div-zero or type error; the cold
              * undefined-global error - the operation itself is AST-free):
-             * record the loc -> AST-free. */
-            chunk.locs.push_back(
-                {static_cast<uint32_t>(pc), node->start, node->end});
+             * record the loc -> AST-free. #76: a div/mod's loc comes from
+             * the DIVISOR (loc_node_idx) while the inline chain above used
+             * the CHAIN node. */
+            {
+                /*
+                 * #76 carets a div/mod at its DIVISOR - but a divisor the
+                 * FOLDER synthesized carries no Loc at all (`1 / (n - n)`
+                 * with n substituted folds the divisor to a bare `0`), and
+                 * an empty one recorded here makes the VM throw with NO
+                 * location: no caret, no "at line/col", and a backtrace
+                 * whose innermost frame reads "line 0". The tree-walker
+                 * never shows this because Construct::eval stamps the
+                 * ENCLOSING node's loc onto any exception that arrives
+                 * without one - so fall back to exactly that node, which
+                 * is what that wrapper would have supplied.
+                 */
+                const Construct *ln =
+                    (locnode && locnode->start) ? locnode : node;
+                Loc ls = ln->start, le = ln->end;
+                /* #68: an inlined call's value as the divisor carets the
+                 * call, as the operation writes it */
+                if (ln == locnode)
+                    inline_operand_span(locnode->inline_call, ls, le);
+                chunk.locs.push_back({static_cast<uint32_t>(pc), ls, le});
+            }
             in.node_idx = -1;
             break;
         case OpCode::JumpUnlessIntCmp:
         case OpCode::JumpUnlessFloatCmp:
+        case OpCode::CmpIntV:        /* typed compare-to-bool; can't fault */
+        case OpCode::CmpFloatV:
         case OpCode::ForLoopStep:
-        case OpCode::LogV:
         case OpCode::MemberV:
         case OpCode::ArrLen:         /* never throws (just reads the size) */
         case OpCode::DictIterInit:   /* pins a proven dict; no node-based throw */
-            /* node not needed for a caret: LogV never throws; MemberV's carets
-             * (and name/uid/optional) live in the member-key pool; ArrLen /
-             * DictIterInit never throw with a node loc. Drop it. */
+            /* node not needed for a caret: MemberV's carets (and name/uid/
+             * optional) live in the member-key pool; ArrLen / DictIterInit
+             * never throw with a node loc. Drop it. */
             in.node_idx = -1;
             break;
         case OpCode::CallV:
@@ -6693,6 +9782,14 @@ static void verify_ast_free(const std::vector<CgInstr> &code)
 {
     for (const CgInstr &in : code) {
         ML_CHECK(in.node_idx == -1);
+        ML_CHECK(in.loc_node_idx == -1);   /* #76: the loc twin too */
+        ML_CHECK(in.base_node_idx == -1);  /* #127: the base-caret twin */
+        ML_CHECK(in.op_node_idx == -1);    /* RULE 2: the op-caret twin */
+        ML_CHECK(in.inl == nullptr);       /* #38: the inherited chain */
+        /* #97 E1: not an AST handle, but the same "consumed exactly once"
+         * invariant - a stamp still set here never reached value_callees,
+         * so the site would silently lose its baked callee. */
+        ML_CHECK(in.callee_def_idx == -1 && in.callee_def_idx2 == -1);
         (void)in;
     }
 }
@@ -6701,7 +9798,7 @@ static void verify_ast_free(const std::vector<CgInstr> &code)
 
 
 /*
- * B1/B2 (plans/vm-performance-roadmap.md): rewrite general IntBin/FloatBin
+ * B1/B2 (plans/archived/vm-performance-roadmap.md): rewrite general IntBin/FloatBin
  * ops into their per-operator, per-shape variants (see the enum comment in
  * bytecode.h). IN PLACE - opcode + (for a lit-first commutative op) an
  * operand swap only, so pcs, the loc side table, and every pool stay
@@ -6733,8 +9830,29 @@ static void specialize_arith_ops(Chunk &ck)
                                        : OpCode::IntAddRR; break;
             case Op::minus: in.op = ri ? OpCode::IntSubRI
                                        : OpCode::IntSubRR; break;
-            case Op::times: in.op = ri ? OpCode::IntMulRI
-                                       : OpCode::IntMulRR; break;
+            case Op::times:
+                /* #100: `x * 2^k` -> `x << k` AT THE BYTECODE LEVEL,
+                 * so both engines take the shift (the JIT's IntShlRI
+                 * arms then emit `shl` where imul's 3-cycle latency
+                 * sat on the dependency chain). EXACT for every int64
+                 * x: bit_shl with a count in [1,62] is the plain
+                 * shift, and x*2^k == x<<k mod 2^64 under -fwrapv -
+                 * no operand can make one throw where the other does
+                 * not. m == 0/1 and every non-power stay IntMulRI
+                 * (the JIT strength-reduces those at emit; see
+                 * mul_plan, jit.cpp). */
+                if (ri && in.b_lit() >= 2
+                        && (in.b_lit() & (in.b_lit() - 1)) == 0) {
+                    int_type k = 0;
+                    while (!((in.b_lit() >> k) & 1))
+                        k++;
+                    in.op = OpCode::IntShlRI;
+                    in.pb = k;             /* the count (kind stays
+                                            * the int literal m was) */
+                    break;
+                }
+                in.op = ri ? OpCode::IntMulRI
+                           : OpCode::IntMulRR; break;
             case Op::band:  in.op = ri ? OpCode::IntAndRI
                                        : OpCode::IntAndRR; break;
             case Op::bor:   in.op = ri ? OpCode::IntOrRI
@@ -6749,7 +9867,10 @@ static void specialize_arith_ops(Chunk &ck)
                 /* Only the NONZERO-immediate form (no zero check needed -
                  * the checksum shape); mod-by-reg / mod-by-zero keep
                  * IntBin's checked path + its div0 loc. */
-                if (ri && in.b_lit() != 0)
+                /* imm -1 excluded too: INT_MIN % -1 now THROWS (#103)
+                 * and the RI handler is uncheck-fast - IntBin's checked
+                 * path serves `% -1` (nonexistent in real code) */
+                if (ri && in.b_lit() != 0 && in.b_lit() != -1)
                     in.op = OpCode::IntModRI;
                 break;
             default:
@@ -6787,7 +9908,7 @@ static void specialize_arith_ops(Chunk &ck)
 
 /* ============ The post-codegen PEEPHOLE pass (roadmap E1-E4) ============
  *
- * plans/vm-peephole.md. Runs BEFORE extract_locs, so the loc/inline_ctxs
+ * plans/archived/vm-peephole.md. Runs BEFORE extract_locs, so the loc/inline_ctxs
  * side tables are built from the ALREADY-compacted code and the pass only
  * ever rewrites Instr pc fields (every pool is operand-indexed, never
  * pc-indexed; Instr::node_idx handles ride inside the moved Instr structs).
@@ -6801,7 +9922,7 @@ static void specialize_arith_ops(Chunk &ck)
  * site in vm.cpp. THE TRAP (fuzzer-caught in E-v1): a "target" field is NOT
  * always a pc - ForLoopStep::target2 is the COUNTER SLOT, JumpUnlessTrueV's
  * target2 the value slot, SetPend::target a Pend enum. A new branching op
- * MUST be added here, and ALWAYS run tests/nested_fuzz.py after touching
+ * MUST be added here, and ALWAYS run tests/nested_fuzz after touching
  * this pass.
  */
 template <typename F>
@@ -6816,11 +9937,10 @@ static void visit_pc_fields(Instr &in, F f)
     case OpCode::ForLoopStep:          /* target2 = the COUNTER SLOT */
     case OpCode::DictIterNext:
     case OpCode::ForeachDynNext:
-    case OpCode::CatchTest:            /* a.lit = catch_types idx */
-    case OpCode::PushHandler:          /* -> the runtime handler's catch_pc */
     case OpCode::JumpUnlessElemInt:    /* E4 fusion; target2 = the BASE slot */
     case OpCode::IntAddStep:           /* #9 fusion; target2 = COUNTER slot */
     case OpCode::ForStepElemInt:       /* #9 fusion; target2 = COUNTER slot */
+    case OpCode::GuardCalleeV:         /* #97 closure inlining; a = callee */
         f(in.target);
         break;
     default:
@@ -6828,7 +9948,7 @@ static void visit_pc_fields(Instr &in, F f)
     }
 }
 
-/* Ops that never continue at pc+1. Throw/Reraise/Rethrow also never fall
+/* Ops that never continue at pc+1. Throw/Rethrow also never fall
  * through, but control can resume at handler pcs - keeping their fall-through
  * edge is CONSERVATIVE (it only keeps more ops alive / extends liveness). */
 static bool op_falls_through(OpCode op)
@@ -6854,6 +9974,16 @@ static int pp_thread(const std::vector<CgInstr> &code, int t)
            && code[t].target != t)
         t = code[t].target;
     return t;
+}
+
+/* A handler-table pc (a catch clause's body, a finally) of the chunk the
+ * peephole is optimizing. Codegen places each at a real instruction and
+ * every rewrite here moves it with the code, so it always names one: the
+ * passes below index by it without a range test of their own. */
+static size_t pp_handler_pc(int pc, size_t n)
+{
+    ML_CHECK(pc >= 0 && static_cast<size_t>(pc) < n);
+    return static_cast<size_t>(pc);
 }
 
 /* `JumpUnlessIntCmp(C)` inversion for branch-over-jump. INT ONLY: float
@@ -6894,10 +10024,36 @@ static bool visit_use_def(const Instr &in, U u, D d)
     switch (in.op) {
     case OpCode::Jump: case OpCode::Halt: case OpCode::PopHandler:
     case OpCode::PushHandler: case OpCode::SetPend: case OpCode::EndFinally:
-    case OpCode::Reraise: case OpCode::Rethrow: case OpCode::ThrowRuntimeV:
+    case OpCode::Rethrow: case OpCode::ThrowRuntimeV:
         return true;
     case OpCode::IntBin: case OpCode::FloatBin:
+    case OpCode::CmpIntV: case OpCode::CmpFloatV:
     case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
+    /*
+     * The B1/B2 SPECIALIZED family - same 3-address shape as the
+     * IntBin/FloatBin they replace (an RI form's `b` is a literal,
+     * which opnd() skips). These do NOT occur when the PEEPHOLE runs
+     * (specialize_arith_ops is a later pass), nor when compute_ref_slots
+     * does - but jit_fwd_info runs at JIT TIME, on the specialized code,
+     * and an op MISSING here is a use-def BARRIER there: `lin = all`,
+     * every temp live at every pc. That silently defeated BOTH JIT-time
+     * consumers - lever A's write elision and C4a-i's read-elision entry
+     * gate (which is why C4a-i measured flat: every float temp read as
+     * live-in at its own run head). Any future post-peephole opcode
+     * belongs here for the same reason.
+     */
+    case OpCode::IntAddRR: case OpCode::IntAddRI:
+    case OpCode::IntSubRR: case OpCode::IntSubRI:
+    case OpCode::IntMulRR: case OpCode::IntMulRI:
+    case OpCode::IntAndRR: case OpCode::IntAndRI:
+    case OpCode::IntOrRR:  case OpCode::IntOrRI:
+    case OpCode::IntXorRR: case OpCode::IntXorRI:
+    case OpCode::IntShlRR: case OpCode::IntShlRI:
+    case OpCode::IntShrRR: case OpCode::IntShrRI:
+    case OpCode::IntModRI:
+    case OpCode::FloatAddRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRR: case OpCode::FloatSubRI:
+    case OpCode::FloatMulRR: case OpCode::FloatMulRI:
         opnd(in.a()); opnd(in.b()); d(in.target); return true;
     case OpCode::JumpUnlessIntCmp: case OpCode::JumpUnlessFloatCmp:
         opnd(in.a()); opnd(in.b()); return true;
@@ -6928,7 +10084,14 @@ static bool visit_use_def(const Instr &in, U u, D d)
     case OpCode::LoadConstV: case OpCode::LoadLiteralObjV:
     case OpCode::LoadGlobalV: case OpCode::LoadCaptureV:
     case OpCode::LoadBuiltinV: case OpCode::DefinedGlobalV:
-    case OpCode::MakeClosureV:   /* captures snapshot NAMED locals, not temps */
+        d(in.target); return true;
+    case OpCode::MakeClosureV:
+        /* an unspliced op's captures snapshot NAMED locals, which no
+         * temp analysis tracks; a SPLICED one (#97 increment 3) reads
+         * what are now the caller's TEMPS, and says which in `a` */
+        if (in.a_dual_hi() > 0)
+            for (int k = 0; k < in.a_dual_hi(); k++)
+                u(in.a_dual_lo() + k);
         d(in.target); return true;
     case OpCode::UnaryV: case OpCode::CoerceNumV:
         opnd(in.a()); d(in.target); return true;
@@ -6940,27 +10103,80 @@ static bool visit_use_def(const Instr &in, U u, D d)
     case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
     case OpCode::LoadElemBool: case OpCode::LoadStrChar:
+    /* LoadElemValue was a BARRIER too (H2, 2026-08-12) - the SAME
+     * omission as the struct reads below, found the same way. Its only
+     * caller was compile_array_base's nested-read base, whose enclosing
+     * shapes never showed the cost; the moment H2 gave it a plain
+     * `x = a[i]` inside a LOOP, the barrier made every temp look live
+     * across the back edge and the call-cluster dead-dst rule stopped
+     * firing - 76_funcval_dispatch's discarded `fn(st, i);` went from
+     * `dst = -1` back to materializing its result. It reads its base
+     * (target2) + index (a) and writes target, exactly like the
+     * siblings on this line. */
+    case OpCode::LoadElemValue:
     /* the struct reads (were BARRIERS, which made every temp look live
      * inside a struct-loop body and silently blocked the E4 IntAddModRI
      * fusion there - found by #9 F-C): */
     case OpCode::LoadStructFieldInt: case OpCode::LoadStructFieldFloat:
     case OpCode::LoadStructElemV:
         u(in.target2); opnd(in.a()); d(in.target); return true;
+    case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
+        /* a DUAL = (outer index slot, chain_locs idx) - a_dual_lo is a
+         * real slot USE; b is the inner index operand. */
+        u(in.target2); u(in.a_dual_lo()); opnd(in.b()); d(in.target);
+        return true;
     case OpCode::LoadMemberInt: case OpCode::LoadMemberFloat:
         /* a = the member_keys pool idx (a lit), not a slot */
         u(in.target2); d(in.target); return true;
     case OpCode::ArrLen: case OpCode::StrLen:
+    case OpCode::ArrEpochMark:        /* #53: m = c's shift epoch */
         u(in.target2); d(in.target); return true;
+    case OpCode::ArrEpochCheck:       /* reads c and m, writes nothing */
+        u(in.target2); u(in.a_slot()); return true;
+    case OpCode::UnpackLenCheck:      /* reads the array; the flag, if any */
+        u(in.target2);
+        if (in.target >= 0)
+            d(in.target);
+        return true;
+    case OpCode::OrdCharV:
+        u(in.target2); opnd(in.a()); d(in.target); return true;
     case OpCode::SliceV:
         u(in.target2);
         if (in.a_slot() >= 0) u(static_cast<int>(in.a_slot()));
         if (in.b_slot() >= 0) u(static_cast<int>(in.b_slot()));
         d(in.target); return true;
     case OpCode::ReturnV:
+    /*
+     * ⛔ `Throw` WAS ABSENT HERE UNTIL 2026-08-29, so it fell to the
+     * `default:` BARRIER - "reads every temp, may write anything" - for
+     * no reason but omission. It reads the value in slot `a` (vm.cpp's
+     * VM_CASE(Throw), and verify_chunk classifies it as exactly one
+     * register read) and writes no frame slot at all, which is this
+     * line's contract precisely.
+     *
+     * A barrier is CONSERVATIVE, so nothing was ever wrong - only
+     * slower, and silently: lever A and the E1 liveness gave up inside
+     * every `try` body in the corpus. It was found by writing a new
+     * consumer of this table (compute_nonneg_slots, #106 phase 2),
+     * which fails CLOSED on a barrier and so declined 42_exceptions -
+     * a program whose counted loop is the qualifying shape exactly.
+     * The generalisable half: a table's gaps surface when something
+     * that cannot afford them starts reading it.
+     */
+    case OpCode::Throw:
         opnd(in.a()); return true;
     case OpCode::StoreGlobalV: case OpCode::StoreCaptureV:
         /* target = the GLOBAL/CAPTURE index, NOT a frame slot - no def */
         opnd(in.a()); return true;
+    /* #97 closure inlining: the callee slot is read by all three; the
+     * capture index is an index into the CLOSURE's captures, never a
+     * frame slot (target2 on the load, target on the store) */
+    case OpCode::GuardCalleeV:
+        u(in.a_slot()); return true;
+    case OpCode::LoadCaptureOfV:
+        u(in.a_slot()); d(in.target); return true;
+    case OpCode::StoreCaptureOfV:
+        u(in.a_slot()); u(in.b_slot()); return true;
     case OpCode::CallV: case OpCode::CachedCallV: case OpCode::CallBuiltinV:
         run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
         d(in.target); return true;
@@ -6968,20 +10184,177 @@ static bool visit_use_def(const Instr &in, U u, D d)
         u(in.target2);
         run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
         d(in.target); return true;
-    case OpCode::MakeArrayV: case OpCode::StructCtorV:
+    case OpCode::CheckNoneArgsV:   /* reads the callee and the run; no def */
+        if (in.target == 0)
+            u(in.target2);
         run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
+        return true;
+    case OpCode::LoadBoxV:         /* dst = *box */
+        u(in.a_slot()); d(in.target); return true;
+    case OpCode::StoreBoxV:        /* *box = value: the box OBJECT changes,
+                                    * no frame slot does */
+        u(in.a_slot()); u(in.b_slot()); return true;
+    case OpCode::CheckFitV:        /* reads the value; no def (#49) */
+        u(in.a_slot()); return true;
+    case OpCode::StampTypeV:       /* the array's TYPE changes, no slot
+                                    * does (Q2) */
+        u(in.a_slot()); return true;
+    case OpCode::CastV:            /* dst = cast<T>(src) */
+        u(in.a_slot()); d(in.target); return true;
+    case OpCode::MakeArrayV:
+        run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
+        d(in.target); return true;
+    case OpCode::StructCtorV:      /* b is DUAL: lo = nfields, hi = plan */
+        if (in.b_dual_hi() >= 0) {
+            /* PLANNED: a is DUAL (lo = computed-run base or -1, hi =
+             * count). Direct-LOCAL plan srcs are < slot_count, so they
+             * are irrelevant to the TEMP liveness this feeds; the
+             * computed mini-run covers every temp read. */
+            if (in.a_dual_lo() >= 0)
+                run(in.a_dual_lo(), in.a_dual_hi());
+        } else {
+            run(static_cast<int>(in.a_lit()), in.b_dual_lo());
+        }
         d(in.target); return true;
     case OpCode::MakeDictV:
         run(static_cast<int>(in.a_lit()), 2 * static_cast<int>(in.b_lit()));
         d(in.target); return true;
     case OpCode::AppendV:
-        if (in.a_lit() == 0)             /* arg0 kind 0 = a frame slot */
+        /* arg0 kind 0 = a frame slot; `a` is the DUAL (pool index, kind) -
+         * an a_lit() test read the pair, so a call site at pool index > 0
+         * hid the read, and a temp holding the target (`append(f(), x)`)
+         * looked dead and lost its producer's write */
+        if (in.a_dual_hi() == 0)
             u(in.target2);
         u(static_cast<int>(in.b_lit())); /* the value's SLOT (lit-encoded) */
         d(in.target); return true;
+    /*
+     * ⛔ THE ELEMENT-STORE FAMILY WAS A BARRIER UNTIL 2026-09-21 (#25) -
+     * eight ops, every one hitting `default:` for no reason but omission,
+     * exactly as `Throw` had (above). The cost was the largest this
+     * table has paid: `compute_ref_slots` BAILS on a barrier, so every
+     * chunk with an element store listed EVERY slot as reference-carrying
+     * - 76_funcval_dispatch's `st[0] = st[0] + x` body got `refs=[0 1 2
+     * 3]` for two ints and a none - and the E1 liveness, jit_fwd_info,
+     * the struct-fact KILL and compute_nonneg_slots all gave up at the
+     * store. Found by W3 (the newest consumer), the tenth shape again.
+     *
+     * THE CONTRACT, verified against vm.cpp's VM_CASEs and verify_chunk:
+     * a store READS its base, its keys and its value and WRITES NO FRAME
+     * SLOT. The base slot is read only when its KIND is local (the kind
+     * rides `target`: 1 global, 2 capture, anything else local -
+     * `vm_store_base`'s switch); a global or capture base names no frame
+     * slot at all, and reporting target2 as a use there would name an
+     * unrelated one. The keys and value are plain slots in the boxed
+     * forms (the VM reads `a_slot()`/`b_slot()` unconditionally),
+     * operands (slot or literal) in the flat int/float forms.
+     * StoreElem2V's `a` is a DUAL (k1 slot, chain_locs idx), its base is
+     * always a frame slot and its VALUE rides `target`.
+     *
+     * The two CHAIN forms stay barriers for a structural reason, not an
+     * omission: StoreElemChainV's keys are the run [b_lit, +nkeys) with
+     * nkeys the chain_locs entry's LENGTH, and a StoreLValueChainV
+     * subscript step's key is the frame temp its chain_steps entry names
+     * - both live in a POOL this Instr-only signature cannot reach.
+     * Zero corpus programs emit either (2026-09-21 census); the day one
+     * pays for it, the fix is a `const Chunk *` through every consumer.
+     *
+     * WHY "no def" IS RIGHT although the store can REWRITE the base slot:
+     * the COW paths (`clone_internal_vec` on a slice base,
+     * `clone_aliased_slices` on an aliased one, the dict/struct clones in
+     * vm_subscript_store / vm_member_store) replace the HANDLE inside the
+     * base slot's value, in place, type unchanged - an array stays an
+     * array of the same elements, a struct keeps its def. No consumer of
+     * a def can see that: liveness already has the base as a USE at the
+     * same pc; compute_ref_slots needs the base listed and it already is
+     * (whatever put the container there listed it, or it is a parameter
+     * seed); the C4d struct fact is (slot, def) and a same-def clone
+     * preserves it; a sign fact is about an int slot, never a container.
+     * Reporting a def would only KILL the struct fact at every member
+     * store for nothing. `jit_hoist_op_defs` (jit.cpp) already says the
+     * same of these ops: "no frame-slot writes".
+     *
+     * STILL BARRIERS, on purpose: the IncDec family, the Unpack family,
+     * MultiUnpackV, EmplaceStruct - those DO write frame slots through
+     * their pools, a different contract that needs its own audit.
+     */
+    case OpCode::StoreElemInt: case OpCode::StoreElemFloat:
+        if (in.target != 1 && in.target != 2)
+            u(in.target2);
+        opnd(in.a()); opnd(in.b()); return true;
+    case OpCode::StoreElemValue: case OpCode::DictStore:
+        if (in.target != 1 && in.target != 2)
+            u(in.target2);
+        u(in.a_slot()); u(in.b_slot()); return true;
+    case OpCode::StoreMemberV:         /* a = the member_keys pool idx */
+        if (in.target != 1 && in.target != 2)
+            u(in.target2);
+        u(in.b_slot()); return true;
+    case OpCode::StoreElem2V:          /* base always a frame slot */
+        u(in.target2); u(in.a_dual_lo()); u(in.b_slot()); u(in.target);
+        return true;
     default:
         return false;                  /* BARRIER - reads everything */
     }
+}
+
+/*
+ * The table's POOL-AWARE twin, for a caller that can hand the chunk the
+ * op belongs to. The in-place builtin call (pop/sort/insert/... on a
+ * NAMED arg0) keeps its value arguments in a RUN whose length lives in
+ * the builtin_calls pool, beyond an Instr - so only this entry point has
+ * its row, and visit_use_def proper keeps the barrier (a separate
+ * function so the row's branches are not instantiated once per caller).
+ * Reads: arg0's slot when it is a local (a = DUAL: lo the pool index, hi
+ * arg0's kind 0 local / 1 global / 2 capture) and the rest run at `b`
+ * (when set: nargs - 1 slots, what vm_call_builtin_lv_rest reads).
+ * Writes: the dst. arg0 is NOT a def: the builtin mutates it IN PLACE
+ * (the store family's rule). For liveness a missing def costs a kill;
+ * for compute_ref_slots it is the DANGEROUS direction, and it holds for
+ * a reason worth stating: every in-place builtin either only READS arg0
+ * (intptr, refcount) or refuses an arg0 that is not a container, and
+ * the one write back into the slot (sort / reverse storing a
+ * materialized slice) stores an array where an array was - as does
+ * struct_own's copy into a shared or borrowed holder. So arg0 holds a
+ * reference BEFORE the call, and whatever wrote it listed it (an op, a
+ * parameter seed, a catch bind); in a raw-scalar frame (ref_slots_raw)
+ * the builtin throws on it.
+ * The Elem form (`append(a[i], x)`) reads the same base plus a run whose
+ * first slot is the INDEX (nargs slots); the Member form (`append(s.f,
+ * x)`) the base plus the values (nargs - 1) - its field name is in the
+ * pool. Neither defines the base: the element/field is reached through
+ * it and mutated in place, and a COW detach rewrites the handle with its
+ * type unchanged (the element-store family's argument).
+ */
+template <typename U, typename D>
+static bool visit_use_def_pooled(const Instr &in, U u, D d,
+                                 const Chunk *pools)
+{
+    const bool lv = in.op == OpCode::CallBuiltinLV
+                    || in.op == OpCode::CallBuiltinLVElem
+                    || in.op == OpCode::CallBuiltinLVMember;
+    if (!lv || !pools)
+        return visit_use_def(in, u, d);
+    /* the pool index is in range: verify_chunk bounds it, for our own
+     * bytecode and a loaded image alike */
+    const size_t na = pools->builtin_calls[
+        static_cast<size_t>(in.a_dual_lo())].args.size();
+    if (in.a_dual_hi() == 0)
+        u(in.target2);
+    /* #32: the Member form's chain - each subscript step's key temp */
+    for (const Chunk::ChainStep &st : pools->builtin_calls[
+             static_cast<size_t>(in.a_dual_lo())].steps)
+        if (!st.is_member)
+            u(st.operand);
+    /* the run at `b`: Elem's holds the INDEX first, then the values */
+    if (in.b_is_lit()) {
+        const size_t nrun = in.op == OpCode::CallBuiltinLVElem ? na
+                                                                : na - 1;
+        for (size_t i = 0; i < nrun; i++)
+            u(static_cast<int>(in.b_lit() + static_cast<int64_t>(i)));
+    }
+    d(in.target);
+    return true;
 }
 
 /* Producer ops whose ONLY frame-slot write is `target` (verified above) and
@@ -6990,6 +10363,7 @@ static bool retargetable_dst(OpCode op)
 {
     switch (op) {
     case OpCode::IntBin: case OpCode::FloatBin:
+    case OpCode::CmpIntV: case OpCode::CmpFloatV:
     case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
     case OpCode::UnaryV: case OpCode::CoerceNumV: case OpCode::MoveV:
     case OpCode::LoadImmInt: case OpCode::LoadImmFloat:
@@ -7000,7 +10374,19 @@ static bool retargetable_dst(OpCode op)
     case OpCode::SubscriptV: case OpCode::MemberV:
     case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+    case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
+    /* LoadElemValue was MISSING here while every sibling was present -
+     * a pre-existing gap this table's shape invites (see THE AUDIT-TABLE
+     * STAGE TRAP): its only caller was compile_array_base's nested-read
+     * base, which is consumed by the next op and never reaches the
+     * `<produce t>; MoveV d = t` shape E1 fuses, so the absence cost
+     * nothing VISIBLE. The moment H2 made it serve a plain `x = a[i]`,
+     * the move survived and the win was half eaten. It writes only
+     * `target` and never reads it - the same contract as the LoadElem*
+     * siblings above. */
+    case OpCode::LoadElemValue:
     case OpCode::LoadStrChar: case OpCode::ArrLen: case OpCode::StrLen:
+    case OpCode::OrdCharV:
     case OpCode::SliceV: case OpCode::CallV: case OpCode::CachedCallV:
     case OpCode::CallValueV: case OpCode::CallBuiltinV:
     case OpCode::MakeArrayV: case OpCode::MakeDictV: case OpCode::StructCtorV:
@@ -7011,7 +10397,739 @@ static bool retargetable_dst(OpCode op)
     }
 }
 
-static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
+/* #78: `chunk` is non-const now - the pass remaps the HANDLER TABLE's pcs
+ * alongside the instruction pc fields (threading, target marking,
+ * compaction). Everything else it reads stays read-only. */
+/* Lever A (see codegen.h): temp live-out + branch-target flags for the
+ * JIT's dead-temp forwarding, over the chunk's FINAL Instr code. The same
+ * fixpoint as the peephole's E1 block, on the same audited enumerations -
+ * kept here so jit.cpp never grows a drifting copy of visit_use_def /
+ * visit_pc_fields / the handler collection. */
+/* The handler bodies + finally pcs, which the liveness ABSORBS into every
+ * op's live-out (a throw can resume there from anywhere in the region) and
+ * which are entry targets like any branch. Shared by both wrappers. */
+static void jit_live_targets(const Chunk &chunk, std::vector<int> &handler_pcs,
+                             std::vector<char> &is_tgt)
+{
+    const size_t n = chunk.code.size();
+    is_tgt.assign(n + 1, 0);
+    for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+        for (const Chunk::HandlerClause &cl : hs.clauses)
+            handler_pcs.push_back(cl.body_pc);
+        if (hs.fin_pc >= 0)
+            handler_pcs.push_back(hs.fin_pc);
+    }
+    for (int h : handler_pcs)
+        if (h >= 0 && static_cast<size_t>(h) <= n)
+            is_tgt[h] = 1;
+    for (size_t p = 0; p < n; p++) {
+        /* visit_pc_fields takes Instr& (the remaps write through it); this
+         * read-only walk borrows it via a const_cast, mutating nothing. */
+        Instr &in = const_cast<Instr &>(chunk.code[p]);
+        visit_pc_fields(in, [&](int &t) {
+            if (t >= 0 && static_cast<size_t>(t) <= n)
+                is_tgt[t] = 1;
+        });
+    }
+}
+
+/*
+ * THE ONE BACKWARD LIVENESS. Both jit_fwd_info (temps, one word) and
+ * jit_slot_liveness (#96: every slot, `words` words) are wrappers over
+ * this, so the audited enumerations - visit_use_def for use/def,
+ * visit_pc_fields for the CFG edges, the handler absorption - are read
+ * from exactly one place.
+ *
+ * A MAY analysis: an op visit_use_def does not know sets every covered
+ * slot live, which over-approximates and is therefore safe in the only
+ * direction that matters.
+ */
+static void jit_liveness_core(const Chunk &chunk,
+                              const std::vector<int> &handler_pcs,
+                              int base, int count,
+                              std::vector<uint64_t> &livein,
+                              std::vector<uint64_t> &liveout,
+                              size_t words)
+{
+    const size_t n = chunk.code.size();
+    const auto set_bit = [&](std::vector<uint64_t> &m, size_t off, int slot) {
+        if (slot < base || slot >= base + count)
+            return;
+        const int b = slot - base;
+        m[off + b / 64] |= uint64_t(1) << (b % 64);
+    };
+    livein.assign(n * words, 0);
+
+    std::vector<uint64_t> out(words), use(words), def(words), lin(words);
+    for (bool changed = true; changed; ) {
+        changed = false;
+        std::vector<uint64_t> hlive(words, 0);
+        for (int h : handler_pcs)
+            if (h >= 0 && static_cast<size_t>(h) < n)
+                for (size_t w = 0; w < words; w++)
+                    hlive[w] |= livein[h * words + w];
+        for (size_t r = 0; r < n; r++) {
+            const size_t p = n - 1 - r;
+            Instr &in = const_cast<Instr &>(chunk.code[p]);
+            out = hlive;
+            visit_pc_fields(in, [&](int &t) {
+                if (t >= 0 && static_cast<size_t>(t) < n)
+                    for (size_t w = 0; w < words; w++)
+                        out[w] |= livein[t * words + w];
+            });
+            if (op_falls_through(in.op) && p + 1 < n)
+                for (size_t w = 0; w < words; w++)
+                    out[w] |= livein[(p + 1) * words + w];
+            std::fill(use.begin(), use.end(), 0);
+            std::fill(def.begin(), def.end(), 0);
+            const bool known = visit_use_def_pooled(in,
+                [&](int s) { set_bit(use, 0, s); },
+                [&](int s) { set_bit(def, 0, s); }, &chunk);
+            for (size_t w = 0; w < words; w++) {
+                uint64_t all = ~uint64_t(0);
+                const int hi = count - static_cast<int>(w) * 64;
+                if (hi < 64)
+                    all = hi <= 0 ? 0 : ((uint64_t(1) << hi) - 1);
+                lin[w] = known ? ((out[w] & ~def[w]) | use[w]) : all;
+            }
+            for (size_t w = 0; w < words; w++)
+                if (lin[w] != livein[p * words + w]) {
+                    livein[p * words + w] = lin[w];
+                    changed = true;
+                }
+        }
+    }
+
+    /* live-OUT per pc: successors' live-in + the handler absorption */
+    std::vector<uint64_t> hlive(words, 0);
+    for (int h : handler_pcs)
+        if (h >= 0 && static_cast<size_t>(h) < n)
+            for (size_t w = 0; w < words; w++)
+                hlive[w] |= livein[h * words + w];
+    liveout.assign(n * words, 0);
+    for (size_t p = 0; p < n; p++) {
+        Instr &in = const_cast<Instr &>(chunk.code[p]);
+        for (size_t w = 0; w < words; w++)
+            liveout[p * words + w] = hlive[w];
+        visit_pc_fields(in, [&](int &t) {
+            if (t >= 0 && static_cast<size_t>(t) < n)
+                for (size_t w = 0; w < words; w++)
+                    liveout[p * words + w] |= livein[t * words + w];
+        });
+        if (op_falls_through(in.op) && p + 1 < n)
+            for (size_t w = 0; w < words; w++)
+                liveout[p * words + w] |= livein[(p + 1) * words + w];
+    }
+}
+
+bool jit_fwd_info(const Chunk &chunk, std::vector<uint64_t> &liveout,
+                  std::vector<uint64_t> &livein,
+                  std::vector<char> &is_tgt)
+{
+    liveout.clear();
+    livein.clear();
+    std::vector<int> handler_pcs;
+    jit_live_targets(chunk, handler_pcs, is_tgt);
+
+    if (chunk.n_temps <= 0 || chunk.n_temps > 64)
+        return false;                    /* reads may forward; no elision */
+
+    /* one word, based at the first temp - byte-identical to the
+     * hand-rolled fixpoint this replaced (verified over the corpus) */
+    jit_liveness_core(chunk, handler_pcs, chunk.slot_count, chunk.n_temps,
+                      livein, liveout, 1);
+    return true;
+}
+
+bool jit_slot_liveness(const Chunk &chunk, SlotLiveness &out)
+{
+    out = SlotLiveness();
+    const int count = chunk.slot_count + chunk.n_temps;
+    if (count <= 0 || chunk.code.empty())
+        return false;                    /* caller assumes everything live */
+    std::vector<int> handler_pcs;
+    std::vector<char> is_tgt;
+    jit_live_targets(chunk, handler_pcs, is_tgt);
+    out.base = 0;
+    out.count = count;
+    out.words = (static_cast<size_t>(count) + 63) / 64;
+    jit_liveness_core(chunk, handler_pcs, out.base, out.count,
+                      out.livein, out.liveout, out.words);
+    out.ok = true;
+    return true;
+}
+
+/* the index of the lowest set bit of a non-zero word (portable: MSVC
+ * has no __builtin_ctzll) */
+static inline int lowest_bit64(uint64_t x)
+{
+    int n = 0;
+    if (!(x & 0xffffffffu)) { n += 32; x >>= 32; }
+    if (!(x & 0xffffu)) { n += 16; x >>= 16; }
+    if (!(x & 0xffu)) { n += 8; x >>= 8; }
+    if (!(x & 0xfu)) { n += 4; x >>= 4; }
+    if (!(x & 0x3u)) { n += 2; x >>= 2; }
+    if (!(x & 0x1u))
+        n += 1;
+    return n;
+}
+
+bool jit_build_intervals(const Chunk &chunk, size_t begin, size_t end,
+                         const SlotLiveness &sl,
+                         std::vector<LiveInterval> &out)
+{
+    out.clear();
+    if (!sl.ok || begin >= end || end > chunk.code.size())
+        return false;
+    const int count = sl.count;
+    const size_t words = sl.words;
+    /* #34: a word of slots at a time. A slot is ACTIVE at pc iff it is
+     * live-in there or defined there (the header's spec); an interval
+     * opens where a slot turns active and closes where it stops. The
+     * per-slot walk over every pc this replaced was (run length x slot
+     * count) - quadratic in a long run, 2.7 G instructions for a
+     * 400-block `main`. Only the bits that CHANGE, and the slots the op
+     * touches, cost anything per pc now. */
+    std::vector<uint64_t> prev(words, 0), act(words, 0), def(words, 0);
+    std::vector<int> open(static_cast<size_t>(count), -1);
+    std::vector<size_t> touched_at(static_cast<size_t>(count), SIZE_MAX);
+    std::vector<int> uses, defs, touched;
+    const auto in_range = [&](int s) {
+        return s >= sl.base && s < sl.base + count;
+    };
+    for (size_t p = begin; p < end; p++) {
+        jit_op_slot_refs(chunk.code[p], uses, defs);
+        std::fill(def.begin(), def.end(), 0);
+        touched.clear();
+        for (const int s : defs)
+            if (in_range(s)) {
+                const int b = s - sl.base;
+                def[b / 64] |= uint64_t(1) << (b % 64);
+                if (touched_at[b] != p) {
+                    touched_at[b] = p;
+                    touched.push_back(b);
+                }
+            }
+        for (const int s : uses)
+            if (in_range(s)) {
+                const int b = s - sl.base;
+                if (touched_at[b] != p) {
+                    touched_at[b] = p;
+                    touched.push_back(b);
+                }
+            }
+        for (size_t w = 0; w < words; w++) {
+            act[w] = sl.livein[p * words + w] | def[w];
+            uint64_t closed = prev[w] & ~act[w];
+            while (closed) {
+                const int b = static_cast<int>(w * 64)
+                              + lowest_bit64(closed);
+                closed &= closed - 1;
+                out[static_cast<size_t>(open[b])].end =
+                    static_cast<uint32_t>(p);
+                open[b] = -1;
+            }
+            uint64_t opened = act[w] & ~prev[w];
+            while (opened) {
+                const int b = static_cast<int>(w * 64)
+                              + lowest_bit64(opened);
+                opened &= opened - 1;
+                open[b] = static_cast<int>(out.size());
+                out.push_back({ sl.base + b, static_cast<uint32_t>(p),
+                                0, 0 });
+            }
+        }
+        for (const int b : touched)
+            if ((act[b / 64] >> (b % 64)) & 1)
+                out[static_cast<size_t>(open[b])].weight++;
+        prev.swap(act);
+    }
+    for (int b = 0; b < count; b++)
+        if (open[b] >= 0)
+            out[static_cast<size_t>(open[b])].end =
+                static_cast<uint32_t>(end);
+    /* by start pc - the order a linear scan consumes */
+    std::sort(out.begin(), out.end(),
+              [](const LiveInterval &a, const LiveInterval &b) {
+                  return a.start != b.start ? a.start < b.start
+                                            : a.slot < b.slot;
+              });
+    return true;
+}
+
+void jit_next_use(const Chunk &chunk, size_t begin, size_t end,
+                  int base, int count, std::vector<int> &dist)
+{
+    /* A HEURISTIC - see the header. Backward scan in PC ORDER, which is
+     * not execution order across a back edge. */
+    const size_t n = end > begin ? end - begin : 0;
+    dist.assign(n * static_cast<size_t>(count > 0 ? count : 0),
+                JIT_NO_NEXT_USE);
+    if (!n || count <= 0)
+        return;
+    std::vector<int> cur(count, JIT_NO_NEXT_USE);
+    for (size_t r = 0; r < n; r++) {
+        const size_t p = end - 1 - r;
+        Instr &in = const_cast<Instr &>(chunk.code[p]);
+        for (int &d : cur)
+            if (d != JIT_NO_NEXT_USE)
+                d++;
+        /* An op the table does not know may read ANY slot, so every
+         * covered slot's next use is right here. */
+        const bool known = visit_use_def(in,
+            [&](int s) {
+                if (s >= base && s < base + count)
+                    cur[s - base] = 0;
+            },
+            [](int) {});
+        if (!known)
+            std::fill(cur.begin(), cur.end(), 0);
+        std::copy(cur.begin(), cur.end(),
+                  dist.begin() + (p - begin) * static_cast<size_t>(count));
+    }
+}
+
+void NextUse::build(const Chunk &chunk, size_t begin, size_t end,
+                    int base, int count)
+{
+    begin_ = begin;
+    end_ = end > begin ? end : begin;
+    base_ = base;
+    count_ = count > 0 ? count : 0;
+    uses_.assign(static_cast<size_t>(count_), {});
+    barriers_.clear();
+    for (size_t p = begin_; p < end_; p++) {
+        Instr &in = const_cast<Instr &>(chunk.code[p]);
+        const bool known = visit_use_def(in,
+            [&](int s) {
+                if (s >= base_ && s < base_ + count_) {
+                    std::vector<uint32_t> &v = uses_[s - base_];
+                    if (v.empty() || v.back() != p)
+                        v.push_back(static_cast<uint32_t>(p));
+                }
+            },
+            [](int) {});
+        if (!known)
+            barriers_.push_back(static_cast<uint32_t>(p));
+    }
+}
+
+int NextUse::at(size_t pc, int slot) const
+{
+    if (pc < begin_ || pc >= end_ || slot < base_ || slot >= base_ + count_)
+        return JIT_NO_NEXT_USE;
+    uint32_t q = UINT32_MAX;
+    const std::vector<uint32_t> &v = uses_[slot - base_];
+    const auto it = std::lower_bound(v.begin(), v.end(), pc);
+    if (it != v.end())
+        q = *it;
+    const auto bt = std::lower_bound(barriers_.begin(), barriers_.end(), pc);
+    if (bt != barriers_.end() && *bt < q)
+        q = *bt;
+    return q == UINT32_MAX ? static_cast<int>(JIT_NO_NEXT_USE)
+                           : static_cast<int>(q - pc);
+}
+
+/*
+ * C4d: THE STRUCT-IDENTITY FACTS (plans/archived/typed-invariant-arrays.md).
+ *
+ * A baked member read (LoadMemberInt/Float) guards `slot holds a struct`
+ * + `that struct's def is D` before every single byte read - 7
+ * instructions - although in the shape those ops exist for the answer is
+ * a compile-time certainty: a PLANNED StructCtorV on the same slot just
+ * established it. This is the MUST dataflow that says so.
+ *
+ * A fact is a (slot, def) pair, one bit each, capped at 32 (past that the
+ * analysis declines rather than losing precision silently).
+ *
+ * GEN - a planned StructCtorV on slot S with def D generates (S, D) on
+ * BOTH of its arms, which is what makes the fact reach the reads that
+ * follow it with no join subtlety: the emitted fast path only rewrites
+ * the reused instance's BYTES, and the slow tier is
+ * vm_struct_ctor_planned, which either reuses that same-def instance or
+ * puts a FRESH `def` one in the slot. Neither can leave the slot holding
+ * anything else, and neither throws.
+ *
+ * KILL - any write to S. Taken from `visit_use_def`, the same audited
+ * enumeration E1 and jit_fwd_info use, with the same contract: an op the
+ * table does not know is a BARRIER that kills every fact. That is the
+ * load-bearing conservatism here - a builtin that rebinds its lvalue arg0
+ * through a pool, a chain store, an unpack, all of them barrier out. Note
+ * a fact survives a CALL: a callee gets its own window and cannot reach
+ * our slots, and the call's own dst is enumerated.
+ *
+ * MEET is intersection over predecessors: the fall-through edge (unless
+ * the previous op cannot reach pc+1) plus every branch whose pc field -
+ * `visit_pc_fields`, the audited enumeration, since a "target" is not
+ * always a pc - names this op. An extra predecessor can only SHRINK the
+ * fact set, so the conservative direction is to over-enumerate.
+ *
+ * ENTRY pcs are bottom: pc 0, every handler body and finally pc, and
+ * every per-pc entry stub the caller passes (a resume arrives with no
+ * history the dataflow modelled). Unreachable pcs are bottom too - a
+ * strongly-connected region with no entry path would otherwise let the
+ * optimistic initialisation keep a fact alive forever; it can never run,
+ * but it would still be EMITTED, so the reachability pass removes the
+ * whole class rather than reasoning about it.
+ *
+ * The iteration starts at TOP (all facts) and only shrinks, which is what
+ * lets a loop-carried fact survive the back edge.
+ */
+bool jit_struct_facts(const Chunk &chunk, const std::vector<int> &entry_pcs,
+                      std::vector<int> &fact_slot,
+                      std::vector<const StructTypeDef *> &fact_def,
+                      std::vector<uint32_t> &in)
+{
+    const size_t n = chunk.code.size();
+    fact_slot.clear();
+    fact_def.clear();
+    in.clear();
+    if (!n)
+        return false;
+
+    /* the GEN sites */
+    std::vector<int> gen_of(n, -1);
+    for (size_t p = 0; p < n; p++) {
+        const Instr &i = chunk.code[p];
+        if (i.op != OpCode::StructCtorV || i.b_dual_hi() < 0)
+            continue;                              /* not a PLANNED ctor */
+        if (i.target < 0 || i.target2 < 0
+                || static_cast<size_t>(i.target2) >= chunk.struct_defs.size())
+            continue;
+        const StructTypeDef *const def = chunk.struct_defs[i.target2];
+        if (!def)
+            continue;
+        int idx = -1;
+        for (size_t f = 0; f < fact_slot.size(); f++)
+            if (fact_slot[f] == i.target && fact_def[f] == def) {
+                idx = static_cast<int>(f);
+                break;
+            }
+        if (idx < 0) {
+            if (fact_slot.size() >= 32)
+                return false;                      /* out of bits */
+            idx = static_cast<int>(fact_slot.size());
+            fact_slot.push_back(i.target);
+            fact_def.push_back(def);
+        }
+        gen_of[p] = idx;
+    }
+    if (fact_slot.empty())
+        return false;
+
+    const size_t nf = fact_slot.size();
+    const uint32_t all = nf == 32 ? ~uint32_t(0)
+                                  : ((uint32_t(1) << nf) - 1);
+
+    std::vector<uint32_t> kill(n, 0);
+    for (size_t p = 0; p < n; p++) {
+        uint32_t k = 0;
+        const bool known = visit_use_def(chunk.code[p],
+            [](int) {},
+            [&](int s) {
+                for (size_t f = 0; f < nf; f++)
+                    if (fact_slot[f] == s)
+                        k |= uint32_t(1) << f;
+            });
+        kill[p] = known ? k : all;                 /* unaudited = barrier */
+    }
+
+    /* entry pcs (bottom) + the predecessor lists */
+    std::vector<char> is_entry(n, 0);
+    is_entry[0] = 1;
+    for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+        for (const Chunk::HandlerClause &cl : hs.clauses)
+            if (cl.body_pc >= 0 && static_cast<size_t>(cl.body_pc) < n)
+                is_entry[cl.body_pc] = 1;
+        if (hs.fin_pc >= 0 && static_cast<size_t>(hs.fin_pc) < n)
+            is_entry[hs.fin_pc] = 1;
+    }
+    for (int ep : entry_pcs)
+        if (ep >= 0 && static_cast<size_t>(ep) < n)
+            is_entry[ep] = 1;
+
+    std::vector<std::vector<int>> preds(n);
+    for (size_t p = 0; p < n; p++) {
+        /* visit_pc_fields takes Instr& (the remaps write through it); this
+         * read-only walk borrows it via a const_cast, mutating nothing. */
+        Instr &i = const_cast<Instr &>(chunk.code[p]);
+        visit_pc_fields(i, [&](int &t) {
+            if (t >= 0 && static_cast<size_t>(t) < n)
+                preds[t].push_back(static_cast<int>(p));
+        });
+        if (op_falls_through(i.op) && p + 1 < n)
+            preds[p + 1].push_back(static_cast<int>(p));
+    }
+
+    /* reachability from the entry pcs (see the header comment) */
+    std::vector<char> live(n, 0);
+    std::vector<int> stack;
+    for (size_t p = 0; p < n; p++)
+        if (is_entry[p]) {
+            live[p] = 1;
+            stack.push_back(static_cast<int>(p));
+        }
+    while (!stack.empty()) {
+        const size_t p = static_cast<size_t>(stack.back());
+        stack.pop_back();
+        const auto reach = [&](int t) {
+            if (t >= 0 && static_cast<size_t>(t) < n && !live[t]) {
+                live[t] = 1;
+                stack.push_back(t);
+            }
+        };
+        Instr &i = const_cast<Instr &>(chunk.code[p]);
+        visit_pc_fields(i, [&](int &t) { reach(t); });
+        if (op_falls_through(i.op) && p + 1 < n)
+            reach(static_cast<int>(p + 1));
+    }
+
+    in.assign(n, 0);
+    std::vector<uint32_t> out(n, all);
+    for (bool changed = true; changed; ) {
+        changed = false;
+        for (size_t p = 0; p < n; p++) {
+            uint32_t v = 0;
+            if (live[p] && !is_entry[p] && !preds[p].empty()) {
+                v = all;
+                for (int q : preds[p])
+                    v &= out[q];
+            }
+            uint32_t o = v & ~kill[p];
+            if (gen_of[p] >= 0)
+                o |= uint32_t(1) << gen_of[p];
+            if (!live[p])
+                o = 0;
+            if (v != in[p] || o != out[p]) {
+                in[p] = v;
+                out[p] = o;
+                changed = true;
+            }
+        }
+    }
+    return true;
+}
+
+/*
+ * #97 G3: WHICH INLINE-CACHE GUARDS ARE TRUE BY CONSTRUCTION. A
+ * GuardCalleeV asks "does slot S hold a closure of descriptor D?"; when
+ * every path reaching it passes through a `make.closure S = D` with no
+ * other write to S in between, the answer is yes before the program
+ * runs, and the JIT emits nothing for the guard. The proof is over the
+ * bytecode that is about to EXECUTE - so, unlike a claim the compiler
+ * recorded, it is as sound on a loaded image as on our own compile: a
+ * tampered image either still contains the proving make.closure on
+ * every path (then the guard really is true) or it does not (then the
+ * guard stays).
+ *
+ * A forward MUST dataflow, the C4d shape (jit_struct_facts above): a
+ * fact is (slot, descriptor), one bit each, at most 32.
+ *   GEN  - MakeClosureV writes a fresh FuncObject of closure_defs[t2]
+ *          into slot `target` (it cannot throw, and nothing else can
+ *          be in the slot afterwards). Descriptors are compared by
+ *          POINTER, so two pool entries naming one descriptor agree.
+ *   KILL - any write to S per `visit_use_def`; an unaudited op is a
+ *          barrier that kills everything. A call does NOT kill: the
+ *          callee has its own window, and the call's dst is a listed
+ *          write. A FuncObject's descriptor never changes, so a capture
+ *          store through the slot (StoreCaptureOfV) keeps the fact.
+ *   MEET - intersection over the fall-through and every pc field that
+ *          names this op (visit_pc_fields).
+ *   BOTTOM - pc 0 and every handler body/finally pc (an exception can
+ *          arrive from any op of the region). Unreachable pcs too.
+ *
+ * Unlike jit_struct_facts, the JIT's post-call RESUME pcs are NOT
+ * bottom: a resume continues the same frame right after its call op,
+ * whose only write to the frame is its listed dst - which is exactly
+ * the fall-through edge the dataflow already has. Making them bottom
+ * would lose every proof past the first call in a loop (a miss arm is
+ * a call, and it rejoins right before the next guard).
+ *
+ * `proven[pc]` is set for each GuardCalleeV the facts decide. Returns
+ * false when there is nothing to prove.
+ */
+bool closure_slot_facts(const Chunk &chunk, std::vector<int> &fact_slot,
+                        std::vector<const FuncDescriptor *> &fact_def,
+                        std::vector<uint32_t> &in)
+{
+    const size_t n = chunk.code.size();
+    fact_slot.clear();
+    fact_def.clear();
+    in.clear();
+
+    const auto def_at = [&](int idx) -> const FuncDescriptor * {
+        return idx >= 0 && static_cast<size_t>(idx)
+                                < chunk.closure_defs.size()
+            ? chunk.closure_defs[static_cast<size_t>(idx)] : nullptr;
+    };
+    std::vector<int> gen_of(n, -1);
+    for (size_t p = 0; p < n; p++) {
+        const Instr &i = chunk.code[p];
+        if (i.op != OpCode::MakeClosureV || i.target < 0)
+            continue;
+        const FuncDescriptor *const d = def_at(i.target2);
+        if (!d)
+            continue;
+        int idx = -1;
+        for (size_t f = 0; f < fact_slot.size(); f++)
+            if (fact_slot[f] == i.target && fact_def[f] == d) {
+                idx = static_cast<int>(f);
+                break;
+            }
+        if (idx < 0) {
+            if (fact_slot.size() >= 32)
+                return false;                      /* out of bits */
+            idx = static_cast<int>(fact_slot.size());
+            fact_slot.push_back(i.target);
+            fact_def.push_back(d);
+        }
+        gen_of[p] = idx;
+    }
+    if (fact_slot.empty())
+        return false;
+    const size_t nf = fact_slot.size();
+    const uint32_t all = nf == 32 ? ~uint32_t(0)
+                                  : ((uint32_t(1) << nf) - 1);
+
+    std::vector<uint32_t> kill(n, 0);
+    for (size_t p = 0; p < n; p++) {
+        uint32_t k = 0;
+        const bool known = visit_use_def(chunk.code[p],
+            [](int) {},
+            [&](int s) {
+                for (size_t f = 0; f < nf; f++)
+                    if (fact_slot[f] == s)
+                        k |= uint32_t(1) << f;
+            });
+        kill[p] = known ? k : all;                 /* unaudited = barrier */
+    }
+
+    std::vector<char> is_entry(n, 0);
+    is_entry[0] = 1;
+    for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+        for (const Chunk::HandlerClause &cl : hs.clauses)
+            if (cl.body_pc >= 0 && static_cast<size_t>(cl.body_pc) < n)
+                is_entry[cl.body_pc] = 1;
+        if (hs.fin_pc >= 0 && static_cast<size_t>(hs.fin_pc) < n)
+            is_entry[hs.fin_pc] = 1;
+    }
+    std::vector<std::vector<int>> preds(n);
+    std::vector<char> live(n, 0);
+    std::vector<int> stack;
+    for (size_t p = 0; p < n; p++) {
+        Instr &i = const_cast<Instr &>(chunk.code[p]);
+        visit_pc_fields(i, [&](int &t) {
+            if (t >= 0 && static_cast<size_t>(t) < n)
+                preds[t].push_back(static_cast<int>(p));
+        });
+        if (op_falls_through(i.op) && p + 1 < n)
+            preds[p + 1].push_back(static_cast<int>(p));
+        if (is_entry[p]) {
+            live[p] = 1;
+            stack.push_back(static_cast<int>(p));
+        }
+    }
+    while (!stack.empty()) {
+        const size_t p = static_cast<size_t>(stack.back());
+        stack.pop_back();
+        const auto reach = [&](int t) {
+            if (t >= 0 && static_cast<size_t>(t) < n && !live[t]) {
+                live[t] = 1;
+                stack.push_back(t);
+            }
+        };
+        Instr &i = const_cast<Instr &>(chunk.code[p]);
+        visit_pc_fields(i, [&](int &t) { reach(t); });
+        if (op_falls_through(i.op) && p + 1 < n)
+            reach(static_cast<int>(p + 1));
+    }
+
+    in.assign(n, 0);
+    std::vector<uint32_t> out(n, all);
+    for (bool changed = true; changed; ) {
+        changed = false;
+        for (size_t p = 0; p < n; p++) {
+            uint32_t v = 0;
+            if (live[p] && !is_entry[p] && !preds[p].empty()) {
+                v = all;
+                for (int q : preds[p])
+                    v &= out[q];
+            }
+            uint32_t o = v & ~kill[p];
+            if (gen_of[p] >= 0)
+                o |= uint32_t(1) << gen_of[p];
+            if (!live[p])
+                o = 0;
+            if (v != in[p] || o != out[p]) {
+                in[p] = v;
+                out[p] = o;
+                changed = true;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool jit_guard_facts(const Chunk &chunk, std::vector<char> &proven)
+{
+    const size_t n = chunk.code.size();
+    proven.assign(n, 0);
+    bool any_guard = false;
+    for (size_t p = 0; p < n; p++)
+        if (chunk.code[p].op == OpCode::GuardCalleeV)
+            any_guard = true;
+    if (!any_guard)
+        return false;
+    std::vector<int> fact_slot;
+    std::vector<const FuncDescriptor *> fact_def;
+    std::vector<uint32_t> in;
+    if (!closure_slot_facts(chunk, fact_slot, fact_def, in))
+        return false;
+    const size_t nf = fact_slot.size();
+    bool any = false;
+    for (size_t p = 0; p < n; p++) {
+        const Instr &i = chunk.code[p];
+        if (i.op != OpCode::GuardCalleeV)
+            continue;
+        const FuncDescriptor *const d =
+            i.target2 >= 0
+                && static_cast<size_t>(i.target2) < chunk.closure_defs.size()
+                ? chunk.closure_defs[static_cast<size_t>(i.target2)]
+                : nullptr;
+        if (!d)
+            continue;
+        for (size_t f = 0; f < nf; f++)
+            if ((in[p] & (uint32_t(1) << f)) && fact_slot[f] == i.a_slot()
+                    && fact_def[f] == d) {
+                proven[p] = 1;
+                any = true;
+                break;
+            }
+    }
+    return any;
+}
+
+/*
+ * C4e: the audited enumeration itself, for an emitter policy that has to
+ * ask "does this op touch slot S, and how". Exported rather than copied
+ * into jit.cpp for the reason jit_fwd_info/jit_struct_facts are: a second
+ * per-op slot table would be free to drift from this one, and the trap
+ * that costs (THE AUDIT-TABLE STAGE TRAP) is silence, not failure.
+ * Returns false for an op the table does not know - the caller must then
+ * treat it as touching EVERYTHING.
+ */
+bool jit_op_slot_refs(const Instr &in, std::vector<int> &uses,
+                      std::vector<int> &defs, const Chunk *pools)
+{
+    uses.clear();
+    defs.clear();
+    return visit_use_def_pooled(in,
+                                [&](int s) { uses.push_back(s); },
+                                [&](int s) { defs.push_back(s); }, pools);
+}
+
+static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
 {
     if (code.empty())
         return;
@@ -7032,25 +11150,39 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
          * chunk has handlers, every op may (via a throw) continue at any
          * handler pc, so each op's live-out absorbs the handlers' live-in.
          */
-        if (ck.n_temps > 0 && ck.n_temps <= 64) {
+        if (chunk.n_temps > 0 && chunk.n_temps <= 64) {
 
-            const int tbase = ck.slot_count;
-            const uint64_t all = ck.n_temps == 64
-                ? ~uint64_t(0) : ((uint64_t(1) << ck.n_temps) - 1);
+            const int tbase = chunk.slot_count;
+            const uint64_t all = chunk.n_temps == 64
+                ? ~uint64_t(0) : ((uint64_t(1) << chunk.n_temps) - 1);
             const auto bit = [&](int slot) -> uint64_t {
-                return (slot >= tbase && slot < tbase + ck.n_temps)
+                return (slot >= tbase && slot < tbase + chunk.n_temps)
                     ? (uint64_t(1) << (slot - tbase)) : 0;
             };
 
             std::vector<char> is_tgt(n + 1, 0);
-            std::vector<int> handler_pcs;
             for (CgInstr &in : code) {
                 visit_pc_fields(in, [&](int &t) {
                     if (t >= 0 && static_cast<size_t>(t) <= n)
                         is_tgt[t] = 1;
                 });
-                if (in.op == OpCode::PushHandler)
-                    handler_pcs.push_back(in.target);
+            }
+            /* The pcs a THROW can resume at. #78 step D moved them off
+             * PushHandler (which now carries only its region id in `a`,
+             * target = -1) into the handler TABLE - reading in.target
+             * here collected -1s that the `h >= 0` filter dropped, so
+             * the handler absorption was silently EMPTY from step D
+             * until this fix (found building the jit dead-after pass,
+             * which shares this machinery). No exploit shape is known -
+             * codegen does not keep a temp live from a try body into a
+             * catch body - but the belt exists because that is a
+             * structural claim about today's codegen, not an invariant. */
+            std::vector<int> handler_pcs;
+            for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+                for (const Chunk::HandlerClause &cl : hs.clauses)
+                    handler_pcs.push_back(cl.body_pc);
+                if (hs.fin_pc >= 0)
+                    handler_pcs.push_back(hs.fin_pc);
             }
 
             std::vector<uint64_t> live_in(n, 0);
@@ -7058,8 +11190,7 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                 liv_changed = false;
                 uint64_t hlive = 0;
                 for (int h : handler_pcs)
-                    if (h >= 0 && static_cast<size_t>(h) < n)
-                        hlive |= live_in[h];
+                    hlive |= live_in[pp_handler_pc(h, n)];
                 for (size_t r = 0; r < n; r++) {
                     const size_t p = n - 1 - r;
                     Instr &in = code[p];
@@ -7085,8 +11216,33 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
 
             uint64_t hlive = 0;
             for (int h : handler_pcs)
-                if (h >= 0 && static_cast<size_t>(h) < n)
-                    hlive |= live_in[h];
+                hlive |= live_in[pp_handler_pc(h, n)];
+
+            /* Producers the MoveV elimination RETARGETS this round: their dst
+             * changes (to the eliminated move's dst), so the `live_in` computed
+             * above is STALE for them - the dead-dst rule below MUST NOT use it
+             * (it would see the NEW dst as dead where the OLD one was, wrongly
+             * -1'ing a live call result). Skip them; the next round recomputes
+             * fresh liveness. (The fusion rules only OVERSTATE liveness after a
+             * mutation, which is safe; the dead-dst rule UNDERSTATES, which is
+             * not - hence this guard.) */
+            std::vector<char> retargeted(n, 0);
+
+            /* #34: the branch sources aiming at each pc. The predecessor
+             * test below walked the WHOLE chunk per candidate move -
+             * quadratic in a long chunk. An entry is re-verified where
+             * it is read (the rewrites below change instructions), and a
+             * rewritten instruction is indexed again, so a NEW edge is
+             * never missed. */
+            std::vector<std::vector<size_t>> into(n);
+            const auto index_pcs = [&](size_t j) {
+                visit_pc_fields(code[j], [&](int &t) {
+                    if (t >= 0 && static_cast<size_t>(t) < n)
+                        into[static_cast<size_t>(t)].push_back(j);
+                });
+            };
+            for (size_t j = 0; j < n; j++)
+                index_pcs(j);
 
             for (size_t q = 0; q < n; q++) {
                 CgInstr &m = code[q];
@@ -7113,7 +11269,12 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                  * (`prod; jmp Lq` / `prod` fall-through + one move at Lq). */
                 std::vector<size_t> prods;
                 bool ok = true;
-                for (size_t j = 0; j < n && ok; j++) {
+                std::vector<size_t> &cand = into[q];
+                std::sort(cand.begin(), cand.end());
+                cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+                for (const size_t j : cand) {
+                    if (!ok)
+                        break;
                     if (j == q)
                         continue;
                     bool hits = false;
@@ -7145,10 +11306,14 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                 }
                 if (prods.empty())
                     continue;
-                for (size_t p : prods)   /* produce straight into d */
+                for (size_t p : prods) { /* produce straight into d */
                     code[p].target = m.target;
+                    retargeted[p] = 1;   /* live_in now stale for this pc */
+                    index_pcs(p);
+                }
                 m.op = OpCode::Jump;     /* neutralize: jump-to-next... */
                 m.target = static_cast<int>(q) + 1;  /* ...deleted below */
+                index_pcs(q);
                 changed = true;
             }
 
@@ -7175,6 +11340,11 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                  * once fused here, target = load pc + 1 marks it a branch
                  * target (is_tgt next round) - the sieve rule then declines
                  * at the load forever. */
+                /* ⛔ the `b_lit() == 1` below is READ BY
+                 * compute_nonneg_slots: the fusion repurposes b, so a
+                 * ForStepElemInt's step is +1 by CONSTRUCTION and the
+                 * pass cannot re-check it. Widening this precondition
+                 * means excluding the op there. */
                 if (op1.op == OpCode::ForLoopStep
                     && op1.b_is_lit() && op1.b_lit() == 1
                     && op1.target >= 0
@@ -7189,6 +11359,11 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                         f.set_b_dual(ld.target2 /* array */,
                                      ld.target  /* elem dst */);
                         f.node_idx = ld.node_idx;   /* the OOB caret */
+                        /* C1d: f copied the STEP's struct, so the LOAD's
+                         * ELEM-BOOL hint must transfer by hand (after
+                         * set_b_dual, which clears b's flag bits) */
+                        if (ld.elem_bool_hint())
+                            f.set_elem_bool_hint();
                         op1 = f;
                         changed = true;
                         continue;
@@ -7204,6 +11379,7 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                 if (op1.op == OpCode::IntBin && op1.aop == Op::plus
                     && op2.op == OpCode::IntBin && op2.aop == Op::mod
                     && op2.b_is_lit() && op2.b_lit() != 0
+                    && op2.b_lit() != -1        /* INT_MIN % -1 throws */
                     && op2.b_lit() == static_cast<int32_t>(op2.b_lit())
                     && !op2.a_is_lit() && op2.a_slot() == op1.target
                     && bit(op1.target)) {
@@ -7229,6 +11405,9 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                  * excludes loops with `continue` (it targets the step); a
                  * branch to the ADD is fine (add-then-step is what it
                  * expects). Never throws - node-free. */
+                /* ⛔ same as F-B above: `op2.b_lit() == 1` is what
+                 * lets compute_nonneg_slots treat an IntAddStep as a
+                 * +1 counter step it can no longer read. */
                 if (op1.op == OpCode::IntBin && op1.aop == Op::plus
                     && op2.op == OpCode::ForLoopStep
                     && op2.b_is_lit() && op2.b_lit() == 1
@@ -7265,8 +11444,19 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                  * dead-after temp -> StructFieldAddInt
                  * `dst = other + a[i].f`. EXACTLY one operand is t (both
                  * == t would read the pre-load value). No-fault read +
-                 * wrapping add - node-free. */
+                 * wrapping add - node-free.
+                 *
+                 * G4: the CHECKED (subscript) form is EXCLUDED. This fusion
+                 * is sound only because the foreach form cannot fault - it
+                 * even drops the caret (`node_idx = -1`) - whereas
+                 * `a[i].f` bounds-checks and can raise OutOfBoundsEx, and
+                 * StructFieldAddInt's helper is the UNCHECKED reader. Fusing
+                 * it read past the end of the buffer: ASan caught a
+                 * heap-buffer-overflow on `acc += row[i].x + row[j].y` with
+                 * j out of range, the very first time this gate let the new
+                 * form through. */
                 if (op1.op == OpCode::LoadStructFieldInt
+                    && !op1.struct_checked()
                     && op2.op == OpCode::IntBin && op2.aop == Op::plus
                     && !op2.a_is_lit() && !op2.b_is_lit()
                     && (op2.a_slot() == op1.target)
@@ -7302,7 +11492,8 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                 if ((op1.op == OpCode::AppendV || op1.op == OpCode::CallV
                      || op1.op == OpCode::CallValueV)
                     && op1.target >= 0
-                    && bit(op1.target)) {
+                    && bit(op1.target)
+                    && !retargeted[p]) {   /* stale liveness - see above */
                     const uint64_t aout =
                         (p + 1 < n ? live_in[p + 1] : 0) | hlive;
                     if (!(aout & bit(op1.target))) {
@@ -7315,6 +11506,72 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                  * JumpUnlessElemInt arr[i], L (the sieve test). The temp
                  * must be dead on BOTH successor paths; op1's node/loc
                  * (the OOB caret) rides along in place. */
+                /*
+                 * store.cap k = v ; load.capture d, k  ->
+                 * store.cap k = v ; move d = v
+                 *
+                 * A closure that mutates a capture and then USES it -
+                 * `count++; return count`, the whole of 11_closure_
+                 * counter's callee - re-reads the slot it has just
+                 * written. The load is not cheap: reaching a capture
+                 * means ctx -> captures -> data() (three chained loads,
+                 * re-derived per access) plus the type guards and a
+                 * 24-byte boxed copy - about TWELVE emitted
+                 * instructions for a value already sitting in a slot.
+                 *
+                 * SOUND because a plain-assign StoreCaptureV is exactly
+                 * `lv.put(RValue(frame[v]))`: no coercion (unlike a
+                 * declared-type slot store), and a capture LValue has no
+                 * container, so no COW can intervene. The two ops are
+                 * ADJACENT, so nothing can write `v` in between.
+                 *
+                 * ⛔ THE aop GATE IS LOAD-BEARING: a COMPOUND store
+                 * (`cap += x`) writes num_binop's RESULT, which is not
+                 * what slot `v` holds - forwarding `v` there would
+                 * return the addend. A LITERAL operand is excluded for
+                 * the same reason MoveV needs a slot to copy from.
+                 */
+                if (op1.op == OpCode::StoreCaptureV
+                    && op2.op == OpCode::LoadCaptureV
+                    && op1.aop == Op::invalid
+                    && !op1.a_is_lit()
+                    && op2.target2 == op1.target
+                    && op1.a_slot() >= 0) {
+                    /*
+                     * THE THREE-OP WINDOW, which is where the win
+                     * actually is: `store.cap k = v; load.cap d, k;
+                     * return.v d` is the counter-closure idiom
+                     * (`count++; return count`) in full. Rewriting the
+                     * LOAD to a MoveV alone only traded ~12 emitted
+                     * instructions for ~9 - a boxed MoveV has its own
+                     * type guards and 24-byte copy. Pointing the RETURN
+                     * straight at `v` removes both.
+                     *
+                     * The load is neutralised as a Jump to the next pc
+                     * - the peephole rewrites in place and cannot
+                     * ERASE (pcs are jump targets), which is the same
+                     * idiom the LoadElemInt/JumpUnlessTrueV fusion
+                     * below uses for its consumed op.
+                     */
+                    if (p + 2 < n && code[p + 2].op == OpCode::ReturnV
+                        && !code[p + 2].a_is_lit()
+                        && code[p + 2].a_slot() == op2.target) {
+                        code[p + 2].set_a(slot_op(op1.a_slot()));
+                        op2.op = OpCode::Jump;
+                        op2.target = static_cast<int>(p) + 2;
+                        op2.target2 = -1;
+                        changed = true;
+                        continue;
+                    }
+                    /* MoveV reads its SOURCE from target2, not from
+                     * `a` (vm.cpp's handler) - the first version set
+                     * `a` and produced `move r0 = r-1`, which -vd
+                     * showed immediately. */
+                    op2.op = OpCode::MoveV;
+                    op2.target2 = op1.a_slot();
+                    changed = true;
+                    continue;
+                }
                 if (op1.op == OpCode::LoadElemInt
                     && op2.op == OpCode::JumpUnlessTrueV
                     && op2.target2 == op1.target
@@ -7345,6 +11602,19 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                     changed = true;
                 }
             });
+        /* #78: the HANDLER TABLE's pcs are the same targets (a clause body,
+         * the shared finally) and must thread identically - they are the
+         * only reference to them once the chain is deleted (step D). */
+        for (Chunk::HandlerSite &hs : chunk.handler_sites) {
+            for (Chunk::HandlerClause &cl : hs.clauses) {
+                const int nt = pp_thread(code, cl.body_pc);
+                if (nt != cl.body_pc) { cl.body_pc = nt; changed = true; }
+            }
+            if (hs.fin_pc >= 0) {
+                const int nt = pp_thread(code, hs.fin_pc);
+                if (nt != hs.fin_pc) { hs.fin_pc = nt; changed = true; }
+            }
+        }
 
         /* Branch-target map (post-threading). */
         std::vector<char> is_tgt(n + 1, 0);
@@ -7353,6 +11623,15 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                 if (t >= 0 && static_cast<size_t>(t) <= n)
                     is_tgt[t] = 1;
             });
+        /* #78: a handler-table pc is an ENTRY the raise path jumps to, so it
+         * counts as a branch target (identical to the CatchTest targets
+         * today - a no-op here, load-bearing once the chain is gone). */
+        for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+            for (const Chunk::HandlerClause &cl : hs.clauses)
+                is_tgt[pp_handler_pc(cl.body_pc, n)] = 1;
+            if (hs.fin_pc >= 0)
+                is_tgt[pp_handler_pc(hs.fin_pc, n)] = 1;
+        }
 
         std::vector<char> del(n, 0);
 
@@ -7411,6 +11690,19 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                 }
             };
             push(0);
+            /*
+             * #78 step D: a catch body / shared finally is entered by the
+             * RAISE PATH, which reads its pc off the handler table - there
+             * is no longer a CatchTest jumping to it, so it has no
+             * in-code predecessor and this DFS would call it dead and
+             * DELETE it. The table pcs are roots, exactly like pc 0.
+             */
+            for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+                for (const Chunk::HandlerClause &cl : hs.clauses)
+                    push(pp_handler_pc(cl.body_pc, n));
+                if (hs.fin_pc >= 0)
+                    push(pp_handler_pc(hs.fin_pc, n));
+            }
             while (!stack.empty()) {
                 const size_t p = stack.back();
                 stack.pop_back();
@@ -7452,6 +11744,12 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
                     if (t >= 0 && static_cast<size_t>(t) <= n)
                         t = newpc[t];
                 });
+            for (Chunk::HandlerSite &hs : chunk.handler_sites) {   /* #78 */
+                for (Chunk::HandlerClause &cl : hs.clauses)
+                    cl.body_pc = newpc[pp_handler_pc(cl.body_pc, n)];
+                if (hs.fin_pc >= 0)
+                    hs.fin_pc = newpc[pp_handler_pc(hs.fin_pc, n)];
+            }
             code = std::move(out);
         }
 
@@ -7464,16 +11762,45 @@ static void peephole_chunk(std::vector<CgInstr> &code, const Chunk &ck)
  * value - the audited set behind Chunk::ref_slots (profile #2). Anything
  * not listed is treated as possibly-reference (conservative). Computed
  * before specialize_arith_ops, so only the generic forms appear here. */
-static bool op_writes_scalar(OpCode op)
+bool op_writes_scalar(OpCode op)
 {
     switch (op) {
+    /*
+     * THE B1/B2 SPECIALIZED FAMILY. They exist only AFTER
+     * specialize_arith_ops, which runs after compute_ref_slots below -
+     * so for THAT consumer listing them changes nothing. They are here
+     * for the consumers that ask at JIT time, on the specialized code
+     * (C5's release picker), where their absence made the conservative
+     * "not a scalar write" answer decline most real arithmetic.
+     *
+     * This is the AUDIT-TABLE STAGE TRAP (CLAUDE.md) a second time, on
+     * the sibling table: `visit_use_def` was fixed for this exact family
+     * on 2026-08-04, and this one was not, because at the stage it was
+     * written for it cannot see them either.
+     */
+    case OpCode::IntAddRR: case OpCode::IntAddRI:
+    case OpCode::IntSubRR: case OpCode::IntSubRI:
+    case OpCode::IntMulRR: case OpCode::IntMulRI:
+    case OpCode::IntAndRR: case OpCode::IntAndRI:
+    case OpCode::IntOrRR:  case OpCode::IntOrRI:
+    case OpCode::IntXorRR: case OpCode::IntXorRI:
+    case OpCode::IntShlRR: case OpCode::IntShlRI:
+    case OpCode::IntShrRR: case OpCode::IntShrRI:
+    case OpCode::IntModRI:
+    case OpCode::FloatAddRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRR: case OpCode::FloatSubRI:
+    case OpCode::FloatMulRR: case OpCode::FloatMulRI:
     case OpCode::IntBin: case OpCode::FloatBin:
+    case OpCode::CmpIntV: case OpCode::CmpFloatV:
     case OpCode::IntAddModRI: case OpCode::IntAddStep:
     case OpCode::ForLoopStep: case OpCode::ForStepElemInt:
     case OpCode::StructFieldAddInt: case OpCode::MathFnV:
-    case OpCode::ArrLen: case OpCode::StrLen:
+    case OpCode::ArrLen: case OpCode::StrLen: case OpCode::OrdCharV:
+    case OpCode::ArrEpochMark:        /* an int: the epoch, or -1 */
+    case OpCode::UnpackLenCheck:      /* its flag: an int 0/1 */
     case OpCode::LoadImmInt: case OpCode::LoadImmFloat:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+    case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
     case OpCode::LoadElemBool:
     case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
     case OpCode::LoadStructFieldInt: case OpCode::LoadStructFieldFloat:
@@ -7486,55 +11813,1874 @@ static bool op_writes_scalar(OpCode op)
     }
 }
 
-static void compute_ref_slots(const std::vector<CgInstr> &code, Chunk &chunk)
+/*
+ * Templated over the instruction type because it runs TWICE: at codegen
+ * over the CgInstr vector (before `chunk.code` exists), and at LOAD over a
+ * stored chunk's `Instr` code - `ref_slots` is a DERIVED pool since myv
+ * v18 (2026-09-22), rebuilt by the loader exactly like boxed_ops and
+ * nonneg_slots and never read from the file. The reason is the one the
+ * v4 note gives, in its sharpest form: a list the image carries can
+ * DISAGREE with the code beside it, and `ref_slots` decides which slots
+ * the frame pop RELEASES - a mutated entry (myv_fuzz small-1305: one bit,
+ * `[1, 2]` -> `[0, 2]`) made the release scan skip the temp two closures
+ * were built in, and LeakSanitizer reported them at exit. Derived from
+ * the verified code, the list cannot disagree with it.
+ */
+template <class I>
+static void compute_ref_slots_impl(const std::vector<I> &code,
+                                   Chunk &chunk,
+                                   const std::vector<int32_t> *seeds,
+                                   std::vector<int32_t> &out,
+                                   bool count)
 {
     const int total = chunk.slot_count + chunk.n_temps;
     std::vector<char> is_ref(total, 0);
     bool bail = false;
 
-    for (const CgInstr &in : code) {
-        const bool known = visit_use_def(
+    /*
+     * ⛔ THE PARAMETER SEEDS COME IN, THEY ARE NOT MERGED AFTERWARDS -
+     * and getting that backwards is the audit-table STAGE trap, caught
+     * by `jit_ret_audit` on the first run.
+     *
+     * A reference PARAMETER's slot is written by the BIND, which is no
+     * instruction, so `visit_use_def` cannot see it; `compile_func_body`
+     * used to union the non-scalar params into `ref_slots` AFTER this
+     * function returned. That was fine while every write was marked
+     * independently - and became wrong the moment a MoveV's answer
+     * DEPENDED on its source, because `move t = param` then propagated
+     * from a source this pass believed trivial. The fix is not to redo
+     * the union later but to make the input COMPLETE here.
+     */
+    if (seeds)
+        for (const int32_t sl : *seeds)
+            if (sl >= 0 && sl < total)
+                is_ref[sl] = 1;
+
+    /*
+     * ⛔ A `MoveV` IS NOT A REFERENCE WRITE - IT IS ITS SOURCE'S ANSWER,
+     * and treating it as an unconditional one made EVERY argument temp
+     * in the program reference-carrying.
+     *
+     * `op_writes_scalar` cannot list MoveV: it copies whatever the
+     * source holds, which is the whole point of the op. So the fallback
+     * marked its dst, and since a call's arguments are STAGED by MoveV,
+     * `ref_slots` claimed every argument temp could hold a reference -
+     * for an `int` argument, forever. The cost was silent and paid three
+     * times per call: the staging move's own dest ref-check, the bind
+     * copy's per-argument source test, and the frame pop's release scan.
+     * It also made the #162 fusion's "only a ref-listed slot" gate look
+     * like it separated shapes it did not.
+     *
+     * The refinement is one line of dataflow: `is_ref[dst] |= is_ref[src]`
+     * for a move, to a FIXPOINT (a move can precede its source's own
+     * marking - a loop body's move reads a slot a later op writes), and
+     * conservative in every other direction. It only ever SHRINKS the
+     * set, which is the dangerous direction, so the oracle matters: the
+     * VM_HARDENING full-window audit at `pop_window` asserts every
+     * NON-listed slot is trivial when the frame pops, and `jit_ret_audit`
+     * asserts the same about the emitted return path.
+     */
+    std::vector<std::pair<int, int>> moves;
+    for (const I &in : code) {
+        /* the POOLED table (2026-11-09): an in-place builtin call's row
+         * lives there, and visit_use_def proper reports it a barrier -
+         * which made this pass list EVERY slot of any chunk that calls
+         * append / sort / pop / ... (see visit_use_def_pooled for why
+         * its arg0 is not a def) */
+        const bool known = visit_use_def_pooled(
             in, [](int) {},
             [&](int dslot) {
-                if (dslot >= 0 && dslot < total
-                    && !op_writes_scalar(in.op))
-                    is_ref[dslot] = 1;
-            });
+                if (dslot < 0 || dslot >= total)
+                    return;
+                if (op_writes_scalar(in.op))
+                    return;
+                if (in.op == OpCode::MoveV) {
+                    /* deferred to the fixpoint below - the source
+                     * decides, and it may not be marked yet */
+                    const int src = static_cast<int>(in.target2);
+                    if (src >= 0 && src < total) {
+                        moves.push_back({ dslot, src });
+                        return;
+                    }
+                }
+                /*
+                 * ⛔ `LoadConstV` IS THE SAME SHAPE AS MoveV, one step
+                 * further out. `op_writes_scalar` cannot list it -
+                 * a constant can be a string or an array - but WHICH
+                 * constant is a compile-time fact and the pool is right
+                 * here. Without this a loop counter initialised by
+                 * `load i, 0` is reference-carrying for the whole
+                 * chunk, and the MoveV rule above then faithfully
+                 * propagates that into every argument staged from it:
+                 * a refinement is only as good as the facts under it.
+                 */
+                /*
+                 * #111: a `cap_scalar` LoadCaptureV writes a PROVEN
+                 * int/float, so its dst is no more a reference than an
+                 * IntBin's. The third instance today of the same rule
+                 * (MoveV, LoadConstV, and now this): a table entry that
+                 * says "this op writes anything" is right about the
+                 * OPCODE and wrong about the INSTRUCTION.
+                 *
+                 * It matters twice over here: the dst's own ref-check in
+                 * the emitted read disappears, and so does the slot from
+                 * the return path's release scan.
+                 */
+                if ((in.op == OpCode::LoadCaptureV
+                     || in.op == OpCode::LoadCaptureOfV)
+                        && in.cap_scalar())
+                    return;
+                /*
+                 * #120: a CALL whose RETURN TYPE the inferencer proved
+                 * is a non-opt int/float/bool. The FOURTH instance of
+                 * the rule above, and the one the others make obvious:
+                 * `op_writes_scalar` cannot list CallV - a call returns
+                 * whatever the callee returns - but WHICH callee, and
+                 * what it returns, is a compile-time fact sitting on
+                 * the CallExpr as `th`, stamped by annotate_hints for
+                 * every node whose static type is a settled non-opt
+                 * scalar (`type_of(call)` IS the return type).
+                 *
+                 * ⛔ IT IS AN OPFLAG, AND THE FIRST TRY WAS WRONG.
+                 * Reading `th` off the AST here looks obvious -
+                 * `CgInstr` carries `node_idx` - and it silently does
+                 * NOTHING: by the time this pass runs, extract_locs has
+                 * already consumed and NULLED every handle (which is
+                 * what `verify_ast_free` then asserts). The probe read
+                 * `node_idx=-1` on every call. So the proof is stamped
+                 * at EMIT time, where the node is still live, exactly
+                 * as `cap_scalar` does.
+                 *
+                 * ⛔ WHY REASSIGNMENT CANNOT BREAK IT. `CallV`'s
+                 * callee is a GLOBAL SLOT read at RUNTIME, so the
+                 * obvious worry is `f = something_else`. Three layers
+                 * answer it: a signature-CHANGING assignment is
+                 * REFUSED at compile time by the function-subtyping
+                 * rule (`func(int)->str` into a `func(int)->int` name
+                 * is a TypeMismatchEx); a signature-PRESERVING one
+                 * leaves the return type identical by construction;
+                 * and `th` is stamped only where the type is settled,
+                 * concrete and non-opt, so a `dyn` callee - the case
+                 * subtyping DEFERS on - is never claimed here. A
+                 * reassignment to a NON-function throws NotCallableEx
+                 * and never writes the dst.
+                 */
+                if ((in.op == OpCode::CallV
+                         || in.op == OpCode::CachedCallV)
+                        && in.ret_scalar())
+                    return;
+                if (in.op == OpCode::LoadConstV) {
+                    const size_t ci = static_cast<size_t>(in.target2);
+                    if (ci < chunk.consts.size()
+                            && chunk.consts[ci].get_type()->t
+                                   < Type::t_str)
+                        return;               /* a TRIVIAL constant */
+                }
+                is_ref[dslot] = 1;
+            }, &chunk);
         if (!known) {
             /* A barrier op writes slots we can't enumerate (pool-target
-             * unpacks, LV builtins, iterators): every slot is a candidate
-             * - identical to the old full scan. */
+             * unpacks, iterators): every slot is a candidate - identical
+             * to the old full scan. */
             bail = true;
             break;
         }
     }
 
-    chunk.ref_slots.clear();
+    /*
+     * THE CATCH-BIND SLOTS - written by the RUNTIME, not by any op.
+     *
+     * Everything above is derived from instruction write-dsts, which is
+     * complete only while every write is an opcode. Since #78 step D it
+     * is not: deleting the interpreted CatchTest chain moved the catch
+     * binding into the RAISE PATH, where vm_dispatch_exc_body does
+     *
+     *     ctx.frame->at(cl.bind_slot).put(vm_catch_bind_val(ex.get()));
+     *
+     * No instruction writes that slot, so visit_use_def never sees it,
+     * so `ref_slots` omitted it - and `catch (T as e)` binds a STRUCT
+     * INSTANCE, a reference. pop_window's release scan then skipped it
+     * and the hardened re-scan aborted:
+     *   `rec.window[i].get().get_type()->t < Type::t_str' failed
+     * on any frame that catches a CALLEE's throw with a bind (found by
+     * the Net 3 enumeration, 2026-08-13; 144 of 480 programs).
+     *
+     * This is the audit-table stage trap in a new shape - not "a pass
+     * added later sees a different opcode universe" but "a WRITE that
+     * is no longer an opcode at all". When a runtime path starts
+     * writing a frame slot, it must join this list.
+     */
+    for (const Chunk::HandlerSite &site : chunk.handler_sites)
+        for (const Chunk::HandlerClause &cl : site.clauses)
+            if (cl.bind_slot >= 0 && cl.bind_slot < total)
+                is_ref[cl.bind_slot] = 1;
+
+    /* the move fixpoint - AFTER the catch binds, so a moved-from catch
+     * variable propagates too. Bounded by `moves.size()` passes; in
+     * practice it settles in one or two. */
+    for (size_t round = 0; round <= moves.size() && !bail; round++) {
+        bool changed = false;
+        for (const auto &mv : moves)
+            if (is_ref[mv.second] && !is_ref[mv.first]) {
+                is_ref[mv.first] = 1;
+                changed = true;
+            }
+        if (!changed)
+            break;
+    }
+
+    out.clear();
     for (int i = 0; i < total; i++)
         if (bail || is_ref[i])
-            chunk.ref_slots.push_back(i);
+            out.push_back(i);
+#ifdef TESTS
+    if (count && !bail)
+        for (const auto &mv : moves)
+            if (!is_ref[mv.first])
+                g_ref_slots_move_excluded++;   /* the engagement proof */
+#endif
+}
+
+/*
+ * #97 CB5: both lists come out of one call, so no site can derive one
+ * and forget the other. `ref_slots_raw` is the same analysis with NO
+ * parameter seeds - the answer for a frame whose every parameter was
+ * bound a raw SCALAR (VmInvoker::call_scalars), where the bind cannot
+ * have written a reference and only the body's own writes can.
+ */
+template <class I>
+static void compute_ref_slots_both(const std::vector<I> &code, Chunk &chunk,
+                                   const std::vector<int32_t> *seeds)
+{
+    compute_ref_slots_impl(code, chunk, seeds, chunk.ref_slots, true);
+    compute_ref_slots_impl(code, chunk, nullptr, chunk.ref_slots_raw,
+                           false);
+}
+
+static void compute_ref_slots(const std::vector<CgInstr> &code,
+                              Chunk &chunk,
+                              const std::vector<int32_t> *seeds)
+{
+    compute_ref_slots_both(code, chunk, seeds);
+}
+
+void compute_ref_slots(Chunk &chunk, const std::vector<int32_t> *seeds)
+{
+    compute_ref_slots_both(chunk.code, chunk, seeds);
+}
+
+/*
+ * The parameter SEEDS of `compute_ref_slots` for a function chunk: every
+ * param slot whose bind can write a reference - i.e. not int/float-COERCED
+ * (bind_param's coerce guarantees those never hold one) and not
+ * inference-PROVEN i/f (C3, ParamDesc::proven_type; the VM_HARDENING
+ * pop_window audit is the net). ONE function for the compile and the
+ * loader, so the two seed sets cannot drift.
+ */
+void ref_seeds_of(const FuncDescriptor &desc, std::vector<int32_t> &seeds)
+{
+    seeds.clear();
+    for (size_t i = 0; i < desc.params.size(); i++)
+        if (!desc.params[i].binds_scalar())
+            seeds.push_back(static_cast<int32_t>(i));
+}
+
+/* model-flip nativize-ops: copy each BinOpV/CmpV/CompoundV's FINAL operand data
+ * (target + two Operands + the arith/compare Op) into Chunk::boxed_ops and store
+ * the pool index in the op's OTHERWISE-UNUSED target2, so the JIT can bake a
+ * STABLE pool-buffer address for these boxed ops (baking &code[pc] is unsafe -
+ * jit_compile_chunk rewrites the code vector). Runs on the final runtime code
+ * (post-peephole/specialize) UNCONDITIONALLY: the interpreter ignores target2
+ * for these ops, and the VM precompile jits in a LATER pass that needs the pool
+ * already built. */
+/*
+ * #78: the handler-table REMAP net. Step B cross-checked the table against
+ * the interpreted CatchTest chain; step D deleted the chain, so there is no
+ * second description to compare against - what remains, and what the net was
+ * really for, is that every table pc survives each pc-MOVING transformation
+ * (the peephole's threading + compaction, and both JIT remaps). A missed
+ * remap leaves a pc that is out of range or lands past the code, so:
+ *   - every PushHandler's region indexes a real site;
+ *   - every site reachable that way has >= 1 clause or a finally (an empty
+ *     site would silently swallow nothing and fall to the frame walk);
+ *   - every clause body_pc and every fin_pc is a valid pc into `code`.
+ * Called after codegen and after both JIT remaps. ASSERTS-only.
+ */
+void verify_handler_sites(const Chunk &chunk)
+{
+#ifndef NDEBUG
+    const int n = static_cast<int>(chunk.code.size());
+    for (const Instr &ph : chunk.code) {
+        if (ph.op != OpCode::PushHandler)
+            continue;
+        const int region = static_cast<int>(ph.a_lit());
+        ML_CHECK(region >= 0
+                 && static_cast<size_t>(region) < chunk.handler_sites.size());
+        const Chunk::HandlerSite &site = chunk.handler_sites[region];
+        ML_CHECK(!site.clauses.empty() || site.fin_pc >= 0
+                 || site.chain >= 0);
+        for (const Chunk::HandlerClause &cl : site.clauses)
+            ML_CHECK(cl.body_pc >= 0 && cl.body_pc < n);
+        ML_CHECK(site.fin_pc < 0 || site.fin_pc < n);
+        ML_CHECK(site.chain < 0 || static_cast<size_t>(site.chain)
+                                       < chunk.handler_sites.size());
+    }
+#else
+    (void)chunk;
+#endif
+}
+
+/* Declared in codegen.h - see the contract there. */
+const char *handler_balance_fault(const Chunk &chunk, size_t *at_pc)
+{
+    const size_t n = chunk.code.size();
+    const size_t nregions = chunk.handler_sites.size();
+    /* -1 = not reached; else the handler depth ON ENTRY to the pc */
+    std::vector<int> depth(n, -1);
+    /* the depth each region's PushHandler was met at, -1 = not yet */
+    std::vector<int> entry(nregions, -1);
+    std::vector<size_t> work;
+    const char *fault = nullptr;
+    size_t fault_pc = 0;
+    const auto fail = [&](size_t pc, const char *what) {
+        if (!fault) {
+            fault = what;
+            fault_pc = pc;
+        }
+    };
+    /* control (or a dispatch) reaches `t` with depth `d` */
+    const auto reach = [&](size_t from, int_type t, int d) {
+        if (t < 0 || static_cast<size_t>(t) >= n) {
+            fail(from, "a branch past the code");
+            return;
+        }
+        const size_t s = static_cast<size_t>(t);
+        if (depth[s] < 0) {
+            depth[s] = d;
+            work.push_back(s);
+        } else if (depth[s] != d) {
+            fail(s, "the handler depth disagrees at a join");
+        }
+    };
+    if (n == 0)
+        return nullptr;                 /* "empty chunk" is refused apart */
+    reach(0, 0, 0);
+    while (!work.empty() && !fault) {
+        const size_t pc = work.back();
+        work.pop_back();
+        /* visit_pc_fields takes Instr& (the remaps write through it); this
+         * read-only walk borrows it via a const_cast, mutating nothing. */
+        Instr &in = const_cast<Instr &>(chunk.code[pc]);
+        int d = depth[pc];
+        if (in.op == OpCode::PushHandler) {
+            const int_type r = in.a_lit();
+            if (r < 0 || static_cast<size_t>(r) >= nregions) {
+                fail(pc, "handler region");
+                break;
+            }
+            /* The dispatch pops THIS handler (and every inner one) before
+             * resuming at a clause body or the finally, so those pcs are
+             * entered at the depth the push was met at. One region, one
+             * push depth: the table is per region, not per push. */
+            if (entry[r] >= 0 && entry[r] != d) {
+                fail(pc, "a handler region pushed at two depths");
+                break;
+            }
+            entry[r] = d;
+            const Chunk::HandlerSite &site = chunk.handler_sites[r];
+            for (const Chunk::HandlerClause &cl : site.clauses)
+                reach(pc, cl.body_pc, d);
+            if (site.fin_pc >= 0)
+                reach(pc, site.fin_pc, d);
+            d++;
+        } else if (in.op == OpCode::PopHandler) {
+            if (d == 0) {
+                fail(pc, "a PopHandler with no handler pushed");
+                break;
+            }
+            d--;
+        }
+        visit_pc_fields(in, [&](int &t) { reach(pc, t, d); });
+        if (op_falls_through(in.op) && pc + 1 < n)
+            reach(pc, static_cast<int_type>(pc + 1), d);
+    }
+    if (fault && at_pc)
+        *at_pc = fault_pc;
+    return fault;
+}
+
+/*
+ * THE READ-BEFORE-WRITE SLOTS (2026-09-22, myv_fuzz small-60): the frame
+ * slots some path can READ before any instruction has WRITTEN them. A
+ * forward MUST dataflow of "definitely written" over the chunk's CFG:
+ * entry pcs (pc 0, every handler body pc and finally pc - a dispatch
+ * arrives with no history this walk modelled) start with NOTHING
+ * written; each op first reads its uses - one not in the state is
+ * read-first - then adds its defs; a join is the INTERSECTION of its
+ * predecessors' states (the fixpoint starts at TOP and only shrinks,
+ * which is what lets a loop-carried write survive the back edge).
+ * Successors are `visit_pc_fields`' targets plus the fall-through of
+ * every op that has one. An op the audited table does not know is a
+ * barrier that may read anything: every slot is read-first.
+ *
+ * Its consumer is W3's `jit_chunk_frameless_init_free`, which used to ask
+ * only that every WRITE of a slot be raw - true VACUOUSLY of a slot with
+ * no write at all, which codegen never emits (a local is declared before
+ * use, a temp written before read) but one mutated `StructCtorV` dst
+ * does: `p` was never written, the frameless site left it uninitialised,
+ * `p.x` read raw stack whose stale type word said "dict", and
+ * `member_read_core` retained a garbage pointer - a SEGV in both builds
+ * where `-nj` raised a clean TypeErrorEx. Codegen's own output pays
+ * nothing for the rule (emitted code byte-identical corpus-wide).
+ */
+uint64_t chunk_read_before_write(const Chunk &chunk)
+{
+    const size_t n = chunk.code.size();
+    /* one bit per slot: past 64 the chunk is not frameless anyway
+     * (FRAMELESS_MAX_SLOTS), and the set is capped at what a mask holds */
+    const int total = std::min(chunk.slot_count + chunk.n_temps, 64);
+    const uint64_t all = total >= 64 ? ~uint64_t(0)
+                                     : (uint64_t(1) << total) - 1;
+    if (!n)
+        return 0;
+    std::vector<uint64_t> in(n, all);          /* TOP: everything written */
+    std::vector<char> seen(n, 0);
+    std::vector<size_t> work;
+    const auto enter = [&](size_t pc) {
+        if (pc < n && in[pc] != 0) {
+            in[pc] = 0;
+            seen[pc] = 1;
+            work.push_back(pc);
+        } else if (pc < n && !seen[pc]) {
+            seen[pc] = 1;
+            work.push_back(pc);
+        }
+    };
+    enter(0);
+    for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+        for (const Chunk::HandlerClause &cl : hs.clauses)
+            if (cl.body_pc >= 0)
+                enter(static_cast<size_t>(cl.body_pc));
+        if (hs.fin_pc >= 0)
+            enter(static_cast<size_t>(hs.fin_pc));
+    }
+    uint64_t read_first = 0;
+    std::vector<int> uses, defs;
+    const auto flow = [&](size_t from, int_type t, uint64_t st) {
+        if (t < 0 || static_cast<size_t>(t) >= n)
+            return;
+        const size_t s = static_cast<size_t>(t);
+        const uint64_t nst = in[s] & st;       /* MEET: intersection */
+        if (!seen[s] || nst != in[s]) {
+            in[s] = nst;
+            seen[s] = 1;
+            work.push_back(s);
+        }
+    };
+    while (!work.empty()) {
+        const size_t pc = work.back();
+        work.pop_back();
+        Instr &ins = const_cast<Instr &>(chunk.code[pc]);
+        uint64_t st = in[pc];
+        if (!jit_op_slot_refs(ins, uses, defs))
+            return all;                        /* a barrier reads anything */
+        for (const int u : uses)
+            if (u >= 0 && u < total && !((st >> u) & 1))
+                read_first |= uint64_t(1) << u;
+        for (const int d : defs)
+            if (d >= 0 && d < total)
+                st |= uint64_t(1) << d;
+        visit_pc_fields(ins, [&](int &t) { flow(pc, t, st); });
+        if (op_falls_through(ins.op) && pc + 1 < n)
+            flow(pc, static_cast<int_type>(pc + 1), st);
+    }
+    return read_first;
+}
+
+/* ------------------------------------------------------------------ */
+/* #137: STRUCTURAL VERIFICATION of a chunk's instruction operands      */
+/* ------------------------------------------------------------------ */
+
+namespace {
+
+/*
+ * The per-operand checks verify_chunk's switch is written in terms of. Each
+ * one names the LIMIT its operand belongs to, so a case reads as a
+ * declaration of what the op's fields mean:
+ *
+ *      case OpCode::LoadConstV:
+ *          dst(in.target); pool(in.target2, ck.consts.size(), "consts");
+ *          break;
+ *
+ * Every rejection is fatal for the image, so the checks throw rather than
+ * returning a status - a case never has to propagate anything.
+ */
+struct ChunkVerifier {
+
+    const Chunk &ck;
+    const ChunkLimits &lim;
+    size_t pc = 0;
+
+    ChunkVerifier(const Chunk &c, const ChunkLimits &l) : ck(c), lim(l) { }
+
+    [[noreturn]] void reject(const char *what) const
+    {
+        throw Exception("MyvError",
+                        intern_msg("corrupt .myv (" + std::string(what)
+                                   + " at pc " + std::to_string(pc) + ")"));
+    }
+
+    /* A FRAME SLOT that must exist - a register read or written. */
+    void reg(int_type s) const
+    {
+        if (s < 0 || s >= lim.nslots)
+            reject("frame slot");
+    }
+    /* The same, but -1 ("unset") is legal: a DISCARDED call result, an
+     * absent slice bound. */
+    void reg_opt(int_type s) const
+    {
+        if (s != -1)
+            reg(s);
+    }
+    /* A contiguous RUN of `n` slots starting at `base` - a call's argument
+     * window, a literal's element window. `n == 0` needs no slot at all,
+     * which is why an empty run does not require a valid base. */
+    void run(int_type base, int_type n) const
+    {
+        if (n < 0)
+            reject("run length");
+        if (n == 0)
+            return;
+        if (base < 0 || base > lim.nslots - n)
+            reject("run window");
+    }
+    /* A GLOBAL-table slot / a CAPTURE index / a builtin-table index. */
+    void gslot(int_type s) const
+    {
+        if (s < 0 || static_cast<size_t>(s) >= lim.nglobals)
+            reject("global slot");
+    }
+    void cslot(int_type s) const
+    {
+        if (s < 0 || static_cast<size_t>(s) >= lim.ncaptures)
+            reject("capture slot");
+    }
+    void builtin(int_type s) const
+    {
+        if (s < 0 || static_cast<size_t>(s) >= lim.nbuiltins)
+            reject("builtin slot");
+    }
+    /* A container-store BASE, by the slot KIND vm_store_base switches on:
+     * 1 global, 2 capture, anything else (0, and the -1 default) local. */
+    void base(int_type kind, int_type slot) const
+    {
+        if (kind == 1)
+            gslot(slot);
+        else if (kind == 2)
+            cslot(slot);
+        else
+            reg(slot);
+    }
+    /* A chain's steps (vm_chain_walk walks them): a member step indexes
+     * member_keys, a subscript step's key is a frame temp. */
+    void steps(const std::vector<Chunk::ChainStep> &st) const
+    {
+        for (const Chunk::ChainStep &s : st) {
+            if (s.is_member)
+                pool(s.operand, ck.member_keys.size(), "member key");
+            else
+                reg(s.operand);
+        }
+    }
+    /* A branch destination. */
+    void target_pc(int_type p) const
+    {
+        if (p < 0 || static_cast<size_t>(p) >= ck.code.size())
+            reject("jump target");
+    }
+    /* An index into one of the chunk's pools. */
+    void pool(int_type i, size_t n, const char *what) const
+    {
+        if (i < 0 || static_cast<size_t>(i) >= n)
+            reject(what);
+    }
+    /* Q2: a creation op's container type - a REF into Chunk::ctypes (0:
+     * untyped, else the index + 1) */
+    void ctype(unsigned ref) const
+    {
+        if (ref > ck.ctypes.size())
+            reject("ctype");
+    }
+    /* A pool entry the OP WILL DEREFERENCE. Several def pointers have a
+     * legitimate null form for OTHER consumers (a boxed ctor's, an emplace
+     * site's), so bounding the index is not enough - the op that reads one
+     * walks `def->fields` with no null test, and a null reached
+     * vm_struct_ctor_planned through a `noexcept` JIT helper, whose throw
+     * then hit std::terminate instead of unwinding (the #132 shape). */
+    void defined_ptr(const void *p, const char *what) const
+    {
+        if (!p)
+            reject(what);
+    }
+    /* A per-frame side-state id (a dict / dyn iterator), sized by the
+     * chunk's own count exactly as vm_run_chunk allocates the slice. */
+    void iter(int_type i, int n) const
+    {
+        if (i < 0 || i >= n)
+            reject("iterator id");
+    }
+    /*
+     * A STRUCT FIELD index. The def is only known at RUN time (it comes from
+     * whatever value the base slot holds), so the tightest COMPILE-time bound
+     * is the widest struct in the whole program - enough to refuse the
+     * mangled-byte case, which is the point here. A field index valid for
+     * some other struct still reaches the runtime path, exactly as a slot
+     * holding the wrong type does.
+     */
+    void field(int_type f) const
+    {
+        if (f < 0 || static_cast<size_t>(f) >= lim.max_fields)
+            reject("struct field index");
+    }
+    /*
+     * The ARITH/COMPARE `aop` of a boxed op. It is one raw byte in an image,
+     * and vm_num_binop turns it into a pointer-to-member with no fallback:
+     * a value in neither table gives a NULL, and the call through it was a
+     * SIGSEGV in the default release build (the ML_VM_CHECK that catches it
+     * is VM_HARDENING-tier, off there). Asked of the dispatch's OWN tables
+     * (vm.h) so a new operator cannot be valid in one and not the other.
+     */
+    void aop_dispatchable(Op aop) const
+    {
+        if (!vm_aop_dispatchable(aop))
+            reject("arith/compare op");
+    }
+    /* The same, for a COMPOUND global/capture store, where Op::invalid is
+     * the legal "plain assignment, no operator" encoding. */
+    void aop_opt_dispatchable(Op aop) const
+    {
+        if (aop != Op::invalid)
+            aop_dispatchable(aop);
+    }
+    /* A struct def a BYTE-LEVEL path will write into: `pod_get`/`pod_set` and
+     * the baked ctor plans index `bytes`, which a non-POD instance leaves
+     * EMPTY - the store then lands on a null buffer (UBSan: "store to null
+     * pointer", and a silent hang in a release). */
+    void pod_def(const StructTypeDef *def, const char *what) const
+    {
+        defined_ptr(def, what);
+        if (!def->is_pod())
+            reject(what);
+    }
+
+    /* An operand that is a slot unless it is an immediate. */
+    void a_reg(const Instr &in) const
+    {
+        if (!in.a_is_lit())
+            reg(in.a_slot());
+    }
+    void b_reg(const Instr &in) const
+    {
+        if (!in.b_is_lit())
+            reg(in.b_slot());
+    }
+    void ab_regs(const Instr &in) const { a_reg(in); b_reg(in); }
+    /*
+     * An operand the VM reads as a SLOT whatever the lit flag says
+     * (`frame->at(in->a_slot())` in DictStore / StoreElemValue /
+     * StoreMemberV / StoreElem2V - codegen materialises every literal
+     * into a temp first, so a set flag never comes from a compile).
+     * `a_reg`/`b_reg` SKIP the bound on a lit flag, and on these ops
+     * that skip was a hole: one mutated opflags bit and the handler
+     * indexed the frame with the payload, unchecked in a release build
+     * (2026-09-21, found auditing the store family for #25).
+     */
+    void a_slot_only(const Instr &in) const
+    {
+        if (in.a_is_lit())
+            reject("a literal where a slot is read");
+        reg(in.a_slot());
+    }
+    void b_slot_only(const Instr &in) const
+    {
+        if (in.b_is_lit())
+            reject("a literal where a slot is read");
+        reg(in.b_slot());
+    }
+    /*
+     * A chain_locs entry a TWO-LEVEL op dereferences as a PAIR:
+     * vm_nested_subscript_store / jit_store_elem2 read locs[0] and
+     * locs[1], the fused reads `&locs[1]` - so bounding the INDEX alone
+     * (as LoadElem2Int/Float did) still lets a one-pair entry, which a
+     * StoreElemChainV legitimately owns, be read past its end. The
+     * StoreElem2V index was not bounded at all: the VM indexes the pool
+     * with it and the load-time JIT bakes the entry's `.data()`.
+     */
+    void chain_pair(int_type i) const
+    {
+        pool(i, ck.chain_locs.size(), "chain locs");
+        if (ck.chain_locs[static_cast<size_t>(i)].size() < 2)
+            reject("chain locs pair");
+    }
+
+    void verify_one(const Instr &in);
+};
+
+/*
+ * ONE CASE PER OPCODE, and the switch has NO `default` - see the header
+ * comment. The operand meanings are the ones disasm.cpp's render_row prints
+ * and vm.cpp's handlers read; when the two ever disagree, the HANDLER wins,
+ * because that is what indexes the memory.
+ */
+void ChunkVerifier::verify_one(const Instr &in)
+{
+    switch (in.op) {
+
+    /* --- control flow ------------------------------------------------ */
+    case OpCode::Jump:
+        target_pc(in.target);
+        break;
+    case OpCode::Halt:
+    case OpCode::PopHandler:
+        break;
+    case OpCode::ExitBlock:
+        /*
+         * A CONTAINER-only op, inserted by the JIT (jit_try_container) and
+         * never stored - exactly like EnterNative below, and refused for
+         * the same reason. myv_fuzz found the hole (2026-09-20): a
+         * mutated opcode became an ExitBlock in a body the frameless gate
+         * then admitted (every op "fully native", a terminal ReturnV),
+         * the container path took the chunk without the frameless
+         * ENTRY, and its return arm ran on a frame that was never
+         * frameless - an oracle abort in the debug build, a SEGV in the
+         * assert-free one.
+         */
+        if (!ck.native.base)
+            reject("a container op in stored code");
+        target_pc(in.a_lit());          /* the container's resume pc */
+        break;
+    case OpCode::EnterNative:
+        /*
+         * `a` is a BYTE OFFSET into the JIT's fragment buffer, not a pc. A
+         * STORED image never contains one (`-c` compiles with jit=false and
+         * fragments are not serializable), so a null `native.base` here means
+         * the op was invented by corruption - refuse it rather than compute
+         * an address from a mangled offset.
+         */
+        if (!ck.native.base
+            || in.a_lit() < 0
+            || static_cast<size_t>(in.a_lit()) >= ck.native.len)
+            reject("native fragment offset");
+        break;
+
+    /* --- exceptions --------------------------------------------------- */
+    case OpCode::Throw:
+        reg(in.a_slot());
+        break;
+    case OpCode::PushHandler:
+    case OpCode::Rethrow:
+    case OpCode::EndFinally:
+    case OpCode::SetPend:               /* target is a 0/1 action, not a pc */
+        /* A region id indexes TWO things: the handler table, and the
+         * activation's per-region {exc, pend} slice, which n_trys sizes. */
+        pool(in.a_lit(), ck.handler_sites.size(), "handler region");
+        pool(in.a_lit(), static_cast<size_t>(ck.n_trys), "try region");
+        /* SetPend's target2 is its drop flag: -1, or 1 (question 12) */
+        if (in.op == OpCode::SetPend && in.target2 != -1 && in.target2 != 1)
+            reject("SetPend drop flag");
+        /* A PUSHED region catches something, has a finally or is a chain
+         * marker. Codegen leaves an empty entry only as a hole no
+         * PushHandler names; one a PushHandler names is a mutated image,
+         * which the JIT's remap check aborted on in an ASSERTS build
+         * (myv_fuzz, 2026-10-21). A marker's chain region indexes the
+         * {exc, pend} slice the dispatch reads (question 12). */
+        if (in.op == OpCode::PushHandler) {
+            const Chunk::HandlerSite &site =
+                ck.handler_sites[static_cast<size_t>(in.a_lit())];
+            if (site.clauses.empty() && site.fin_pc < 0 && site.chain < 0)
+                reject("an empty handler region");
+            if (site.chain >= 0)
+                pool(site.chain, static_cast<size_t>(ck.n_trys),
+                     "chain region");
+        }
+        break;
+    case OpCode::ThrowRuntimeV:
+        pool(in.target, ck.throws.size(), "throw site");
+        break;
+
+    /* --- scalar arithmetic (3-address: dst, a, b) --------------------- */
+    case OpCode::IntBin:
+    case OpCode::FloatBin:
+    case OpCode::CmpIntV:
+    case OpCode::CmpFloatV:
+    case OpCode::IntAddRR: case OpCode::IntAddRI:
+    case OpCode::IntSubRR: case OpCode::IntSubRI:
+    case OpCode::IntMulRR: case OpCode::IntMulRI:
+    case OpCode::IntAndRR: case OpCode::IntAndRI:
+    case OpCode::IntOrRR:  case OpCode::IntOrRI:
+    case OpCode::IntXorRR: case OpCode::IntXorRI:
+    case OpCode::IntShlRR: case OpCode::IntShlRI:
+    case OpCode::IntShrRR: case OpCode::IntShrRI:
+    case OpCode::FloatAddRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRR: case OpCode::FloatSubRI:
+    case OpCode::FloatMulRR: case OpCode::FloatMulRI:
+        reg(in.target);
+        ab_regs(in);
+        break;
+    case OpCode::IntModRI:
+        /* `dst = a % imm`, UNCHECKED: codegen selects it only for a
+         * modulus other than 0 and -1 (INT_MIN % -1 traps like a division
+         * by zero), so either is a SIGFPE in the handler and in the JIT's
+         * idiv - and the handler reads the immediate whatever the operand
+         * flag says (myv_fuzz, 2026-11-15: a mutated immediate 0 killed
+         * an assert-free build) */
+        reg(in.target);
+        ab_regs(in);
+        if (in.b_lit() == 0 || in.b_lit() == -1)
+            reject("mod immediate");
+        break;
+    case OpCode::IntAddModRI:
+        /* E4: `dst = (a + b) % target2` - the same premise, fused from
+         * the IntModRI above */
+        reg(in.target);
+        ab_regs(in);
+        if (in.target2 == 0 || in.target2 == -1)
+            reject("addmod modulus");
+        break;
+    case OpCode::MathFnV:
+        /* `pow_` is the only two-argument entry; every other selector
+         * leaves `b` unset. */
+        reg(in.target);
+        a_reg(in);
+        if (in.target2 < 0
+            || in.target2 > static_cast<int>(MathFn::pow_))
+            reject("math selector");
+        if (static_cast<MathFn>(in.target2) == MathFn::pow_)
+            b_reg(in);
+        break;
+    case OpCode::CoerceNumV:
+        reg(in.target);
+        a_reg(in);
+        break;
+
+    /* --- conditional branches ----------------------------------------- */
+    case OpCode::JumpUnlessIntCmp:
+    case OpCode::JumpUnlessFloatCmp:
+        target_pc(in.target);
+        ab_regs(in);
+        break;
+    case OpCode::JumpIfNotNoneV:
+        target_pc(in.target);
+        a_reg(in);
+        break;
+    case OpCode::JumpUnlessTrueV:
+        target_pc(in.target);
+        reg(in.target2);
+        break;
+    case OpCode::GuardCalleeV:
+        /* #97 closure inlining: the else-pc, the callee SLOT (read raw,
+         * never through the lit flag), and the def it is compared to */
+        target_pc(in.target);
+        a_slot_only(in);
+        pool(in.target2, ck.closure_defs.size(), "guarded closure def");
+        defined_ptr(ck.closure_defs[in.target2], "guarded closure def");
+        break;
+    case OpCode::JumpUnlessElemInt:     /* E4: `if (!a[i]) jump` */
+        target_pc(in.target);
+        reg(in.target2);
+        a_reg(in);
+        break;
+
+    /* --- counted-loop steps (target is the back edge) ----------------- */
+    case OpCode::ForLoopStep:
+        target_pc(in.target);
+        reg(in.target2);                /* the counter */
+        ab_regs(in);                    /* bound, step */
+        break;
+    case OpCode::IntAddStep:
+        /* #9: a_dual = (the added-to dst, the bound slot-or-immediate). */
+        target_pc(in.target);
+        reg(in.target2);
+        reg(in.a_dual_lo());
+        if (!in.a_is_lit())
+            reg(in.a_dual_hi());
+        b_reg(in);
+        break;
+    case OpCode::ForStepElemInt:
+        /* #9: b_dual = (the array, the element dst). */
+        target_pc(in.target);
+        reg(in.target2);
+        a_reg(in);
+        reg(in.b_dual_lo());
+        reg(in.b_dual_hi());
+        break;
+
+    /* --- element / member READS --------------------------------------- */
+    case OpCode::LoadElemInt:
+    case OpCode::LoadElemFloat:
+    case OpCode::LoadElemBool:
+    case OpCode::LoadElemValue:
+    case OpCode::LoadStructElemV:
+    case OpCode::LoadStrChar:
+    case OpCode::OrdCharV:
+    case OpCode::SubscriptV:
+        reg(in.target);
+        reg(in.target2);
+        a_reg(in);
+        break;
+    case OpCode::LoadElem2Int:
+    case OpCode::LoadElem2Float:
+        /* the fused nested read: a_dual = (outer index slot, chain_locs). */
+        reg(in.target);
+        reg(in.target2);
+        reg(in.a_dual_lo());
+        chain_pair(in.a_dual_hi());
+        b_reg(in);
+        break;
+    case OpCode::LoadStructFieldInt:
+    case OpCode::LoadStructFieldFloat:
+        reg(in.target);
+        reg(in.target2);
+        a_reg(in);
+        field(in.b_lit());
+        break;
+    case OpCode::StructFieldAddInt:
+        /* #9: `dst = other + a[i].f`; b_dual = (field index, other slot). */
+        reg(in.target);
+        reg(in.target2);
+        a_reg(in);
+        field(in.b_dual_lo());
+        reg(in.b_dual_hi());
+        break;
+    case OpCode::ArrLen:
+    case OpCode::StrLen:
+    case OpCode::MoveV:
+    case OpCode::ArrEpochMark:
+        reg(in.target);
+        reg(in.target2);
+        break;
+    case OpCode::ArrEpochCheck:
+        /* the mark `a` is read as a SLOT by the JIT's inline compare
+         * (never through the lit flag), so a literal is refused */
+        reg(in.target2);
+        a_slot_only(in);
+        break;
+    case OpCode::UnpackLenCheck:
+        /* `target` is a COUNT, not a slot: bounded by sign only (the
+         * test compares it with a length; no index is formed from it) */
+        reg(in.target2);
+        reg_opt(in.target);
+        /* `a` = the count, `b` = the flags - both literals; a flat-kind
+         * bit needs the flag slot, and names ONE kind */
+        if (!in.a_is_lit() || in.a_lit() < 0)
+            reject("unpack length count");
+        if (!in.b_is_lit() || in.b_lit() < 0 || in.b_lit() > 5
+                || (in.b_lit() & 6) == 6
+                || ((in.b_lit() & 6) != 0) != (in.target >= 0))
+            reject("unpack length flags");
+        break;
+    case OpCode::MemberV:
+        reg(in.target);
+        reg(in.target2);
+        pool(in.a_lit(), ck.member_keys.size(), "member key");
+        break;
+    case OpCode::LoadMemberInt:
+    case OpCode::LoadMemberFloat:
+        /* H1: b_dual = (baked byte offset or -1, struct_defs idx << 2 |
+         * form). The def index is only read when an offset was baked. */
+        reg(in.target);
+        reg(in.target2);
+        pool(in.a_lit(), ck.member_keys.size(), "member key");
+        if (in.b_dual_lo() >= 0) {
+            pool(in.b_dual_hi() >> 2, ck.struct_defs.size(), "struct def");
+            defined_ptr(ck.struct_defs[in.b_dual_hi() >> 2], "struct def");
+        }
+        break;
+    case OpCode::DictLoadInt:
+    case OpCode::DictLoadFloat:
+        /* a member's key is a const-pool entry, a subscript's is a temp. */
+        reg(in.target);
+        reg(in.target2);
+        if (in.a_is_lit())
+            pool(in.a_lit(), ck.consts.size(), "consts");
+        else
+            reg(in.a_slot());
+        break;
+    case OpCode::SliceV:
+        reg(in.target);
+        reg(in.target2);
+        reg_opt(in.a_slot());           /* an absent bound is -1 */
+        reg_opt(in.b_slot());
+        break;
+
+    /* --- element / member STORES (target = the base's slot KIND) ------ */
+    case OpCode::StoreElemInt:
+    case OpCode::StoreElemFloat:
+        base(in.target, in.target2);
+        ab_regs(in);                    /* index, value: slot or literal */
+        break;
+    case OpCode::StoreElemValue:
+    case OpCode::DictStore:
+        base(in.target, in.target2);
+        a_slot_only(in);                /* key / index: always a slot */
+        b_slot_only(in);                /* value: always a slot */
+        break;
+    case OpCode::StoreMemberV:
+        base(in.target, in.target2);
+        pool(in.a_lit(), ck.member_keys.size(), "member key");
+        b_slot_only(in);                /* value: always a slot */
+        break;
+    case OpCode::StoreElem2V:
+        /* value in `target`, base in `target2`, a_dual = (k1 slot,
+         * chain_locs idx - a PAIR the store dereferences), k2 in `b`. */
+        reg(in.target);
+        reg(in.target2);
+        reg(in.a_dual_lo());
+        chain_pair(in.a_dual_hi());
+        b_slot_only(in);
+        break;
+    case OpCode::StoreElemChainV:
+        /* a_dual = (chain_locs idx, base kind); the keys are the run
+         * [b_lit, +nkeys), nkeys being that pool entry's length. */
+        reg(in.target);
+        base(in.a_dual_hi(), in.target2);
+        pool(in.a_dual_lo(), ck.chain_locs.size(), "chain locs");
+        run(in.b_lit(),
+            static_cast<int_type>(ck.chain_locs[in.a_dual_lo()].size()));
+        break;
+    case OpCode::StoreLValueChainV:
+        /* a_dual = (chain_steps idx, base kind). A subscript step's key is
+         * a frame temp named by the step itself. */
+        reg(in.target);
+        base(in.a_dual_hi() & 3, in.target2);
+        pool(in.a_dual_lo(), ck.chain_steps.size(), "chain steps");
+        for (const Chunk::ChainStep &st : ck.chain_steps[in.a_dual_lo()]) {
+            if (st.is_member)
+                pool(st.operand, ck.member_keys.size(), "member key");
+            else
+                reg(st.operand);
+        }
+        break;
+
+    /* --- ++ / -- ------------------------------------------------------ */
+    case OpCode::IncDecCheckedV:
+        base(in.target2, in.target);    /* here the KIND rides target2 */
+        break;
+    case OpCode::IncDecElemCheckedV:
+        base(in.target, in.target2);
+        reg(in.a_slot());               /* the key temp - never a literal */
+        pool(in.b_lit(), ck.incdec_sites.size(), "incdec site");
+        break;
+    case OpCode::IncDecMemberCheckedV:
+        base(in.target, in.target2);
+        pool(in.b_lit(), ck.incdec_sites.size(), "incdec site");
+        /* the member form's site must name its member (the elem form's
+         * has none); vm_incdec_member reads it */
+        if (!ck.incdec_sites[in.b_lit()].memUid)
+            reject("incdec member with no name");
+        break;
+    case OpCode::IncDecChainV:
+        /* a held root is a frame slot like any local (kind 0); kind 3, the
+         * rvalue root, is gone since v30 - like any kind but 1 and 2 it now
+         * names a local, as vm_store_base reads it */
+        reg(in.target);
+        base(in.a_lit(), in.target2);
+        pool(in.b_lit(), ck.incdec_chains.size(), "incdec chain");
+        for (const Chunk::ChainStep &st
+                 : ck.incdec_chains[in.b_lit()].steps) {
+            if (st.is_member)
+                pool(st.operand, ck.member_keys.size(), "member key");
+            else
+                reg(st.operand);
+        }
+        break;
+
+    /* --- destructuring / iteration ------------------------------------ */
+    case OpCode::UnpackElemInt:
+    case OpCode::UnpackElemFloat:
+    case OpCode::UnpackElemValue:
+        run(in.target, in.b_lit());     /* the consecutive target run */
+        reg(in.target2);
+        a_reg(in);
+        break;
+    case OpCode::UnpackElemTargets:
+        pool(in.target, ck.unpack_targets.size(), "unpack targets");
+        reg(in.target2);
+        a_reg(in);
+        for (int32_t t : ck.unpack_targets[in.target])
+            reg_opt(t);                 /* -1 == the `_` placeholder */
+        break;
+    case OpCode::MultiUnpackV:
+        reg(in.a_slot());               /* the rvalue - always a slot */
+        pool(in.target, ck.unpack_targets.size(), "unpack targets");
+        for (int32_t t : ck.unpack_targets[in.target])
+            reg_opt(t);
+        if (in.b_is_lit())
+            pool(in.b_lit(), ck.unpack_coerce.size(), "unpack coerce");
+        break;
+    case OpCode::DictIterInit:
+        iter(in.target, ck.n_dict_iters);
+        reg(in.target2);
+        break;
+    case OpCode::DictIterNext:
+        /* the key and value binds are each -1 when the loop does not want
+         * that half (`foreach (var k in d)` leaves the value unset, `_`
+         * leaves either). */
+        target_pc(in.target);
+        iter(in.target2, ck.n_dict_iters);
+        reg_opt(in.a_slot());
+        reg_opt(in.b_slot());
+        break;
+    case OpCode::ForeachDynInit:
+        iter(in.target, ck.n_dyn_iters);
+        reg(in.target2);
+        pool(in.b_lit(), ck.unpack_targets.size(), "unpack targets");
+        for (int32_t t : ck.unpack_targets[in.b_lit()])
+            reg_opt(t);
+        break;
+    case OpCode::ForeachDynNext:
+        target_pc(in.target);
+        iter(in.target2, ck.n_dyn_iters);
+        break;
+
+    /* --- calls -------------------------------------------------------- */
+    case OpCode::CallBuiltinV:
+        reg(in.target);
+        pool(in.target2, ck.builtin_calls.size(), "builtin call");
+        run(in.a_lit(), in.b_lit());
+        break;
+    case OpCode::CallBuiltinLV:
+    case OpCode::CallBuiltinLVElem:
+    case OpCode::CallBuiltinLVMember:
+        /* a_dual = (builtin_calls idx, arg0's slot kind); `b`, when it is an
+         * immediate, is the base of the remaining VALUE args, whose count
+         * the pool entry's ArgLoc list gives (arg0 is not in the run). */
+        reg(in.target);
+        pool(in.a_dual_lo(), ck.builtin_calls.size(), "builtin call");
+        {
+            /* `append(s.f, x)`: vm_member_lvalue reads the entry's member;
+             * the #32 chain form (`steps`, member null) walks its steps -
+             * which only the Member op reads */
+            const Chunk::BuiltinCall &bc = ck.builtin_calls[in.a_dual_lo()];
+            if (in.op != OpCode::CallBuiltinLVMember) {
+                if (!bc.steps.empty())
+                    reject("builtin chain on a non-member op");
+            } else if (bc.steps.empty() ? !bc.member : bc.member != nullptr) {
+                reject("builtin member with no name");
+            }
+            steps(bc.steps);
+        }
+        base(in.a_dual_hi(), in.target2);
+        if (in.b_is_lit()) {
+            const size_t nargs =
+                ck.builtin_calls[in.a_dual_lo()].args.size();
+            /* LVElem's run additionally holds the INDEX at run[0]. */
+            const int_type nrun = static_cast<int_type>(nargs)
+                - (in.op == OpCode::CallBuiltinLVElem ? 0 : 1);
+            run(in.b_lit(), nrun > 0 ? nrun : 0);
+        }
+        break;
+    case OpCode::AppendV:
+        /* D1: the same shape with the marshaling deleted; `b` is the single
+         * value slot and a -1 dst means the result is discarded. */
+        reg_opt(in.target);
+        pool(in.a_dual_lo(), ck.builtin_calls.size(), "builtin call");
+        if (!ck.builtin_calls[in.a_dual_lo()].steps.empty())
+            reject("builtin chain on a non-member op");
+        base(in.a_dual_hi(), in.target2);
+        reg(in.b_lit());
+        break;
+    case OpCode::EmplaceStruct:
+        /* `a` packs (kind | emplace_sites idx << 2); the field args are the
+         * run [b_lit, +nfields) named by the pool entry. */
+        reg(in.target);
+        pool(in.a_lit() >> 2, ck.emplace_sites.size(), "emplace site");
+        {
+            const Chunk::EmplaceSite &es = ck.emplace_sites[in.a_lit() >> 2];
+            /* vm_emplace_struct asserts exactly this, and BOTH sides are
+             * static - the def's field count and the site's caret list. */
+            pod_def(es.def, "emplace def");
+            if (es.field_locs.size() != es.def->fields.size())
+                reject("emplace field count");
+            base(in.a_lit() & 3, in.target2);
+            run(in.b_lit(),
+                static_cast<int_type>(es.field_locs.size()));
+        }
+        break;
+    case OpCode::CallV:
+    case OpCode::CachedCallV:
+        reg_opt(in.target);             /* -1 == a discarded result */
+        gslot(in.target2);
+        run(in.a_lit(), in.b_lit());
+        break;
+    case OpCode::CallValueV:
+        reg_opt(in.target);
+        reg(in.target2);                /* the callee VALUE's slot */
+        run(in.a_lit(), in.b_lit());
+        break;
+    case OpCode::CallValueGenericV:
+        /* `b` packs (argc | call_sites idx << 12). */
+        reg(in.target);
+        reg(in.target2);
+        run(in.a_lit(), in.b_lit() & 0xfff);
+        pool(in.b_lit() >> 12, ck.call_sites.size(), "call site");
+        {
+            /* arg0's DESCRIPTOR, which the dispatch reads as slots: the
+             * slot form by kind (3 a builtin), the elem / member / chain
+             * forms a base of vm_store_base's kinds plus their key temp,
+             * member key or steps (2026-10-08: none of it was bounded) */
+            const Chunk::CallSite &cs = ck.call_sites[in.b_lit() >> 12];
+            using A0 = Chunk::CallSite::A0;
+            if (cs.a0_form != A0::chain && !cs.a0_steps.empty())
+                reject("call site steps");
+            switch (cs.a0_form) {
+            case A0::none:
+            case A0::undef:
+                break;
+            case A0::slot:
+                if (cs.a0_kind == 0)
+                    reg(cs.a0_slot);
+                else if (cs.a0_kind == 1)
+                    gslot(cs.a0_slot);
+                else if (cs.a0_kind == 2)
+                    cslot(cs.a0_slot);
+                else
+                    builtin(cs.a0_slot);
+                break;
+            case A0::elem:
+                base(cs.a0_kind, cs.a0_slot);
+                reg(cs.a0_operand);
+                break;
+            case A0::member:
+                base(cs.a0_kind, cs.a0_slot);
+                pool(cs.a0_operand, ck.member_keys.size(), "member key");
+                break;
+            case A0::chain:
+                base(cs.a0_kind, cs.a0_slot);
+                if (cs.a0_steps.empty())
+                    reject("call site chain");
+                steps(cs.a0_steps);
+                break;
+            }
+        }
+        break;
+    case OpCode::LoadBoxV:
+        /* `b` = the proven box (0..5), `target2` its struct for 5 */
+        reg(in.target);
+        a_slot_only(in);
+        if (!in.b_is_lit() || in.b_lit() < 0 || in.b_lit() > 5)
+            reject("box element kind");
+        if (in.b_lit() == 5) {
+            pool(in.target2, ck.struct_defs.size(), "struct def");
+            defined_ptr(ck.struct_defs[in.target2], "struct def");
+        } else if (in.target2 != -1) {
+            reject("box element def");
+        }
+        break;
+    case OpCode::StoreBoxV:
+        a_slot_only(in);
+        b_slot_only(in);
+        break;
+    case OpCode::StampTypeV:
+        /* Q2: `a` the sum's slot, `target2` a ctypes ref (never 0) */
+        a_slot_only(in);
+        if (in.target2 < 1)
+            reject("ctype");
+        ctype(static_cast<unsigned>(in.target2));
+        break;
+    case OpCode::CastV:
+        /* `a` the source's slot, `target2` its cast_types entry */
+        a_slot_only(in);
+        reg(in.target);
+        pool(in.target2, ck.cast_types.size(), "cast type");
+        break;
+    case OpCode::CheckFitV:
+        /* #49: `a` the value's slot, `target2` its fit_specs entry */
+        a_slot_only(in);
+        pool(in.target2, ck.fit_specs.size(), "fit spec");
+        if (!ck.fit_specs[static_cast<size_t>(in.target2)].annot)
+            reject("fit spec annotation");
+        break;
+    case OpCode::CheckNoneArgsV:
+        /* `target` = the callee's kind: 0 a frame slot, 1 a global slot */
+        if (in.target == 0)
+            reg(in.target2);
+        else if (in.target == 1)
+            gslot(in.target2);
+        else
+            reject("none-check callee kind");
+        run(in.a_lit(), in.b_lit());
+        break;
+    case OpCode::CheckFuncV:
+    case OpCode::CheckCallableV:
+    case OpCode::ReturnV:
+        a_reg(in);
+        break;
+    case OpCode::MapFilterV:
+        reg(in.target);
+        ab_regs(in);
+        ctype(static_cast<unsigned>(in.target2) >> 3);
+        break;
+
+    /* --- value construction ------------------------------------------- */
+    case OpCode::LoadImmInt:
+    case OpCode::LoadImmFloat:
+        reg(in.target);
+        break;
+    case OpCode::LoadConstV:
+        reg(in.target);
+        pool(in.target2, ck.consts.size(), "consts");
+        break;
+    case OpCode::LoadLiteralObjV:
+        reg(in.target);
+        pool(in.target2, ck.literal_objs.size(), "literal obj");
+        break;
+    case OpCode::MakeArrayV:
+        reg(in.target);
+        run(in.a_lit(), in.b_lit());
+        ctype(static_cast<unsigned>(in.target2) >> 8);
+        break;
+    case OpCode::MakeDictV:
+        reg(in.target);
+        run(in.a_lit(), 2 * in.b_lit());   /* key/value pairs */
+        ctype(static_cast<unsigned>(in.target2));
+        break;
+    case OpCode::MakeClosureV:
+        reg(in.target);
+        pool(in.target2, ck.closure_defs.size(), "closure def");
+        defined_ptr(ck.closure_defs[in.target2], "closure def");
+        /* #97 increment 3: a SPLICED op's capture span (`a` as a dual)
+         * must be the descriptor's own span, shifted up, inside this
+         * frame - the construction reads every capture at slot + shift */
+        if (in.a_dual_hi() > 0) {
+            int lo = 0, span = 0;
+            if (!make_closure_span(ck.closure_defs[in.target2], lo, span)
+                    || span != in.a_dual_hi() || in.a_dual_lo() < lo)
+                reject("spliced closure capture span");
+            run(in.a_dual_lo(), in.a_dual_hi());
+        } else if (in.a_dual_lo() != -1 || in.a_dual_hi() != -1) {
+            reject("closure capture span");
+        }
+        /*
+         * The new closure SNAPSHOTS its captures here, through `read_sym`,
+         * from THIS chunk's frame / captures and the program tables - so the
+         * descriptor's capture list is really a set of operands of this op,
+         * and its slots are bounded by exactly the limits above. Without
+         * this a mutated capture slot reached `Frame::at(16580619)`.
+         */
+        for (const FuncDescriptor::CaptureDesc &cd
+                 : ck.closure_defs[in.target2]->captures) {
+            switch (cd.kind) {
+            case SymKind::local:
+                reg(cd.slot + make_closure_offset(
+                                  in, ck.closure_defs[in.target2]));
+                break;
+            case SymKind::global:  gslot(cd.slot);   break;
+            case SymKind::capture: cslot(cd.slot);   break;
+            case SymKind::builtin: builtin(cd.slot); break;
+            case SymKind::unresolved: break;  /* read_sym falls back to the
+                                               * by-NAME map walk */
+            }
+        }
+        break;
+    case OpCode::StructCtorV:
+        /* b_dual_hi >= 0 selects the BAKED plan (each field naming its own
+         * source slot); otherwise the args are the run [a_lit, +b_dual_lo). */
+        reg(in.target);
+        pool(in.target2, ck.struct_defs.size(), "struct def");
+        defined_ptr(ck.struct_defs[in.target2], "struct def");
+        if (in.b_dual_hi() >= 0) {
+            /* the PLANNED form stores raw bytes, so the def must be POD -
+             * a boxed one has an EMPTY byte buffer and the store lands on
+             * a null pointer. */
+            pod_def(ck.struct_defs[in.target2], "planned ctor def");
+            pool(in.b_dual_hi(), ck.ctor_plans.size(), "ctor plan");
+            /* The plan's computed-arg MINI-RUN rides `a` as a DUAL (lo =
+             * base or -1, hi = count) and is read by NO handler - only by
+             * visit_use_def, whose run(base, cnt) then ITERATES the
+             * count. Unbounded, a burst mutation made it 0x73A07676
+             * (myv_fuzz small-938: the load-time liveness "never
+             * converged" - it was walking two billion uses per op). */
+            if (in.a_dual_lo() >= 0)
+                run(in.a_dual_lo(), in.a_dual_hi());
+            else if (in.a_dual_hi() != 0)
+                reject("ctor mini-run");
+            const StructTypeDef *d = ck.struct_defs[in.target2];
+            for (const Chunk::CtorPlanField &f
+                     : ck.ctor_plans[in.b_dual_hi()].f) {
+                reg(f.src);
+                /* The plan stores RAW BYTES, and its own `act` gives the
+                 * exact width: 0 = int, 1 = float (both 8), 2 = a bool
+                 * BYTE. The store must END inside the instance, not merely
+                 * start inside it - so the width is part of the check, and
+                 * using a blanket 8 would falsely refuse a trailing bool. */
+                if (f.act > 2)
+                    reject("ctor plan action");
+                const int32_t w = f.act == 2
+                    ? 1 : static_cast<int32_t>(sizeof(int_type));
+                if (f.off < 0
+                    || f.off + w > static_cast<int32_t>(d->size))
+                    reject("ctor plan field offset");
+            }
+        } else {
+            /* vm_struct_ctor walks def->fields[i] for i < this count, so
+             * it is not merely a run length - it must fit the def. NOT an
+             * equality: a TRAILING OPT FIELD is skippable at the call site
+             * (`R(1)` for `struct R { int x; dyn? d; }`), which the suite
+             * caught the moment `==` was tried. */
+            if (in.b_dual_lo()
+                > static_cast<int>(
+                      ck.struct_defs[in.target2]->fields.size()))
+                reject("ctor arg count");
+            run(in.a_lit(), in.b_dual_lo());
+        }
+        break;
+    case OpCode::StructCtorBoxedV:
+        reg(in.target);
+        pool(in.target2, ck.boxed_ctors.size(), "boxed ctor");
+        {
+            const Chunk::BoxedCtor &bc = ck.boxed_ctors[in.target2];
+            defined_ptr(bc.def, "boxed ctor def");
+            /* `<=`, not `==` - see the StructCtorV note above: an omitted
+             * trailing opt field is bound to none by the ctor itself. */
+            if (bc.arg_locs.size() > bc.def->fields.size())
+                reject("boxed ctor arg count");
+            run(in.a_lit(), static_cast<int_type>(bc.arg_locs.size()));
+        }
+        break;
+    case OpCode::MakeStructArrayV:
+        /* N structs' fields, interleaved: the run is N * the def's width -
+         * which is also what bounds the element buffer the op allocates. */
+        reg(in.target);
+        pool(in.target2, ck.struct_defs.size(), "struct def");
+        pod_def(ck.struct_defs[in.target2], "struct array def");
+        if (in.b_lit() < 0)
+            reject("struct array count");
+        run(in.a_lit(),
+            in.b_lit() * static_cast<int_type>(
+                ck.struct_defs[in.target2]->fields.size()));
+        break;
+
+    /* --- boxed general ops -------------------------------------------- */
+    case OpCode::BinOpV:
+    case OpCode::CmpV:
+        reg(in.target);
+        ab_regs(in);
+        aop_dispatchable(in.aop);
+        break;
+    case OpCode::LogV:
+        /* `&&` / `||` - branch-free boxed form; its aop never reaches
+         * vm_num_binop, so only the operands matter here. */
+        reg(in.target);
+        ab_regs(in);
+        break;
+    case OpCode::UnaryV:
+        reg(in.target);
+        a_reg(in);
+        break;
+    case OpCode::CompoundV:
+        reg(in.target);                 /* read-modify-written in place */
+        b_reg(in);
+        aop_dispatchable(in.aop);
+        break;
+
+    /* --- global / capture / builtin access ---------------------------- */
+    case OpCode::LoadGlobalV:
+    case OpCode::DefinedGlobalV:
+        reg(in.target);
+        gslot(in.target2);
+        break;
+    case OpCode::StoreGlobalV:
+        gslot(in.target);
+        a_reg(in);
+        aop_opt_dispatchable(in.aop);
+        break;
+    case OpCode::LoadCaptureV:
+        reg(in.target);
+        cslot(in.target2);
+        break;
+    case OpCode::StoreCaptureV:
+        cslot(in.target);
+        a_reg(in);
+        aop_opt_dispatchable(in.aop);
+        break;
+    /*
+     * #97 closure inlining: the capture index is into the CLOSURE in the
+     * callee slot, whose def this chunk cannot name statically - so it is
+     * bounded at run time (vm_closure_capture's provenance check), as a
+     * value in a slot must be. What is bounded here is every frame slot.
+     */
+    case OpCode::LoadCaptureOfV:
+        reg(in.target);
+        a_slot_only(in);
+        if (in.target2 < 0)
+            reject("closure capture index");
+        break;
+    case OpCode::StoreCaptureOfV:
+        a_slot_only(in);
+        b_slot_only(in);
+        if (in.target < 0)
+            reject("closure capture index");
+        break;
+    case OpCode::LoadBuiltinV:
+        reg(in.target);
+        builtin(in.target2);
+        break;
+    case OpCode::DeclConstV:
+        /* target2 selects the destination table: a global slot or a local. */
+        if (in.target2)
+            gslot(in.target);
+        else
+            reg(in.target);
+        a_reg(in);
+        break;
+
+    case OpCode::OpCount_:
+        reject("opcode");               /* the sentinel is never emitted */
+    }
+}
+
+}   /* anon namespace */
+
+/* Declared in codegen.h - see the contract (and the no-`default` rule). */
+void verify_chunk(const Chunk &chunk, const ChunkLimits &lim)
+{
+    ChunkVerifier v(chunk, lim);
+
+    /*
+     * A chunk that RUNS must be able to reach an end: vm_run_chunk indexes
+     * `code[pc]` and only a terminator stops it, so an empty code vector
+     * would read past the buffer on the very first fetch.
+     */
+    if (chunk.code.empty())
+        v.reject("empty chunk");
+
+    for (v.pc = 0; v.pc < chunk.code.size(); v.pc++) {
+        const Instr &in = chunk.code[v.pc];
+        if (static_cast<unsigned>(in.op)
+                >= static_cast<unsigned>(OpCode::OpCount_))
+            v.reject("opcode");
+        v.verify_one(in);
+    }
+
+    /* The handler table is reachable from every raise, not just from the
+     * PushHandler that names it, so its pcs are checked whole. */
+    v.pc = 0;
+    for (const Chunk::HandlerSite &site : chunk.handler_sites) {
+        for (const Chunk::HandlerClause &cl : site.clauses) {
+            if (cl.types_idx >= 0)
+                v.pool(cl.types_idx, chunk.catch_types.size(), "catch types");
+            v.target_pc(cl.body_pc);
+            v.reg_opt(cl.bind_slot);
+        }
+        if (site.fin_pc >= 0)
+            v.target_pc(site.fin_pc);
+    }
+
+    /*
+     * The handler-stack BALANCE - the one property of a PopHandler no
+     * per-operand bound above can express (see handler_balance_fault). A
+     * chunk with a native fragment is skipped: its pushes and pops live
+     * inside the fragment, and its bytecode is no longer the whole CFG.
+     * That skip costs nothing here - a STORED image has no fragments, and
+     * vm_compile's self-check runs this on every chunk the JIT declined.
+     */
+    if (!chunk.native.base) {
+        size_t at = 0;
+        if (const char *what = handler_balance_fault(chunk, &at)) {
+            v.pc = at;
+            v.reject(what);
+        }
+    }
+
+    /*
+     * The pc-KEYED side tables. It is tempting to leave their pcs unchecked -
+     * the VM only ever binary-searches them for an exact match, so a pc past
+     * the code simply never matches. That reasoning is WRONG, and a fuzz run
+     * proved it: every pc-MOVING transformation REMAPS these tables by
+     * INDEXING a per-pc vector (`l.pc = remap[l.pc]`, jit.cpp), so the JIT
+     * that runs right after a load reads `remap[67108891]`. Bound them.
+     */
+    for (const Chunk::LocEntry &e : chunk.locs)
+        v.target_pc(static_cast<int_type>(e.pc));
+    for (const Chunk::LocEntry &e : chunk.base_locs)
+        v.target_pc(static_cast<int_type>(e.pc));
+    for (const Chunk::LocEntry &e : chunk.op_locs)       /* RULE 2 */
+        v.target_pc(static_cast<int_type>(e.pc));
+    /*
+     * The per-argument carets (RULE 2): the pc is remapped by indexing
+     * like the two above, and `first`/`n` name a run of arg_loc_pool the
+     * JIT bakes a POINTER to (`&arg_loc_pool[first]`) and the emitted
+     * stamp indexes at run time by the exception's bind_arg (< n) - so an
+     * out-of-range run would be a wild read from generated code.
+     */
+    for (const Chunk::ArgLocEntry &e : chunk.arg_locs) {
+        v.target_pc(static_cast<int_type>(e.pc));
+        if (static_cast<size_t>(e.first) > chunk.arg_loc_pool.size()
+                || static_cast<size_t>(e.n)
+                       > chunk.arg_loc_pool.size() - e.first)
+            v.reject("an arg_locs entry past its pool");
+    }
+    for (const Chunk::InlineEntry &e : chunk.inline_ctxs) {
+        v.target_pc(static_cast<int_type>(e.pc));
+        v.pool(e.frame, chunk.inline_frames.size(), "inline frame");
+    }
+    /*
+     * #97 E1. The pc is remapped by indexing like the tables above, and the
+     * `def` is handed to the EMITTER, which bakes closure_defs[def] into
+     * machine code as a descriptor pointer - so an out-of-range index from a
+     * mutated image would be baked and then dereferenced. The identity
+     * compare makes a WRONG entry harmless; it does nothing about an
+     * out-of-range one, which is this check's job.
+     */
+    for (const Chunk::CalleeName &e : chunk.value_callees) {
+        v.target_pc(static_cast<int_type>(e.pc));
+        v.pool(e.def, chunk.closure_defs.size(), "value callee");
+        v.defined_ptr(chunk.closure_defs[static_cast<size_t>(e.def)],
+                      "value callee");
+    }
+    for (const Chunk::InlineFrame &f : chunk.inline_frames)
+        if (f.parent >= 0)
+            v.pool(f.parent, chunk.inline_frames.size(), "inline frame");
+
+    /* ref_slots drives the frame's reference-release scan - it INDEXES. */
+    for (int32_t s : chunk.ref_slots)
+        v.reg(s);
+}
+
+/* Declared in codegen.h - the `.myv` loader calls it to REBUILD this derived
+ * pool instead of storing it (see the header comment). */
+void build_boxed_ops(Chunk &chunk)
+{
+    for (size_t pc = 0; pc < chunk.code.size(); pc++) {
+        Instr &in = chunk.code[pc];
+        const bool boxed_arith =
+            in.op == OpCode::BinOpV || in.op == OpCode::CmpV
+            || in.op == OpCode::CompoundV || in.op == OpCode::LogV
+            || in.op == OpCode::UnaryV;
+        /* A COMPOUND global/capture store `g OP=`/`cap OP=` reads its rhs via
+         * boxed_operand + runs num_bin_op (like CompoundV), so it needs the pool
+         * for the rhs operand too; the slot (global/capture) rides target, the
+         * rhs is `a`. The PLAIN case (aop invalid) needs no pool (jit_store_*
+         * lea's the src slot directly). target2 is otherwise unused for these. */
+        const bool compound_store =
+            (in.op == OpCode::StoreGlobalV || in.op == OpCode::StoreCaptureV)
+            && in.aop != Op::invalid;
+        if (boxed_arith || compound_store) {
+            in.target2 = static_cast<int>(chunk.boxed_ops.size());
+            /* the op's own caret, from the (already-extracted) loc table -
+             * the jit helpers stamp a conveyed throw with it, making these
+             * ops' carets pc-independent (re-raise deletability). */
+            Loc s, en;
+            chunk.loc_at(pc, s, en);
+            chunk.boxed_ops.push_back(
+                { in.target, in.aop, in.a(), in.b(), s, en });
+        }
+    }
+}
+
+/*
+ * #106 phase 2 - THE NON-NEGATIVE SLOTS. Fill `Chunk::nonneg_slots`
+ * (bytecode.h) with the frame slots this chunk can only ever observe
+ * holding a value >= 0.
+ *
+ * ⛔ WHY THE FACT IS WORTH A PASS. MyLang's `%` TRUNCATES (C semantics -
+ * the sign follows the DIVIDEND, so `-5 % 4` is `-1`, not `3`), which is
+ * why phase 1's power-of-two arm is a FOUR-instruction sign bias around
+ * the mask rather than the textbook `and`. Prove the dividend cannot be
+ * negative and the bias is dead: `x % 2^k` becomes one `and`, `x / 2^k`
+ * one `sar`. Six instructions to one, on a loop's hot path.
+ *
+ * ⛔ THE RULE, and every clause of it is load-bearing:
+ *
+ *   S qualifies iff SOME instruction defines S, EVERY instruction that
+ *   defines S is one of
+ *     (a) LoadImmInt / LoadConstV of an int constant >= 0 - the init;
+ *     (b) a STEP op (ForLoopStep, or the #9 fusions IntAddStep /
+ *         ForStepElemInt) naming S as its COUNTER (target2), with
+ *         `aop == Op::lt` and a step of exactly +1,
+ *   and at least one (b) exists.
+ *
+ * - **`<`, NEVER `<=`.** The counter is only read where the test held,
+ *   so `i < bound <= INT64_MAX` gives `i <= INT64_MAX - 1` and the step's
+ *   `i + 1` cannot overflow. With `<=` and `bound == INT64_MAX` it CAN:
+ *   `i + 1` wraps to INT64_MIN, `i <= bound` is still true, and the body
+ *   runs with a NEGATIVE counter. That is an infinite loop either way,
+ *   but it is a DEFINED one (RULE 1) whose printed answers an
+ *   optimization may not change (RULE 2).
+ * - **A STEP OF EXACTLY +1**, for the same reason: `i += 3` at
+ *   `i == bound - 1` overflows when `bound` is within 2 of INT64_MAX.
+ *   (A literal bound below INT64_MAX - step would license a bigger step;
+ *   not built - no corpus program wants it.)
+ * - **AT LEAST ONE STEP OP, i.e. S is a loop COUNTER.** This is what
+ *   excludes the two writers no instruction performs, WITHOUT this pass
+ *   having to enumerate them (the enumeration lives in
+ *   compute_ref_slots, and going stale is exactly the audit-table trap):
+ *   a PARAMETER slot, written by the bind, and a CATCH-BIND slot,
+ *   written by vm_dispatch_exc_body. Neither can be a counter - a
+ *   counter comes from `for (var i = ...)`, which try_for_range REQUIRES
+ *   to be a DECL (`init->fl & pInDecl`, inferencer.cpp), or from a
+ *   foreach's hidden `alloc_temp` counter. Both are fresh slots the
+ *   resolver hands out monotonically. Without this clause
+ *   `func f(n) { var r = n % 4; n = 0; return r; }` would claim `n` is
+ *   non-negative on the strength of the LATER `n = 0` and answer 3 for
+ *   f(-5). ASSERTED below against handler_sites, which this pass can
+ *   see; the parameter half rests on the decl argument.
+ * - **A BARRIER DROPS EVERYTHING.** `visit_use_def` returns false for an
+ *   op whose slot traffic it cannot describe (the LV builtin family, the
+ *   stores, MultiUnpackV / UnpackElem* / IncDecChainV - they reach slots
+ *   through pools and runs). Such an op may write a slot it does not
+ *   report, so no candidate can survive it. Conservative on purpose: a
+ *   narrower rule needs a per-barrier write table, which is one more
+ *   thing to go stale for a fact whose false direction is a wrong
+ *   answer.
+ *
+ * ⛔ IT MUST RUN ON THE FINAL CODE - after the peephole (which MAKES the
+ * IntAddStep / ForStepElemInt forms) and after specialize_arith_ops
+ * (which makes the IntModRI that consumes the fact). Both call sites -
+ * codegen_chunk and the loader's read_chunk - place it beside
+ * build_boxed_ops for that reason.
+ */
+void compute_nonneg_slots(Chunk &chunk)
+{
+    chunk.nonneg_slots.clear();
+    const int total = chunk.slot_count + chunk.n_temps;
+    if (total <= 0)
+        return;
+
+    /* Is `in` a definition of slot `s` that PRESERVES non-negativity?
+     * `counter` reports whether it was a step op naming s as its
+     * counter, which is the "at least one (b)" evidence. */
+    const auto benign_def = [&chunk](const Instr &in, int s, bool &counter) {
+        counter = false;
+        switch (in.op) {
+        case OpCode::LoadImmInt:
+            /* slot[target] = a.lit (bytecode.h) */
+            return in.a_is_lit() && in.a_kind() != Operand::LitKind::f
+                   && in.a_lit() >= 0;
+        case OpCode::LoadConstV: {
+            if (in.target2 < 0
+                || static_cast<size_t>(in.target2) >= chunk.consts.size())
+                return false;
+            const EvalValue &c = chunk.consts[in.target2];
+            return c.is<int_type>() && c.get<int_type>() >= 0;
+        }
+        case OpCode::ForLoopStep:
+            /* the only form whose step is still readable: b is it */
+            counter = s == in.target2 && in.aop == Op::lt
+                      && in.b_is_lit()
+                      && in.b_kind() != Operand::LitKind::f
+                      && in.b_lit() == 1;
+            return counter;
+        case OpCode::IntAddStep:
+        case OpCode::ForStepElemInt:
+            /* ⛔ THE STEP IS +1 BY CONSTRUCTION AND NOT BY INSPECTION.
+             * Both #9 fusions are formed ONLY from a ForLoopStep with
+             * `b_is_lit() && b_lit() == 1` (the peephole, above) and
+             * then REPURPOSE b - IntAddStep to the add's operand,
+             * ForStepElemInt to the (array, elem dst) dual - so the
+             * step is no longer a readable field. The fusion sites
+             * carry a note pointing back here; a fusion taught to
+             * accept another step must exclude itself from this arm. */
+            counter = s == in.target2 && in.aop == Op::lt;
+            return counter;
+        default:
+            return false;
+        }
+    };
+
+    std::vector<char> cand(total, 1), is_counter(total, 0);
+    bool any = false;
+
+    for (const Instr &in : chunk.code) {
+        const bool described = visit_use_def(in, [](int) { },
+            [&](int s) {
+                if (s < 0 || s >= total)
+                    return;
+                bool counter = false;
+                if (!benign_def(in, s, counter))
+                    cand[s] = 0;
+                else if (counter)
+                    is_counter[s] = 1;
+            });
+        if (!described)
+            return;               /* a BARRIER: nothing can be claimed */
+    }
+
+    for (int i = 0; i < total; i++)
+        if (cand[i] && is_counter[i]) {
+            chunk.nonneg_slots.push_back(i);
+            any = true;
+        }
+
+#ifndef NDEBUG
+    /*
+     * The rule's own premise, checked where it IS checkable: a loop
+     * counter is a fresh decl slot, so it can never be the slot the
+     * raise path binds a caught exception into. (The PARAMETER half of
+     * the same premise has no chunk-visible input - see the header.)
+     */
+    if (any)
+        for (const Chunk::HandlerSite &site : chunk.handler_sites)
+            for (const Chunk::HandlerClause &cl : site.clauses)
+                ML_CHECK_MSG(cl.bind_slot < 0
+                             || !std::binary_search(
+                                    chunk.nonneg_slots.begin(),
+                                    chunk.nonneg_slots.end(),
+                                    static_cast<int32_t>(cl.bind_slot)),
+                             "nonneg: a catch-bind slot is a loop counter");
+#else
+    (void) any;
+#endif
 }
 
 Chunk
-codegen_chunk(const Block *block, int slot_count)
+codegen_chunk(const Block *block, int slot_count, bool jit,
+              const std::vector<int32_t> *ref_seeds)
 {
     Codegen cg;
     cg.temp_base = cg.next_temp = cg.max_temp = slot_count;
     cg.gen_stmts(block->elems);
     /* A body that ends in a ReturnV needs no Halt terminator: ReturnV already
-     * stops the chunk (vm_run_chunk `return`s), so a trailing Halt is dead AND
-     * unreferenced - the codegen emits no jump to the chunk end past a
-     * return (an if whose branches all return leaves no merge Jump; a loop
-     * exit targets the following op, not the end). A FALL-THROUGH body (last op
-     * not a ReturnV - a void fn, a trailing loop/if) keeps the Halt as
-     * its implicit-return-`none` terminator + jump target. Saves one dead instr
-     * per always-returning function. */
+     * stops the chunk (vm_run_chunk `return`s), so a trailing Halt is dead.
+     * A FALL-THROUGH body (last op not a ReturnV - a void fn, a trailing
+     * loop/if) keeps the Halt as its implicit-return-`none` terminator +
+     * jump target. Saves one dead instr per always-returning function.
+     *
+     * ... UNLESS SOMETHING BRANCHES TO THE END, which is the second half of
+     * the condition and was missing (fixed 2026-08-02). This comment used
+     * to claim "the codegen emits no jump to the chunk end past a return",
+     * and that is simply FALSE for a body whose last statement is a
+     * conditional return with nothing after it:
+     *
+     *     func f(x) { ...; if (s > 0) return s; }
+     *
+     * The `if` emits `JumpUnlessIntCmp -> <end>` for the false arm - the
+     * implicit `return none` - and <end> is exactly the pc the Halt would
+     * have occupied. Dropping it left that branch pointing one past the
+     * last instruction, so taking it made `vm_dispatch` READ code[n]: a
+     * heap-buffer-overflow (ASan-confirmed) that returned garbage instead
+     * of none. So the Halt is dead only when it is also UNREFERENCED, and
+     * that has to be checked rather than asserted in prose. */
+    bool end_is_targeted = false;
+    {
+        const size_t endpc = cg.code.size();
+        for (CgInstr &in : cg.code)
+            visit_pc_fields(in, [&](int &t) {
+                if (t >= 0 && static_cast<size_t>(t) >= endpc)
+                    end_is_targeted = true;
+            });
+    }
     if (cg.code.empty()
-        || cg.code.back().op != OpCode::ReturnV)
+        || cg.code.back().op != OpCode::ReturnV
+        || end_is_targeted)
         cg.emit(OpCode::Halt);
     cg.chunk.n_temps = cg.max_temp - slot_count;
     cg.chunk.n_dict_iters = cg.max_dict_iters;
     cg.chunk.n_dyn_iters = cg.max_dyn_iters;
+    cg.chunk.n_trys = cg.next_try_region;             /* #78: region count */
+    cg.chunk.set_plain_frame();   /* DERIVED from the three counts above */
     cg.chunk.slot_count = slot_count;
     collect_slot_names(block, cg.chunk.slot_names);   /* -vd debug info */
     peephole_chunk(cg.code, cg.chunk);   /* E1-E4 - BEFORE extract_locs, so
@@ -7543,10 +13689,29 @@ codegen_chunk(const Block *block, int slot_count)
                                           * side-table remap) */
     extract_locs(cg.code, cg.chunk, cg.ast_nodes);   /* carets -> loc table */
     verify_ast_free(cg.code);     /* every node handle consumed */
+    /*
+     * NO BRANCH MAY POINT PAST THE LAST INSTRUCTION. Taking one makes
+     * vm_dispatch read code[n] - an out-of-bounds read that returns
+     * whatever byte follows the vector, which is how a conditional return
+     * with nothing after it silently produced garbage instead of `none`
+     * (see the Halt condition above). Checked AFTER the peephole, which
+     * moves and deletes pcs, so it covers what the emit-time condition
+     * cannot see.
+     */
+#ifndef NDEBUG
+    {
+        const size_t endpc = cg.code.size();
+        for (CgInstr &in : cg.code)
+            visit_pc_fields(in, [&](int &t) {
+                ML_CHECK_MSG(t < 0 || static_cast<size_t>(t) < endpc,
+                             "codegen: a branch targets past the last instr");
+            });
+    }
+#endif
     /* B3 stage 2: SLICE the runtime Instr sub-objects out of the codegen's
      * CgInstr vector - the runtime Chunk cannot hold a node handle AT THE
      * TYPE LEVEL (CgInstr, bytecode.h). */
-    compute_ref_slots(cg.code, cg.chunk);   /* profile #2 - the audited
+    compute_ref_slots(cg.code, cg.chunk, ref_seeds);  /* profile #2 - audited
                                              * reference-slot list */
     cg.chunk.code.assign(cg.code.begin(), cg.code.end());
     specialize_arith_ops(cg.chunk);   /* B1/B2 - AFTER extract_locs: an
@@ -7554,13 +13719,53 @@ codegen_chunk(const Block *block, int slot_count)
                                        * a stale IntBin div0 loc entry for a
                                        * specialized (non-throwing) op is
                                        * never queried */
+    build_boxed_ops(cg.chunk);        /* model-flip: BinOpV/CmpV/CompoundV pool
+                                       * (stable JIT-bakeable operand data;
+                                       * stores the pool index in target2) */
+    compute_nonneg_slots(cg.chunk);   /* #106 phase 2 - derived like
+                                       * boxed_ops, and for the same reason
+                                       * rebuilt by the loader, not stored */
+    /* #78 step B: the handler table must still describe the (now compacted,
+     * threaded, specialized) chain - a missed remap aborts HERE. */
+    verify_handler_sites(cg.chunk);
+    /* #137: and the handler-stack BALANCE the loader will demand of an
+     * image - asserted here on everything codegen emits, BEFORE the JIT
+     * moves any push or pop into a fragment, so a lowering that leaves a
+     * PopHandler reachable with nothing pushed (or a join at two depths)
+     * aborts the suite instead of teaching the verifier to refuse our own
+     * output. ASSERTS-only. */
+#ifndef NDEBUG
+    {
+        size_t at = 0;
+        const char *what = handler_balance_fault(cg.chunk, &at);
+        ML_CHECK_MSG(!what, "codegen: the handler stack is unbalanced");
+    }
+#endif
+    /* #55 STEP 2: set the native_leaf FLAG from the (now final, specialized)
+     * ops - BEFORE jit, so the precompile can defer jit and still have every
+     * callee's flag for a caller's native-call gate. jit_compile_chunk reads
+     * this flag and records native_entry_off. */
+    cg.chunk.native_leaf = jit_chunk_is_native_leaf(cg.chunk);
+    /* #97 REACH PROBE - derived here, beside native_leaf, for the same
+     * reason: both ends of a call protocol must read it BEFORE any jit.
+     * Nothing consumes it to decide emission yet. */
+    jit_chunk_frameless_derive(cg.chunk);           /* W3 / small-60 */
+    if (jit)
+        jit_compile_chunk(cg.chunk);  /* native-AOT (plans/archived/native-aot.md):
+                                       * LAST - needs the specialized ops +
+                                       * ref_slots; inserts EnterNative
+                                       * heads + remaps pcs itself. A
+                                       * `.myv` load will call it the same
+                                       * way. No-op off-platform / -nj.
+                                       * Deferred (jit==false) by the VM
+                                       * precompile's codegen pass. */
     return std::move(cg.chunk);
 }
 
 Chunk
-codegen_program(const Block *root)
+codegen_program(const Block *root, bool jit)
 {
-    return codegen_chunk(root, root->slot_count);
+    return codegen_chunk(root, root->slot_count, jit);
 }
 
 void
@@ -7568,7 +13773,7 @@ collect_funcs(const Construct *c, std::vector<const FuncDeclStmt *> &out)
 {
     if (!c)
         return;
-    if (const FuncDeclStmt *fn = dynamic_cast<const FuncDeclStmt *>(c)) {
+    if (const FuncDeclStmt *fn = node_cast<const FuncDeclStmt>(c)) {
         out.push_back(fn);
         collect_funcs(fn->body.get(), out);   /* nested closures within */
         return;
@@ -7582,11 +13787,17 @@ collect_funcs(const Construct *c, std::vector<const FuncDeclStmt *> &out)
 }
 
 bool
-codegen_func_body(const FuncDeclStmt *fn, Chunk &out)
+codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit)
 {
-    /* A base template is a monomorphization source, never called → no chunk
-     * (the ONLY compiled-set exclusion; do_func_call ML_CHECKs if one is ever
-     * called after the AST teardown). */
+    /* A DEAD base template - never used as a VALUE, so every call to it was
+     * redirected to an instance - is a monomorphization source with no
+     * runtime reachability: no chunk (the ONLY compiled-set exclusion;
+     * do_func_call ML_CHECKs if one is ever called after the AST teardown).
+     * A VALUE-used base is NOT excluded - an indirect call can reach it
+     * (see the is_template_base stamping in the inferencer), and its body
+     * may contain shapes only a checked body lowers, which is fine: a
+     * value-used base's body IS checked (it is not skipped as a template
+     * once its value escapes - #149). */
     if (fn->desc->is_template_base)
         return false;
 
@@ -7606,24 +13817,2309 @@ codegen_func_body(const FuncDeclStmt *fn, Chunk &out)
     if (!body->scope_free)
         throw_not_lowered(fn);
 
+    /* Param slots are ref_slots SEEDS unless the param is int/float-
+     * COERCED (bind_param's coerce guarantees those never hold a
+     * reference) or inference-PROVEN i/f (C3: ParamDesc::proven_type -
+     * every call path is compile-checked, see funcdesc.h; the
+     * VM_HARDENING pop_window audit is the net). The BIND writes refs
+     * into param slots, which no chunk op accounts for.
+     *
+     * ⛔ THEY GO IN, they are not merged with the RESULT. That was the
+     * order until 2026-08-27 and it was safe only while every write was
+     * marked independently of every other; `ref_slots`' MoveV rule
+     * propagates from a SOURCE, so a `move t = param` computed with the
+     * params still missing answered "trivial" for a reference. Caught by
+     * `jit_ret_audit` on the first run - watched. */
+    std::vector<int32_t> seeds;
+    ref_seeds_of(*fn->desc, seeds);       /* shared with the LOADER */
+#ifdef TESTS
+    for (const FuncDescriptor::ParamDesc &pd : fn->desc->params)
+        if (pd.binds_scalar() && (pd.proven_type == DeclType::i
+                                  || pd.proven_type == DeclType::f))
+            g_ref_slots_proven_excluded++;   /* C3: the engagement proof */
+#endif
+
     /* EVERY callable body keeps its chunk - even an empty/no-op one (a bare
      * Halt returning none): after the AST teardown the chunk is the only way
      * to run the body, so there is no "not worth it" tier anymore. */
-    out = codegen_chunk(body, fn->desc->frame_size);
-
-    /* Param slots join ref_slots unless the param is int/float-COERCED
-     * (bind_param's coerce guarantees those never hold a reference). The
-     * BIND writes refs into param slots, which no chunk op accounts for. */
-    std::vector<int32_t> merged;
-    const auto &params = fn->desc->params;
-    for (size_t i = 0; i < params.size(); i++)
-        if (params[i].decl_type != DeclType::i
-            && params[i].decl_type != DeclType::f)
-            merged.push_back(static_cast<int32_t>(i));
-    merged.insert(merged.end(), out.ref_slots.begin(), out.ref_slots.end());
-    std::sort(merged.begin(), merged.end());
-    merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
-    out.ref_slots = std::move(merged);
+    out = codegen_chunk(body, fn->desc->frame_size, jit, &seeds);
+#ifdef TESTS
+    /* a CALLEE-eligible chunk - counted here, for function bodies only:
+     * main is never a callee, and since #97 H1 (a builtin call no longer
+     * refuses a body) its print() stopped keeping it out of the count */
+    if (out.frameless_ok)
+        g_jit_frameless_chunks++;
+#endif
     return true;
 }
 
+
+/* ===================================================================
+ * THE BYTECODE-LEVEL INLINER (plans/bytecode-inliner.md)
+ * =================================================================== */
+
+/*
+ * The op WHITELIST. An op qualifies only if BOTH hold, verified by reading
+ * its emit site and its VM_CASE:
+ *   - every field of it that holds a FRAME SLOT is enumerated by the
+ *     remapper (so a splice can rebase them all), and
+ *   - it carries NO index into a chunk POOL (consts, member_keys,
+ *     closure_defs, chain_locs, ...), because a splice would have to
+ *     re-base that too and there is no audited table of which field holds
+ *     which pool's index.
+ *
+ * Everything else DECLINES. That direction is the whole point: this
+ * codebase has had visit_use_def, op_writes_scalar and visit_pc_fields go
+ * stale when an op was added, and here a forgotten op must cost an
+ * optimization rather than a corrupt frame or a wrong constant.
+ *
+ * `Halt` is deliberately NOT on the list even though it is pool-free: a
+ * spliced Halt would stop the CALLER. A fall-through body (which returns
+ * none) needs the return boundary to synthesize that none, and that is a
+ * later increment.
+ */
+
+/* #98 census shim: the retarget whitelist (op_writes_pure_target) lives
+ * in the anonymous namespace above; export it under a test name - a
+ * plain forwarder, so there is no second copy to drift. */
+bool bc_test_op_writes_pure_target(OpCode op)
+{
+    return op_writes_pure_target(op);
+}
+
+bool make_closure_span(const FuncDescriptor *d, int &lo, int &span)
+{
+    if (!d || d->captures.empty())
+        return false;
+    int mn = INT32_MAX, mx = -1;
+    for (const auto &cap : d->captures) {
+        if (cap.kind != SymKind::local || cap.slot < 0)
+            return false;
+        mn = std::min(mn, cap.slot);
+        mx = std::max(mx, cap.slot);
+    }
+    lo = mn;
+    span = mx - mn + 1;
+    return true;
+}
+
+int make_closure_offset(const Instr &in, const FuncDescriptor *d)
+{
+    if (in.a_dual_hi() <= 0)
+        return 0;                       /* unspliced: the default -1 */
+    int lo = 0, span = 0;
+    const bool ok = make_closure_span(d, lo, span);
+    ML_CHECK_MSG(ok && span == in.a_dual_hi() && in.a_dual_lo() >= lo,
+                 "a spliced MakeClosureV disagrees with its descriptor");
+    (void)ok;
+    return in.a_dual_lo() - lo;
+}
+
+bool bc_inline_op_ok(OpCode op)
+{
+    switch (op) {
+    /* the typed scalar core - B1/B2's specialized forms included, since
+     * specialize_arith_ops has already run by the time a chunk is seen */
+    case OpCode::IntBin:      case OpCode::FloatBin:
+    case OpCode::IntAddRR:    case OpCode::IntAddRI:
+    case OpCode::IntSubRR:    case OpCode::IntSubRI:
+    case OpCode::IntMulRR:    case OpCode::IntMulRI:
+    case OpCode::IntAndRR:    case OpCode::IntAndRI:
+    case OpCode::IntOrRR:     case OpCode::IntOrRI:
+    case OpCode::IntXorRR:    case OpCode::IntXorRI:
+    case OpCode::IntShlRR:    case OpCode::IntShlRI:
+    case OpCode::IntShrRR:    case OpCode::IntShrRI:
+    case OpCode::IntModRI:    case OpCode::IntAddModRI:
+    case OpCode::FloatAddRR:  case OpCode::FloatAddRI:
+    case OpCode::FloatSubRR:  case OpCode::FloatSubRI:
+    case OpCode::FloatMulRR:  case OpCode::FloatMulRI:
+    case OpCode::CmpIntV:     case OpCode::CmpFloatV:
+    case OpCode::LoadImmInt:  case OpCode::LoadImmFloat:
+    case OpCode::MoveV:
+    /* control flow: pcs are handled by visit_pc_fields, which IS audited */
+    case OpCode::Jump:
+    case OpCode::JumpUnlessIntCmp:
+    case OpCode::JumpUnlessFloatCmp:
+    /* The COUNTED-LOOP fusions. Admitted 2026-08-02 after their layouts
+     * were read off the VM cases and cross-checked against visit_use_def
+     * and the pc-field table (see bc_remap_slots for both, and for the
+     * is-literal flag set_a_dual silently clears). They were the biggest
+     * limit on reach: a `for` loop in a callee fuses to one of these, so
+     * every counted loop declined while they were out. */
+    case OpCode::ForLoopStep:
+    case OpCode::IntAddStep:
+    /* the boundary + the nested call (its target2 is a GLOBAL slot, not a
+     * frame slot - the remapper must leave it alone, and does). NOT the
+     * none check that may stand before such a call (CheckNoneArgsV, RULE
+     * 1): a body holding one is not pasted - no corpus body has one, and
+     * the caller's own check stays in front of a pasted call. */
+    case OpCode::ReturnV:
+    case OpCode::CallV:
+    /* #97 increment 2: the flat element READS - base (target2) and
+     * index (a) read, dst written; no pool. (The element STORES are
+     * admitted by bc_inline_callee_ok, since whether one may run in
+     * another frame depends on its base KIND, not its opcode.) */
+    case OpCode::LoadElemInt:
+    case OpCode::LoadElemFloat:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Max ops in a splice-able callee. Deliberately small for the first
+ * increment: the shapes this is for (a linear-recursion body, a closure
+ * factory) are under ten ops, and a bigger budget only grows the caller's
+ * frame and its I-cache footprint for calls that are not the bottleneck. */
+static const size_t BC_INLINE_MAX_OPS = 24;
+
+bool bc_inline_callee_ok(const Chunk &callee, std::string *why,
+                         bool captures_ok)
+{
+    const auto no = [&](const char *r) { if (why) *why = r; return false; };
+
+    if (callee.code.empty())
+        return no("empty");
+    if (callee.code.size() > BC_INLINE_MAX_OPS)
+        return no("too-big");
+    /* #97 increment 2: a VOID body ends in Halt (the implicit `return
+     * none`); a site inlines one only when the call's result is
+     * DISCARDED (bc_inline_chunk), where falling off the body is exactly
+     * what the call did */
+    if (callee.code.back().op != OpCode::ReturnV
+            && callee.code.back().op != OpCode::Halt)
+        return no("no-tail-return");
+    /* per-frame side state lives in watermarked slices of shared stacks,
+     * indexed per CALL RECORD - a splice has no record of its own */
+    if (callee.n_trys != 0)
+        return no("try-regions");
+    if (callee.n_dict_iters != 0 || callee.n_dyn_iters != 0)
+        return no("frame-iterators");
+
+    /*
+     * NO BRANCH MAY POINT PAST THE CALLEE'S END. Such a target means "fall
+     * off the end", i.e. the implicit `return none` - and a splice CANNOT
+     * express that: it would map onto the join and leave the call's dst
+     * slot UNWRITTEN, so the caller reads whatever was there before (a
+     * stale previous result, not none). That was a real miscompile before
+     * the trailing-Halt fix, which is what made these callees reachable.
+     *
+     * Today codegen gives such a body a Halt and `no-tail-return` above
+     * already rejects it, so this is belt-and-braces - but it states the
+     * requirement DIRECTLY instead of depending on another pass's side
+     * effect, and it is what lets the splice's own remap ASSERT that every
+     * target is in range rather than silently mapping it to the join.
+     */
+    {
+        const size_t nb = callee.code.size();
+        for (const Instr &bin : callee.code) {
+            bool oor = false;
+            Instr tmp = bin;
+            visit_pc_fields(tmp, [&](int &t) {
+                if (t < 0 || static_cast<size_t>(t) >= nb)
+                    oor = true;
+            });
+            if (oor)
+                return no("branch-past-end");
+        }
+    }
+
+    for (size_t pc = 0; pc < callee.code.size(); pc++) {
+        const Instr &in = callee.code[pc];
+        if (in.op == OpCode::Halt && pc + 1 == callee.code.size())
+            continue;                  /* the void body's end, above */
+        /* #97 increment 2: an element STORE runs in the caller's frame
+         * as it did in the callee's - its base is a frame slot (re-based)
+         * or a GLOBAL (untouched) - except a CAPTURE base, which would
+         * index the caller's ctx.captures; that one declines. */
+        if ((in.op == OpCode::StoreElemInt
+             || in.op == OpCode::StoreElemFloat) && in.target != 2)
+            continue;
+        /* #97 increment 3: a closure CREATED in the body. Its captures
+         * are read from the running frame at construction, so they move
+         * with the splice base (make_closure_offset) - possible only
+         * when every capture is a frame local; a capture of a capture
+         * or of a global reads other tables, and declines. */
+        if (in.op == OpCode::MakeClosureV && in.a_dual_hi() <= 0
+                && in.target2 >= 0
+                && static_cast<size_t>(in.target2)
+                       < callee.closure_defs.size()) {
+            const FuncDescriptor *cd = callee.closure_defs[in.target2];
+            int lo = 0, span = 0;
+            if (cd && (cd->captures.empty()
+                       || make_closure_span(cd, lo, span)))
+                continue;
+        }
+        /* #97 closure inlining: a VALUE site reaches the callee's
+         * captures through the callee slot, so its body may read and
+         * PLAINLY write them; a CallV site cannot (its callee is not in a
+         * slot of the caller), and a compound store's target2 is a pool
+         * index - both stay declined. */
+        if (captures_ok && (in.op == OpCode::LoadCaptureV
+                            || (in.op == OpCode::StoreCaptureV
+                                && in.aop == Op::invalid)))
+            continue;
+        if (!bc_inline_op_ok(in.op)) {
+            if (why)
+                *why = std::string("op:") + opcode_name(in.op);
+            return false;
+        }
+    }
+    return true;
+}
+
+void bc_inline_audit(const Chunk &caller, const char *caller_name,
+                     const std::vector<const FuncDescriptor *> &slot_desc)
+{
+    if (!env_get("MYLANG_INLAUDIT"))
+        return;
+    for (size_t pc = 0; pc < caller.code.size(); pc++) {
+        const Instr &in = caller.code[pc];
+        if (in.op != OpCode::CallV && in.op != OpCode::CallValueV
+                && in.op != OpCode::CachedCallV)
+            continue;
+        if (in.op != OpCode::CallV) {
+            /* a runtime callee - unreachable without a GUARD, and 76/11
+             * are entirely this shape (plans/bytecode-inliner.md) */
+            fprintf(stderr, "INLAUDIT %s pc%zu %s: runtime-callee\n",
+                    caller_name, pc, opcode_name(in.op));
+            continue;
+        }
+        const int gslot = in.target2;
+        const FuncDescriptor *d =
+            (gslot >= 0 && static_cast<size_t>(gslot) < slot_desc.size())
+                ? slot_desc[gslot] : nullptr;
+        const Chunk *cc = d ? static_cast<const Chunk *>(d->vm_chunk)
+                            : nullptr;
+        if (!cc) {
+            fprintf(stderr, "INLAUDIT %s pc%zu CallV: unresolved-callee\n",
+                    caller_name, pc);
+            continue;
+        }
+        std::string why;
+        const bool ok = bc_inline_callee_ok(*cc, &why);
+        fprintf(stderr, "INLAUDIT %s pc%zu CallV -> %s (%zu ops): %s%s\n",
+                caller_name, pc, d->name ? d->name->val.c_str() : "?",
+                cc->code.size(), ok ? "OK" : "no ",
+                ok ? "" : why.c_str());
+    }
+}
+
+/*
+ * OPT-IN (-bi / MYLANG_BCINLINE=1), and DEFAULT OFF until the two
+ * defects in plans/bytecode-inliner.md are fixed - the splice's bytecode
+ * is correct (it runs right with the JIT off, and -vd shows the textbook
+ * form) but (1) a spliced frame's VIRTUAL backtrace frame is dropped and
+ * (2) a chunk with TWO splices miscompiles under the JIT. Shipping it on
+ * would be a correctness regression; deleting it would throw away a
+ * working transform. The switch is also the same-binary A/B a splice
+ * needs, since the un-inlined bytecode is its only oracle.
+ */
+/* #91 coverage: proof that the CALLER-FRAME path ran - a splice into a
+ * caller that already carries inlined-at frames of its own (an AST-inlined
+ * call plus a bytecode-spliced one in the same body). Bumped only from
+ * that branch, so a test cannot pass by taking some other route. */
+unsigned long g_bc_inline_caller_frames = 0;
+
+/* #91: total call SITES spliced. Lets a shape-matrix test assert that each
+ * shape it believes is spliceable actually was - without it a "all modes
+ * agree" table is satisfied by a pass that inlines nothing. */
+unsigned long g_bc_inline_splices = 0;
+/* #97 closure inlining: VALUE sites spliced behind a guard (a subset of
+ * g_bc_inline_splices) */
+unsigned long g_bc_inline_value_splices = 0;
+/* #97 increment 2: value sites spliced with TWO arms (a guard chain) */
+unsigned long g_bc_inline_value_twoway = 0;
+/* #97 increment 3: closures created in a spliced body */
+unsigned long g_bc_inline_closures = 0;
+/* #97 increment 5: closure SLOTS scalar-replaced (no object is built) */
+unsigned long g_bc_sra_closures = 0;
+/* ...and the moves its collapse removed or retyped */
+unsigned long g_bc_sra_collapsed = 0;
+/* ...and the slots replaced with a TAG (two or more closures) */
+unsigned long g_bc_sra_tagged = 0;
+/* #97 increment 5 (MYLANG_BCINLINE_SRA=0): the scalar replacement of a
+ * non-escaping closure, alone - the same-binary A/B */
+bool g_bc_sra_enabled = [] {
+    const auto e = env_get("MYLANG_BCINLINE_SRA");
+    return !(e && !e->empty() && (*e)[0] == '0');
+}();
+/* ...and the collapse of its move chains alone (MYLANG_BCINLINE_SRAC=0) */
+bool g_bc_sra_collapse = [] {
+    const auto e = env_get("MYLANG_BCINLINE_SRAC");
+    return !(e && !e->empty() && (*e)[0] == '0');
+}();
+unsigned long g_ref_slots_move_excluded = 0;    /* #97 (TESTS) */
+unsigned long g_ref_slots_proven_excluded = 0;  /* C3 (TESTS): params the
+                                                 * proven-type stamp kept
+                                                 * out of ref_slots */
+
+bool g_bc_inline_enabled = [] {
+    const auto e = env_get("MYLANG_BCINLINE");
+    return !(e && !e->empty() && (*e)[0] == '0');
+                                      /* DEFAULT ON since 2026-08-02 */
+}();
+/* #97 closure inlining: the VALUE-site half of the splice alone
+ * (MYLANG_BCINLINE_VALUE=0), under the whole-splice switch above. The
+ * call-protocol tests hold it off: a closure call is their only reach into
+ * the frameless / capbase / capture-forwarding tiers, and inlining it
+ * would leave those tiers nothing to run. */
+bool g_bc_inline_value_enabled = [] {
+    const auto e = env_get("MYLANG_BCINLINE_VALUE");
+    return !(e && !e->empty() && (*e)[0] == '0');
+}();
+
+/* The bytecode inliner takes a DIRECT call to a function with typed
+ * (int/float) parameters too, binding each through CoerceNumV as a value
+ * site always did (MYLANG_BCINLINE_TYPED=0 restores the old decline: the
+ * same-binary A/B). A call-protocol test whose only reach into its tier
+ * was a typed callee holds it off. */
+bool g_bc_inline_typed_enabled = [] {
+    const auto e = env_get("MYLANG_BCINLINE_TYPED");
+    return !(e && !e->empty() && (*e)[0] == '0');
+}();
+
+/* #97 closure inlining STEP 1 - the result rename and the argument
+ * sourcing (MYLANG_BCINLINE_STEP1=0 turns both off: the same-binary A/B,
+ * and the oracle - the step-1 form must render what the increment-1
+ * form does). */
+bool g_bc_inline_value_step1 = [] {
+    const auto e = env_get("MYLANG_BCINLINE_STEP1");
+    return !(e && !e->empty() && (*e)[0] == '0');
+}();
+unsigned long g_bc_chain_partial = 0;   /* #72: chains declined as
+                                        * partial (all-or-nothing) */
+unsigned long g_bc_step1_renamed = 0;   /* sites whose result move went */
+unsigned long g_bc_step1_sourced = 0;   /* arguments bound from source */
+unsigned long g_bc_step1_params = 0;    /* 1b: parameters read in place */
+
+/*
+ * #97 closure inlining STEP 1: what a spliced site can drop, decided on
+ * the caller before the splice - a VALUE site (step 1) and, since step
+ * 1b, a plain CallV site, whose staging has no miss arm to sink into and
+ * is simply DELETED under the same gates (`callee` is -1 there: a CallV
+ * names a global slot, not a frame slot the body could reach).
+ *
+ * THE ARGUMENT STAGING. A call needs its arguments in a contiguous run of
+ * temps, so codegen stages each one - `move argbase+i = src` - right
+ * before the call. Of the two paths an inline cache splits into, only the
+ * MISS arm (the original call) reads that run. So the inlined body binds
+ * from `src` directly and the staging moves are sunk into the miss arm.
+ * Taken only for the maximal run of such moves IMMEDIATELY before the
+ * call, where each is sound by construction:
+ *  - `src` is not written between its move and the call: the run writes
+ *    only its own argument temps, and a source inside the run declines;
+ *  - nothing branches INTO the run past its first op - a join there would
+ *    make the move one of several producers (the JOIN trap the staging
+ *    retarget met, CLAUDE.md); a branch to the FIRST op lands on the
+ *    guard, which binds from the same unmodified sources;
+ *  - the staging temp is dead after the call (liveness), or it IS the
+ *    call's dst, which both paths write.
+ *
+ * THE RESULT RENAME. Every ReturnV of the body returns ONE slot R, a
+ * local or temp of the body (a parameter is written by its bind), which
+ * the body never reads before writing (`read_first`), and the body holds
+ * no call (whose argument RUN a one-slot rename would split). Then every
+ * field naming R names the call's dst instead and no result move is
+ * emitted. dst is a caller slot the body cannot otherwise touch - it
+ * reaches only its own slots, the binds' sources (read BEFORE the body)
+ * and the callee slot, which is why dst == callee slot declines. Writing
+ * dst early, mid-body, is unobservable: a splice caller has no try
+ * region (bc_inline_chunk's gate), so an exception after the write leaves
+ * the frame that holds dst.
+ */
+static void bc_value_site_step1(const Chunk &ck, size_t pc, int nargs,
+                                const BcInlineSnapshot &snap, int nparams,
+                                int callee,
+                                const std::vector<char> &is_target,
+                                const SlotLiveness &live,
+                                size_t &stage_first, std::vector<int> &src_of,
+                                int &rename_from, bool &ref_rename)
+{
+    const Instr &call = ck.code[pc];
+    const int argbase = static_cast<int>(call.a_lit());
+    const int dst = call.target;
+    src_of.assign(static_cast<size_t>(nargs), -1);
+    stage_first = pc;
+    size_t p = pc;
+    while (p > 0 && nargs > 0) {
+        const Instr &m = ck.code[p - 1];
+        if (m.op != OpCode::MoveV || is_target[p])
+            break;
+        const int t = m.target, src = m.target2;
+        if (t < argbase || t >= argbase + nargs || src < 0
+                || (src >= argbase && src < argbase + nargs))
+            break;
+        const size_t i = static_cast<size_t>(t - argbase);
+        if (src_of[i] >= 0)
+            break;
+        if (t != dst && live.live_out(pc, t))
+            break;
+        src_of[i] = src;
+        p--;
+    }
+    stage_first = p;
+
+    rename_from = -1;
+    ref_rename = false;
+    if (dst < 0 || dst == callee)
+        return;
+    int r = -1;
+    for (const Instr &bi : snap.code) {
+        if (bi.op == OpCode::CallV)
+            return;
+        if (bi.op != OpCode::ReturnV)
+            continue;
+        if (bi.a_is_lit() || bi.a_slot() < 0)
+            return;
+        if (r >= 0 && r != bi.a_slot())
+            return;
+        r = bi.a_slot();
+    }
+    if (r < nparams || r >= 64 || ((snap.read_first >> r) & 1))
+        return;
+    /* #97 increment 3: a closure created in the body reads a SPAN of
+     * slots; a rename cannot split a span */
+    for (const Instr &bi : snap.code) {
+        if (bi.op != OpCode::MakeClosureV || bi.target2 < 0
+                || static_cast<size_t>(bi.target2) >= snap.closure_defs.size())
+            continue;
+        int lo = 0, span = 0;
+        if (make_closure_span(snap.closure_defs[bi.target2], lo, span)
+                && r >= lo && r < lo + span)
+            return;
+    }
+    rename_from = r;
+    ref_rename = std::find(snap.ref_slots.begin(), snap.ref_slots.end(), r)
+                 != snap.ref_slots.end();
+}
+
+/*
+ * #97 closure inlining STEP 1b: the PARAMETERS a site can read straight
+ * from their argument's slot. Parameter i qualifies when
+ *  - its argument was SOURCED (step 1: the staging move is gone, so the
+ *    source is a caller slot the body cannot write - the body reaches
+ *    only its own slots, the callee slot's captures through the closure
+ *    object, and dst, excluded next);
+ *  - the source is not the renamed result's dst (the body writes dst
+ *    mid-body, and would then read the new value as the parameter);
+ *  - its bind is the IDENTITY: an untyped parameter (a MoveV bind), or
+ *    a typed one whose argument inference PROVED exactly that type
+ *    (`call_arg_kinds` - an int that is not a bool into `int`, a float
+ *    into `float`); a widening or a dyn argument keeps its CoerceNumV;
+ *  - the body never WRITES the parameter (a barrier op counts as a
+ *    write), and holds no call - the rename must not name a slot inside
+ *    an argument run.
+ */
+static void bc_site_param_renames(const Chunk &ck, size_t pc,
+                                  const BcInlineSnapshot &snap,
+                                  const std::vector<uint8_t> &coerce,
+                                  const std::vector<int> &src_of,
+                                  int renamed_dst,
+                                  std::vector<char> &out)
+{
+    out.assign(src_of.size(), 0);
+    std::vector<char> written(src_of.size(), 0);
+    for (const Instr &bi : snap.code) {
+        if (bi.op == OpCode::CallV)
+            return;
+        const bool known = visit_use_def(bi, [](int) {}, [&](int sl) {
+            if (sl >= 0 && static_cast<size_t>(sl) < written.size())
+                written[static_cast<size_t>(sl)] = 1;
+        });
+        if (!known)
+            return;
+    }
+    /* #97 increment 3: a parameter a body closure CAPTURES is read as
+     * part of that closure's capture span, which a one-slot rename cannot
+     * reach - it keeps its bind */
+    for (const Instr &bi : snap.code) {
+        if (bi.op != OpCode::MakeClosureV || bi.target2 < 0
+                || static_cast<size_t>(bi.target2) >= snap.closure_defs.size())
+            continue;
+        int lo = 0, span = 0;
+        if (make_closure_span(snap.closure_defs[bi.target2], lo, span))
+            for (int k = lo; k < lo + span; k++)
+                if (k >= 0 && static_cast<size_t>(k) < written.size())
+                    written[static_cast<size_t>(k)] = 1;
+    }
+    const uint32_t kinds = ck.call_arg_kinds_at(pc);
+    for (size_t i = 0; i < src_of.size(); i++) {
+        if (src_of[i] < 0 || written[i] || src_of[i] == renamed_dst)
+            continue;
+        const uint8_t co = i < coerce.size() ? coerce[i] : 0;
+        const uint32_t k = i < 16 ? (kinds >> (2 * i)) & 3u : 0u;
+        if (co == 0 || (co == 1 && k == 1) || (co == 2 && k == 2))
+            out[i] = 1;
+    }
+}
+
+/*
+ * Remap every FRAME SLOT field of a whitelisted op by +base.
+ *
+ * The layouts are read off each op's emit site and its VM_CASE, and are
+ * written down in plans/bytecode-inliner.md so nobody re-derives them.
+ * The net below is what makes that safe without a SECOND audited table:
+ * `visit_use_def` independently enumerates this op's slots, and every
+ * callee-local slot is < base, so a field this function MISSED is still
+ * below base and the check fires. The audited table is used as a CHECKER
+ * rather than duplicated - duplication is exactly how the other per-op
+ * tables drifted.
+ */
+template <class F>
+static void bc_map_slots(Instr &in, const F &map)
+{
+    const auto ra = [&]() {
+        if (!in.a_is_lit() && in.a_slot() >= 0) {
+            Operand o = in.a();
+            o.slot = map(o.slot);
+            in.set_a(o);
+        }
+    };
+    const auto rb = [&]() {
+        if (!in.b_is_lit() && in.b_slot() >= 0) {
+            Operand o = in.b();
+            o.slot = map(o.slot);
+            in.set_b(o);
+        }
+    };
+    const auto rt = [&]() {
+        if (in.target >= 0) in.target = map(in.target);
+    };
+
+    switch (in.op) {
+    case OpCode::Jump:
+        break;                          /* target is a pc, not a slot */
+    case OpCode::JumpUnlessIntCmp:
+    case OpCode::JumpUnlessFloatCmp:
+        ra(); rb();                     /* target is a pc */
+        break;
+    case OpCode::LoadImmInt: case OpCode::LoadImmFloat:
+        rt();                           /* a is the immediate */
+        break;
+    case OpCode::MoveV:
+        rt();
+        if (in.target2 >= 0)
+            in.target2 = map(in.target2);
+        break;
+    case OpCode::ReturnV:
+        /* UNREACHABLE today, and gcov says so: the emit loop rewrites a
+         * ReturnV into "move to the call's dst [+ jump to the join]" and
+         * `continue`s before it can reach here. Kept because this is a
+         * whitelist - the `default:` below ABORTS, so an op that ever does
+         * arrive must have an entry, and a correct one costs nothing. */
+        ra();
+        break;
+
+    /*
+     * THE COUNTED-LOOP FUSIONS. Their layouts were read off the VM cases
+     * (vm.cpp) and cross-checked against `visit_use_def` and the pc-field
+     * table, which is the bar the plan set before either could carry a
+     * splice - a `for` loop in a callee fuses to one of these, so without
+     * them any counted loop declines and that was the biggest single limit
+     * on the splice's reach.
+     *
+     * NOTE `target` is a PC for both, NOT a slot: `visit_pc_fields` owns it
+     * and the splice's own pass remaps it. Calling rt() here would corrupt
+     * it into a frame slot.
+     */
+    case OpCode::ForLoopStep:
+        /* target2 = the COUNTER slot; a = the bound operand; b = step */
+        if (in.target2 >= 0)
+            in.target2 = map(in.target2);
+        ra(); rb();
+        break;
+
+    case OpCode::IntAddStep: {
+        /*
+         * target2 = the COUNTER slot; b = the added value operand; and `a`
+         * is a DUAL that is NOT uniform:
+         *     lo = the accumulate DST - ALWAYS a frame slot,
+         *     hi = the bound - a LITERAL VALUE when a_is_lit(), else a SLOT
+         * (vm.cpp reads it as `a_is_lit() ? (int_type)a_dual_hi()
+         *                                 : read_int_slot(a_dual_hi())`).
+         *
+         * THE TRAP: `set_a_dual` CLEARS the is-literal bits as a side
+         * effect. Writing the halves back without restoring the flag would
+         * turn a literal bound into a SLOT INDEX, and the VM would then
+         * read the loop bound out of whatever slot that number names - a
+         * silent wrong-iteration-count, not a crash. So save and restore.
+         */
+        if (in.target2 >= 0)
+            in.target2 = map(in.target2);
+        const bool lit = in.a_is_lit();
+        const int lo = map(in.a_dual_lo());
+        const int hi = lit ? in.a_dual_hi() : map(in.a_dual_hi());
+        in.set_a_dual(lo, hi);
+        if (lit)
+            in.opflags = static_cast<uint8_t>(in.opflags | 1u);
+        rb();
+        break;
+    }
+    case OpCode::CallV:
+        /* target2 is a GLOBAL-table slot, NOT a frame slot - leaving it
+         * alone is the whole reason this is written by hand. `a` is the
+         * ARG RUN's base, a frame slot carried as a literal. */
+        rt();
+        in.set_a(int_lit(map(static_cast<int>(in.a_lit()))));
+        break;
+    /* #97 closure inlining - a VALUE site's body only (the gate admits
+     * them nowhere else). The capture index is NOT a frame slot: the
+     * load's is `target2`, the store's is `target`; both become an
+     * explicit-closure op right after this remap. The store is PLAIN
+     * (the gate refuses a compound one, whose target2 is a pool index). */
+    case OpCode::LoadCaptureV:
+        rt();
+        break;
+    case OpCode::StoreCaptureV:
+        ra();
+        break;
+    /* ...and their explicit-closure forms, which only the step-1 RESULT
+     * RENAME meets (it runs after the rewrite): the closure's slot is a
+     * CALLER slot, mapped like any other - the rename never names it,
+     * since a site whose dst IS the callee slot does not rename. */
+    case OpCode::LoadCaptureOfV:
+        rt(); ra();
+        break;
+    /* #97 increment 2: the flat element ops. The READ: target2 = the
+     * base slot (always a frame slot), a = the index, target = dst. The
+     * STORE: target = the base KIND (0 local / 1 global / 2 capture -
+     * the gate refuses 2), target2 = the base, a slot only for a local;
+     * a = the index, b = the value. `target` is not a slot there, so rt()
+     * would corrupt it into one. */
+    case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+        rt(); ra();
+        if (in.target2 >= 0)
+            in.target2 = map(in.target2);
+        break;
+    case OpCode::StoreElemInt: case OpCode::StoreElemFloat:
+        if (in.target == 0 && in.target2 >= 0)
+            in.target2 = map(in.target2);
+        ra(); rb();
+        break;
+    /* #97 increment 3: target = dst; target2 = a closure_defs index (a
+     * POOL index - the splice re-points it into the caller's pool); `a`
+     * the capture DUAL (lo = the lowest captured slot, a frame slot;
+     * hi = the span, a count). The renames never name a slot inside the
+     * span (bc_value_site_step1 / bc_site_param_renames keep them out),
+     * so mapping lo is exact for the re-base and a no-op for them. */
+    case OpCode::MakeClosureV:
+        rt();
+        if (in.a_dual_hi() > 0)
+            in.set_a_dual(map(in.a_dual_lo()), in.a_dual_hi());
+        break;
+    case OpCode::StoreCaptureOfV:
+        ra(); rb();
+        break;
+    case OpCode::IntBin:      case OpCode::FloatBin:
+    case OpCode::IntAddRR:    case OpCode::IntAddRI:
+    case OpCode::IntSubRR:    case OpCode::IntSubRI:
+    case OpCode::IntMulRR:    case OpCode::IntMulRI:
+    case OpCode::IntAndRR:    case OpCode::IntAndRI:
+    case OpCode::IntOrRR:     case OpCode::IntOrRI:
+    case OpCode::IntXorRR:    case OpCode::IntXorRI:
+    case OpCode::IntShlRR:    case OpCode::IntShlRI:
+    case OpCode::IntShrRR:    case OpCode::IntShrRI:
+    case OpCode::IntModRI:    case OpCode::IntAddModRI:
+    case OpCode::FloatAddRR:  case OpCode::FloatAddRI:
+    case OpCode::FloatSubRR:  case OpCode::FloatSubRI:
+    case OpCode::FloatMulRR:  case OpCode::FloatMulRI:
+    case OpCode::CmpIntV:     case OpCode::CmpFloatV:
+        /* IntAddModRI's target2 is the IMM, not a slot - untouched */
+        ra(); rb(); rt();
+        break;
+    default:
+        /* unreachable: bc_inline_callee_ok gates on the same whitelist */
+        ML_CHECK_MSG(false, "bc_remap_slots: op not on the whitelist");
+        break;
+    }
+}
+
+static void bc_remap_slots(Instr &in, int base)
+{
+    bc_map_slots(in, [base](int s) { return s + base; });
+#ifndef NDEBUG
+    visit_use_def(in,
+                  [&](int s) { ML_CHECK(s >= base); },
+                  [&](int s) { ML_CHECK(s >= base); });
+#endif
+}
+
+/* #97 closure inlining step 1: the RESULT RENAME - every field naming
+ * `from` (the body's returned slot, already re-based) names `to` (the
+ * call's dst). Checked the same way the re-base is: `visit_use_def`
+ * enumerates the op's slots independently, so a field this pass MISSED
+ * still names `from` and the check fires. */
+static void bc_rename_slot(Instr &in, int from, int to)
+{
+    bc_map_slots(in, [from, to](int s) { return s == from ? to : s; });
+#ifndef NDEBUG
+    visit_use_def(in,
+                  [&](int s) { ML_CHECK(s != from); },
+                  [&](int s) { ML_CHECK(s != from); });
+#endif
+}
+
+/* The frame a splice may grow the caller to. A bound, not a tuning knob:
+ * every level of a recursion allocates the whole frame, so an unbounded
+ * splice trades call count for stack. */
+static const int BC_INLINE_MAX_FRAME = 96;
+
+/*
+ * Splice every inline-able CallV in `ck`. ONE level - a self-recursive
+ * callee is spliced from a SNAPSHOT of its pre-splice code, so the body
+ * cannot compound (the AST inliner's `rec_orig` rule, one layer down).
+ *
+ * Returns true if anything changed.
+ */
+void bc_inline_snapshot(const Chunk &ck, BcInlineSnapshots &out)
+{
+    BcInlineSnapshot s;
+    s.code = ck.code;
+    s.locs = ck.locs;
+    s.base_locs = ck.base_locs;                        /* #127 */
+    s.op_locs = ck.op_locs;                            /* RULE 2 */
+    s.arg_locs = ck.arg_locs;                          /* RULE 2 */
+    s.arg_loc_pool = ck.arg_loc_pool;
+    s.ref_slots = ck.ref_slots;
+    s.closure_defs = ck.closure_defs;     /* #97 increment 3 */
+    s.slot_count = ck.slot_count;
+    s.n_temps = ck.n_temps;
+    /* The gate runs on the PRISTINE body: after a splice the chunk gains
+     * inline_ctxs entries (and different ops), so asking it later would
+     * answer about a body no caller is going to inline anyway. */
+    s.eligible = bc_inline_callee_ok(ck, nullptr) && ck.inline_ctxs.empty();
+    s.value_eligible = bc_inline_callee_ok(ck, nullptr, true)
+                       && ck.inline_ctxs.empty();
+    s.read_first = chunk_read_before_write(ck);
+    out.emplace(&ck, std::move(s));
+}
+
+#ifdef INT_TESTS
+/* #107: one `splice` event per (call site, candidate) - the verdict the
+ * splice reached for it, so a test can name a site and ask why. */
+static void bc_int_note(const Chunk &ck, size_t pc,
+                        const FuncDescriptor *d, bool value,
+                        const char *verdict)
+{
+    Loc ls, le;
+    ck.loc_at(pc, ls, le);
+    const std::string callee =
+        !d ? std::string("?")
+        : !d->display_name.empty() ? d->display_name
+        : d->name ? std::string(d->name->val) : std::string("<lambda>");
+    ML_INT(splice, verdict, value ? "value" : "call", callee, ls.line,
+           ls.col);
+}
+std::string g_bc_int_caller = "?";
+std::string bc_int_key_fn(const FuncDescriptor *d, const Chunk &ck)
+{
+    if (!d)
+        return "main";
+    if (d->name)
+        return std::string(d->name->val);
+    return "<lambda>@" + (ck.locs.empty()
+                              ? std::string("?")
+                              : std::to_string(ck.locs.front().start.line));
+}
+/* the SPLICE as an enumerated decision: a committed site may be declined
+ * (alternative 1) - the call stays a call, which RULE 2 says must not
+ * change anything observable */
+static bool bc_int_splice_declined(const Chunk &ck, size_t pc)
+{
+    Loc ls, le;
+    ck.loc_at(pc, ls, le);
+    const std::string key = g_bc_int_caller + "/splice@"
+                          + std::to_string(ls.line) + ":"
+                          + std::to_string(ls.col);
+    const int pick = int_choose(key, 2, 0);
+    ML_INT(splice_choice, key, int64_t(2), int64_t(0), int64_t(pick));
+    return pick == 1;
+}
+#endif
+#define BC_NOTE(d, why) ML_INT_ONLY(bc_int_note(ck, pc, d, is_value, why))
+
+static bool bc_inline_chunk_splice(Chunk &ck,
+                     const std::vector<const FuncDescriptor *> &slot_desc,
+                     const BcInlineSnapshots &snaps, bool value_only)
+{
+    if (!g_bc_inline_enabled)
+        return false;
+    /* a caller try region would need its handler table's body/fin pcs
+     * remapped too - a later increment, gated out rather than guessed */
+    if (ck.n_trys != 0)
+        return false;
+
+    /* One inlined BODY. A plain CallV site and a one-way value site
+     * have one; a TWO-WAY value site (#97 increment 2 - the callee-set
+     * analysis names two functions) has one per candidate the gate
+     * admits, each behind its own guard, the original call after them. */
+    struct Arm {
+        int base;                       /* the callee frame's slot base */
+        int32_t def = -1;               /* value site: closure_defs idx */
+        std::vector<Instr> body;        /* SNAPSHOT (self-recursion) */
+        bool halts = false;             /* ends in Halt: a void body */
+        std::vector<Chunk::LocEntry> locs;
+        std::vector<Chunk::LocEntry> base_locs;   /* #127 */
+        std::vector<Chunk::LocEntry> op_locs;     /* RULE 2 */
+        std::vector<Chunk::ArgLocEntry> arg_locs; /* RULE 2 */
+        std::vector<ArgLoc> arg_loc_pool;
+        std::vector<int32_t> ref_slots;
+        /* the callee's closure_defs pool (increment 3: a make.closure in
+         * the body names ITS pool, re-pointed into the caller's) */
+        std::vector<const FuncDescriptor *> closure_defs;
+        Chunk::InlineFrame frame;
+        /* each typed parameter binds through CoerceNumV (`coerce[i]` =
+         * 1 int, 2 float, 0 a plain move), carrying its argument's caret */
+        std::vector<uint8_t> coerce;
+        /* step 1: the body's returned slot (callee-relative) renamed to
+         * `dst`, so no result move is emitted - or -1 */
+        int rename_from = -1;
+        bool ref_rename = false;       /* the renamed slot is ref-listed */
+        /* step 1b: parameter i is read straight from src_of[i] - its bind
+         * is the identity and the body never writes it - so no bind op
+         * is emitted and every field naming it names the source */
+        std::vector<char> param_renamed;
+    };
+    struct Site {
+        size_t pc;
+        int nargs;
+        int argbase;                    /* the caller's arg run */
+        int dst;                        /* the call's result slot */
+        /* #97 closure inlining: a VALUE site - the inline cache. Each
+         * arm's guard compares `callee_slot` against its closure_defs
+         * entry. */
+        bool value = false;
+        int callee_slot = -1;
+        /* step 1: the caller's argument-STAGING moves, pcs
+         * [stage_first, pc), each `MoveV argbase+i = src`: the inlined
+         * bodies bind from `src` directly and the moves themselves are
+         * SUNK into the miss arm, the one path that reads the run.
+         * `src_of[i]` is -1 for an argument not sourced this way. A
+         * caller-side fact, so every arm shares it. */
+        size_t stage_first = 0;
+        std::vector<int> src_of;
+        std::vector<Arm> arms;
+    };
+    std::vector<Site> sites;
+    int next_base = ck.slot_count + ck.n_temps;
+
+    /* step 1's two facts about the CALLER, computed once and only if a
+     * value site may want them: every branch target (a staging run
+     * something jumps INTO is not a run), and slot liveness (a staging
+     * temp read after the call must still be written on the hit path) */
+    std::vector<char> is_target;
+    SlotLiveness live;
+    bool facts_ready = false;
+    const auto caller_facts = [&]() {
+        if (facts_ready)
+            return;
+        facts_ready = true;
+        is_target.assign(ck.code.size() + 1, 0);
+        for (const Instr &ci : ck.code) {
+            Instr c = ci;
+            visit_pc_fields(c, [&](int &t) {
+                if (t >= 0 && static_cast<size_t>(t) < is_target.size())
+                    is_target[static_cast<size_t>(t)] = 1;
+            });
+        }
+        jit_slot_liveness(ck, live);
+    };
+
+    for (size_t pc = 0; pc < ck.code.size(); pc++) {
+        const Instr &in = ck.code[pc];
+        const bool is_value = in.op == OpCode::CallValueV;
+        if (in.op != OpCode::CallV && !is_value)
+            continue;
+        /* main: value sites only - plus (increment 3) a call to a
+         * closure FACTORY, checked below once the callee is known */
+        const bool factory_only = value_only && !is_value;
+        if (is_value && !g_bc_inline_value_enabled)
+            continue;
+        /* the candidate callees: a CallV names one through its global
+         * slot; a value site takes what the callee-set analysis named -
+         * one function, or (increment 2) two. The GUARDS, not the
+         * analysis, are what each inlined body's soundness rests on. */
+        std::vector<std::pair<const FuncDescriptor *, int32_t>> cands;
+        ML_INT_ONLY(const char *no_cand_why = "no_candidate";)
+        if (is_value) {
+            int32_t vd[ML_VALUE_CANDS_HARD];
+            const int nv = std::min(
+                ck.value_callees_at(pc, vd, ML_VALUE_CANDS_HARD),
+                ML_VALUE_CANDS_HARD);
+            for (int k = 0; k < nv; k++) {
+                if (vd[k] < 0
+                        || static_cast<size_t>(vd[k]) >= ck.closure_defs.size())
+                    continue;
+                const FuncDescriptor *cd =
+                    ck.closure_defs[static_cast<size_t>(vd[k])];
+                bool dup = false;
+                for (const auto &c : cands)
+                    dup |= c.first == cd;
+                if (cd && cd->vm_chunk && !dup)
+                    cands.push_back({ cd, vd[k] });
+            }
+        } else {
+            const int g = in.target2;
+            const FuncDescriptor *d =
+                (g >= 0 && static_cast<size_t>(g) < slot_desc.size())
+                    ? slot_desc[g] : nullptr;
+            /* a typed parameter binds through CoerceNumV, exactly as at
+             * a value site (a.coerce below) - its type is information
+             * the inlined body keeps, not a reason to decline */
+            if (d && d->vm_chunk
+                    && (d->fast_bind || g_bc_inline_typed_enabled))
+                cands.push_back({ d, -1 });
+            ML_INT_ONLY(else if (!d) no_cand_why = "callee_unknown";
+                        else if (!d->vm_chunk) no_cand_why = "no_chunk";
+                        else no_cand_why = "typed_params";)
+        }
+        const int nargs = static_cast<int>(in.b_lit());
+
+        Site s;
+        s.pc = pc;
+        s.nargs = nargs;
+        s.argbase = static_cast<int>(in.a_lit());
+        s.dst = in.target;
+        s.stage_first = pc;             /* nothing sunk unless step 1 says */
+        s.value = is_value;
+        s.callee_slot = is_value ? in.target2 : -1;
+        int site_base = next_base;
+        bool step1_done = false;
+        ML_INT_ONLY(std::vector<const FuncDescriptor *> admitted;)
+        for (const auto &cand : cands) {
+            const FuncDescriptor *d = cand.first;
+            const Chunk *cc = static_cast<const Chunk *>(d->vm_chunk);
+            /* the PRE-PASS snapshot, never the live chunk: by now an
+             * earlier iteration may have spliced this callee, and which
+             * one that is depends on an unordered_map's order (see
+             * BcInlineSnapshot). */
+            const auto snap_it = snaps.find(cc);
+            if (snap_it == snaps.end()) {
+                BC_NOTE(d, "not_in_pass");
+                continue;               /* not part of this pass (main) */
+            }
+            const BcInlineSnapshot &snap = snap_it->second;
+            if (factory_only) {
+                /* #97 increment 3: main splices a plain call only when
+                 * the body CREATES a closure - the factory shape, whose
+                 * splice is what lets main's own value sites see the
+                 * closure's make.closure (G3 then proves their guards).
+                 * Every other top-level call stays a call: admitting
+                 * them all would change every program's main, a
+                 * separate and separately measured step. */
+                bool makes = false;
+                for (const Instr &bi : snap.code)
+                    makes |= bi.op == OpCode::MakeClosureV;
+                if (!makes) {
+                    BC_NOTE(d, "main_not_factory");
+                    continue;
+                }
+            }
+            if (is_value ? !snap.value_eligible : !snap.eligible) {
+                BC_NOTE(d, "body_ineligible");
+                continue;               /* gate ran on the pristine body,
+                                         * incl. "no inline_ctxs" - the
+                                         * callee's own chains would need
+                                         * re-parenting (a later step) */
+            }
+            if (nargs != static_cast<int>(d->params.size())) {
+                BC_NOTE(d, "arity");
+                continue;               /* an omitted trailing opt param
+                                         * binds none - the bind loop here
+                                         * only moves what was passed */
+            }
+            const Instr &last = snap.code.back();
+            if (last.op == OpCode::ReturnV && last.a_is_lit()) {
+                BC_NOTE(d, "literal_return");
+                continue;               /* ReturnV always emits a slot;
+                                         * a literal would need a load */
+            }
+            if (last.op == OpCode::Halt && in.target >= 0) {
+                BC_NOTE(d, "void_result_used");
+                continue;               /* a void body's result is none,
+                                         * which a used dst would need
+                                         * loaded - only a DISCARDED call
+                                         * inlines one (76's shape) */
+            }
+            const int cframe = snap.slot_count + snap.n_temps;
+            if (site_base + cframe > BC_INLINE_MAX_FRAME) {
+                BC_NOTE(d, "frame_budget");
+                continue;
+            }
+
+            Arm a;
+            a.base = site_base;
+            a.def = cand.second;
+            a.halts = last.op == OpCode::Halt;
+            for (const auto &p : d->params)
+                a.coerce.push_back(p.decl_type == DeclType::i ? 1
+                                   : p.decl_type == DeclType::f ? 2
+                                                                : 0);
+            if (g_bc_inline_value_step1) {
+                caller_facts();
+                /* the staging half is a CALLER fact - identical for
+                 * every arm, so the first arm's answer is the site's */
+                size_t sf = pc;
+                std::vector<int> so;
+                bc_value_site_step1(ck, pc, nargs, snap,
+                                    static_cast<int>(d->params.size()),
+                                    is_value ? in.target2 : -1,
+                                    is_target, live, sf, so,
+                                    a.rename_from, a.ref_rename);
+                if (!step1_done) {
+                    s.stage_first = sf;
+                    s.src_of = std::move(so);
+                    step1_done = true;
+                }
+                bc_site_param_renames(ck, pc, snap, a.coerce, s.src_of,
+                                      a.rename_from >= 0 ? in.target : -1,
+                                      a.param_renamed);
+            }
+            a.body = snap.code;         /* the PRISTINE body (see above) */
+            a.locs = snap.locs;
+            /* #127 / RULE 2: every caret pool rides along - the element
+             * STORE ops (increment 2) are the first spliced ops to carry
+             * a base caret (a global base) and an operation caret (a
+             * compound store) */
+            a.base_locs = snap.base_locs;
+            a.op_locs = snap.op_locs;
+            /* RULE 2: a nested CallV's per-argument carets */
+            a.arg_locs = snap.arg_locs;
+            a.arg_loc_pool = snap.arg_loc_pool;
+            a.ref_slots = snap.ref_slots;
+            a.closure_defs = snap.closure_defs;
+            /* the virtual frame, built to render EXACTLY as the physical
+             * one would (backtrace.cpp's frame_display over the
+             * descriptor) */
+            a.frame.callee_name = !d->display_name.empty()
+                                      ? d->display_name
+                                      : d->name ? std::string(d->name->val)
+                                                : std::string("<lambda>");
+            for (const auto &p : d->params)
+                a.frame.params.push_back(std::string(p.name->val));
+            Loc ls, le;
+            ck.loc_at(pc, ls, le);
+            a.frame.call_site = ls;
+            a.frame.parent = ck.inline_frame_at(pc);
+            s.arms.push_back(std::move(a));
+            ML_INT_ONLY(admitted.push_back(d);)
+            site_base += cframe;
+        }
+        /* a value site the callee-set analysis named nothing for, or a
+         * direct call whose global slot names no spliceable descriptor */
+        ML_INT_ONLY(if (cands.empty())
+                        bc_int_note(ck, pc,
+                                    is_value || in.target2 < 0
+                                        || static_cast<size_t>(in.target2)
+                                               >= slot_desc.size()
+                                        ? nullptr
+                                        : slot_desc[in.target2],
+                                    is_value, no_cand_why);)
+        if (s.arms.empty())
+            continue;
+        /* #72: a guard CHAIN of three or more is ALL OR NOTHING. A
+         * candidate left out (the frame budget, an ineligible body)
+         * would reach its call only after failing every guard of the
+         * chain - measured SLOWER than no splice at all (8 candidates of
+         * ~22-op bodies, 5 fitting: 61.5 vs 54.9 cycles per call for the
+         * last one). Sites of one or two keep their partial splice. */
+        if (cands.size() >= 3 && s.arms.size() < cands.size()) {
+#ifdef TESTS
+            g_bc_chain_partial++;
+#endif
+            ML_INT_ONLY(for (const FuncDescriptor *ad : admitted)
+                            BC_NOTE(ad, "chain_partial");)
+            continue;
+        }
+        ML_INT_ONLY(if (bc_int_splice_declined(ck, pc)) {
+                        for (const FuncDescriptor *ad : admitted)
+                            BC_NOTE(ad, "forced_decline");
+                        continue;
+                    })
+        ML_INT_ONLY(for (const FuncDescriptor *ad : admitted)
+                        BC_NOTE(ad, "spliced");)
+        next_base = site_base;
+        sites.push_back(std::move(s));
+    }
+    if (sites.empty())
+        return false;
+#ifdef TESTS
+    /* unsigned long is 32-bit on LLP64 (Windows) - C4267 without the cast */
+    g_bc_inline_splices += static_cast<unsigned long>(sites.size());
+#endif
+
+    /* the caller's own pc -> loc, so a copied op keeps its caret */
+    std::vector<Instr> nc;
+    std::vector<Chunk::LocEntry> nlocs;
+    std::vector<Chunk::LocEntry> nbase;                /* #127 */
+    std::vector<Chunk::LocEntry> nop;                  /* RULE 2 */
+    std::vector<Chunk::CalleeName> nvc;                /* #97 E1 */
+    std::vector<Chunk::InlineEntry> nctx;
+    std::vector<char> from_caller;
+    std::vector<uint32_t> old2new(ck.code.size() + 1);
+
+    const auto caller_loc = [&](size_t pc, Loc &s, Loc &e) -> bool {
+        for (const auto &le : ck.locs)
+            if (le.pc == pc) { s = le.start; e = le.end; return true; }
+        return false;
+    };
+    /* #127: the store-base caret rides the splice exactly like the loc. */
+    const auto caller_base_loc = [&](size_t pc, Loc &s, Loc &e) -> bool {
+        for (const auto &le : ck.base_locs)
+            if (le.pc == pc) { s = le.start; e = le.end; return true; }
+        return false;
+    };
+    /* RULE 2: so does a compound store's operation caret. */
+    const auto caller_op_loc = [&](size_t pc, Loc &s, Loc &e) -> bool {
+        for (const auto &le : ck.op_locs)
+            if (le.pc == pc) { s = le.start; e = le.end; return true; }
+        return false;
+    };
+    /* RULE 2: the per-argument carets ride the splice like the loc - the
+     * caller's own pool is kept as is (a re-based entry keeps its run),
+     * a spliced body's run is APPENDED to the caller's pool. */
+    std::vector<Chunk::ArgLocEntry> nargl;
+    std::vector<ArgLoc> nargpool = ck.arg_loc_pool;
+    const auto caller_arg_locs = [&](size_t pc, uint32_t &first,
+                                     uint32_t &n) -> bool {
+        for (const auto &ae : ck.arg_locs)
+            if (ae.pc == pc) { first = ae.first; n = ae.n; return true; }
+        return false;
+    };
+    /*
+     * #97 E1: the named callee rides the splice the same way. A SPLICED
+     * body's own sites are dropped rather than carried: the splice pastes
+     * the callee's bytecode into this chunk, so a `def` index from the
+     * callee's closure_defs would name an entry in the WRONG pool. Losing
+     * it costs a bake, never an answer.
+     */
+    const auto caller_value_callees = [&](size_t pc,
+                                          std::vector<int32_t> &out) {
+        for (const auto &e : ck.value_callees)
+            if (e.pc == pc) out.push_back(e.def);   /* #97 E3: both */
+    };
+
+    /* A CALLER op carried to its new pc with every pc-keyed side table
+     * it owns. Also how a VALUE site keeps its original call - the inline
+     * cache's miss arm - so that arm's carets, backtrace chain and
+     * value-callee entry are exactly an untouched op's. */
+    const auto emit_caller_op = [&](size_t pc) {
+        Loc s, e;
+        if (caller_loc(pc, s, e))
+            nlocs.push_back({ static_cast<uint32_t>(nc.size()), s, e });
+        if (caller_base_loc(pc, s, e))
+            nbase.push_back({ static_cast<uint32_t>(nc.size()), s, e });
+        if (caller_op_loc(pc, s, e))
+            nop.push_back({ static_cast<uint32_t>(nc.size()), s, e });
+        {
+            uint32_t afirst, an;
+            if (caller_arg_locs(pc, afirst, an))
+                nargl.push_back({ static_cast<uint32_t>(nc.size()),
+                                  afirst, an });
+        }
+        {
+            std::vector<int32_t> vcds;
+            caller_value_callees(pc, vcds);
+            for (const int32_t vcd : vcds)
+                nvc.push_back({ static_cast<uint32_t>(nc.size()), vcd });
+        }
+        const int32_t f = ck.inline_frame_at(pc);
+        if (f >= 0) {
+#ifdef TESTS
+            g_bc_inline_caller_frames++;
+#endif
+            /* a CALLER op that is itself inlined-at code keeps its frame
+             * index: the caller's own chains must survive the splice, or
+             * a throw from AST-inlined code in a spliced body renders the
+             * wrong virtual frames */
+            nctx.push_back({ static_cast<uint32_t>(nc.size()), f });
+        }
+        nc.push_back(ck.code[pc]);
+        from_caller.push_back(1);
+    };
+
+    /* step 1: the staging moves sunk into their site's miss arm; a
+     * branch to the first one lands on the guard (old2new below) */
+    std::vector<char> staged(ck.code.size(), 0);
+    for (const Site &S : sites)
+        for (size_t q = S.stage_first; q < S.pc; q++)
+            staged[q] = 1;
+
+    size_t si = 0;
+    for (size_t pc = 0; pc < ck.code.size(); pc++) {
+        old2new[pc] = static_cast<uint32_t>(nc.size());
+        if (staged[pc])
+            continue;
+        if (si < sites.size() && sites[si].pc == pc) {
+            const Site &S = sites[si++];
+            /*
+             * THE LAYOUT, sized first so every forward pc is known:
+             *   per arm:  [GuardCalleeV (value)] binds body [Jump join]
+             *   then (value): the sunk staging + the original call
+             *   join:
+             * A guard's else-pc is the NEXT arm's guard, or the miss arm
+             * for the last one - so a two-way site is a guard CHAIN, and
+             * a callee the gate refused is simply left to the call.
+             */
+            struct ArmPlan {
+                std::vector<uint32_t> lmap;
+                size_t emitted = 0;     /* the body's own ops */
+                size_t start = 0;       /* its first op (the guard) */
+                bool keep_result = false;
+            };
+            std::vector<ArmPlan> plans(S.arms.size());
+            size_t cursor = nc.size();
+            for (size_t k = 0; k < S.arms.size(); k++) {
+                const Arm &A = S.arms[k];
+                ArmPlan &P = plans[k];
+                /* step 1: a renamed result is already in dst - no move */
+                P.keep_result = S.dst >= 0 && A.rename_from < 0;
+#ifdef TESTS
+                if (A.rename_from >= 0)
+                    g_bc_step1_renamed++;
+#endif
+                const size_t nb = A.body.size();
+                P.lmap.resize(nb);
+                for (size_t j = 0; j < nb; j++) {
+                    P.lmap[j] = static_cast<uint32_t>(P.emitted);
+                    if (A.body[j].op == OpCode::ReturnV)
+                        P.emitted += (P.keep_result ? 1u : 0u)
+                                     + (j + 1 != nb ? 1u : 0u);
+                    else if (A.body[j].op == OpCode::Halt)
+                        ;               /* the terminal Halt of a void
+                                         * body falls to what follows */
+                    else
+                        P.emitted++;
+                }
+                size_t nbinds = 0;
+                for (int i = 0; i < S.nargs; i++)
+                    if (!(static_cast<size_t>(i) < A.param_renamed.size()
+                          && A.param_renamed[static_cast<size_t>(i)]))
+                        nbinds++;
+                P.start = cursor;
+                cursor += (S.value ? 2 : 0) + nbinds + P.emitted;
+            }
+            const size_t miss_start = cursor;
+            const size_t join = S.value ? miss_start + (S.pc - S.stage_first)
+                                          + 1
+                                        : miss_start;
+
+            for (size_t k = 0; k < S.arms.size(); k++) {
+                const Arm &A = S.arms[k];
+                const ArmPlan &P = plans[k];
+                ML_CHECK(nc.size() == P.start);
+                const int32_t fidx =
+                    static_cast<int32_t>(ck.inline_frames.size());
+                ck.inline_frames.push_back(A.frame);
+                if (S.value) {
+                    Instr gd;
+                    gd.op = OpCode::GuardCalleeV;
+                    Operand co;
+                    co.slot = S.callee_slot;
+                    gd.set_a(co);
+                    gd.target2 = A.def;
+                    gd.target = static_cast<int>(
+                        k + 1 < S.arms.size() ? plans[k + 1].start
+                                              : miss_start);
+                    nc.push_back(gd);
+                    from_caller.push_back(0);
+                }
+                /* the arg bind: the interpreted call's fast_bind, as
+                 * MoveVs (frame slots have no container back-pointer, so
+                 * put() is rebind()) - or, for a TYPED parameter of a
+                 * value site, the coercion bind_param performs, as
+                 * CoerceNumV: the identity for an argument of the
+                 * declared type, a widening for int into float, a
+                 * TypeErrorEx for a dyn value that fits neither -
+                 * carrying that ARGUMENT's caret and the CALLER's
+                 * inlined-at chain, since a bind error is the caller's */
+                for (int i = 0; i < S.nargs; i++) {
+                    if (static_cast<size_t>(i) < A.param_renamed.size()
+                            && A.param_renamed[static_cast<size_t>(i)]) {
+#ifdef TESTS
+                        g_bc_step1_params++;
+#endif
+                        continue;           /* step 1b: read in place */
+                    }
+                    const uint8_t co =
+                        static_cast<size_t>(i) < A.coerce.size()
+                            ? A.coerce[static_cast<size_t>(i)] : 0;
+                    /* step 1: an argument whose staging was sunk binds
+                     * from its source */
+                    const int from =
+                        (static_cast<size_t>(i) < S.src_of.size()
+                         && S.src_of[static_cast<size_t>(i)] >= 0)
+                            ? S.src_of[static_cast<size_t>(i)]
+                            : S.argbase + i;
+#ifdef TESTS
+                    if (from != S.argbase + i)
+                        g_bc_step1_sourced++;
+#endif
+                    Instr mv;
+                    mv.op = co ? OpCode::CoerceNumV : OpCode::MoveV;
+                    mv.target = A.base + i;
+                    if (co) {
+                        Operand ao;
+                        ao.slot = from;
+                        mv.set_a(ao);
+                        mv.target2 = co == 2 ? 1 : 0;
+                        Loc as, ae;
+                        if (ck.arg_loc_at(S.pc, static_cast<size_t>(i), as,
+                                          ae)
+                                || caller_loc(S.pc, as, ae))
+                            nlocs.push_back(
+                                { static_cast<uint32_t>(nc.size()), as,
+                                  ae });
+                        const int32_t cf = ck.inline_frame_at(S.pc);
+                        if (cf >= 0)
+                            nctx.push_back(
+                                { static_cast<uint32_t>(nc.size()), cf });
+                    } else {
+                        mv.target2 = from;
+                    }
+                    nc.push_back(mv);
+                    from_caller.push_back(0);
+                }
+                /*
+                 * `S.dst < 0` is the call whose RESULT IS DISCARDED (`c(a);`
+                 * as a statement - the peephole's dead-dst rule). There is
+                 * then no destination to move into, and emitting the move
+                 * anyway wrote frame slot -1: `Frame::at(-1)` is out of
+                 * bounds, and the JIT's store would have computed an
+                 * address one LValue BELOW the window. It survived only
+                 * because the one corpus shape that reached it sat in a
+                 * chunk the const-folder had made dead; #137's verifier is
+                 * what found it.
+                 */
+                const size_t nb = A.body.size();
+                const size_t body_base = nc.size();
+                /* a body's returns land past the whole site - its own
+                 * `Jump join` exists only for the fall-through */
+                for (size_t j = 0; j < nb; j++) {
+                    Loc bs, be;
+                    bool has_loc = false;
+                    for (const auto &le : A.locs)
+                        if (le.pc == j) {
+                            bs = le.start; be = le.end; has_loc = true;
+                            break;
+                        }
+                    Loc bbs, bbe;                          /* #127 */
+                    bool has_base = false;
+                    for (const auto &le : A.base_locs)
+                        if (le.pc == j) {
+                            bbs = le.start; bbe = le.end; has_base = true;
+                            break;
+                        }
+                    Loc obs, obe;                          /* RULE 2 */
+                    bool has_op = false;
+                    for (const auto &le : A.op_locs)
+                        if (le.pc == j) {
+                            obs = le.start; obe = le.end; has_op = true;
+                            break;
+                        }
+                    const Chunk::ArgLocEntry *bargs = nullptr; /* RULE 2 */
+                    for (const auto &ae : A.arg_locs)
+                        if (ae.pc == j) { bargs = &ae; break; }
+                    if (A.body[j].op == OpCode::Halt) {
+                        ML_CHECK(j + 1 == nb);
+                        continue;
+                    }
+                    if (A.body[j].op == OpCode::ReturnV) {
+                        if (P.keep_result) {
+                            Instr mv;
+                            mv.op = OpCode::MoveV;
+                            mv.target = S.dst;
+                            /* a body returning a PARAMETER read in place
+                             * (step 1b) returns the argument's source -
+                             * `func id(x) => x` - the slot A.base + x is
+                             * never bound (#72 found it: a third arm of
+                             * that shape read a stale temp) */
+                            const int rs = A.body[j].a_slot();
+                            mv.target2 =
+                                rs >= 0
+                                && static_cast<size_t>(rs)
+                                       < A.param_renamed.size()
+                                && A.param_renamed[static_cast<size_t>(rs)]
+                                    ? S.src_of[static_cast<size_t>(rs)]
+                                    : rs + A.base;
+                            nctx.push_back(
+                                { static_cast<uint32_t>(nc.size()), fidx });
+                            nc.push_back(mv);
+                            from_caller.push_back(0);
+                        }
+                        if (j + 1 != nb) {
+                            Instr jm;
+                            jm.op = OpCode::Jump;
+                            jm.target = static_cast<int>(join);
+                            nc.push_back(jm);
+                            from_caller.push_back(0);
+                        }
+                        continue;
+                    }
+                    Instr bi = A.body[j];
+                    /* #97 increment 3: a closure created in the body -
+                     * record its capture span (callee-relative, so the
+                     * re-base below shifts it), then re-point its
+                     * descriptor into the CALLER's pool */
+                    if (bi.op == OpCode::MakeClosureV) {
+                        const FuncDescriptor *cd =
+                            A.closure_defs[static_cast<size_t>(bi.target2)];
+                        int lo = 0, span = 0;
+                        if (make_closure_span(cd, lo, span))
+                            bi.set_a_dual(lo, span);
+                        int idx = -1;
+                        for (size_t q = 0; q < ck.closure_defs.size(); q++)
+                            if (ck.closure_defs[q] == cd) {
+                                idx = static_cast<int>(q);
+                                break;
+                            }
+                        if (idx < 0) {
+                            idx = static_cast<int>(ck.closure_defs.size());
+                            ck.closure_defs.push_back(cd);
+                        }
+                        bi.target2 = idx;
+#ifdef TESTS
+                        g_bc_inline_closures++;
+#endif
+                    }
+                    bc_remap_slots(bi, A.base);
+                    /* #97 closure inlining: the body now runs in the
+                     * CALLER's frame, whose ctx.captures is the caller's
+                     * own - so each capture op reaches the closure
+                     * through the callee slot the guard just checked (a
+                     * CALLER slot: not re-based) */
+                    if (bi.op == OpCode::LoadCaptureV) {
+                        Operand co;
+                        co.slot = S.callee_slot;
+                        bi.op = OpCode::LoadCaptureOfV;
+                        bi.set_a(co);
+                    } else if (bi.op == OpCode::StoreCaptureV) {
+                        Operand co;
+                        co.slot = S.callee_slot;
+                        bi.op = OpCode::StoreCaptureOfV;
+                        bi.set_b(co);
+                    }
+                    if (A.rename_from >= 0)
+                        bc_rename_slot(bi, A.rename_from + A.base, S.dst);
+                    for (size_t q = 0; q < A.param_renamed.size(); q++)
+                        if (A.param_renamed[q])
+                            bc_rename_slot(bi, A.base + static_cast<int>(q),
+                                           S.src_of[q]);
+                    visit_pc_fields(bi, [&](int &t) {
+                        /*
+                         * The gate's `branch-past-end` rejection means
+                         * every target is a real pc of this body. It did
+                         * NOT always: this used to map an out-of-range
+                         * target to the join, which SILENTLY left the
+                         * call's dst unwritten - the caller then read a
+                         * stale value where the callee would have returned
+                         * none. So assert rather than "handle" it: the
+                         * handling was the bug, and a loud abort is what
+                         * a revived shape should get. (A target naming a
+                         * void body's terminal Halt maps to the op after
+                         * the body, which is exactly where it falls.)
+                         */
+                        ML_CHECK_MSG(t >= 0 && static_cast<size_t>(t) < nb,
+                                     "bc splice: callee branch past its "
+                                     "end");
+                        t = static_cast<int>(body_base + P.lmap[t]);
+                    });
+                    if (has_loc)
+                        nlocs.push_back({ static_cast<uint32_t>(nc.size()),
+                                          bs, be });
+                    if (has_base)
+                        nbase.push_back({ static_cast<uint32_t>(nc.size()),
+                                          bbs, bbe });
+                    if (has_op)
+                        nop.push_back({ static_cast<uint32_t>(nc.size()),
+                                        obs, obe });
+                    if (bargs) {
+                        Chunk::ArgLocEntry ae;
+                        ae.pc = static_cast<uint32_t>(nc.size());
+                        ae.first = static_cast<uint32_t>(nargpool.size());
+                        ae.n = bargs->n;
+                        for (uint32_t q = 0; q < bargs->n; q++)
+                            nargpool.push_back(
+                                A.arg_loc_pool[bargs->first + q]);
+                        nargl.push_back(ae);
+                    }
+                    nctx.push_back({ static_cast<uint32_t>(nc.size()),
+                                     fidx });
+                    nc.push_back(bi);
+                    from_caller.push_back(0);
+                }
+                ML_CHECK(nc.size() == body_base + P.emitted);
+                if (S.value) {
+                    /* the hit path leaves over the rest of the site */
+                    Instr jm;
+                    jm.op = OpCode::Jump;
+                    jm.target = static_cast<int>(join);
+                    nc.push_back(jm);
+                    from_caller.push_back(0);
+                }
+            }
+            if (S.value) {
+                /* the miss arm - the original call, carried with its own
+                 * side tables, after the step-1 staging it reads */
+                ML_CHECK(nc.size() == miss_start);
+                for (size_t q = S.stage_first; q < S.pc; q++)
+                    emit_caller_op(q);
+                emit_caller_op(pc);
+                from_caller.back() = 0;     /* no pc fields to remap */
+                ML_CHECK(nc.size() == join);
+#ifdef TESTS
+                g_bc_inline_value_splices++;
+                if (S.arms.size() > 1)
+                    g_bc_inline_value_twoway++;
+#endif
+            }
+            continue;
+        }
+        emit_caller_op(pc);
+    }
+    old2new[ck.code.size()] = static_cast<uint32_t>(nc.size());
+
+    /* the caller's OWN branches move; the spliced ops already hold
+     * absolute new pcs, which is why from_caller exists */
+    for (size_t k = 0; k < nc.size(); k++)
+        if (from_caller[k])
+            visit_pc_fields(nc[k], [&](int &t) {
+                if (t >= 0 && static_cast<size_t>(t) < old2new.size())
+                    t = static_cast<int>(old2new[t]);
+            });
+
+    ck.code = std::move(nc);
+    ck.locs = std::move(nlocs);
+    ck.base_locs = std::move(nbase);                   /* #127 */
+    ck.op_locs = std::move(nop);                       /* RULE 2 */
+    ck.arg_locs = std::move(nargl);                    /* RULE 2 */
+    ck.arg_loc_pool = std::move(nargpool);
+    ck.value_callees = std::move(nvc);                 /* #97 E1 */
+    ck.call_arg_kinds.clear();      /* step 1b: its pcs die here */
+    ck.inline_ctxs = std::move(nctx);
+    ck.n_temps = next_base - ck.slot_count;
+    /* both lists (#97 CB5): a spliced body's slots are not the caller's
+     * PARAMETERS, so a raw scalar bind of the caller says nothing about
+     * them - they join ref_slots_raw in full */
+    for (std::vector<int32_t> *rl : { &ck.ref_slots, &ck.ref_slots_raw }) {
+        for (const Site &S : sites)
+            for (const Arm &A : S.arms) {
+                for (const int32_t r : A.ref_slots)
+                    rl->push_back(r + A.base);
+                /* step 1: a renamed reference result lives in dst now */
+                if (A.ref_rename)
+                    rl->push_back(S.dst);
+            }
+        std::sort(rl->begin(), rl->end());
+        rl->erase(std::unique(rl->begin(), rl->end()), rl->end());
+    }
+    ck.set_plain_frame();
+    /* boxed_ops is DERIVED from the final code + locs - rebuild rather
+     * than re-base (the .myv loader's rule, for the same reason) */
+    ck.boxed_ops.clear();
+    build_boxed_ops(ck);
+    ck.native_leaf = jit_chunk_is_native_leaf(ck);
+    jit_chunk_frameless_derive(ck);   /* #97 reach probe, W3, small-60 */
+    return true;
+}
+
+/*
+ * Rewrite a chunk's code op by op: `repl[pc].replace` swaps the op at pc
+ * for `repl[pc].ops` (none = delete it). Every pc field and every
+ * pc-keyed side table follows - a branch to a replaced op lands on its
+ * first replacement, a branch to a deleted one on the next op that
+ * survives; a side-table entry moves with its op (to the first
+ * replacement) and dies with a deleted one. The caller guarantees the
+ * chunk has no handler sites (whose pcs this does not remap); a
+ * replacement op's pc fields name OLD pcs, like every other op's.
+ */
+/* #97 increment 5: the capture slots the replacement created in the
+ * chunk it is working on (scratch, cleared around each chunk) */
+static std::set<int> g_bc_sra_cap_slots;
+
+struct BcRepl {
+    bool replace = false;
+    std::vector<Instr> ops;
+};
+static void bc_rewrite_ops(Chunk &ck, const std::vector<BcRepl> &repl)
+{
+    const size_t n = ck.code.size();
+    ML_CHECK(repl.size() == n && ck.handler_sites.empty());
+    std::vector<uint32_t> first(n + 1), alive(n, 1);
+    std::vector<Instr> nc;
+    for (size_t pc = 0; pc < n; pc++) {
+        first[pc] = static_cast<uint32_t>(nc.size());
+        if (!repl[pc].replace) {
+            nc.push_back(ck.code[pc]);
+            continue;
+        }
+        if (repl[pc].ops.empty())
+            alive[pc] = 0;
+        for (const Instr &o : repl[pc].ops)
+            nc.push_back(o);
+    }
+    first[n] = static_cast<uint32_t>(nc.size());
+    /* a deleted op's pc means the next op that survives: `first` of a
+     * deleted pc already IS that index, since nothing was pushed for it.
+     * A replacement op's pc fields are in the OLD numbering too, so every
+     * op is remapped the same way. */
+    for (Instr &in : nc)
+        visit_pc_fields(in, [&](int &t) {
+            if (t >= 0 && static_cast<size_t>(t) <= n)
+                t = static_cast<int>(first[static_cast<size_t>(t)]);
+        });
+    const auto move_pc = [&](auto &table) {
+        size_t w = 0;
+        for (size_t r = 0; r < table.size(); r++) {
+            const uint32_t p = table[r].pc;
+            if (p >= n || !alive[p])
+                continue;
+            table[w] = table[r];
+            table[w].pc = first[p];
+            w++;
+        }
+        table.resize(w);
+    };
+    move_pc(ck.locs);
+    move_pc(ck.base_locs);
+    move_pc(ck.op_locs);
+    move_pc(ck.arg_locs);
+    move_pc(ck.value_callees);
+    move_pc(ck.call_arg_kinds);
+    move_pc(ck.inline_ctxs);
+    ck.code = std::move(nc);
+}
+
+/*
+ * #97 closure inlining, INCREMENT 5 - SCALAR REPLACEMENT OF A CLOSURE
+ * THAT NEVER ESCAPES. After increments 3 and 4 a factory's closure is
+ * built in the frame that calls it (`make.closure c = D`) and every call
+ * of it is inlined behind a guard the make.closure proves. The object
+ * then does nothing a frame slot could not: its captures are per-
+ * instance state, and when nothing but those capture ops ever sees the
+ * instance, the instance is unobservable. So the captures become frame
+ * slots of the caller:
+ *     make.closure c = D   ->  move cap_k = <capture k's source slot>
+ *     load.capof x, c.cap[k]  ->  move x = cap_k
+ *     store.capof c.cap[k] = y  ->  move cap_k = y
+ *     guard.callee c is D  ->  (deleted: proven, see below)
+ * and no FuncObject is allocated, snapshotted, reference-counted, read
+ * through or freed.
+ *
+ * A slot S qualifies when, over the whole chunk:
+ *  - every WRITE of S is a make.closure of ONE descriptor D, whose
+ *    captures are all frame locals (the construction then only COPIES
+ *    slots, which moves reproduce);
+ *  - every READ of S in REACHABLE code (with S's proven guards counted
+ *    as falling through - their miss arms become dead) is a guard on S
+ *    or a plain capture op through S, AND at that pc every path has S
+ *    holding a D closure (closure_slot_facts - the G3 dataflow). Any
+ *    other read - a copy, a call, a return, an argument, a store into a
+ *    container, an unaudited op - is an ESCAPE, and S stays an object.
+ * Reassigning S (the next iteration's make.closure) starts a fresh
+ * instance, exactly as the copies re-initialise cap_k; the old instance
+ * was unreachable. A dead miss arm keeps its call through S - it never
+ * runs, and S is simply never written any more.
+ *
+ * Not in a chunk with try regions (handler pcs are not remapped) or
+ * past the splice's frame bound. Returns true if anything changed.
+ */
+static bool bc_scalar_replace_closures(Chunk &ck)
+{
+    if (!g_bc_inline_enabled || !g_bc_sra_enabled || ck.n_trys != 0
+            || !ck.handler_sites.empty())
+        return false;
+    const size_t n = ck.code.size();
+    const auto def_at = [&](int idx) -> const FuncDescriptor * {
+        return idx >= 0 && static_cast<size_t>(idx) < ck.closure_defs.size()
+                   ? ck.closure_defs[static_cast<size_t>(idx)] : nullptr;
+    };
+
+    /* the candidate slots and, per slot, the closures written into it */
+    struct Cand {
+        int slot;
+        std::vector<const FuncDescriptor *> defs;
+        bool dead = false;
+    };
+    std::vector<Cand> cands;
+    std::map<int, size_t> cand_of;
+    for (const Instr &in : ck.code) {
+        if (in.op != OpCode::MakeClosureV || in.target < 0)
+            continue;
+        const FuncDescriptor *d = def_at(in.target2);
+        int lo = 0, span = 0;
+        auto it = cand_of.find(in.target);
+        if (it == cand_of.end()) {
+            it = cand_of.emplace(in.target, cands.size()).first;
+            cands.push_back({ in.target, {}, false });
+        }
+        Cand &c = cands[it->second];
+        /* a capture-free closure has no state: only its identity, which
+         * the tag carries */
+        if (!d || (!d->captures.empty() && !make_closure_span(d, lo, span))) {
+            c.dead = true;              /* a capture that is not a local */
+            continue;
+        }
+        /* a dead slot stops collecting: the masks below are built over
+         * EVERY candidate's defs, and a 17th def shifts past uint16_t
+         * (and a 29th past the 32-bit shift itself - UB) */
+        if (c.dead)
+            continue;
+        if (std::find(c.defs.begin(), c.defs.end(), d) == c.defs.end())
+            c.defs.push_back(d);
+        if (c.defs.size() > 14)
+            c.dead = true;              /* past the mask's width */
+    }
+    if (cands.empty())
+        return false;
+    const size_t nc = cands.size();
+    /* per slot, a MAY mask: bit 0 = unwritten (none), bit 1 = some other
+     * value, bit 2 + j = a closure of defs[j] */
+    const uint16_t M_NONE = 1, M_OTHER = 2;
+    const auto dbit = [](size_t j) { return uint16_t(4u << j); };
+    const auto dbits = [&](const Cand &c) {
+        uint16_t m = 0;
+        for (size_t j = 0; j < c.defs.size(); j++)
+            m = static_cast<uint16_t>(m | dbit(j));
+        return m;
+    };
+    const auto djx = [&](const Cand &c, const FuncDescriptor *d) -> int {
+        for (size_t j = 0; j < c.defs.size(); j++)
+            if (c.defs[j] == d)
+                return static_cast<int>(j);
+        return -1;
+    };
+
+    /*
+     * THE MAY DATAFLOW, with its own reachability: a state per pc (one
+     * mask per candidate), unioned at joins, propagated only along edges
+     * the guards leave open - a guard on S for closure j lets through
+     * S & {j} on its fall-through and S & ~{j} on its else-edge, and an
+     * edge whose guarded mask is EMPTY is dead. So the miss arm of a
+     * guard chain that covers every closure the slot can hold is never
+     * reached, and neither is the call in it.
+     */
+    std::vector<uint16_t> in(n * nc, 0);
+    std::vector<char> reached(n, 0);
+    std::vector<size_t> work;
+    for (size_t k = 0; k < nc; k++)
+        in[k] = M_NONE;
+    reached[0] = 1;
+    work.push_back(0);
+    std::vector<uint16_t> out(nc);
+    while (!work.empty()) {
+        const size_t p = work.back();
+        work.pop_back();
+        const Instr &op = ck.code[p];
+        for (size_t k = 0; k < nc; k++)
+            out[k] = in[p * nc + k];
+        std::vector<int> defs;
+        if (!visit_use_def(op, [](int) {}, [&](int d) { defs.push_back(d); }))
+            return false;               /* an unaudited op may write S */
+        for (int d : defs) {
+            auto it = cand_of.find(d);
+            if (it == cand_of.end())
+                continue;
+            const Cand &c = cands[it->second];
+            if (op.op == OpCode::MakeClosureV && op.target == d) {
+                const int j = djx(c, def_at(op.target2));
+                out[it->second] = j >= 0 ? dbit(static_cast<size_t>(j))
+                                         : M_OTHER;
+            } else {
+                out[it->second] = M_OTHER;
+            }
+        }
+        const auto flow = [&](size_t t, int gk, uint16_t gmask) {
+            if (t >= n)
+                return;
+            bool changed = !reached[t];
+            for (size_t k = 0; k < nc; k++) {
+                const uint16_t v = static_cast<int>(k) == gk ? gmask : out[k];
+                uint16_t &dst = in[t * nc + k];
+                if ((dst | v) != dst) {
+                    dst = static_cast<uint16_t>(dst | v);
+                    changed = true;
+                }
+            }
+            reached[t] = 1;
+            if (changed)
+                work.push_back(t);
+        };
+        int gk = -1;
+        uint16_t gbit = 0;
+        if (op.op == OpCode::GuardCalleeV && !op.a_is_lit()) {
+            auto it = cand_of.find(op.a_slot());
+            if (it != cand_of.end()) {
+                const int j = djx(cands[it->second], def_at(op.target2));
+                gk = static_cast<int>(it->second);
+                gbit = j >= 0 ? dbit(static_cast<size_t>(j)) : 0;
+            }
+        }
+        if (gk >= 0) {
+            const uint16_t m = out[static_cast<size_t>(gk)];
+            /* else-edge: the slot does NOT hold closure j */
+            const uint16_t me = static_cast<uint16_t>(m & ~gbit);
+            if (me && op.target >= 0)
+                flow(static_cast<size_t>(op.target), gk, me);
+            const uint16_t mf = static_cast<uint16_t>(m & gbit);
+            if (mf && p + 1 < n)
+                flow(p + 1, gk, mf);
+            continue;
+        }
+        Instr tmp = op;
+        visit_pc_fields(tmp, [&](int &t) {
+            if (t >= 0)
+                flow(static_cast<size_t>(t), -1, 0);
+        });
+        if (op_falls_through(op.op) && p + 1 < n)
+            flow(p + 1, -1, 0);
+    }
+
+    /*
+     * THE ESCAPE SCAN, over reached code. A read of S while it may hold a
+     * closure must be one the replacement can express: a guard (only
+     * where S can hold nothing BUT closures - a stale tag must not
+     * answer for an int), or a plain capture op (only where S holds
+     * exactly one known closure - the op must know whose capture slots
+     * it reads). A read while S cannot hold a closure is not a closure
+     * read at all (the slot is reused as a scalar temp - a factory's
+     * renamed return slot does this) and stays as it is.
+     */
+    for (size_t pc = 0; pc < n; pc++) {
+        if (!reached[pc])
+            continue;
+        const Instr &op = ck.code[pc];
+        std::vector<int> uses;
+        visit_use_def(op, [&](int u) { uses.push_back(u); }, [](int) {});
+        for (int u : uses) {
+            auto it = cand_of.find(u);
+            if (it == cand_of.end())
+                continue;
+            Cand &c = cands[it->second];
+            const uint16_t m = in[pc * nc + it->second];
+            const uint16_t cl = static_cast<uint16_t>(m & dbits(c));
+            if (!cl)
+                continue;                /* not a closure read */
+            const bool single = (cl & (cl - 1)) == 0
+                                && !(m & (M_NONE | M_OTHER));
+            bool ok = false;
+            if (op.op == OpCode::GuardCalleeV && op.a_slot() == u)
+                ok = !(m & (M_NONE | M_OTHER));
+            else if (op.op == OpCode::LoadCaptureOfV && op.a_slot() == u
+                     && op.target != u)
+                ok = single;
+            else if (op.op == OpCode::StoreCaptureOfV && op.b_slot() == u
+                     && !op.a_is_lit() && op.a_slot() != u
+                     && op.aop == Op::invalid)
+                ok = single;
+            if (!ok)
+                c.dead = true;
+        }
+    }
+
+    /*
+     * PROFITABILITY: only where a closure is BUILT in a loop. There the
+     * replacement removes an allocation, a capture snapshot, a
+     * reference count and a free per iteration (63_closures: -65%
+     * cycles). A closure built once, before its loop, costs nothing per
+     * iteration - its guards are already proven (G3) or hoisted (G1) and
+     * its capture ops are proven-scalar 8-byte copies - while the
+     * replacement's MoveV is the BOXED move the JIT deliberately never
+     * treats as type evidence. Measured before this gate:
+     * 11_closure_counter +20% cycles and 98_local_closure_call +51%,
+     * instructions 2x.
+     */
+    {
+        std::vector<char> in_loop(n, 0);
+        for (size_t p = 0; p < n; p++) {
+            Instr tmp = ck.code[p];
+            visit_pc_fields(tmp, [&](int &t) {
+                if (t >= 0 && static_cast<size_t>(t) <= p)
+                    for (size_t q = static_cast<size_t>(t); q <= p; q++)
+                        in_loop[q] = 1;
+            });
+        }
+        std::set<int> built_in_loop;
+        for (size_t p = 0; p < n; p++)
+            if (ck.code[p].op == OpCode::MakeClosureV && in_loop[p])
+                built_in_loop.insert(ck.code[p].target);
+        for (Cand &c : cands)
+            if (!built_in_loop.count(c.slot) || c.defs.empty())
+                c.dead = true;
+    }
+    bool any_live = false;
+    for (const Cand &c : cands)
+        any_live |= !c.dead;
+    if (!any_live)
+        return false;
+
+    /* the new slots: per closure its capture slots; per slot with more
+     * than one closure, an int TAG naming which one it holds */
+    int next = ck.slot_count + ck.n_temps;
+    std::vector<std::vector<int>> cap_base(nc);
+    std::vector<int> tag(nc, -1);
+    for (size_t k = 0; k < nc; k++) {
+        Cand &c = cands[k];
+        if (c.dead)
+            continue;
+        if (c.defs.size() > 1)
+            tag[k] = next++;
+        for (const FuncDescriptor *d : c.defs) {
+            cap_base[k].push_back(next);
+            next += static_cast<int>(d->captures.size());
+        }
+    }
+    if (next > BC_INLINE_MAX_FRAME)
+        return false;
+
+    std::vector<BcRepl> repl(n);
+    std::set<int32_t> refs(ck.ref_slots.begin(), ck.ref_slots.end());
+    std::set<int32_t> new_refs;
+    /* a capture every access of which carries the #111 scalar proof
+     * (`cap_scalar`: the captured variable's static type is int or
+     * float) can never hold a reference, whatever the temp it was copied
+     * from once held - such a slot stays off ref_slots */
+    std::map<int, bool> scalar_cap;              /* capture slot -> */
+    const auto cap_slot_at = [&](size_t pc, size_t k, int idx) -> int {
+        const uint16_t cl = static_cast<uint16_t>(
+            in[pc * nc + k] & dbits(cands[k]));
+        for (size_t j = 0; j < cands[k].defs.size(); j++)
+            if (cl == dbit(j))
+                return cap_base[k][j] + idx;
+        return -1;
+    };
+    for (size_t pc = 0; pc < n; pc++) {
+        if (!reached[pc])
+            continue;
+        const Instr &op = ck.code[pc];
+        int sl = -1, idx = -1;
+        if (op.op == OpCode::LoadCaptureOfV && !op.a_is_lit()) {
+            sl = op.a_slot(); idx = op.target2;
+        } else if (op.op == OpCode::StoreCaptureOfV && !op.b_is_lit()) {
+            sl = op.b_slot(); idx = op.target;
+        }
+        auto it = cand_of.find(sl);
+        if (sl < 0 || it == cand_of.end() || cands[it->second].dead)
+            continue;
+        const int cs = cap_slot_at(pc, it->second, idx);
+        if (cs < 0)
+            continue;
+        auto sc = scalar_cap.find(cs);
+        if (sc == scalar_cap.end())
+            scalar_cap[cs] = op.cap_scalar();
+        else
+            sc->second = sc->second && op.cap_scalar();
+    }
+    const auto is_scalar_cap = [&](int cs) {
+        auto it = scalar_cap.find(cs);
+        return it != scalar_cap.end() && it->second;
+    };
+    const auto mv = [](int dst, int src) {
+        Instr m;
+        m.op = OpCode::MoveV;
+        m.target = dst;
+        m.target2 = src;
+        return m;
+    };
+    for (size_t pc = 0; pc < n; pc++) {
+        const Instr &op = ck.code[pc];
+        BcRepl &r = repl[pc];
+        if (op.op == OpCode::MakeClosureV) {
+            auto it = cand_of.find(op.target);
+            if (it == cand_of.end() || cands[it->second].dead)
+                continue;
+            const size_t k = it->second;
+            const FuncDescriptor *d = def_at(op.target2);
+            const int j = djx(cands[k], d);
+            const int off = make_closure_offset(op, d);
+            r.replace = true;
+            for (size_t q = 0; q < d->captures.size(); q++) {
+                const int cs = cap_base[k][static_cast<size_t>(j)]
+                               + static_cast<int>(q);
+                const int src = d->captures[q].slot + off;
+                r.ops.push_back(mv(cs, src));
+                if (refs.count(src) && !is_scalar_cap(cs))
+                    new_refs.insert(cs);
+            }
+            /* the tag LAST: the collapse forwards a move only into the
+             * op right after it, and the copy the factory made of a
+             * capture is that op's source */
+            if (tag[k] >= 0) {
+                Instr li;
+                li.op = OpCode::LoadImmInt;
+                li.target = tag[k];
+                li.set_a(int_lit(j));
+                r.ops.push_back(li);
+            }
+            continue;
+        }
+        if (!reached[pc])
+            continue;                   /* dead code keeps its ops */
+        if (op.op == OpCode::GuardCalleeV && !op.a_is_lit()) {
+            auto it = cand_of.find(op.a_slot());
+            if (it == cand_of.end() || cands[it->second].dead)
+                continue;
+            const size_t k = it->second;
+            const int j = djx(cands[k], def_at(op.target2));
+            const uint16_t m = in[pc * nc + k];
+            const uint16_t gb = j >= 0 ? dbit(static_cast<size_t>(j)) : 0;
+            r.replace = true;
+            if ((m & ~gb) == 0) {
+                /* proven: delete */
+            } else if ((m & gb) == 0) {
+                Instr jm;                /* refuted: always the else */
+                jm.op = OpCode::Jump;
+                jm.target = op.target;
+                r.ops.push_back(jm);
+            } else {
+                Instr cj;                /* the tag decides */
+                cj.op = OpCode::JumpUnlessIntCmp;
+                cj.aop = Op::eq;
+                Operand ta;
+                ta.slot = tag[k];
+                cj.set_a(ta);
+                cj.set_b(int_lit(j));
+                cj.target = op.target;
+                r.ops.push_back(cj);
+            }
+            continue;
+        }
+        if (op.op == OpCode::LoadCaptureOfV && !op.a_is_lit()) {
+            auto it = cand_of.find(op.a_slot());
+            if (it == cand_of.end() || cands[it->second].dead)
+                continue;
+            const int cs = cap_slot_at(pc, it->second, op.target2);
+            ML_CHECK(cs >= 0);
+            r.replace = true;
+            r.ops.push_back(mv(op.target, cs));
+            continue;
+        }
+        if (op.op == OpCode::StoreCaptureOfV && !op.b_is_lit()) {
+            auto it = cand_of.find(op.b_slot());
+            if (it == cand_of.end() || cands[it->second].dead)
+                continue;
+            const int cs = cap_slot_at(pc, it->second, op.target);
+            ML_CHECK(cs >= 0);
+            r.replace = true;
+            r.ops.push_back(mv(cs, op.a_slot()));
+            if (refs.count(op.a_slot()) && !is_scalar_cap(cs))
+                new_refs.insert(cs);
+        }
+    }
+#ifdef TESTS
+    for (const Cand &c : cands)
+        if (!c.dead) {
+            g_bc_sra_closures++;
+            if (c.defs.size() > 1)
+                g_bc_sra_tagged++;
+        }
+#endif
+    bc_rewrite_ops(ck, repl);
+    ck.n_temps = next - ck.slot_count;
+    for (size_t k = 0; k < nc; k++)
+        for (size_t j = 0; j < cap_base[k].size(); j++)
+            for (size_t q = 0; q < cands[k].defs[j]->captures.size(); q++)
+                g_bc_sra_cap_slots.insert(cap_base[k][j]
+                                          + static_cast<int>(q));
+    /* a capture slot may hold a reference exactly when something that
+     * may hold one is copied into it (the MoveV rule of ref_slots) */
+    for (std::vector<int32_t> *rl : { &ck.ref_slots, &ck.ref_slots_raw }) {
+        for (const int32_t r : new_refs)
+            rl->push_back(r);
+        std::sort(rl->begin(), rl->end());
+        rl->erase(std::unique(rl->begin(), rl->end()), rl->end());
+    }
+    return true;
+}
+
+/*
+ * #97 increment 5 follow-up: COLLAPSE the move chains the replacement
+ * leaves. Each capture op became a MoveV, and so did the capture copy at
+ * construction - the BOXED move, which the JIT never treats as type
+ * evidence. So a capture slot written only by moves can never live in a
+ * register, and every access is a full value copy with reference checks.
+ * Three local rewrites, over moves touching a capture slot C only, each
+ * at a pc no branch lands on (a path around the move would see the
+ * other slot's old value):
+ *   FORWARD   move x = C ; op(x)      ->  op(C)
+ *             x a temp the move alone writes and the op alone reads;
+ *   RETARGET  op y = ... ; move C = y  ->  op C = ...
+ *             y a temp that op alone writes and the move alone reads;
+ *   SWAP      op y = ... ; move C = y  ->  op C = ... ; move y = C
+ *             y read again later - the TYPED op now writes C, which is
+ *             what lets the JIT keep C in a register.
+ * `op` is one that writes exactly its `target` (checked through
+ * visit_use_def, not assumed): the typed arithmetic and compares, the
+ * immediates, a move, a flat element read. A retarget carries y's
+ * reference status to C. Returns true if anything changed.
+ */
+static bool bc_collapse_capture_moves(Chunk &ck)
+{
+    const auto retargetable = [](const Instr &in) {
+        const OpCode op = in.op;
+        const bool fam = static_cast<int>(op)
+                             >= static_cast<int>(OpCode::IntAddRR)
+                         && static_cast<int>(op)
+                             <= static_cast<int>(OpCode::FloatMulRI);
+        /* (IntModRI is a member of the family range, so `fam` is its
+         * answer: listed again here it was a term no op could decide) */
+        const bool listed = fam || op == OpCode::IntBin
+            || op == OpCode::FloatBin || op == OpCode::CmpIntV
+            || op == OpCode::CmpFloatV
+            || op == OpCode::IntAddModRI || op == OpCode::LoadImmInt
+            || op == OpCode::LoadImmFloat || op == OpCode::MoveV
+            || op == OpCode::LoadElemInt || op == OpCode::LoadElemFloat;
+        if (!listed || in.target < 0)
+            return false;
+        std::vector<int> defs;
+        if (!visit_use_def(in, [](int) {}, [&](int d) { defs.push_back(d); }))
+            return false;
+        return defs.size() == 1 && defs[0] == in.target;
+    };
+    const auto renamable = [](const Instr &in) {
+        return (bc_inline_op_ok(in.op) && in.op != OpCode::CallV)
+               || in.op == OpCode::StoreElemInt
+               || in.op == OpCode::StoreElemFloat;
+    };
+    bool changed_any = false;
+    for (int iter = 0; iter < 16; iter++) {
+        const size_t n = ck.code.size();
+        std::vector<int> nuse(ck.slot_count + ck.n_temps + 1, 0),
+                         ndef(ck.slot_count + ck.n_temps + 1, 0);
+        std::vector<char> is_target(n + 1, 0);
+        for (size_t p = 0; p < n; p++) {
+            const Instr &in = ck.code[p];
+            if (!visit_use_def(in,
+                    [&](int s) {
+                        if (s >= 0 && static_cast<size_t>(s) < nuse.size())
+                            nuse[s]++;
+                    },
+                    [&](int s) {
+                        if (s >= 0 && static_cast<size_t>(s) < ndef.size())
+                            ndef[s]++;
+                    }))
+                return changed_any;         /* an unaudited op: stop */
+            Instr tmp = in;
+            visit_pc_fields(tmp, [&](int &t) {
+                if (t >= 0 && static_cast<size_t>(t) <= n)
+                    is_target[static_cast<size_t>(t)] = 1;
+            });
+        }
+        const auto temp1 = [&](int s) {       /* one def, one use, a temp */
+            return s >= ck.slot_count
+                   && static_cast<size_t>(s) < nuse.size()
+                   && ndef[s] == 1 && nuse[s] == 1;
+        };
+        std::set<int32_t> refs(ck.ref_slots.begin(), ck.ref_slots.end());
+        std::vector<BcRepl> repl(n);
+        std::vector<char> touched(n, 0);
+        bool any = false;
+        for (size_t pc = 0; pc < n; pc++) {
+            if (touched[pc])
+                continue;
+            Instr &in = ck.code[pc];
+            if (in.op != OpCode::MoveV)
+                continue;
+            const int dst = in.target, src = in.target2;
+            /* FORWARD: move x = C ; op(x) */
+            if (g_bc_sra_cap_slots.count(src) && temp1(dst)
+                    && pc + 1 < n && !touched[pc + 1]
+                    && !is_target[pc + 1] && renamable(ck.code[pc + 1])) {
+                Instr &nx = ck.code[pc + 1];
+                bool reads = false, writes = false;
+                visit_use_def(nx, [&](int s) { reads |= s == dst; },
+                              [&](int s) { writes |= s == dst; });
+                if (reads && !writes) {
+#ifdef TESTS
+                    g_bc_sra_collapsed++;
+#endif
+                    bc_rename_slot(nx, dst, src);
+                    repl[pc].replace = true;          /* delete */
+                    touched[pc] = touched[pc + 1] = 1;
+                    any = true;
+                    continue;
+                }
+            }
+            /* RETARGET / SWAP: op y = ... ; move C = y */
+            /* no count of y's OTHER writers is needed: the move is
+             * reached only from the op before it (no branch lands on
+             * it), so the value it copies is that op's */
+            if (g_bc_sra_cap_slots.count(dst) && src >= ck.slot_count
+                    && pc > 0 && !touched[pc - 1] && !is_target[pc]
+                    && static_cast<size_t>(src) < nuse.size()) {
+                Instr &pv = ck.code[pc - 1];
+                if (!retargetable(pv) || pv.target != src)
+                    continue;
+                bool reads_dst = false;
+                visit_use_def(pv, [&](int s) { reads_dst |= s == dst; },
+                              [](int) {});
+                if (nuse[src] == 1) {
+                    pv.target = dst;                  /* RETARGET */
+                    repl[pc].replace = true;
+                } else if (pv.op != OpCode::MoveV) {
+                    pv.target = dst;                  /* SWAP */
+                    Instr back;
+                    back.op = OpCode::MoveV;
+                    back.target = src;
+                    back.target2 = dst;
+                    repl[pc].replace = true;
+                    repl[pc].ops.push_back(back);
+                } else {
+                    continue;
+                }
+                (void)reads_dst;    /* op reads C then writes it: fine */
+                if (refs.count(src)) {
+                    ck.ref_slots.push_back(dst);
+                    ck.ref_slots_raw.push_back(dst);
+                }
+                touched[pc] = touched[pc - 1] = 1;
+                any = true;
+#ifdef TESTS
+                g_bc_sra_collapsed++;
+#endif
+            }
+        }
+        if (!any)
+            break;
+        bc_rewrite_ops(ck, repl);
+        changed_any = true;
+    }
+    for (std::vector<int32_t> *rl : { &ck.ref_slots, &ck.ref_slots_raw }) {
+        std::sort(rl->begin(), rl->end());
+        rl->erase(std::unique(rl->begin(), rl->end()), rl->end());
+    }
+    return changed_any;
+}
+
+std::vector<const FuncDescriptor *> bc_inline_slot_map(
+    const std::vector<const FuncDescriptor *> &slot_desc,
+    const std::vector<char> &reassigned)
+{
+    std::vector<const FuncDescriptor *> m = slot_desc;
+    for (size_t s = 0; s < m.size(); s++)
+        if (s < reassigned.size() && reassigned[s])
+            m[s] = nullptr;
+    return m;
+}
+
+bool bc_inline_chunk(Chunk &ck,
+                     const std::vector<const FuncDescriptor *> &slot_desc,
+                     const BcInlineSnapshots &snaps, bool value_only)
+{
+    const bool spliced = bc_inline_chunk_splice(ck, slot_desc, snaps,
+                                                value_only);
+    g_bc_sra_cap_slots.clear();
+    const bool replaced = bc_scalar_replace_closures(ck);
+    if (replaced && g_bc_sra_collapse)
+        bc_collapse_capture_moves(ck);
+    g_bc_sra_cap_slots.clear();
+    if (!replaced)
+        return spliced;
+    ck.set_plain_frame();
+    ck.boxed_ops.clear();
+    build_boxed_ops(ck);
+    ck.native_leaf = jit_chunk_is_native_leaf(ck);
+    jit_chunk_frameless_derive(ck);
+    return true;
+}

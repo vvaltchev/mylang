@@ -4,15 +4,21 @@
 #include "statictype.h"
 #include "errors.h"
 #include "inferencer.h"
+#include "inttest.h"
 #include "analyzer.h"
 #include "evalvalue.h"
 #include "eval.h"
+#include "cyclewalk.h"    /* a constant's value may contain itself */
 #include "trace.h"
 #include "resolver.h"     /* for_each_child_slot (fold_show_calls) */
 #include "coderender.h"   /* render_func_code / render_construct_code */
+#include "env.h"          /* env_get (#72: MYLANG_BCINLINE_CANDS) */
 
+#include <cstring>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
+#include <map>
 #include <vector>
 #include <memory>
 #include <string>
@@ -21,9 +27,21 @@
 #include <ostream>
 #include <cstdio>
 
+/* #97 (#72): the most candidates a value call site is stamped with -
+ * the splice's guard-chain cap, measured (see docs/jit-optimizations.md,
+ * *#97 #72*). MYLANG_BCINLINE_CANDS overrides it (2 = the two-way sites
+ * only, as before #72), clamped to ML_VALUE_CANDS_HARD. */
+int g_value_cands_max = [] {
+    const auto e = env_get("MYLANG_BCINLINE_CANDS");
+    int v = 8;      /* measured: every k <= 8 wins when fully spliced */
+    if (e && !e->empty())
+        v = std::atoi(e->c_str());
+    return v < 2 ? 2 : v > ML_VALUE_CANDS_HARD ? ML_VALUE_CANDS_HARD : v;
+}();
+
 /*
- * Whole-program static type inference + checking. See plans/type-inference.md
- * and plans/type-inference-questions.md for the design and decisions.
+ * Whole-program static type inference + checking. See plans/archived/type-inference.md
+ * and plans/archived/type-inference-questions.md for the design and decisions.
  *
  * Pipeline (Inferencer::run):
  *   1. structural  - build scopes; one TypeSym per declaration; resolve every
@@ -32,9 +50,10 @@
  *                    return type into `acc` (join of all contributions) while
  *                    reading the previous round's stable `type`; commit acc->
  *                    type; repeat until stable. Reading stable values keeps the
- *                    round order-independent; kinds only climb the lattice,
- *                    so a join conflict (e.g. int vs str) is a real, stable
- *                    error and is raised immediately.
+ *                    round order-independent. A join conflict (e.g. int vs
+ *                    str) is an error only if it is still there once the
+ *                    fixpoint has converged: a type can climb to `dyn`,
+ *                    where the conflict disappears (Inferencer::conflict).
  *   3. check       - with final types, validate every operation/call/assign/
  *                    return and throw on a violation.
  */
@@ -45,6 +64,11 @@
 namespace {
 
 struct FuncInfo;
+
+/* TypeSym::arg_kinds bits: the scalar kinds contributed to a parameter */
+enum : uint8_t {
+    ARGK_BOOL = 1, ARGK_INT = 2, ARGK_FLOAT = 4, ARGK_DYN = 8,
+};
 
 struct TypeSym {
     const UniqueId *name = nullptr;
@@ -63,6 +87,7 @@ struct TypeSym {
      * the full type (kind AND element types), exactly like a scalar pin. */
     std::shared_ptr<TypeAnnot> ann_annot;
     bool is_param = false;
+    bool const_param = false;  /* a `const` parameter */
     bool const_decl = false;   /* declared `const` (vs `var`) */
     bool is_loopvar = false;   /* a foreach loop variable (type is derived) */
     /*
@@ -78,7 +103,48 @@ struct TypeSym {
      * inferencer stamps `decl_id->decl_type` so `coerce_to_decl_type` fires.
      */
     bool round_got_dyn = false;
+    /* ...and one of those values was a `dyn?`: what the symbol becomes is
+     * nullable too (a numeric local an `int?`, anything else a `dyn?`) -
+     * a `none` it may bring is not coerced away */
+    bool round_got_dyn_opt = false;
     bool coerces_dyn = false;
+    /*
+     * Rule 1 (plans/strict-container-types.md): the ELEMENT analogue of
+     * the coercion above. A non-opt `dyn` stored or appended into an
+     * inferred container (`a[i] = d`, `append(a, d)`) does not widen a
+     * NUMERIC element type to `dyn` - the store converts the value at run
+     * time, checked - so `var a = [1]; append(a, runtime(2))` stays an
+     * array<int>; any other element type takes the `dyn` (commit_round).
+     * Bit 1: an array's element or a dict's value got one this round,
+     * bit 2: a dict's key. Choice 7: an explicit `none` stored the same
+     * way is a `none`, not "no element" - the component becomes nullable
+     * (bit 4: an element or a dict's value, bit 8: a dict's key), so
+     * `var a = [1]; a[0] = none` is an array<int?>.
+     */
+    unsigned char round_elem_dyn = 0;
+    /*
+     * A contribution whose type the fixpoint could not settle (Unknown at
+     * the top): this round, and as of the last committed round. A local
+     * that ends Unknown having received one is NOT unconstrained - it was
+     * assigned values of an unknowable type (an undefined name, a call to
+     * one, a parameter no call site feeds) - so it finalizes `dyn`, not
+     * `none`, and `untyped_dyn` exempts it from the mandatory-dyn rule:
+     * an undefined name is the resolver's error to report (the inferencer
+     * runs first, and its "type 'none'" NullabilityEx hid "Undefined
+     * variable"), and a `defined()`-guarded branch reading one is
+     * deleted, never run.
+     */
+    bool round_got_unknown = false;
+    bool got_unknown = false;
+    bool untyped_dyn = false;
+    /* A PARAMETER's contributed scalar kinds (bit per ArgKind), per round
+     * and as of the last committed round: what stamp_inferred_param_types
+     * reads to stamp a decl_type only where a bind can actually CONVERT
+     * (a float param some site feeds an int). Stamping one whose every
+     * contribution already has its final type turns fast_bind off for
+     * nothing - measured +49% Ir on 34_sort_custom_cmp's comparator. */
+    uint8_t round_arg_kinds = 0;
+    uint8_t arg_kinds = 0;
     Identifier *decl_id = nullptr;   /* the decl Identifier (for decl_type stamp) */
     /* Structural-pass bookkeeping for safe var-bound-lambda monomorphization:
      * how many times the name is written (decl + assigns), and whether it is
@@ -87,6 +153,12 @@ struct TypeSym {
      * a template (calls redirect to typed clones; nothing else holds it). */
     int writes = 0;
     bool value_used = false;
+    /* The symbol is a NAMED function's name (a FuncDeclStmt binds it; its
+     * declaration is not counted in `writes`). With writes > 0 the name is
+     * REBOUND - a global holding a function value - so no pass may treat a
+     * call through it as a call to the declared function (see
+     * func_name_rebound). */
+    bool named_func = false;
     /* A param that received a possibly-none (opt/none) argument at some call
      * site (set in the check pass). With strict_dyn on, a non-opt non-dyn param
      * with this set is a compile error demanding `opt` (enforce_nonnull_params,
@@ -106,11 +178,41 @@ struct TypeSym {
      * rather than these. Set during the structural pass. */
     bool in_template = false;
     Loc decl_loc;
+    Loc decl_end;              /* its name's end (an error's caret span) */
     FuncInfo *func = nullptr;  /* non-null when this name is a function */
     /* non-null when this name is a struct TYPE (a `struct` decl): the symbol is
      * a type descriptor, callable (construction) + `.CONST`-accessible. */
     const StructTypeDef *struct_type = nullptr;
+    /* ...and it is a TYPE ALIAS (`const T = S;`), not the struct's own
+     * declaration: a const, bound where its declaration runs (a
+     * construction through it stamps CallExpr::ctor_alias) */
+    bool type_alias = false;
 };
+
+/*
+ * A TEMPLATE parameter - the ones an instance's signature is keyed by: an
+ * un-annotated, non-`dyn` one, or (rule 5, plans/strict-container-types.md)
+ * one annotated with a bare `array` / `dict`, a HOLE each call fills (the
+ * annotation then only checks the argument is an array / a dict, in the
+ * instance) - `opt` or not (rule 8.1: an `opt` one is keyed by the
+ * argument's type without its `?`, template_arg_key). Each used to join
+ * its call sites into one type, which rule 1 refuses for two different
+ * element types, and which made `f(2)` and `f(2.5)` both return floats.
+ */
+static bool template_param(bool dyn, DeclType ann, const TypeAnnot *annot)
+{
+    return !dyn
+        && (ann == DeclType::none
+            || ((ann == DeclType::arr || ann == DeclType::dict) && !annot));
+}
+static bool template_param(const TypeSym *p)
+{
+    return template_param(p->dyn_decl, p->ann, p->ann_annot.get());
+}
+static bool template_param(const Identifier *p)
+{
+    return template_param(p->dyn_mod, p->decl_type, p->decl_annot.get());
+}
 
 struct FuncInfo {
     FuncDeclStmt *decl = nullptr;
@@ -131,25 +233,63 @@ struct FuncInfo {
      * A TEMPLATE: at least one parameter is un-annotated and not explicitly
      * `dyn`, so its type is not fixed by the declaration. Such a function is
      * not type-checked in isolation; it is instantiated per call-site signature
-     * as a typed clone (see plans/function-templates.md). A `dyn` param is not
+     * as a typed clone (see plans/archived/function-templates.md). A `dyn` param is not
      * a template parameter - it is the explicit "one instantiation, any type".
      */
     bool is_template = false;
 
-    /*
-     * Value-template tracking (plans/value-template-instantiation.md): the
-     * template's VALUE escaped precise tracking (a join dropped its finfo
-     * set, or it was passed as a call/builtin ARGUMENT or captured) - an
-     * untracked call site could then reach a typed instance with a
-     * mismatched signature, so an escaped template is never
-     * value-instantiated (its base keeps running, as before).
-     */
-    bool value_escaped = false;
+};
+
+/*
+ * THE CALLEE-SET ANALYSIS's value domain (#116). The analysis itself
+ * is calleeset.cpp.h, included once at the end of this file; only the
+ * types the Inferencer's members need live here.
+ *
+ * A set of ABSTRACT VALUES a location may hold: functions, and
+ * container allocation sites ("objects"). `top` is ⊤ - "I do not
+ * know" - which the empty set (⊥, "nothing can reach here")
+ * deliberately does NOT mean. That distinction is the whole point:
+ * `StaticType::finfos`, which this replaces, could not express it and
+ * needed a side ledger (escaped_finfos) to fake it.
+ */
+struct CsSet {
+    bool top = false;                /* ⊤ - unknown */
+    std::vector<FuncInfo *> funcs;   /* unique, unordered */
+    std::vector<int> objs;           /* unique, unordered - alloc sites */
+
+    bool add_func(FuncInfo *f);
+    bool add_obj(int o);
+    bool set_top();
+    bool merge(const CsSet &o);      /* -> did anything change? */
+    bool empty() const { return !top && funcs.empty() && objs.empty(); }
+};
+
+/* An ABSTRACT LOCATION, keyed by PROGRAM LOCATION and never by type -
+ * which is exactly what `finfos` got wrong. */
+enum class CsLocKind : unsigned char {
+    sym,       /* a variable / parameter / capture (TypeSym *)   */
+    ret,       /* a function's return value      (FuncInfo *)    */
+    elem,      /* everything inside one container (an obj id)    */
+};
+
+struct CsLocKey {
+    CsLocKind kind;
+    const void *p;
+    int obj;
+    bool operator<(const CsLocKey &o) const {
+        if (kind != o.kind) return kind < o.kind;
+        if (p != o.p)       return p < o.p;
+        return obj < o.obj;
+    }
 };
 
 struct Scope {
     std::unordered_map<const UniqueId *, TypeSym *> syms;
     Scope *parent = nullptr;
+    /* the names in `syms` that are a closure's CAPTURES: each is bound to
+     * the outer symbol (a capture has its type), but is its own binding -
+     * never the outer `const` */
+    std::unordered_set<const UniqueId *> capture_names;
 };
 
 class Inferencer {
@@ -158,10 +298,28 @@ public:
 
     explicit Inferencer(Construct *root = nullptr) : root(root) { }
     void run();
+    void propagate_decl_types();   /* question 5: see infer_parse_time */
+    std::string value_type_key(const EvalValue &v) {
+        return static_type_to_string(static_type_from_value(v));
+    }
+    void stamp_proven_params();     /* C3: see the definition */
+    /* #38 C: see the definition */
+    void stamp_inferred_param_types(Construct *rootn);
     void setup();                  /* once: bottom + global scope */
     void infer_input(Block *root); /* REPL: one input, commit+pin its globals */
+    void reject_input();           /* REPL: take the last input back */
+    /* REPL: forget what a part-run input's unreached decls committed */
+    void forget_unbound(const std::function<bool (const UniqueId *)> &ran);
     void undef_global(const UniqueId *name);  /* REPL undef(x) */
     void dump_debug_ti(std::ostream &os);   /* --debug-ti */
+    void dump_callee_sets(std::ostream &os); /* -dcs (see calleeset.cpp.h) */
+
+    /* THE CALLEE-SET ANALYSIS (#116). `callee_set(e)` answers which
+     * functions the expression `e` can evaluate to - a set, or ⊤;
+     * `callee_escaped(f)` whether f's value left the analysed program.
+     * Run at the end of infer_one, after instantiation (see there). */
+    CsSet callee_set(Construct *e);
+    bool callee_escaped(FuncInfo *f);
     void collect_arrays(AnalysisInfo &out); /* -a: array storage colors */
 
     /* Complete child-visitor (no `this`, hence static) - also used by the
@@ -188,6 +346,11 @@ public:
      * named-argument lowering (both required for correctness), but skips the
      * fixpoint / checking / strict enforcement. */
     bool checks_enabled = true;
+    /* The program is WHOLE (infer_types): a struct field's type named by a
+     * forward reference must be declared somewhere in it. False for the
+     * REPL, whose later input may still declare it, and for a parse-time
+     * call's copy, which holds only the declarations the call reaches. */
+    bool closed_world = false;
 
 private:
 
@@ -200,9 +363,32 @@ private:
     std::vector<std::unique_ptr<Scope>> all_scopes;
 
     std::unordered_map<const Construct *, TypeSym *> id_sym;
+    /* the identifiers id_sym bound through a capture (Scope::capture_names),
+     * re-decided at every resolution exactly like id_sym */
+    std::unordered_set<const Construct *> capture_uses;
     std::unordered_map<const Construct *, FuncInfo *> func_of_decl;
+    /*
+     * Subtrees a pass CUT OUT of the tree while the node-keyed maps
+     * above (and indirect_callee, cs_obj_ids, a FuncInfo's decl) may
+     * still name nodes inside them. A type query's argument is the
+     * case: fold_type_query replaces it with its folded literal, and
+     * the argument can hold any expression - identifiers, calls, a
+     * lambda, an allocation site. Freeing it left every one of those
+     * keys dangling: -dti and -a ITERATE id_sym and read the freed
+     * nodes (an ASan use-after-free), and a later allocation reusing
+     * one of the addresses would match a stale key - the identity bug
+     * CLAUDE.md warns about. Retiring the subtree for the inferencer's
+     * lifetime keeps every key a live, never-reused address, with no
+     * enumeration of "which maps might hold a node in here" to go
+     * stale. (Its identifiers are real source uses, so -dti listing
+     * them is right.)
+     */
+    std::vector<std::unique_ptr<Construct>> retired;
     /* struct types by name (for resolving a struct-typed field/annotation). */
     std::unordered_map<const UniqueId *, const StructTypeDef *> struct_by_name;
+    /* the program's own struct/class declarations (struct_by_name also
+     * holds the native reflection types, which follow other rules) */
+    std::unordered_set<const StructTypeDef *> declared_structs;
 
     Scope *global = nullptr;
     bool changed = false;
@@ -232,27 +418,73 @@ private:
      * the whole session so a re-declared template can't reuse a prior name) */
     std::unordered_map<const UniqueId *, int> clone_name_counter;
     /* Per-template instantiation count + a per-template "already warned" guard:
-     * past MAX_TMPL_INSTANCES distinct signatures, further calls run
+     * past g_tmpl_max_instances distinct signatures, further calls run
      * dynamically (no clone) - a backstop for runaway polymorphism (D4). */
     std::unordered_map<FuncInfo *, int> tmpl_inst_count;
+    /*
+     * REPL: the state the last infer_input started from. A rejected
+     * input restores it - infer_input itself when the check refuses it,
+     * reject_input() when a LATER stage does (the optimizers raised while
+     * compiling it) - so a refused input commits nothing: no global, and
+     * no instance a later input would reuse by name while it was never
+     * bound at run time.
+     */
+    struct InputSnapshot {
+        std::unordered_map<const UniqueId *, TypeSym *> globals;
+        std::unordered_map<std::string, const UniqueId *> tmpl_cache;
+        std::unordered_map<FuncInfo *, int> tmpl_inst_count;
+        std::unordered_map<const UniqueId *, const StructTypeDef *>
+            struct_by_name;
+        std::unordered_set<const StructTypeDef *> declared_structs;
+    } last_input;
+    void restore_last_input();
     /* Value-instantiated clones' uniform signatures - seeded into the
      * clone's params each fixpoint round (no direct call feeds them). */
     std::map<FuncInfo *, std::vector<StaticTypeRef>> value_inst_sigs;
     /* Templates already value-instantiated (their uses redirected). */
     std::set<FuncInfo *> value_inst_done;
     std::unordered_set<FuncInfo *> tmpl_cap_warned;
+    /*
+     * #115 (fixed 2026-08-27): the INDIRECT call sites whose callee is
+     * provably ONE function, decided ONCE from a settled fixpoint.
+     *
+     * ⛔ THE GATE CANNOT BE EVALUATED MID-FIXPOINT. A `Func` type's
+     * finfo set only GROWS (join unions it), so a callee that will end
+     * up with two candidates passes through a round where it has one -
+     * and a contribution made in that round is already committed when
+     * the second appears. The answer then depended on ROUND ORDER,
+     * which is exactly what the fixpoint's read-stable-values design
+     * exists to prevent, and it is unrecoverable: nothing can un-join a
+     * param.
+     *
+     * So the decision is a SNAPSHOT, taken after `run_fixpoint` has
+     * settled and never revised. While the map is empty (the first
+     * fixpoint) `accumulate_call` behaves exactly as it did before
+     * #115, which is what makes the snapshot trustworthy: it is read
+     * off a fixpoint that this rule did not influence.
+     */
+    std::map<CallExpr *, FuncInfo *> indirect_callee;
 
     /* Flow-sensitive null narrowing (check pass only): inside the proven branch
      * of `if (x != none)` / `if (x)`, x reads as non-opt. */
     std::unordered_map<const TypeSym *, StaticTypeRef> narrowed;
     bool narrowing_on = false;
 
+    /* #115: fill `indirect_callee` from a SETTLED fixpoint (see it). */
+    void snapshot_indirect_callees(Block *rootBlock);
+    void stamp_callee_fn(Block *rootBlock);  /* #116 inc 4 - see it */
+
     void infer_one(Block *root);     /* the per-root passes (shared) */
+    void apply_late_folds(Block *root);                 /* #96 */
+    bool late_fold_fits(Construct *node, Construct *lit);
+    bool late_fold_fits_one(Construct *node, Construct *lit);
 
     /* helpers */
     Scope *new_scope(Scope *parent);
-    TypeSym *new_sym(const UniqueId *name, Scope *s, Loc loc);
+    TypeSym *new_sym(const UniqueId *name, Scope *s, Loc loc,
+                     Loc end = Loc());
     static TypeSym *lookup(Scope *s, const UniqueId *name);
+    static bool resolves_to_capture(Scope *s, const UniqueId *name);
     FuncInfo *callee_funcinfo(Construct *e);   /* named func or inline lambda */
     static bool is_builtin(const UniqueId *name);
     static bool always_exits(const Construct *n);
@@ -267,58 +499,216 @@ private:
     /* a parsed TypeAnnot -> StaticType */
     StaticTypeRef annot_to_static_type(const TypeAnnot *ta);
     void declare_target(Construct *lvalue, Scope *s, bool is_const);
+    void bind_type_aliases(Expr14 *e14);
+    void resolve_catch_types(AllowedExList &cl, Scope *s);
     void enforce_decl_types();       /* explicit-type annotations (array/dict) */
     void enforce_concrete_decls();   /* the mandatory-`dyn` rule */
     void lower_named_args(Construct *n);        /* desugar named-arg calls */
     void lower_call_named_args(CallExpr *call); /* ...for one call */
     void reject_dev_builtins(Construct *n);     /* DEV-only builtins in a script */
+    void stamp_lazy_calls(Construct *n);  /* isbound()'s arg SHAPE, and
+                                           * CallExpr::user_callee */
     void enforce_nonnull_params();   /* the mandatory-`opt` rule for params */
     static bool type_has_dyn(StaticTypeRef t, bool deep);
+    static bool type_has_bottom_elem(StaticTypeRef t);
 
     /* type computation (reads stable `type`) */
     StaticTypeRef type_of(const Construct *e);
+    StaticTypeRef type_of_node(const Construct *e);
+    /* What reading a container component yields: `bottom` (defer) for an
+     * UNFILLED one - `none`, from `[]`, `{}` or array(N) with nothing
+     * typed put in yet - so a later round's fill types the read; if
+     * nothing ever fills it, the reader finalizes `dyn` (question 9). */
+    StaticTypeRef component_read(StaticTypeRef c);
+    /* The component type of a container that HOLDS the values typed `t`:
+     * `t`, but a `none` one is `dyn?` - a component typed `none` means
+     * UNFILLED (nothing is in it: `[]`, `{}`, array(N)), and one that
+     * holds nones is not empty (rule 3, choice 7: `[none]` is an
+     * array<dyn?>, so a later `a[0] = 5` does not make it an
+     * array<int> still holding a none). */
+    StaticTypeRef held(StaticTypeRef t);
     StaticTypeRef func_static_type(FuncInfo *fi);
     StaticTypeRef binop_result(Op op, StaticTypeRef a, StaticTypeRef b);
     StaticTypeRef unary_result(Op op, StaticTypeRef a);
     StaticTypeRef builtin_result(const UniqueId *name, ExprList *args);
     StaticTypeRef static_type_from_value(const EvalValue &v);
+    StaticTypeRef static_type_from_value(const EvalValue &v, CycStack &st);
     static Op compound_binop(Op op);
 
     /* fixpoint */
     void reset_round();
     void commit_round();
     void accumulate(Construct *n);
-    void contribute(TypeSym *s, StaticTypeRef t, Loc loc);
-    void contribute_arg(TypeSym *param, StaticTypeRef argT, Loc loc);
+    /* `loc`..`loc_end`: the span an error about the contribution marks */
+    void contribute(TypeSym *s, StaticTypeRef t, Loc loc, Loc loc_end);
+    void contribute_arg(TypeSym *param, StaticTypeRef argT, Loc loc,
+                        Loc loc_end);
     void contribute_ret(StaticTypeRef t);
     void accumulate_assign(Expr14 *e);
-    void contribute_to_lvalue(Construct *lv, StaticTypeRef ct, Loc loc);
+    void contribute_to_lvalue(Construct *lv, StaticTypeRef ct);
+    /* A symbol whose type is FIXED - checked, not joined - see the def */
+    StaticTypeRef fixed_type(const TypeSym *s);
+    void contribute_elem(TypeSym *s, StaticTypeRef cont, Loc loc,
+                         Loc loc_end);
+    bool literal_fits(Construct *lit, StaticTypeRef d);
+    bool value_fits_type(const EvalValue &v, StaticTypeRef d);
+    StaticTypeRef literal_dest_type(Expr14 *e);
+    StaticTypeRef literal_into(Construct *rv, StaticTypeRef dest);
+    bool fresh_fits(StaticTypeRef t, StaticTypeRef d);
+    void stamp_literal_into(Construct *rv, StaticTypeRef dest);
+    void stamp_literal_repr(Construct *lit, StaticTypeRef dest);
+    StaticTypeRef fixed_elem_dest(Construct *base, bool key);
+    StaticTypeRef declared_type_of(Construct *e);
+    /* a member-access base's type, a box<P> seen as the P it holds */
+    StaticTypeRef member_base(StaticTypeRef t);
+    /* can a value of this type key the pure-call cache? */
+    bool cache_key_safe(StaticTypeRef t, int depth = 0);
+    /* the fix a misused box names ("read its value with *b"); with
+     * `want`, only when the box's value fits it */
+    std::string box_use_hint(StaticTypeRef t, const Construct *e,
+                             StaticTypeRef want = nullptr);
+    void check_deref(DerefExpr *d);
+    void check_cast(CastExpr *c);
+    bool cast_possible(StaticTypeRef src, const TypeAnnot *t, bool comp);
+    void check_box_call(CallExpr *call);
+    void check_num_builtin_call(CallExpr *call, bool is_round);
+    void check_value_into(StaticTypeRef dest, StaticTypeRef vt,
+                          const std::string &field, Construct *at);
+    void check_declared_store(Expr14 *e);
+    bool new_container_expr(Construct *e);
+    void check_alias_exact(Construct *rv, Identifier *to);
+    void check_flow_exact(Construct *rv, StaticTypeRef dest,
+                          const std::string &what);
+    void refuse_compound_misfit(Op op, StaticTypeRef place,
+                                StaticTypeRef v, Construct *at);
+    void check_builtin_store(CallExpr *call);
+    std::vector<TypeSym *> *known_params(CallExpr *call);
+    StaticTypeRef arg_type(Construct *arg, TypeSym *param);
+    void stamp_literal_args(CallExpr *call);
     void accumulate_call(CallExpr *call);
     void accumulate_foreach(ForeachStmt *fe);
-    void spread_idlist(IdList *idl, Construct *rvalue);
+    void spread_idlist(IdList *idl, Construct *rvalue, Op op);
+    std::vector<StaticTypeRef> idlist_elem_types(IdList *idl,
+                                                 Construct *rvalue,
+                                                 bool into = false);
+    void check_compound_op(Op op, StaticTypeRef l, StaticTypeRef r,
+                           Construct *lv, Construct *rv, Construct *at);
 
-    /* monomorphization (templates - see plans/function-templates.md) */
+    /* monomorphization (templates - see plans/archived/function-templates.md) */
     void mark_lambda_templates();   /* safe var-bound lambdas -> templates */
     void run_fixpoint(Block *root);             /* the Jacobi loop, extracted */
     bool instantiate_round(Block *root);     /* clone + redirect; progress? */
+    StaticTypeRef template_arg_key(CallExpr *call, const TypeSym *p,
+                                   size_t i);
     bool value_instantiate_round(Block *root);  /* value-used templates (see
                                                  * plans/value-template-
                                                  * instantiation.md) */
-    void drain_escapes();       /* arena escape ledger -> value_escaped */
     FuncDeclStmt *make_template_clone(FuncInfo *tmpl, const std::string &key,
                                       Block *root);
     std::string template_sig_key(FuncInfo *tmpl,
                                   const std::vector<StaticTypeRef> &sig);
     void collect_calls(Construct *n,
                        std::vector<std::pair<CallExpr *, bool>> &out,
-                       bool in_func = false);
+                       bool in_func = false, bool skip_templates = false);
+
+    /* ---- the callee-set analysis (#116; calleeset.cpp.h) ---- */
+    std::vector<CsSet> cs_pts;                 /* loc id -> points-to */
+    std::map<CsLocKey, int> cs_loc_ids;        /* location -> loc id   */
+    std::map<const Construct *, int> cs_obj_ids;  /* alloc site -> obj */
+    std::set<FuncInfo *> cs_escaped;           /* left our view        */
+    std::set<int> cs_escaping_objs;            /* worklist, per round  */
+    bool cs_changed = false;
+    bool cs_ran = false;      /* false => every query answers ⊤ */
+    int cs_top_callee_sites = 0;
+    /* cs_can_hold_func's answer per node, for ONE cs_run (types do not
+     * change while it runs; cleared at both ends, so no node address
+     * outlives it): each level of a deep chain asked type_of of its
+     * whole subtree again, every round - 2 billion instructions for a
+     * 120-deep call chain (#98) */
+    std::unordered_map<const Construct *, bool> cs_hold_memo;
+    bool cs_hold_memo_on = false;
+    /* the memo, live for a window in which no type changes: one cs_run,
+     * the indirect-callee snapshot, the callee stamp and the hint stamp
+     * (each reads types and changes none) */
+    struct CsHoldMemoScope {
+        Inferencer &in;
+        explicit CsHoldMemoScope(Inferencer &i) : in(i)
+        {
+            in.cs_hold_memo.clear();
+            in.cs_hold_memo_on = true;
+        }
+        ~CsHoldMemoScope()
+        {
+            in.cs_hold_memo_on = false;
+            in.cs_hold_memo.clear();
+        }
+    };
+
+    void cs_run(Block *root);            /* the fixpoint */
+    void cs_visit(Construct *n, FuncInfo *fn);
+    void cs_assign(Construct *lv, Construct *rv);
+    void cs_bind_target(Construct *lv, const CsSet &v);
+    void cs_call(CallExpr *c);
+    void cs_builtin_container_effect(CallExpr *c);
+    CsSet cs_eval(Construct *e);
+    void cs_eval_value(const EvalValue &v, const Construct *site,
+                       CsSet &out);
+    void cs_eval_value(const EvalValue &v, const Construct *site,
+                       CsSet &out, CycStack &st);
+    CsSet cs_read_elems(const CsSet &base);
+    void cs_write_elems(const CsSet &base, const CsSet &v);
+    void cs_escape_set(const CsSet &v);
+    void cs_escape_flat(const CsSet &v);
+    bool cs_write(int loc, const CsSet &v);
+    int  cs_loc(CsLocKind k, const void *p, int obj);
+    int  cs_obj_for(const Construct *site);
+    bool cs_callee_is_builtin(Construct *e);
+    const StructTypeDef *cs_struct_callee(Construct *e);
+    bool cs_can_hold_func(const Construct *e);
+    bool cs_type_can_hold_func(StaticTypeRef t, std::set<const void *> &seen);
+    bool cs_annot_can_hold_func(const TypeAnnot *a,
+                                std::set<const void *> &seen);
+    bool cs_struct_can_hold_func(const StructTypeDef *def,
+                                 std::set<const void *> &seen);
+    std::string cs_func_name(FuncInfo *f);
+    std::string cs_set_str(const CsSet &s);
 
     /* check pass */
     void check(Construct *n);
+    void check_const_param_store(const Construct *target);
+    bool is_const_param(const Construct *e);
+    void const_param_ref_store(const Construct *ref,
+                               const Construct *target, bool box);
     void check_if(IfStmt *i);
     TypeSym *narrow_target(Construct *cond, bool &in_then);
     void annotate_hints(Construct *n);   /* stamp TypeHints for specializer */
+    bool call_fit_args(CallExpr *call);  /* #49: CallExpr::fit_args */
+    void check_opt_struct_fields();      /* `opt` names a class (parser) */
+    void stamp_literal_coerce(Construct *n, StaticTypeRef t);
+    /* Q2 (plans/typed-containers.md): the type a container is MADE with
+     * (Construct::ctype) - see stamp_ctypes */
+    const TypeAnnot *ctype_of(StaticTypeRef t, bool dict);
+    void stamp_ctypes(Construct *n, StaticTypeRef dest);
+    /* stamp_ctypes is inside a template's base body */
+    bool stamp_in_tmpl_base = false;
+    void stamp_lit_obj_ctype(LiteralObj *lo, StaticTypeRef t);
+    /* creation nodes written where `dyn` is declared (set_array_repr_hint) */
+    std::unordered_set<const Construct *> ctype_dyn_place;
+    /* creation nodes made UNTYPED: a fit check examines them where they
+     * land, or their place's type is unknown here (stamp_ctypes) */
+    std::unordered_set<const Construct *> ctype_untyped;
+    void ctype_untype(Construct *n);
+    bool arg_fit_checked(CallExpr *call, size_t i);
+    TypeSym *user_sym(const Identifier *id);
+    bool names_builtin(const Identifier *cid);
+    /* the FIXED place a baked literal was rebuilt for (stamp_literal_repr) */
+    std::unordered_map<const Construct *, StaticTypeRef> lit_obj_dest;
+    FuncInfo *hint_func = nullptr;   /* annotate_hints: the enclosing func */
+    /* literals whose widening an enclosing literal stamped (#75) */
+    std::unordered_set<const Construct *> lit_coerce_by_parent;
+    void stamp_untyped_calls(Construct *n);   /* #51: -nti's call hints */
     void set_array_repr_hint(Expr14 *e);    /* type-driven ArrHint on rvalue */
+    void stamp_sum_identity(CallExpr *call);  /* #48: sum() of nothing */
     void check_call(CallExpr *call);
     void check_struct_construction(CallExpr *call, const StructTypeDef *def);
     void check_binops(MultiOpConstruct *mo, bool comparison, bool logical,
@@ -327,6 +717,25 @@ private:
     [[noreturn]] void mismatch(const std::string &m, Loc s, Loc e);
     [[noreturn]] void nullability(const std::string &m, Loc s, Loc e);
     [[noreturn]] void argcount(const std::string &m, Loc s, Loc e);
+
+    /*
+     * A CONTRIBUTION THAT CONFLICTS DURING THE FIXPOINT IS AN ERROR ONLY IF
+     * IT STILL CONFLICTS ONCE THE FIXPOINT HAS CONVERGED. A round reads the
+     * previous round's types, and a type can still climb - to `dyn` above
+     * all - and a conflict with a concrete kind disappears at `dyn` (a dyn
+     * value coerces into a numeric local, a dyn element fits any array<T>).
+     * `func big(dyn v) { if (v < 9) return v * 2; return "s"; }` returns
+     * `str` after round 1 (`v * 2` waits for v) and `dyn` after round 2, so
+     * `var k = 5; k = big(x);` was refused, naming a type `big(x)` never
+     * has, until 2026-11-07. During run_fixpoint contribute() records each
+     * conflict here and leaves the symbol's accumulator as it was; the
+     * converged round's first conflict is the error (its contributions are
+     * computed from the final types, so it is a stable one).
+     */
+    bool in_fixpoint = false;
+    struct Conflict { std::string msg; Loc s, e; bool null = false; };
+    std::vector<Conflict> round_conflicts;
+    void conflict(const std::string &m, Loc s, Loc e, bool null = false);
 
     /* Compile-time type queries `decltype(var)` / `typestr(expr)` /
      * `kindstr(expr)`: if the call is one, fold its (unevaluated) arg to a
@@ -378,6 +787,24 @@ private:
     static bool is_unknown(StaticTypeRef t) {
         return static_type_resolve(t)->kind == StaticTypeKind::Unknown;
     }
+    /* an Unknown ANYWHERE in `t` - the defer-on-Unknown invariant reaches
+     * into a container: `[p]` is `array<?>` while p's type is unsettled,
+     * and checking that against a declared `array<P>` refused a valid
+     * program (2026-10-07) */
+    static bool has_unknown(StaticTypeRef t) {
+        t = static_type_resolve(t);
+        if (!t)
+            return false;
+        if (t->kind == StaticTypeKind::Unknown)
+            return true;
+        if (has_unknown(t->elem) || has_unknown(t->key)
+                || has_unknown(t->val) || has_unknown(t->ret))
+            return true;
+        for (StaticTypeRef pt : t->params)
+            if (has_unknown(pt))
+                return true;
+        return false;
+    }
     static bool is_optish(StaticTypeRef t) {
         t = static_type_resolve(t);
         return t->opt || t->kind == StaticTypeKind::None;
@@ -397,7 +824,24 @@ Scope *Inferencer::new_scope(Scope *parent)
     return s;
 }
 
-TypeSym *Inferencer::new_sym(const UniqueId *name, Scope *s, Loc loc)
+/*
+ * A REPL input that REDEFINES a function or a struct over a committed
+ * (pinned) global binds a FRESH symbol, never rewrites the pinned one in
+ * place. The rewrite (`sym->func = fi`) outlived the input's rejection -
+ * restoring the global scope puts back the same, already rewritten
+ * object - so a REFUSED redefinition stayed in force: after
+ * `func f(x) => "s"; int bad = "x"` was refused, `f(1)` ran its body. A
+ * script never pins, so this is the REPL's alone. (A `var` redeclaration
+ * keeps the pinned symbol on purpose: it is checked against the committed
+ * type.)
+ */
+static bool redeclare_fresh(const TypeSym *s)
+{
+    return s && s->pinned;
+}
+
+TypeSym *Inferencer::new_sym(const UniqueId *name, Scope *s, Loc loc,
+                             Loc end)
 {
     /*
      * `_` is RESERVED as the destructuring / foreach placeholder - it may only
@@ -419,6 +863,7 @@ TypeSym *Inferencer::new_sym(const UniqueId *name, Scope *s, Loc loc)
     sym->type = bottom;
     sym->acc = bottom;
     sym->decl_loc = loc;
+    sym->decl_end = end ? end : loc;
     sym->in_template = struct_tmpl_depth > 0;
     s->syms[name] = sym;
     return sym;
@@ -434,18 +879,48 @@ TypeSym *Inferencer::lookup(Scope *s, const UniqueId *name)
     return nullptr;
 }
 
+/* `name` in scope `s` binds a closure's capture */
+bool Inferencer::resolves_to_capture(Scope *s, const UniqueId *name)
+{
+    for (; s; s = s->parent)
+        if (s->syms.count(name))
+            return s->capture_names.count(name) != 0;
+    return false;
+}
+
 /* The FuncInfo a callee expression denotes, if statically a specific function:
  * an identifier bound to a function (named func, or a var initialized with a
  * lambda), or an inline lambda. */
+/*
+ * A named function whose NAME is assigned somewhere (`sq = ng;`, at any
+ * depth) - or a `var f = <lambda>` assigned again: the name is then a
+ * variable holding a function VALUE, and a call
+ * through it may reach any function assigned to it. Nothing may name the
+ * callee from the declaration - no template redirect (which pinned
+ * `sq(3)` to a clone of the ORIGINAL body, in every engine), no
+ * argument contribution to the declared params, no arity/type check
+ * against the declared signature (a call is checked against the NAME's
+ * static type instead, like any function-valued variable).
+ */
+static bool func_name_rebound(const TypeSym *s)
+{
+    /* a named function's declaration is not a counted write; a
+     * `var f = <lambda>` binding is */
+    return s && s->func && s->writes > (s->named_func ? 0 : 1);
+}
+
 FuncInfo *Inferencer::callee_funcinfo(Construct *e)
 {
-    if (auto *id = dynamic_cast<Identifier *>(e)) {
+    if (ctag(e) == ConstructType::id) {
+        auto *id = static_cast<Identifier *>(e);
         auto it = id_sym.find(id);
-        if (it != id_sym.end() && it->second && it->second->func)
+        if (it != id_sym.end() && it->second && it->second->func
+                && !func_name_rebound(it->second))
             return it->second->func;
         return nullptr;
     }
-    if (auto *fd = dynamic_cast<FuncDeclStmt *>(e)) {
+    if (ctag(e) == ConstructType::func_decl) {
+        auto *fd = static_cast<FuncDeclStmt *>(e);
         auto it = func_of_decl.find(fd);
         return it != func_of_decl.end() ? it->second : nullptr;
     }
@@ -461,36 +936,91 @@ bool Inferencer::is_builtin(const UniqueId *name)
 
 Op Inferencer::compound_binop(Op op)
 {
-    switch (op) {
-        case Op::addeq: return Op::plus;
-        case Op::subeq: return Op::minus;
-        case Op::muleq: return Op::times;
-        case Op::diveq: return Op::div;
-        case Op::modeq: return Op::mod;
-        default:        return Op::invalid;
-    }
+    return compound_assign_base(op);    /* operators.h - the single map */
 }
 
-/* True when control cannot fall off the end of `n` (it always returns/throws).
- * Used to decide if a block-bodied function contributes a `none` return. */
+/* A `break` that leaves THIS loop, somewhere in its body: one in a nested
+ * loop leaves that loop, and a function literal's body cannot break out
+ * (the parser refuses it). */
+static bool breaks_out(Construct *n)
+{
+    if (!n)
+        return false;
+    switch (ctag(n)) {
+    case ConstructType::brk:
+        return true;
+    case ConstructType::while_stmt:
+    case ConstructType::for_stmt:
+    case ConstructType::for_range:
+    case ConstructType::foreach_stmt:
+    case ConstructType::func_decl:
+        return false;
+    default:
+        break;
+    }
+    bool found = false;
+    Inferencer::for_each_child(n, [&](Construct *c) {
+        if (!found && breaks_out(c))
+            found = true;
+    });
+    return found;
+}
+
+/* True when control cannot reach the point after `n` by finishing it:
+ * every path through it returns, throws, rethrows, breaks, continues or
+ * loops forever. Decides whether a block-bodied function can reach its end
+ * (and so return `none` there, README *Where a function can end*), and the
+ * guard-clause narrowing (`if (x == none) continue;`). A `break` or a
+ * `continue` counts because the LOOP is asked separately: a loop whose
+ * condition is always true finishes only by a `break` of its own
+ * (breaks_out). True must be a proof; anything not understood is false. */
 bool Inferencer::always_exits(const Construct *n)
 {
     if (!n)
         return false;
 
-    if (dynamic_cast<const ReturnStmt *>(n) ||
-        dynamic_cast<const ThrowStmt *>(n) ||
-        dynamic_cast<const RethrowStmt *>(n))
+    switch (ctag(n)) {
+    case ConstructType::ret:
+    case ConstructType::throw_stmt:
+    case ConstructType::rethrow:
+    case ConstructType::brk:
+    case ConstructType::cont:
         return true;
-
-    if (auto *b = dynamic_cast<const Block *>(n))
-        return !b->elems.empty() && always_exits(b->elems.back().get());
-
-    if (auto *i = dynamic_cast<const IfStmt *>(n))
+    case ConstructType::block:
+        /* any statement that cannot finish ends the block there */
+        for (const auto &st : static_cast<const Block *>(n)->elems)
+            if (always_exits(st.get()))
+                return true;
+        return false;
+    case ConstructType::if_stmt: {
+        auto *i = static_cast<const IfStmt *>(n);
         return i->elseBlock && always_exits(i->thenBlock.get()) &&
                always_exits(i->elseBlock.get());
-
-    return false;
+    }
+    case ConstructType::while_stmt: {
+        auto *w = static_cast<const WhileStmt *>(n);
+        return w->cond_true && !breaks_out(w->body.get());
+    }
+    case ConstructType::for_stmt: {
+        auto *f = static_cast<const ForStmt *>(n);
+        return f->cond_true && !breaks_out(f->body.get());
+    }
+    case ConstructType::try_catch: {
+        /* a `finally` that cannot finish decides; else the body and every
+         * handler must not (an exception no handler takes propagates) */
+        auto *t = static_cast<const TryCatchStmt *>(n);
+        if (always_exits(t->finallyBody.get()))
+            return true;
+        if (!always_exits(t->tryBody.get()))
+            return false;
+        for (const auto &cs : t->catchStmts)
+            if (!always_exits(cs.second.get()))
+                return false;
+        return true;
+    }
+    default:
+        return false;
+    }
 }
 
 void Inferencer::for_each_child(Construct *n,
@@ -499,85 +1029,154 @@ void Inferencer::for_each_child(Construct *n,
     if (!n)
         return;
 
-    if (auto *e = dynamic_cast<Expr14 *>(n)) {
+    /* #102: a TAG SWITCH, not a dynamic_cast chain - the walkers run
+     * per pass x per node, and the RTTI chain (~19 probes, each a
+     * type_info graph walk with strcmp inside) was ~86% of compile
+     * Ir. NO default on purpose: -Werror=switch forces every
+     * ConstructType to be classified, so a new node kind cannot walk
+     * as silently childless (the hidden-occurrence trap that bit the
+     * escape analysis). The per-kind child sets are EXACTLY the old
+     * chain's - IdList's Identifier children stay unwalked, and
+     * TypedScalarExpr stays a leaf here, as before. */
+    switch (n->ct) {
+    case ConstructType::expr14: {
+        auto *e = static_cast<Expr14 *>(n);
         fn(e->lvalue.get()); fn(e->rvalue.get()); return;
     }
-    if (auto *c = dynamic_cast<CallExpr *>(n)) {
+    case ConstructType::call: {
+        auto *c = static_cast<CallExpr *>(n);
         fn(c->what.get()); fn(c->args.get()); return;
     }
-    if (auto *m = dynamic_cast<MemberExpr *>(n)) {
-        fn(m->what.get()); return;
+    case ConstructType::member: {
+        fn(static_cast<MemberExpr *>(n)->what.get()); return;
     }
-    if (auto *s = dynamic_cast<Subscript *>(n)) {
+    case ConstructType::subscript: {
+        auto *s = static_cast<Subscript *>(n);
         fn(s->what.get()); fn(s->index.get()); return;
     }
-    if (auto *s = dynamic_cast<Slice *>(n)) {
-        fn(s->what.get()); fn(s->start_idx.get()); fn(s->end_idx.get()); return;
-    }
-    if (auto *i = dynamic_cast<IfStmt *>(n)) {
-        fn(i->condExpr.get()); fn(i->thenBlock.get()); fn(i->elseBlock.get());
+    case ConstructType::slice: {
+        auto *s = static_cast<Slice *>(n);
+        fn(s->what.get()); fn(s->start_idx.get()); fn(s->end_idx.get());
         return;
     }
-    if (auto *w = dynamic_cast<WhileStmt *>(n)) {
+    case ConstructType::if_stmt: {
+        auto *i = static_cast<IfStmt *>(n);
+        fn(i->condExpr.get()); fn(i->thenBlock.get());
+        fn(i->elseBlock.get());
+        return;
+    }
+    case ConstructType::while_stmt: {
+        auto *w = static_cast<WhileStmt *>(n);
         fn(w->condExpr.get()); fn(w->body.get()); return;
     }
-    if (auto *f = dynamic_cast<ForStmt *>(n)) {
+    case ConstructType::for_stmt: {
+        auto *f = static_cast<ForStmt *>(n);
         fn(f->init.get()); fn(f->cond.get());
         fn(f->inc.get()); fn(f->body.get());
         return;
     }
-    if (auto *fr = dynamic_cast<ForRangeStmt *>(n)) {
+    case ConstructType::for_range: {
+        auto *fr = static_cast<ForRangeStmt *>(n);
         fn(fr->init.get()); fn(fr->bound.get());
         fn(fr->step.get()); fn(fr->body.get());
         return;
     }
-    if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
+    case ConstructType::foreach_stmt: {
+        auto *fe = static_cast<ForeachStmt *>(n);
         fn(fe->container.get()); fn(fe->body.get()); return;
     }
-    if (auto *t = dynamic_cast<TryCatchStmt *>(n)) {
-        fn(t->tryBody.get());
-        for (auto &cs : t->catchStmts)
+    case ConstructType::try_catch: {
+        auto *tc = static_cast<TryCatchStmt *>(n);
+        fn(tc->tryBody.get());
+        for (auto &cs : tc->catchStmts)
             fn(cs.second.get());
-        fn(t->finallyBody.get());
+        fn(tc->finallyBody.get());
         return;
     }
-    if (auto *r = dynamic_cast<ReturnStmt *>(n)) {
-        fn(r->elem.get()); return;
+    case ConstructType::ret: {
+        fn(static_cast<ReturnStmt *>(n)->elem.get()); return;
     }
-    if (auto *idc = dynamic_cast<IncDecExpr *>(n)) {
-        fn(idc->lvalue.get()); return;
+    case ConstructType::incdec: {
+        fn(static_cast<IncDecExpr *>(n)->lvalue.get()); return;
     }
-    if (auto *te = dynamic_cast<TernaryExpr *>(n)) {
+    case ConstructType::deref: {
+        fn(static_cast<DerefExpr *>(n)->elem.get()); return;
+    }
+    case ConstructType::cast: {
+        fn(static_cast<CastExpr *>(n)->elem.get()); return;
+    }
+    case ConstructType::ternary: {
+        auto *te = static_cast<TernaryExpr *>(n);
         fn(te->condExpr.get()); fn(te->thenExpr.get());
-        fn(te->elseExpr.get()); return;
+        fn(te->elseExpr.get());
+        return;
     }
-    if (auto *co = dynamic_cast<CoalesceExpr *>(n)) {
+    case ConstructType::coalesce: {
+        auto *co = static_cast<CoalesceExpr *>(n);
         fn(co->lhs.get()); fn(co->rhs.get()); return;
     }
-    if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
-        fn(fd->body.get()); return;
+    case ConstructType::func_decl: {
+        fn(static_cast<FuncDeclStmt *>(n)->body.get()); return;
     }
-    if (auto *ld = dynamic_cast<LiteralDict *>(n)) {
+    case ConstructType::lit_dict: {
+        auto *ld = static_cast<LiteralDict *>(n);
         for (auto &kv : ld->elems) {
             fn(kv->key.get()); fn(kv->value.get());
         }
         return;
     }
-    if (auto *sc = dynamic_cast<SingleChildConstruct *>(n)) {
-        fn(sc->elem.get()); return;
+    case ConstructType::expr01:
+    case ConstructType::inlined_call:
+    case ConstructType::throw_stmt: {
+        fn(static_cast<SingleChildConstruct *>(n)->elem.get()); return;
     }
-    if (auto *mo = dynamic_cast<MultiOpConstruct *>(n)) {
+    case ConstructType::expr02:
+    case ConstructType::expr03:
+    case ConstructType::expr04:
+    case ConstructType::expr05:
+    case ConstructType::expr06:
+    case ConstructType::expr07:
+    case ConstructType::expr08:
+    case ConstructType::expr09:
+    case ConstructType::expr10:
+    case ConstructType::expr11:
+    case ConstructType::expr12: {
+        auto *mo = static_cast<MultiOpConstruct *>(n);
         for (auto &pr : mo->elems)
             fn(pr.second.get());
         return;
     }
-    /* MultiElemConstruct<>: Block, LiteralArray, ExprList */
-    if (auto *me = dynamic_cast<MultiElemConstruct<> *>(n)) {
+    case ConstructType::block:
+    case ConstructType::lit_arr:
+    case ConstructType::expr_list: {
+        auto *me = static_cast<MultiElemConstruct<> *>(n);
         for (auto &e : me->elems)
             fn(e.get());
         return;
     }
-    /* leaves: literals, Identifier, Break/Continue/Rethrow/Nop */
+    /* leaves - literals, Identifier, IdList (its Identifier children
+     * deliberately unwalked, as in the chain), the childless
+     * statements, StructDeclStmt (consts folded at parse),
+     * TypedScalarExpr (a leaf HERE; the resolver's walkers descend
+     * into it), and the asserted-unreachable `other` */
+    case ConstructType::other:
+    case ConstructType::nop:
+    case ConstructType::brk:
+    case ConstructType::cont:
+    case ConstructType::rethrow:
+    case ConstructType::lit_int:
+    case ConstructType::lit_bool:
+    case ConstructType::lit_float:
+    case ConstructType::lit_none:
+    case ConstructType::lit_str:
+    case ConstructType::lit_obj:
+    case ConstructType::lit_dict_kv:
+    case ConstructType::id:
+    case ConstructType::idlist:
+    case ConstructType::typed_scalar:
+    case ConstructType::struct_decl:
+        return;
+    }
 }
 
 /* ----------------------- monomorphization (templates) -------------------- */
@@ -607,8 +1206,7 @@ void Inferencer::mark_lambda_templates()
         bool has_tparam = false;
         if (fd->params)
             for (auto &p : fd->params->elems)
-                if (!p->opt_mod && !p->dyn_mod &&
-                    p->decl_type == DeclType::none) {
+                if (template_param(p.get())) {
                     has_tparam = true;
                     break;
                 }
@@ -620,8 +1218,14 @@ void Inferencer::mark_lambda_templates()
 /* The Jacobi fixpoint, extracted so the instantiation loop can re-run it. */
 void Inferencer::run_fixpoint(Block *rootBlock)
 {
+    struct InFixpoint {
+        bool &f;
+        explicit InFixpoint(bool &b) : f(b) { f = true; }
+        ~InFixpoint() { f = false; }
+    } in_fp(in_fixpoint);
     for (int iter = 0; iter < 1000; iter++) {
         reset_round();
+        round_conflicts.clear();
         cur_func = nullptr;
         for (auto &e : rootBlock->elems)
             accumulate(e.get());
@@ -633,10 +1237,10 @@ void Inferencer::run_fixpoint(Block *rootBlock)
             const std::vector<StaticTypeRef> &sig = kv.second;
             size_t k = 0;
             for (TypeSym *p : cfi->params) {
-                if (p->opt_decl || p->dyn_decl || p->ann != DeclType::none)
+                if (!template_param(p))
                     continue;
                 if (k < sig.size())
-                    contribute(p, sig[k], Loc());
+                    contribute(p, sig[k], Loc(), Loc());
                 k++;
             }
         }
@@ -645,20 +1249,39 @@ void Inferencer::run_fixpoint(Block *rootBlock)
         if (!changed)
             break;
     }
+    /* the converged round's conflicts are real (see `conflict`) */
+    if (!round_conflicts.empty()) {
+        const Conflict c = round_conflicts.front();
+        round_conflicts.clear();
+        if (c.null)
+            nullability(c.msg, c.s, c.e);
+        mismatch(c.msg, c.s, c.e);
+    }
 }
 
-/* Every CallExpr in the subtree (complete traversal). */
+/* Every CallExpr in the subtree (complete traversal) - with
+ * `skip_templates`, none inside a template BASE's body (see
+ * instantiate_round). */
 void Inferencer::collect_calls(Construct *n,
                                std::vector<std::pair<CallExpr *, bool>> &out,
-                               bool in_func)
+                               bool in_func, bool skip_templates)
 {
     if (!n)
         return;
-    if (auto *c = dynamic_cast<CallExpr *>(n))
+    if (auto *c = node_cast<CallExpr>(n))
         out.push_back({ c, in_func });
     /* a call below a FuncDeclStmt is inside a function body (a live use) */
-    const bool inside = in_func || (dynamic_cast<FuncDeclStmt *>(n) != nullptr);
-    for_each_child(n, [&](Construct *c) { collect_calls(c, out, inside); });
+    const bool is_fd = ctag(n) == ConstructType::func_decl;
+    if (is_fd && skip_templates) {
+        auto it = func_of_decl.find(static_cast<FuncDeclStmt *>(n));
+        if (it != func_of_decl.end() && it->second
+                && it->second->is_template)
+            return;
+    }
+    const bool inside = in_func || is_fd;
+    for_each_child(n, [&](Construct *c) {
+        collect_calls(c, out, inside, skip_templates);
+    });
 }
 
 /* Dedup key for an instantiation: the template identity + the signature. */
@@ -675,7 +1298,7 @@ std::string Inferencer::template_sig_key(FuncInfo *tmpl,
 }
 
 /*
- * Build a concrete clone of a template for one signature: a fresh `$tmplN` name
+ * Build a concrete clone of a template for one signature: a fresh `name$N` name
  * (display_name keeps the original for backtraces), structurally walked so it
  * has its own FuncInfo + param/local syms, marked non-template, and inserted at
  * the root block's front. Its params are NOT seeded - the redirected call (the
@@ -723,7 +1346,8 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
         std::function<void(Construct *)> clr = [&](Construct *n) {
             if (!n) return;
             id_sym.erase(n);
-            if (auto *fd2 = dynamic_cast<FuncDeclStmt *>(n)) {
+            if (ctag(n) == ConstructType::func_decl) {
+                auto *fd2 = static_cast<FuncDeclStmt *>(n);
                 func_of_decl.erase(fd2);
                 clr(fd2->captures.get());
                 clr(fd2->params.get());
@@ -745,7 +1369,7 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
     cfi->is_template = false;             /* an instantiation is concrete */
 
     FuncDeclStmt *raw = fc;
-    rootBlock->elems.insert(rootBlock->elems.begin(), move(cl));
+    rootBlock->elems.insert(rootBlock->elems.begin(), std::move(cl));
     tmpl_cache[key] = fc->id->uid;       /* cache the stable NAME, not a node */
     return raw;
 }
@@ -756,11 +1380,36 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
  * redirect the call to it. Returns whether any call was redirected (so the
  * caller re-runs the fixpoint and looks for newly-exposed template calls).
  */
+/* What template parameter `p` (the `i`th) is keyed by at `call`: the
+ * argument's type - without its `?` for an `opt` parameter, whose
+ * instance takes `none` anyway (rule 8.1) - and `none` when a trailing
+ * `opt` one is omitted: its own instance, as a `none` argument is. */
+StaticTypeRef Inferencer::template_arg_key(CallExpr *call, const TypeSym *p,
+                                           size_t i)
+{
+    if (i >= call->args->elems.size())
+        return A.none_ty();
+    const StaticTypeRef t =
+        static_type_resolve(type_of(call->args->elems[i].get()));
+    return p->opt_decl ? A.with_opt(t, false) : t;
+}
+
 bool Inferencer::instantiate_round(Block *rootBlock)
 {
+    /*
+     * Not from a call inside a template BASE's body: the fixpoint and
+     * the check pass skip that body, so the instance such a call made
+     * was fed by no call site - its parameters stayed unconstrained and
+     * it was checked anyway (`func use(q) { var b = ac(2); ... }` with
+     * `use` never called refused `ac`'s body over a `none` local). The
+     * calls are instantiated where they are live: in each instance of
+     * the enclosing template, a fresh copy of the body. A kept base
+     * (one used as a value) runs its body as written, calling the other
+     * template's base - which its closure keeps compiled.
+     */
     std::vector<std::pair<CallExpr *, bool>> calls;
     for (auto &e : rootBlock->elems)
-        collect_calls(e.get(), calls);
+        collect_calls(e.get(), calls, false, true);
 
     bool progress = false;
     for (const auto &call_pair : calls) {
@@ -783,19 +1432,30 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         if (nargs < min_args || nargs > nparams)
             continue;
 
-        /* The signature is keyed by the TEMPLATE params (un-annotated, non-dyn,
-         * non-opt) only; opt/typed/dyn params just join within the clone. A
-         * template param is non-opt, so min_args > its index => its arg is
-         * always present. */
+        /* The signature is keyed by the TEMPLATE params (template_param)
+         * only; typed/dyn params just join within the clone. */
         std::vector<StaticTypeRef> sig;
         bool ready = true;
         for (size_t i = 0; i < nparams; i++) {
             TypeSym *p = tmpl->params[i];
-            if (p->opt_decl || p->dyn_decl || p->ann != DeclType::none)
+            if (!template_param(p))
                 continue;       /* not a template param */
-            StaticTypeRef t =
-                static_type_resolve(type_of(call->args->elems[i].get()));
-            if (is_unknown(t)) { ready = false; break; }
+            StaticTypeRef t = template_arg_key(call, p, i);
+            /* (a container settled all the way down: an array<?> is not a
+             * signature - rule 1 makes the clone's array<?> refuse what it
+             * settles to; a function value's parameters may stay open) */
+            const std::function<bool(StaticTypeRef)> open_comp =
+                [&](StaticTypeRef c) -> bool {
+                    c = static_type_resolve(c);
+                    if (is_unknown(c))
+                        return true;
+                    if (c->kind == StaticTypeKind::Array)
+                        return open_comp(c->elem);
+                    if (c->kind == StaticTypeKind::Dict)
+                        return open_comp(c->key) || open_comp(c->val);
+                    return false;
+                };
+            if (open_comp(t)) { ready = false; break; }
             sig.push_back(t);
         }
         if (!ready)
@@ -827,15 +1487,14 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         if (!clone_sym) {
             /* D4: a new signature past the cap runs dynamically, not as a clone
              * - a backstop for pathological polymorphic recursion. */
-            static const int MAX_TMPL_INSTANCES = 64;
-            if (tmpl_inst_count[tmpl] >= MAX_TMPL_INSTANCES) {
+            if (tmpl_inst_count[tmpl] >= g_tmpl_max_instances) {
                 if (tmpl_cap_warned.insert(tmpl).second && tmpl->decl->id) {
                     auto nm = tmpl->decl->id->get_str();
                     fprintf(stderr,
                             "warning: template '%.*s' exceeded %d "
                             "instantiations; further calls run dynamically\n",
                             static_cast<int>(nm.size()), nm.data(),
-                            MAX_TMPL_INSTANCES);
+                            g_tmpl_max_instances);
                 }
                 continue;
             }
@@ -868,11 +1527,14 @@ bool Inferencer::instantiate_round(Block *rootBlock)
             const std::string nm = tmpl->decl->id
                 ? std::string(tmpl->decl->id->get_str())
                 : std::string("<lambda>");
-            TRACE(templ, 0, nm + "(" + ss + ") -> " +
-                  std::string(clone_name->val) +
-                  (reused ? "  (reused)"
-                          : "  (instance " +
-                            std::to_string(tmpl_inst_count[tmpl]) + ")"));
+            /* trace_emit, not TRACE: the category is tested above */
+            trace_emit(TraceCat::templ, 0,
+                       nm + "(" + ss + ") -> " +
+                       std::string(clone_name->val) +
+                       (reused ? "  (reused)"
+                               : "  (instance " +
+                                 std::to_string(tmpl_inst_count[tmpl]) +
+                                 ")"));
         }
 
         auto what = make_unique<Identifier>(clone_name->val);
@@ -882,21 +1544,269 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         /* The old callee Identifier is about to be freed: drop its id_sym entry
          * so nothing (e.g. -a's collect_arrays) walks a dangling key. */
         id_sym.erase(call->what.get());
-        call->what = move(what);
+        /* A lambda template's call still READS its variable - the
+         * instance is bound at the top of the program, the variable
+         * where it is written (Identifier::bind_guard). A named
+         * template binds at the top of its scope, as its instance does.
+         * A lambda template is reached through its variable's name only
+         * (mark_lambda_templates: var-bound, calls-only). */
+        if (!tmpl->decl->id) {
+            ML_CHECK(ctag(call->what.get()) == ConstructType::id);
+            what->bind_guard.reset(
+                static_cast<Identifier *>(call->what.release()));
+        }
+        call->what = std::move(what);
         progress = true;
     }
     return progress;
 }
 
-void Inferencer::drain_escapes()
+
+/*
+ * #115: which INDIRECT call sites have a callee this pass may name.
+ *
+ * ⛔ IT ASKS THE CALLEE-SET ANALYSIS NOW (#116 increment 2), not
+ * `StaticType::finfos`. The old source could not distinguish "nothing
+ * flows here" from "I have no idea" - both were the empty set - so
+ * `finfos.size() == 1` was never a proof of anything, and a side
+ * ledger (`escaped_finfos` / `value_escaped`) existed to carry the
+ * "unknown" the set itself could not express.
+ *
+ * Read off a SETTLED analysis and stored, never recomputed - see
+ * `indirect_callee` for why the gate is unsound to evaluate
+ * mid-fixpoint.
+ *
+ * ⛔ AND IT CLOSES A SOUNDNESS HOLE THE FIRST VERSION SHIPPED WITH.
+ * Attributing every size-1 site is not enough: a closure can be
+ * reached BOTH by a site that names it alone AND by a site that may
+ * reach it or another, and only the first was ever counted -
+ *
+ *     func mk_a(n) => func [n] (x) { return "A:" + typestr(x); };
+ *     func mk_b(n) => func [n] (x) { return "B:" + typestr(x); };
+ *     func probe(int k) {
+ *         var only_a = mk_a(1);         # names ONE closure
+ *         var p = [mk_a(2), mk_b(3)];   # ...the SAME FuncInfo
+ *         var either = p[k];            # may be either
+ *         return only_a(7) + " " + either("str");
+ *     }
+ *
+ * - `only_a(7)` typed the closure's parameter `int`, `either("str")`
+ * was never attributed, and the check pass then REFUSED the program on
+ * a signature #115 had invented (`argument 1 has type 'str' but the
+ * parameter is 'int'`). The identical program with no size-1 site
+ * compiles and prints `A:dyn B:dyn`. So a callee is usable only when
+ * EVERY site whose set contains it names it ALONE, which is what
+ * `disqualified` records.
+ *
+ * ⛔ ONE, AND CONTRIBUTING TO ALL OF A LARGER SET IS NOT THE
+ * ALTERNATIVE. It looks sound - the value may be any member, so each
+ * may really receive these arguments - and it is, per site. Across
+ * sites it is not conservative at all: two vars each holding {A, B},
+ * one called with an int and one with a str, would give BOTH A and B
+ * both types and turn a working program into a TypeMismatchEx. The
+ * single-candidate rule is what keeps this pass from inventing
+ * conflicts that no single closure ever sees.
+ */
+void Inferencer::snapshot_indirect_callees(Block *rootBlock)
 {
-    for (void *p : A.escaped_finfos)
-        static_cast<FuncInfo *>(p)->value_escaped = true;
-    A.escaped_finfos.clear();
+    std::vector<std::pair<CallExpr *, bool>> calls;
+    for (auto &e : rootBlock->elems)
+        collect_calls(e.get(), calls);
+
+    /* 1) attribute every indirect call whose callee names ONE function,
+     *    and DISQUALIFY every function named by a site that does not */
+    std::map<FuncInfo *, std::vector<CallExpr *>> sites;
+    std::set<FuncInfo *> disqualified;
+    for (auto &cp : calls) {
+        CallExpr *call = cp.first;
+        if (indirect_callee.count(call))
+            continue;                       /* decided already - never revise */
+        if (callee_funcinfo(call->what.get()))
+            continue;                       /* a direct call */
+        const CsSet cs = callee_set(call->what.get());
+        if (cs.top)
+            continue;   /* ⊤ - covered by callee_escaped below, which
+                         * marks every function such a site can reach */
+        if (cs.funcs.size() == 1)
+            sites[cs.funcs[0]].push_back(call);
+        else
+            for (FuncInfo *f : cs.funcs)
+                disqualified.insert(f);
+    }
+
+    /*
+     * 2) EVERY QUALIFYING SITE CONTRIBUTES, and the join decides.
+     *
+     * ⛔ THERE USED TO BE A UNIFORMITY CHECK HERE - "all of this
+     * closure's sites must pass the SAME argument types, or none of
+     * them contributes" - and DELETING IT (maintainer's call,
+     * 2026-08-28) is what made MyLang's two closure spellings agree.
+     *
+     * It was never computing a different answer; it decided whether to
+     * answer AT ALL. `contribute_arg` below is the SAME function the
+     * ordinary direct-call path uses, so a lambda the inferencer can
+     * NAME already had every one of its call sites contribute
+     * unconditionally, and the fixpoint JOINED them. A factory-returned
+     * closure cannot be named, so this map is its only route to
+     * `contribute_arg` - and with the gate closed it contributed
+     * nothing and its parameters finalized `dyn`. Same source shape,
+     * two behaviours:
+     *
+     *     var wbase = 20;                                  # B: DIRECT
+     *     var f = func [wbase] (x) { return typestr(x); };
+     *     print(f(1) + " " + f(2.5));   # was: float float
+     *
+     *     func mk(n) {                                     # A: FACTORY
+     *         var wbase = n * 10;
+     *         return func [wbase] (x) { return typestr(x); };
+     *     }
+     *     var g = mk(2);
+     *     print(g(1) + " " + g(2.5));   # was: dyn dyn
+     *
+     * Both print `float float` now: the join widens int to float, and
+     * an int/str pair is the join CONFLICT both spellings already
+     * raised for B. (A third spelling, a NON-capturing var-bound
+     * lambda, is a TEMPLATE and monomorphizes per signature - that is
+     * a different feature and is untouched.)
+     *
+     * ⛔ AND THE REASON IT WAS NEEDED IS GONE, which is what made
+     * deleting it safe rather than merely desirable. It went in when
+     * the candidate set UNDER-COLLECTED: `join`'s `static_type_equal`
+     * shortcut dropped one side's members whenever two functions shared
+     * a signature, so sites belonging to two DIFFERENT closures were
+     * attributed to one survivor - and joining those invents a
+     * TypeMismatchEx in a program that has no conflict in it. The
+     * callee-set analysis reports such a site as a TWO-candidate set,
+     * which `disqualified` above already refuses. Watched: the two
+     * pinned array cases in 25_factory_closure_param.my still decline,
+     * for that reason now and not for this one.
+     */
+    for (auto &kv : sites) {
+        FuncInfo *fi = kv.first;
+        if (!fi || fi->is_template || disqualified.count(fi))
+            continue;
+        /* A function whose VALUE left the analysed program can be
+         * called from a site this pass never saw, so no number of
+         * visible sites proves anything about it. */
+        if (callee_escaped(fi))
+            continue;
+        for (CallExpr *c : kv.second)
+            indirect_callee[c] = fi;
+    }
 }
 
 /*
- * Value-used template instantiation (plans/value-template-instantiation.md).
+ * #116 increment 4: stamp `CallExpr::callee_fn` - the single function a
+ * call can reach - so a pass that runs AFTER the inferencer is gone can
+ * still ask the callee-set analysis's question.
+ *
+ * Its consumer is the #93 ESCAPE ANALYSIS (resolver.cpp), which poisons a
+ * whole function whenever a call's callee is not a named global slot,
+ * because a callee it cannot name could reassign the global some caller
+ * passed us and drop the last reference mid-call. Naming the callee turns
+ * that blanket poison into an ordinary call EDGE, which the `unsafe`
+ * fixpoint already propagates.
+ *
+ * ⛔ THE GATES ARE THE SAME ONES A MUST-ANSWER ALWAYS NEEDS, and each is
+ * load-bearing for MEMORY SAFETY here, not for precision:
+ *  - exactly ONE candidate and not ⊤. A flow-insensitive set unions every
+ *    assignment, so |set| == 1 means only that function can ever be there
+ *    - which is also why no separate "is the slot reassigned?" test is
+ *    needed (a reassigned variable holds two candidates and declines).
+ *  - not ESCAPED: a function whose value left the analysed program can be
+ *    reached from a site this pass never saw.
+ *  - it must have a `decl` - a FuncInfo with no node is nothing the
+ *    resolver can match.
+ *
+ * ⛔ A TEMPLATE BASE IS *NOT* EXCLUDED, and that is deliberate - the
+ * question this consumer asks is "WHOSE BODY RUNS HERE", not "which
+ * signature should I type". A base whose value was never redirected to
+ * an instance runs its own (boxed) body, and the analysis names exactly
+ * what the redirect left behind: if `value_instantiate_round` rebound
+ * the value use, the set holds the INSTANCE. Excluding bases here was a
+ * copy of #115's gate, where `is_template` means "instantiation handles
+ * those" - a different question - and it cost the motivating bench
+ * (12_higher_order's `func apply(f, x) => f(x);` reaches `sq`, which is
+ * a template because it is only ever passed as a VALUE).
+ *
+ * A stamp is only ever an ADDITION to what the resolver could already
+ * name, so the failure direction is: a wrong stamp lets the escape
+ * analysis believe a call is analysable when it is not, which is a #94
+ * BORROW of a reference that may be dropped - a use-after-free. The
+ * conservative answer is null, and every path that cannot name returns it.
+ */
+void Inferencer::stamp_callee_fn(Block *rootBlock)
+{
+    std::vector<std::pair<CallExpr *, bool>> calls;
+    for (auto &e : rootBlock->elems)
+        collect_calls(e.get(), calls);
+
+    for (auto &cp : calls) {
+        CallExpr *call = cp.first;
+        call->callee_fn = nullptr;
+        call->callee_desc = DescStamp();
+        call->callee_desc2 = DescStamp();
+        call->callee_desc_more.clear();
+        if (cs_struct_callee(call->what.get()))
+            continue;                     /* a construction, not a call */
+        const CsSet cs = callee_set(call->what.get());
+        if (cs.top)
+            continue;
+        /*
+         * #97 E3: a TWO-WAY site (`ops[i % 2]` reaching add_op or sub_op)
+         * is stamped with BOTH descriptors, for the JIT's frameless
+         * dispatch alone - `callee_fn` stays null, since the resolver's
+         * consumers need one function, and the generic push reads a
+         * two-entry pool pc as unnamed. Both must be nameable, unescaped
+         * functions with a body; a set of three or more stays unnamed.
+         */
+        /* #72: and a site of up to g_value_cands_max candidates, for the
+         * splice's guard chain - on exactly the same terms */
+        if (cs.funcs.size() >= 2
+                && cs.funcs.size() <= static_cast<size_t>(g_value_cands_max)) {
+            bool ok = true;
+            for (size_t k = 0; k < cs.funcs.size() && ok; k++) {
+                FuncInfo *f = cs.funcs[k];
+                ok = f && f->decl && !callee_escaped(f);
+                for (size_t j = 0; j < k && ok; j++)
+                    ok = cs.funcs[j] != f;
+            }
+            if (!ok)
+                continue;
+            /* the set's member ORDER is the fixpoint's insertion order,
+             * which follows pointer-keyed iteration - i.e. the heap
+             * layout - and it becomes the guard chain's order. Sort by
+             * the declaration's monotonic node_id so the emitted code is
+             * the same in every binary (found by #107's vdjcmp: an INT
+             * build, which interns more strings, swapped a1$0/a2$0) */
+            std::vector<FuncInfo *> order(cs.funcs.begin(), cs.funcs.end());
+            std::sort(order.begin(), order.end(),
+                      [](const FuncInfo *a, const FuncInfo *b) {
+                          return a->decl->node_id < b->decl->node_id;
+                      });
+            call->callee_desc = DescStamp(order[0]->decl->desc);
+            call->callee_desc2 = DescStamp(order[1]->decl->desc);
+            for (size_t k = 2; k < order.size(); k++)
+                call->callee_desc_more.push_back(
+                    DescStamp(order[k]->decl->desc));
+            continue;
+        }
+        if (cs.funcs.size() != 1)
+            continue;
+        FuncInfo *fi = cs.funcs[0];
+        if (!fi || !fi->decl)
+            continue;
+        if (callee_escaped(fi))
+            continue;
+        call->callee_fn = fi->decl;
+        /* #97 E1: the same answer, as the program-lifetime DESCRIPTOR, for
+         * consumers that run after the optimizers have freed decls. */
+        call->callee_desc = DescStamp(fi->decl->desc);
+    }
+}
+
+/*
+ * Value-used template instantiation (plans/archived/value-template-instantiation.md).
  * A template whose VALUE flows (through vars/containers - the finfo set on
  * its Func static type rides the ordinary lattice) to indirect call sites
  * that all agree on ONE settled signature is instantiated for that
@@ -907,26 +1817,78 @@ void Inferencer::drain_escapes()
  */
 bool Inferencer::value_instantiate_round(Block *rootBlock)
 {
-    /* 1) Every VALUE USE of a template identifier: a non-callee Identifier
-     * resolving to a template FuncInfo. An ARG-position use (any call's
-     * argument - incl. builtins: map/filter/runtime/...) or a CAPTURE-list
-     * use ESCAPES the template (an untracked consumer). */
+    /*
+     * 1) Every VALUE USE of a template identifier: a non-callee
+     * Identifier resolving to a template FuncInfo.
+     *
+     * ⛔ AN ARG-POSITION AND A CAPTURE-LIST USE ARE ORDINARY VALUE USES
+     * NOW (#116 follow-up, 2026-08-28). They used to ESCAPE the
+     * template outright, on the reasoning that "an untracked call site
+     * could reach the typed instance with a mismatched signature" -
+     * true when nothing could name the consumer of an argument. The
+     * callee-set analysis names it: an argument bound to a parameter
+     * shows up in `pts(param)`, so a call THROUGH that parameter is an
+     * attributed site like any other and lands in `sites[tmpl]` below,
+     * where the signature is computed and uniformity is checked.
+     *
+     * What replaced the blanket rule, and each is load-bearing:
+     *  - every indirect call whose callee set NAMES tmpl is attributed
+     *    to it - including a multi-candidate site, which is attributed
+     *    to ALL its candidates, so it still constrains;
+     *  - a ⊤-callee site anywhere makes tmpl `callee_escaped`, and the
+     *    gate below declines;
+     *  - UNIFORMITY over the attributed sites still decides.
+     *
+     * Measured: `12_higher_order` (`func apply(f, x) => f(x);` with
+     * `apply(sq, i)`) instantiates `sq$0` for the first time, so the
+     * higher-order chain is typed end to end -
+     * `apply$0 : func(func(int)->int, int)->int` where it was
+     * `func(dyn,dyn)->dyn` - and costs **-63.5% Ir per scale unit**.
+     * It is the ONLY corpus program whose bytecode changes; lifting
+     * the CAPTURE half changes none, and is lifted anyway because it
+     * is the SAME rule with the same argument, and one of the two
+     * surviving would be an asymmetry with no reason behind it.
+     */
     struct Use { Identifier *id; TypeSym *sym; bool in_func; };
-    std::map<FuncInfo *, std::vector<Use>> uses;
+    /* keyed in DECLARATION order, not by pointer: iterating `uses` is
+     * what creates the instances, and their creation order decides their
+     * global slots - by address it followed the heap layout, so two
+     * binaries numbered a1$0/a2$0 differently (found by #107's vdjcmp) */
+    struct ByDecl {
+        bool operator()(const FuncInfo *a, const FuncInfo *b) const
+        {
+            /* every FuncInfo has its declaration (declare_funcdecl is
+             * the one creator), and node_id is unique per node */
+            return a->decl->node_id < b->decl->node_id;
+        }
+    };
+    std::map<FuncInfo *, std::vector<Use>, ByDecl> uses;
 
     std::function<void(Construct *, bool)> walk =
         [&](Construct *n, bool in_func) {
         if (!n)
             return;
-        if (auto *call = dynamic_cast<CallExpr *>(n)) {
-            /* the callee position is NOT a value use; ARG uses escape */
-            walk(call->what.get(), in_func);   /* nested callee exprs */
+        if (ctag(n) == ConstructType::call) {
+            auto *call = static_cast<CallExpr *>(n);
+            /* the callee position is NOT a value use; ARG uses escape.
+             * A bare name there is a DIRECT call, so it is not walked:
+             * one that still names the template - left on the base by
+             * --max-instances or the instantiation rounds' bound - was
+             * recorded as a value use and redirected to the VALUE
+             * instance, so `show("ab")` became a call of `show$0(int)`
+             * and a valid program was refused (2026-11-11). Any other
+             * callee expression may hold value uses (`pick(f)(x)`). */
+            if (ctag(call->what.get()) != ConstructType::id)
+                walk(call->what.get(), in_func);
             for (auto &a : call->args->elems) {
-                if (auto *id = dynamic_cast<Identifier *>(a.get())) {
+                if (ctag(a.get()) == ConstructType::id) {
+                    auto *id = static_cast<Identifier *>(a.get());
                     auto it = id_sym.find(id);
                     if (it != id_sym.end() && it->second && it->second->func
                             && it->second->func->is_template) {
-                        it->second->func->value_escaped = true;
+                        /* an ARG-position value use - see the header */
+                        uses[it->second->func].push_back(
+                            { id, it->second, in_func });
                         continue;
                     }
                 }
@@ -934,26 +1896,50 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
             }
             return;
         }
-        if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
+        if (ctag(n) == ConstructType::func_decl) {
+            auto *fd = static_cast<FuncDeclStmt *>(n);
             if (fd->captures)
                 for (auto &cap : fd->captures->elems) {
-                    if (auto *id = dynamic_cast<Identifier *>(cap.get())) {
+                    if (ctag(cap.get()) == ConstructType::id) {
+                        auto *id = static_cast<Identifier *>(cap.get());
                         auto it = id_sym.find(id);
                         if (it != id_sym.end() && it->second
                                 && it->second->func
                                 && it->second->func->is_template)
-                            it->second->func->value_escaped = true;
+                            /* a CAPTURE-LIST value use. `in_func` is
+                             * TRUE unconditionally: the consumer is
+                             * the closure being declared, which is a
+                             * function body - and marking it so only
+                             * makes the REPL keep the instance rather
+                             * than GC it, the conservative side. */
+                            uses[it->second->func].push_back(
+                                { id, it->second, true });
                     }
                 }
             for_each_child(n, [&](Construct *c) { walk(c, true); });
             return;
         }
-        if (auto *id = dynamic_cast<Identifier *>(n)) {
+        if (ctag(n) == ConstructType::id) {
+            auto *id = static_cast<Identifier *>(n);
             auto it = id_sym.find(id);
             if (it != id_sym.end() && it->second && it->second->func
                     && it->second->func->is_template)
                 uses[it->second->func].push_back({ id, it->second, in_func });
             return;
+        }
+        /* the NAME a declaration binds is not a use of its value. `const
+         * tw = pure func(x) => x * 2;` whose value is reached only
+         * through a baked const (`const OPS = [tw];`, folded at parse
+         * time, so no identifier names it) found the declaration's own
+         * `tw` here, renamed it to the instance - whose name was then
+         * declared twice (AlreadyDefinedEx, 2026-11-14) */
+        if (ctag(n) == ConstructType::expr14) {
+            auto *e14 = static_cast<Expr14 *>(n);
+            if ((e14->fl & pFlags::pInDecl)
+                    && ctag(e14->lvalue.get()) == ConstructType::id) {
+                walk(e14->rvalue.get(), in_func);
+                return;
+            }
         }
         for_each_child(n, [&](Construct *c) { walk(c, in_func); });
     };
@@ -966,27 +1952,48 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
     /* 2) Every INDIRECT call (no direct FuncInfo) whose callee type carries
      * a finfo set: attribute its signature to each member. */
     struct Site { CallExpr *call; bool in_func; };
-    std::map<FuncInfo *, std::vector<Site>> sites;
+    std::map<FuncInfo *, std::vector<Site>, ByDecl> sites;
     std::vector<std::pair<CallExpr *, bool>> calls;
     for (auto &e : rootBlock->elems)
         collect_calls(e.get(), calls);
     for (auto &cp : calls) {
         if (callee_funcinfo(cp.first->what.get()))
             continue;                       /* a direct call */
-        StaticTypeRef ct =
-            static_type_resolve(type_of(cp.first->what.get()));
-        if (!ct || ct->kind != StaticTypeKind::Func)
+        /*
+         * #116 increment 3: the CALLEE-SET analysis, not `finfos`.
+         * A ⊤ callee names nothing, and `callee_escaped` below is what
+         * turns that into a decline for the templates it could reach.
+         */
+        const CsSet cs = callee_set(cp.first->what.get());
+        if (cs.top)
             continue;
-        for (void *p : ct->finfos)
-            sites[static_cast<FuncInfo *>(p)].push_back(
-                { cp.first, cp.second });
+        for (FuncInfo *f : cs.funcs)
+            sites[f].push_back({ cp.first, cp.second });
     }
 
     bool progress = false;
 
     for (auto &kv : uses) {
         FuncInfo *tmpl = kv.first;
-        if (!tmpl->is_template || tmpl->value_escaped || !tmpl->decl)
+        /*
+         * ⛔ ONE ESCAPE QUESTION, ONE ANSWER. There used to be TWO
+         * gates here: this one, and `FuncInfo::value_escaped` - a flag
+         * the walk above set whenever a template's name appeared as a
+         * call ARGUMENT or in a CAPTURE LIST, on the reasoning that an
+         * untracked consumer could reach the typed instance with a
+         * mismatched signature.
+         *
+         * Both of its producers are gone (see the walk's header): those
+         * uses are ordinary value uses now, because the callee-set
+         * analysis NAMES their consumers - an argument bound to a
+         * parameter appears in `pts(param)`, so a call through that
+         * parameter is an attributed site like any other. `value_escaped`
+         * had no producers left and is DELETED; `callee_escaped` is the
+         * single escape question, answered by the analysis.
+         */
+        if (!tmpl->is_template || !tmpl->decl)
+            continue;
+        if (callee_escaped(tmpl))
             continue;
         if (value_inst_done.count(tmpl))
             continue;
@@ -1010,12 +2017,9 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
             std::vector<StaticTypeRef> s1;
             for (size_t i = 0; i < nparams; i++) {
                 TypeSym *p = tmpl->params[i];
-                if (p->opt_decl || p->dyn_decl || p->ann != DeclType::none)
+                if (!template_param(p))
                     continue;              /* not a template param */
-                StaticTypeRef t = i < nargs
-                    ? static_type_resolve(
-                          type_of(site.call->args->elems[i].get()))
-                    : A.none_ty();
+                StaticTypeRef t = template_arg_key(site.call, p, i);
                 if (is_unknown(t)) { ok = false; break; }
                 s1.push_back(t);
             }
@@ -1033,16 +2037,33 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
                 break;
             }
         }
-        if (!ok || first)
+        if (!ok)
             continue;
+        ML_CHECK(!first);          /* the site list is not empty */
 
-        /* A dyn in the signature would make the clone no better than the
-         * base - leave the base running. */
-        bool has_dyn = false;
+        /*
+         * A signature that cannot improve on the base - leave the base
+         * running (boxed, exactly as before this feature):
+         *  - a `dyn` param: the clone would be just as boxed.
+         *  - a container carrying the BOTTOM `none` element type (an empty
+         *    `[]`/`{}` the caller has no element info for - see
+         *    type_has_bottom_elem). This one is not merely useless but
+         *    HARMFUL: the clone's params are seeded from the signature, so a
+         *    body that only READS the container types every element as `none`,
+         *    and an ordinary use of one (`k + ":"`) becomes a spurious
+         *    NullabilityEx - even though the container is non-empty at
+         *    runtime, having been filled by a SIBLING function through its
+         *    reference param (samples/phonebook: `cmd_add` fills `data`,
+         *    `cmd_view` iterates it). A writer body repairs the type by
+         *    contribution; a reader body cannot, so declining is the only
+         *    sound answer. Deferred, not vetoed: a later fixpoint round may
+         *    settle the element type, and then the instance is made.
+         */
+        bool bad_sig = false;
         for (StaticTypeRef t : sig)
-            if (type_has_dyn(t, /*deep=*/false))
-                has_dyn = true;
-        if (has_dyn)
+            if (type_has_dyn(t, /*deep=*/false) || type_has_bottom_elem(t))
+                bad_sig = true;
+        if (bad_sig)
             continue;
 
         /* 4) Get-or-make the instance (the ordinary template machinery). */
@@ -1058,8 +2079,7 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
             }
         }
         if (!clone_sym) {
-            static const int MAX_TMPL_INSTANCES = 64;
-            if (tmpl_inst_count[tmpl] >= MAX_TMPL_INSTANCES)
+            if (tmpl_inst_count[tmpl] >= g_tmpl_max_instances)
                 continue;
             FuncDeclStmt *clone = make_template_clone(tmpl, key, rootBlock);
             clone_name = clone->id->uid;
@@ -1086,15 +2106,22 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
             const std::string nm = tmpl->decl->id
                 ? std::string(tmpl->decl->id->get_str())
                 : std::string("<lambda>");
-            TRACE(templ, 0, "value-instantiate " + nm + "(" + ss + ") -> " +
-                  std::string(clone_name->val));
+            trace_emit(TraceCat::templ, 0,
+                       "value-instantiate " + nm + "(" + ss + ") -> " +
+                       std::string(clone_name->val));
         }
 
         /* 5) Redirect EVERY value use IN PLACE (uid + sym rebind - the
-         * Identifier node keeps its loc, so carets are unchanged). */
+         * Identifier node keeps its loc, so carets are unchanged). Each
+         * redirected use IS a value use of the CLONE (that is the
+         * feature's name), so mark its sym: the instance's FuncObject
+         * is reachable as a value (`ops[0]`), dyn-launderable, and
+         * therefore callable with unchecked args - C3's proven-param
+         * stamp must never fire on it. */
         for (const Use &u : kv.second) {
             u.id->uid = clone_name;
             id_sym[u.id] = clone_sym;
+            clone_sym->value_used = true;
             if (u.in_func)
                 clone_sym->func->has_func_consumer = true;
         }
@@ -1133,11 +2160,66 @@ void Inferencer::setup()
  * fixpoint reads but never recomputes them). All passes operate on this root's
  * elems only; the persistent global scope / arena carry cross-input state.
  */
+/*
+ * `opt` on a struct-typed field is for a CLASS-typed one (a null
+ * reference). The parser decides it when the field's type is already
+ * declared; a forward reference is decided here, once every declaration
+ * is known. A syntactic rule, so it runs under -nti too.
+ */
+void Inferencer::check_opt_struct_fields()
+{
+    /* a field typed by a name declared further down (a forward reference)
+     * is resolved here; one no struct or class of the program takes is
+     * not a type - "'K' is not a type", as for a variable (the parser's
+     * not_a_type). The first in SOURCE order. */
+    if (closed_world) {
+        const FieldDef *unk = nullptr;
+        for (const StructTypeDef *d : declared_structs)
+            for (const FieldDef &f : d->fields) {
+                if (f.kind != FieldKind::f_struct || f.struct_def
+                        || struct_by_name.count(f.struct_ty))
+                    continue;
+                if (!unk || f.type_loc.line < unk->type_loc.line
+                    || (f.type_loc.line == unk->type_loc.line
+                        && f.type_loc.col < unk->type_loc.col))
+                    unk = &f;
+            }
+        if (unk) {
+            const std::string n(unk->struct_ty->val);
+            SyntaxErrorEx e(unk->type_loc,
+                            intern_msg("'" + n + "' is not a type"));
+            e.loc_end = unk->type_loc + static_cast<int>(n.size() + 1);
+            throw e;
+        }
+    }
+
+    /* the first in SOURCE order: the map's own order follows pointers */
+    const FieldDef *bad = nullptr;
+    for (const StructTypeDef *d : declared_structs)
+        for (const FieldDef &f : d->fields) {
+            if (!f.is_opt || f.kind != FieldKind::f_struct)
+                continue;
+            auto it = struct_by_name.find(f.struct_ty);
+            if (it != struct_by_name.end() && !it->second->is_class
+                && (!bad || f.loc.line < bad->loc.line
+                    || (f.loc.line == bad->loc.line
+                        && f.loc.col < bad->loc.col)))
+                bad = &f;
+        }
+    /* the parser's message (opt_field_msg) for the same rule: it named no
+     * box here, where the forward-reference case is decided */
+    if (bad)
+        throw SyntaxErrorEx(bad->loc,
+            "'opt' is only allowed on dyn/array/dict/box and class-typed "
+            "fields");
+}
+
 void Inferencer::infer_one(Block *rootBlock)
 {
     hoist_globals(rootBlock);
     for (auto &e : rootBlock->elems)
         walk_struct(e.get(), global);
+    check_opt_struct_fields();
 
     /*
      * Desugar named-argument calls into positional ones BEFORE anything else
@@ -1148,6 +2230,11 @@ void Inferencer::infer_one(Block *rootBlock)
     for (auto &e : rootBlock->elems)
         lower_named_args(e.get());
 
+    /* isbound()'s argument SHAPE, and which calls naming a lazy builtin
+     * call the program's own symbol - syntactic, so ungated (see the fn) */
+    for (auto &e : rootBlock->elems)
+        stamp_lazy_calls(e.get());
+
     /* Reserve DEV-only builtins (show()) in a script - a compile-time error,
      * even under -nti (this runs before the checks_enabled early return). A
      * no-op in the REPL / test runner (they set g_dev_builtins_allowed). */
@@ -1155,8 +2242,15 @@ void Inferencer::infer_one(Block *rootBlock)
         for (auto &e : rootBlock->elems)
             reject_dev_builtins(e.get());
 
-    if (!checks_enabled)
+    if (!checks_enabled) {
+        /* #51: with no types, every call's callee is unknown - say so, or
+         * the codegen (which lowers a call only on a type proof) refuses
+         * the program. */
+        for (auto &e : rootBlock->elems)
+            stamp_untyped_calls(e.get());
+        apply_late_folds(rootBlock);
         return;
+    }
 
     mark_lambda_templates();   /* safe var-bound lambdas become templates */
     run_fixpoint(rootBlock);
@@ -1169,15 +2263,78 @@ void Inferencer::infer_one(Block *rootBlock)
      * until no new signature appears - a clone's body may call other templates
      * (or itself), which surface only once its own params are settled.
      */
-    for (int round = 0; round < 64; round++) {
-        drain_escapes();
-        const bool p1 = instantiate_round(rootBlock);
-        const bool p2 = value_instantiate_round(rootBlock);
-        if (!p1 && !p2)
-            break;
-        run_fixpoint(rootBlock);
+    const auto instantiate_to_fixpoint = [&]() {
+        for (int round = 0; round < 64; round++) {
+            /*
+             * ⛔ THE CALLEE SETS ARE RE-DERIVED PER ROUND, because
+             * `value_instantiate_round` CONSUMES them and runs here.
+             * It is not an optimization to hoist this out: each round
+             * REDIRECTS call sites to fresh clones, so the answer from
+             * the previous round describes a tree that no longer
+             * exists. Cheap - the domain is function values only, and
+             * the loop converges in 2-4 rounds on the corpus.
+             */
+            cs_run(rootBlock);
+            const bool p1 = instantiate_round(rootBlock);
+            const bool p2 = value_instantiate_round(rootBlock);
+            if (!p1 && !p2)
+                break;
+            run_fixpoint(rootBlock);
+        }
+    };
+    instantiate_to_fixpoint();
+
+    /*
+     * #115: ONLY NOW is "this callee is provably one function" a
+     * question with a stable answer, and the ordering is not a detail -
+     * it was the bug. Taken before this loop, every candidate callee
+     * read `dyn`: a call to a TEMPLATE defers by design (see the
+     * defer-on-Unknown invariant), so a factory's return type does not
+     * exist until instantiation has made the clone and redirected the
+     * call. The snapshot found ZERO sites and the whole rule was inert.
+     *
+     * Taken here, the finfo sets are settled and the decision is made
+     * once from complete information - which is the property the
+     * mid-fixpoint gate could not have (a set only GROWS, so a callee
+     * that ends with two candidates passes through a round holding
+     * one, and a contribution made there is already committed when the
+     * second arrives; nothing can un-join a param).
+     *
+     * The contributions can settle new template signatures, so the
+     * instantiate loop runs again. It is idempotent when nothing
+     * changed and bounded either way.
+     */
+    /*
+     * THE CALLEE-SET ANALYSIS (#116), and its placement is the same
+     * constraint #115's snapshot has: it needs POST-INSTANTIATION
+     * types and a post-instantiation TREE. A call to a template DEFERS
+     * by design, so a factory's return type does not exist until
+     * instantiation has made the clone and REDIRECTED the call - run
+     * before this loop, the analysis would walk call sites that no
+     * longer exist and miss the ones that replaced them.
+     */
+    cs_run(rootBlock);
+
+    {
+        CsHoldMemoScope memo(*this);    /* it only reads (#98) */
+        snapshot_indirect_callees(rootBlock);
     }
-    drain_escapes();
+    if (!indirect_callee.empty()) {
+        run_fixpoint(rootBlock);
+        instantiate_to_fixpoint();
+    }
+
+    /*
+     * #116 increment 4: hand the callee sets to the RESOLVER by stamping
+     * them on the call nodes. Last, because everything above can still
+     * redirect a call site to a fresh clone - `instantiate_to_fixpoint`
+     * re-runs `cs_run` per round for exactly that reason, so only now is
+     * the tree final and the analysis current for it.
+     */
+    {
+        CsHoldMemoScope memo(*this);
+        stamp_callee_fn(rootBlock);
+    }
 
     /* finalize. An unconstrained value is `none` for a local ("only-none /
      * doesn't matter") but `dyn` for a PARAMETER: a never-(concretely-)called
@@ -1197,16 +2354,36 @@ void Inferencer::infer_one(Block *rootBlock)
              * contribute() now joins dyn vars). A non-opt dyn is proven
              * non-null - usable without a none-check.
              */
-            const bool opt = s->opt_decl ||
-                             (!s->is_param && is_optish(s->type));
-            s->type = A.with_opt(A.dyn_ty(), opt);
+            /* (rule 3: a `dyn` is never none - only a declared `dyn?`
+             * may be; contribute refuses the rest) */
+            s->type = A.with_opt(A.dyn_ty(), s->opt_decl);
         } else {
-            if (is_unknown(s->type))
+            if (is_unknown(s->type)) {
                 /* An unconstrained PARAM (never concretely called) or foreach
                  * loop var (container was Unknown/dyn) is `dyn` - it could be
-                 * anything. A plain unconstrained local is `none`. */
-                s->type = (s->is_param || s->is_loopvar) ? A.dyn_ty()
-                                                         : A.none_ty();
+                 * anything. A plain unconstrained local is `none` - but one
+                 * ASSIGNED only values of an unknowable type is `dyn` too,
+                 * untyped (see TypeSym::got_unknown). */
+                const bool untyped =
+                    !s->is_param && !s->is_loopvar && s->got_unknown;
+                s->type = (s->is_param || s->is_loopvar || untyped)
+                              ? A.dyn_ty() : A.none_ty();
+                s->untyped_dyn = untyped;
+            } else if (s->got_unknown && !s->is_param && !s->is_loopvar) {
+                /* A NUMERIC local that also received an untyped value -
+                 * `var y = x; if (c) y = 1;` with `x` a parameter no call
+                 * site feeds - keeps its type, and the untyped value is
+                 * a `dyn` coerced at the store (README: a concrete var
+                 * receiving a dyn), as the parameter's `dyn` would have
+                 * been had it been known in the fixpoint. Without the
+                 * store's check an indirect call passing 2.5 left a float
+                 * in an `int` slot: the JIT printed its bits as an int,
+                 * the VM aborted, the tree-walker threw. */
+                const StaticTypeRef ty = static_type_resolve(s->type);
+                if (ty->kind == StaticTypeKind::Int
+                        || ty->kind == StaticTypeKind::Float)
+                    s->coerces_dyn = true;
+            }
             if (s->opt_decl)
                 s->type = A.with_opt(s->type, true);
         }
@@ -1221,18 +2398,222 @@ void Inferencer::infer_one(Block *rootBlock)
      * builtin, bound to a var) can be dispatched INDIRECTLY - that call is NOT
      * redirected, so it runs the base body - so it is kept (compiled + shown).
      * (Its instances, if any, have is_template=false and are unaffected.) The
-     * residual case a `!value_used` template still runs the base - a D4 overflow
-     * (>64 instances) or an uninstantiable direct call - just tree-walks instead
-     * of VM-running (correct, only slower); the planned first-class dyn instance
-     * (foo$dyn) erases even that. Keyed off the name SYM's value_used.
+     * residual case a `!value_used` template still runs the base - a call
+     * instantiation left unredirected (past g_tmpl_max_instances, or past
+     * the loop's 64 rounds) - is KEPT too: the VM runs no AST, so a base
+     * dropped here aborted it ("call to a chunk-less function after AST
+     * teardown"; an ASSERTS=0 build, which never tears the tree down,
+     * walked the base's AST instead) - `depth([x], n - 1)` recursing 70
+     * levels was enough. Keyed off the name SYM's value_used.
+     *
+     * #149: reachability is TRANSITIVE, so "kept" is a CLOSURE, not the
+     * flag. A value-used base runs its ORIGINAL body, whose calls were
+     * never redirected to instances (the check/instantiation passes skip
+     * template bodies) - so any template that body names is itself
+     * runtime-reachable one hop in, and so on: `var dyn g = aa;` keeps aa
+     * (value-used), and aa's base body calls bb, whose base used to be
+     * excluded as dead - the indirect g() call then reached a chunk-less
+     * bb and, post-teardown, aborted (or under ASSERTS=0 walked a freed
+     * AST). Fixpoint over the kept bases' bodies: any IDENTIFIER naming a
+     * template (call or value use; nested lambdas descended - the whole
+     * subtree runs when the base runs) keeps that template too.
+     * Over-keeping (a body-local shadowing a template's name) costs a
+     * compiled chunk, never correctness.
      */
+    std::map<const FuncInfo *, TypeSym *> tmpls;
+    std::map<const UniqueId *, TypeSym *> tmpl_by_uid;
+    std::map<const FuncDescriptor *, TypeSym *> tmpl_by_desc;
+    for (auto &up : all_syms) {
+        TypeSym *s = up.get();
+        if (s->func && s->func->is_template && s->func->decl) {
+            tmpls.emplace(s->func, s);
+            tmpl_by_uid.emplace(s->name, s);
+            tmpl_by_desc.emplace(s->func->decl->desc, s);
+        }
+    }
+    std::set<const FuncInfo *> kept_bases;
+    {
+        std::vector<TypeSym *> work;
+        auto keep = [&](TypeSym *t) {
+            if (kept_bases.insert(t->func).second)
+                work.push_back(t);
+        };
+
+        /*
+         * A BAKED CONST VALUE is the third way a base can be reachable, and
+         * the only one with no Identifier left to see: `const OPS = [sq];`
+         * is const-folded BY THE PARSER into one LiteralObj holding the
+         * array, FuncObject and all, so by the time this pass runs nothing
+         * in the tree NAMES sq and `value_used` is false. The base was then
+         * excluded from codegen, and `var dyn f = OPS[runtime(0)]; f(7)`
+         * reached a chunk-less body: ML_CHECK abort under ASSERTS, a walk
+         * of the freed AST without them - while `-tw`, which never tears
+         * the tree down, printed the right answer (a RULE 2 divergence on
+         * top of the RULE 1 one). Const arrays, dicts, struct instances and
+         * a struct's folded `const` MEMBERS can all carry one, so the value
+         * is walked, not pattern-matched. A flat array (ints/floats/bools/
+         * strs/POD structs) cannot hold a function by construction, and
+         * get_view() on one would PROMOTE it - so those kinds are skipped,
+         * not viewed. A constant may contain itself: a container (or a
+         * struct type's consts) already on the walk's path is not entered
+         * again (cyclewalk.h) - everything in it is being walked already.
+         */
+        CycStack keep_path;
+        std::function<void(const EvalValue &)> keep_in_value =
+            [&](const EvalValue &v) {
+            CycKey ck;
+            bool keyed = cyc_key(v, ck);
+            if (!keyed && v.get_type()->t == Type::t_structtype) {
+                ck = cyc_key_consts(v.get<StructTypeDef *>());
+                keyed = true;
+            }
+            if (keyed && keep_path.contains(ck))
+                return;
+            CycGuard cg(keep_path, ck, keyed);
+
+            switch (v.get_type()->t) {
+
+            case Type::t_func: {
+                auto it = tmpl_by_desc.find(
+                    v.get_ref<intrusive_ptr<FuncObject>>()->func);
+                if (it != tmpl_by_desc.end())
+                    keep(it->second);
+                break;
+            }
+
+            case Type::t_arr: {
+                const SharedArrayObj &arr = v.get_ref<SharedArrayObj>();
+                if (arr.skind() == SharedArrayObj::Storage::objs) {
+                    /* class instances: their fields may hold one */
+                    for (size_type i = 0; i < arr.size(); i++)
+                        keep_in_value(obj_elem_value(
+                            arr.flat_objs()[arr.offset() + i]));
+                    break;
+                }
+                if (arr.skind() != SharedArrayObj::Storage::general)
+                    break;
+                ArrayConstView view = arr.get_view();
+                for (size_type i = 0; i < view.size(); i++)
+                    keep_in_value(view[i].get());
+                break;
+            }
+
+            case Type::t_dict:
+                for (const auto &kv :
+                         v.get_ref<intrusive_ptr<DictObject>>()->get_ref()) {
+                    keep_in_value(kv.first);
+                    keep_in_value(kv.second.get());
+                }
+                break;
+
+            case Type::t_struct: {
+                const StructObject &so =
+                    *v.get_ref<intrusive_ptr<StructObject>>();
+                for (const LValue &f : so.fields)   /* POD holds no func */
+                    keep_in_value(f.get());
+                break;
+            }
+
+            case Type::t_structtype:
+                for (const auto &c : v.get<StructTypeDef *>()->consts)
+                    keep_in_value(c.second);
+                break;
+
+            default:
+                break;
+            }
+        };
+
+        /* The baked values live anywhere a statement does - including
+         * inside a function body, which for_each_child does not enter. */
+        std::function<void(Construct *)> scan_baked = [&](Construct *n) {
+            if (!n)
+                return;
+            if (ctag(n) == ConstructType::lit_obj) {
+                keep_in_value(static_cast<LiteralObj *>(n)->literal_value());
+                return;
+            }
+            if (ctag(n) == ConstructType::struct_decl) {
+                auto *sd = static_cast<StructDeclStmt *>(n);
+                if (sd->def)
+                    for (const auto &c : sd->def->consts)
+                        keep_in_value(c.second);
+                return;
+            }
+            if (ctag(n) == ConstructType::func_decl) {
+                scan_baked(static_cast<FuncDeclStmt *>(n)->body.get());
+                return;
+            }
+            for_each_child(n, [&](Construct *c) { scan_baked(c); });
+        };
+
+        std::function<void(Construct *)> scan = [&](Construct *n) {
+            if (!n)
+                return;
+            if (ctag(n) == ConstructType::id) {
+                auto *id = static_cast<Identifier *>(n);
+                auto it = tmpl_by_uid.find(id->uid);
+                if (it != tmpl_by_uid.end())
+                    keep(it->second);
+                return;
+            }
+            if (ctag(n) == ConstructType::lit_obj
+                    || ctag(n) == ConstructType::struct_decl) {
+                scan_baked(n);   /* a baked value inside a kept base's body */
+                return;
+            }
+            if (ctag(n) == ConstructType::func_decl) {
+                auto *fd = static_cast<FuncDeclStmt *>(n);
+                scan(fd->body.get());   /* a nested lambda runs with the
+                                         * base - its references count */
+                return;
+            }
+            for_each_child(n, [&](Construct *c) { scan(c); });
+        };
+
+        for (auto &kv : tmpls)
+            if (kv.second->value_used || func_name_rebound(kv.second))
+                keep(kv.second);    /* a rebound name's calls stay calls */
+
+        /* A direct call instantiation left UNREDIRECTED - past the
+         * instance cap, past the instantiation loop's 64 rounds (one per
+         * nesting level of `f([x], n - 1)`) - still names the base, which
+         * then runs. Every live call is asked (the collector
+         * instantiate_round uses, so template bodies are skipped: a kept
+         * base's own calls are the closure's business, below). */
+        {
+            std::vector<std::pair<CallExpr *, bool>> live;
+            for (auto &e : rootBlock->elems)
+                collect_calls(e.get(), live, false, true);
+            for (const auto &cp : live) {
+                FuncInfo *fi = callee_funcinfo(cp.first->what.get());
+                if (!fi || !fi->is_template)
+                    continue;
+                /* every template's symbol is in tmpls (built from the
+                 * same all_syms, above) */
+                auto it = tmpls.find(fi);
+                ML_CHECK(it != tmpls.end());
+                keep(it->second);
+            }
+        }
+
+        for (auto &e : rootBlock->elems)
+            scan_baked(e.get());
+
+        while (!work.empty()) {
+            TypeSym *t = work.back();
+            work.pop_back();
+            scan(t->func->decl->body.get());
+        }
+    }
     for (auto &up : all_syms) {
         TypeSym *s = up.get();
         if (s->func && s->func->is_template && s->func->decl) {
             /* ANY template base -> skip specialization (a monomorphization
-             * shell). A DEAD one (never value-used) -> also skip codegen. */
+             * shell). A dead one (unreachable per the closure) -> also
+             * skip codegen. */
             s->func->decl->is_template = true;
-            if (!s->value_used)
+            if (!kept_bases.count(s->func))
                 s->func->decl->desc->is_template_base = true;
         }
         /*
@@ -1247,6 +2628,27 @@ void Inferencer::infer_one(Block *rootBlock)
          * rule wants. Skip a param (bound, not decl_type-coerced) and a pinned
          * REPL global.
          */
+        /*
+         * #75 follow-up: a plain `var` whose type the join WIDENED past one
+         * of its contributions (`var x = fi; ... x = 2.5;` is a float) must
+         * store that contribution widened, or the slot holds an int its
+         * float type denies - the tree-walker printed `1` where the VM,
+         * whose typed stores convert, printed `1.000000`. Same stamp as the
+         * dyn coercion below: the store's coerce_to_decl_type widens. Only
+         * where a narrower kind actually arrived (arg_kinds), so a var
+         * whose every store already has its type keeps no decl_type.
+         */
+        if (!s->is_param && !s->pinned && !s->dyn_decl && s->decl_id &&
+                s->decl_id->decl_type == DeclType::none &&
+                s->ann == DeclType::none) {
+            const StaticTypeRef ty = static_type_resolve(s->type);
+            if (ty->kind == StaticTypeKind::Float
+                && (s->arg_kinds & (ARGK_INT | ARGK_BOOL)))
+                s->decl_id->decl_type = DeclType::f;
+            else if (ty->kind == StaticTypeKind::Int
+                     && (s->arg_kinds & ARGK_BOOL))
+                s->decl_id->decl_type = DeclType::i;
+        }
         if (s->coerces_dyn && !s->is_param && !s->pinned && s->decl_id &&
                 s->decl_id->decl_type == DeclType::none) {
             const StaticTypeRef ty = static_type_resolve(s->type);
@@ -1285,9 +2687,10 @@ void Inferencer::infer_one(Block *rootBlock)
                 continue;
             const char *kind = s->is_param ? "param"
                              : s->const_decl ? "const" : "var";
-            TRACE(infer, 0, std::string(kind) + " " +
-                            std::string(s->name->val) + " : " +
-                            static_type_to_string(s->type) + "  (final)");
+            trace_emit(TraceCat::infer, 0,
+                       std::string(kind) + " " +
+                       std::string(s->name->val) + " : " +
+                       static_type_to_string(s->type) + "  (final)");
         }
         for (auto &up : all_funcs) {
             if (up->pinned || !up->decl || !up->decl->id)
@@ -1303,14 +2706,14 @@ void Inferencer::infer_one(Block *rootBlock)
                     ps += ": " + static_type_to_string(up->params[i]->type);
             }
             if (up->is_template)
-                TRACE(infer, 0, "func " +
-                                std::string(up->decl->id->get_str()) + "(" +
-                                ps + ")  template (instantiated per call)");
+                trace_emit(TraceCat::infer, 0,
+                           "func " + std::string(up->decl->id->get_str()) +
+                           "(" + ps + ")  template (instantiated per call)");
             else
-                TRACE(infer, 0, "func " +
-                                std::string(up->decl->id->get_str()) + "(" +
-                                ps + ") -> " + static_type_to_string(up->ret) +
-                                "  (final)");
+                trace_emit(TraceCat::infer, 0,
+                           "func " + std::string(up->decl->id->get_str()) +
+                           "(" + ps + ") -> " +
+                           static_type_to_string(up->ret) + "  (final)");
         }
     }
 
@@ -1332,19 +2735,328 @@ void Inferencer::infer_one(Block *rootBlock)
         enforce_nonnull_params();
     }
 
+    stamp_inferred_param_types(rootBlock);
+
     /* Stamp TypeHints (int/float) for the M8 specializer + typed conditions. */
+    {
+        CsHoldMemoScope memo(*this);
+        for (auto &e : rootBlock->elems)
+            annotate_hints(e.get());
+    }
+
+    apply_late_folds(rootBlock);
+
+    /* Q2: the type each container is made with - after the late folds,
+     * whose literals stand for calls */
     for (auto &e : rootBlock->elems)
-        annotate_hints(e.get());
+        stamp_ctypes(e.get(), nullptr);
+    ctype_dyn_place.clear();
+    ctype_untyped.clear();
+    lit_obj_dest.clear();
+}
+
+/*
+ * #96: may the literal the parse computed stand for this deferred node?
+ * Typed, only when the literal has the node's type - else the program
+ * types the expression otherwise than the parse-time run did
+ * (`id(opt v)` joined float over its calls: `id(2) + 1` is 3.0) - and,
+ * for a call, only when each argument fits its parameter as is: a bind
+ * that converts runs the body with another type than the parse did
+ * (`str(v)` of a joined float).
+ */
+bool Inferencer::late_fold_fits_one(Construct *node, Construct *lit)
+{
+    /* can a value of type `from` stand where the program has `to`, with
+     * no conversion? (dyn takes anything; an `opt` place its type and
+     * none) */
+    const auto fits_as_is = [&](StaticTypeRef from, StaticTypeRef to) {
+        from = static_type_resolve(from);    /* typed: neither is null */
+        to = static_type_resolve(to);
+        if (to->kind == StaticTypeKind::Dyn || static_type_equal(from, to))
+            return true;
+        return to->opt
+            && (from->kind == StaticTypeKind::None
+                || static_type_equal(A.with_opt(from, true), to));
+    };
+    if (!lit)
+        return false;
+    if (!checks_enabled)
+        return true;            /* -nti: both runs are untyped */
+    if (!fits_as_is(type_of(lit), type_of(node)))
+        return false;
+    if (ctag(node) != ConstructType::call)
+        return true;
+    auto *call = static_cast<CallExpr *>(node);
+    FuncInfo *fi = callee_funcinfo(call->what.get());
+    if (!fi && call->callee_fn) {
+        auto it = func_of_decl.find(call->callee_fn);
+        fi = it != func_of_decl.end() ? it->second : nullptr;
+    }
+    /* a call that still reaches a template's BASE runs it untyped, while
+     * the parse's typed copy may have made an instance for it - the copy
+     * sees this one call, the program every call through the same value
+     * (`OPS[0](3)` with OPS a const array: the program's calls disagree,
+     * the copy's one call agrees) - so the two can give the same type
+     * but another value */
+    if (!fi) {
+        for (FuncInfo *f : callee_set(call->what.get()).funcs)
+            if (f->is_template)
+                return false;
+        return true;
+    }
+    if (fi->is_template)
+        return false;
+    /* a checked call has no more arguments than parameters */
+    const auto &args = call->args->elems;
+    const size_t n = std::min(args.size(), fi->params.size());
+    for (size_t i = 0; i < n; i++)
+        if (!fits_as_is(type_of(args[i].get()), fi->params[i]->type))
+            return false;
+    return true;
+}
+
+/*
+ * The whole node: every deferred node inside it fits too, since the
+ * node's value was computed from theirs (`str(id(2) + 1) == "3.0"`); and
+ * no function literal is written inside it. That last rule is a
+ * precaution no test can see today: inference may name such a literal
+ * from elsewhere (a callee set, stamped as CallExpr::callee_fn /
+ * callee_desc on a call outside the node), and a retired literal's
+ * descriptor dies with the inferencer - every shape tried so far has the
+ * literal refused by the argument check, or its stamp read by no one.
+ * The one exception is a literal written as an ARGUMENT of a BUILTIN
+ * call (`map(pure func(x) => x * 2, K)`): no builtin keeps its argument,
+ * so the function can leave the call only through its result, and
+ * pDeferFold kept no literal for a result naming a function - nothing
+ * else can name it (the callee-set analysis reads a builtin's result
+ * as top).
+ */
+bool Inferencer::late_fold_fits(Construct *node, Construct *lit)
+{
+    bool ok = true;
+    std::function<void(Construct *)> scan = [&](Construct *n) {
+        if (!n || !ok)
+            return;
+        if (ctag(n) == ConstructType::func_decl) {
+            ok = false;
+            return;
+        }
+        if (n != node && n->defer_fold
+                && !late_fold_fits_one(n, n->late_fold.get())) {
+            ok = false;
+            return;
+        }
+        if (ctag(n) == ConstructType::call) {
+            auto *call = static_cast<CallExpr *>(n);
+            auto *cid = node_cast<Identifier>(call->what.get());
+            auto cit = cid ? id_sym.find(cid) : id_sym.end();
+            if (cid && is_builtin(cid->uid)
+                    && (cit == id_sym.end() || !cit->second)) {
+                for (auto &a : call->args->elems)
+                    if (ctag(a.get()) != ConstructType::func_decl)
+                        scan(a.get());
+                return;
+            }
+        }
+        for_each_child(n, scan);
+    };
+    scan(node);
+    return ok && late_fold_fits_one(node, lit);
+}
+
+/*
+ * #96: the second half of a folding parse's deferral (pDeferFold,
+ * parser.cpp): once the program is typed, each outermost deferred node
+ * becomes the literal the parse computed, when late_fold_fits; one that
+ * does not keeps running, as it does under -nc. The replaced subtree is
+ * RETIRED, never freed: its nodes are keys of the maps -dti / -a read.
+ */
+void Inferencer::apply_late_folds(Block *root)
+{
+    std::function<void(unique_ptr<Construct> &)> visit =
+        [&](unique_ptr<Construct> &slot) {
+        Construct *n = slot.get();
+        if (!n)
+            return;
+        if (n->defer_fold) {
+            n->defer_fold = false;
+            unique_ptr<Construct> lit = std::move(n->late_fold);
+            /* a witness only types the value: the node stays a call */
+            const bool witness = n->late_fold_witness;
+            n->late_fold_witness = false;
+            if (lit && !witness && late_fold_fits(n, lit.get())) {
+                /* a builtin call that builds its array to the storage of
+                 * the place it is bound to carries that storage on its
+                 * arguments (set_array_repr_hint, run before this): the
+                 * literal standing for it is rebuilt there, as a value
+                 * the parse baked is (#97 - else `array<int> v =
+                 * values(D)` stayed general where -nc built it flat) */
+                if (ctag(n) == ConstructType::call
+                        && ctag(lit.get()) == ConstructType::lit_obj) {
+                    const ExprList *args = static_cast<CallExpr *>(n)
+                        ->args.get();
+                    if (args && args->arr_hint != ArrHint::dflt) {
+                        auto *lo = static_cast<LiteralObj *>(lit.get());
+                        WidenShape w;
+                        w.k = 'a';
+                        w.hint = args->arr_hint;
+                        w.hint_struct = args->arr_hint_struct;
+                        lo->set_literal_value(
+                            widen_baked_value(lo->literal_value(), w));
+                    }
+                }
+                n->copy_base_fields(*lit);
+                retired.push_back(std::move(slot));
+                slot = std::move(lit);
+                return;
+            }
+        }
+        for_each_child_slot(n, visit);
+    };
+    for (auto &e : root->elems)
+        visit(e);
+}
+
+/*
+ * #38 C: an UN-annotated parameter whose final type is `int` or `float`
+ * binds like one DECLARED so. The fixpoint JOINS every call site's
+ * argument into a non-template function's parameter (a capturing lambda,
+ * a factory-returned closure, a function reached through a value), so
+ * `f(1); f(2.5);` types `x` float - and the int argument then sat
+ * unconverted in a slot every typed consumer reads as a float (RULE 1:
+ * `print(f(1))` printed `1` where the signature says `func(float)->float`,
+ * and the typed tiers read an int's bits as a double). Stamping the
+ * param's `decl_type` - the Identifier (resolve_names propagates it to
+ * the uses, so a reassignment coerces too) and the descriptor's ParamDesc
+ * (what every bind path reads) - makes every engine's bind run
+ * coerce_to_decl_type, exactly as for `float x`: int/bool widen, a `dyn`
+ * argument of another kind throws, `none` passes (an `opt` param).
+ * A template BASE is skipped (its params are fallbacks), and so is an
+ * INSTANCE's template param (keyed by the exact argument type, it joins
+ * nothing - and a typed param would decline the bytecode splice and the
+ * frameless tiers for no reason); so are `dyn` params and pinned REPL
+ * functions. What remains is exactly the JOINED params: a lambda's, and
+ * an `opt` param's.
+ */
+void Inferencer::stamp_inferred_param_types(Construct *rootn)
+{
+    /* the LIVE functions: walk the tree (all_funcs also holds FuncInfos of
+     * literals a parse-time bake or an earlier input already freed) */
+    std::vector<FuncDeclStmt *> fds;
+    std::function<void(Construct *)> collect = [&](Construct *c) {
+        if (!c)
+            return;
+        if (ctag(c) == ConstructType::func_decl)
+            fds.push_back(static_cast<FuncDeclStmt *>(c));
+        for_each_child(c, collect);
+    };
+    collect(rootn);
+    for (FuncDeclStmt *fd : fds) {
+        auto it = func_of_decl.find(fd);
+        if (it == func_of_decl.end() || !it->second)
+            continue;
+        FuncInfo *fi = it->second;
+        if (fi->pinned || fi->is_template || fi->decl != fd || !fd->params)
+            continue;
+        /* a template INSTANCE (make_template_clone names it after its base
+         * via display_name): its template params are keyed by the exact
+         * argument type, so only its `opt` params can have been joined */
+        const bool instance = fd->desc && !fd->desc->display_name.empty();        auto &pe = fd->params->elems;
+        const size_t n = std::min(fi->params.size(), pe.size());
+        for (size_t i = 0; i < n; i++) {
+            const TypeSym *p = fi->params[i];
+            Identifier *pid = pe[i].get();
+            if (!p || p->dyn_decl || p->ann != DeclType::none || !p->type
+                    || p->in_template || pid->decl_type != DeclType::none
+                    || (instance && !p->opt_decl))
+                continue;
+            const StaticType *t = static_type_resolve(p->type);
+            DeclType dt = DeclType::none;
+            if (t && t->kind == StaticTypeKind::Int)
+                dt = DeclType::i;
+            else if (t && t->kind == StaticTypeKind::Float)
+                dt = DeclType::f;
+            if (dt == DeclType::none)
+                continue;
+            /* only where the bind can CONVERT: a narrower scalar (or a
+             * dyn) reached the param. A param every site feeds its final
+             * type keeps fast_bind - stamping it would buy a coercion
+             * that can never fire, per call (see TypeSym::arg_kinds). */
+            const uint8_t narrower = dt == DeclType::f
+                ? (ARGK_BOOL | ARGK_INT | ARGK_DYN)
+                : (ARGK_BOOL | ARGK_DYN);
+            if (!(p->arg_kinds & narrower))
+                continue;
+            pid->decl_type = dt;
+            if (fd->desc && i < fd->desc->params.size())
+                fd->desc->params[i].decl_type = dt;
+        }
+    }
 }
 
 void Inferencer::run()
 {
-    Block *rootBlock = dynamic_cast<Block *>(root);
+    Block *rootBlock = node_cast<Block>(root);
     if (!rootBlock)
         return;
 
     setup();
     infer_one(rootBlock);
+    stamp_proven_params();
+}
+
+/*
+ * C3: stamp ParamDesc::proven_type for params that can ONLY ever
+ * receive one scalar kind - see the field's comment in funcdesc.h for
+ * the full soundness gate. ONE-SHOT only (run(); ReplInfer never calls
+ * this): the REPL's open-world redefinition + input-local value rules
+ * make the never-value-used proof weaker there, and the win is a
+ * script-runtime one. Global-scope functions only (a nested scoped
+ * func is rare and conservatively skipped). specializations()/globals()
+ * return NAMES, and `$` is not an identifier character, so an instance
+ * FuncObject is unreachable as a value except through the value uses
+ * this gate excludes.
+ */
+void Inferencer::stamp_proven_params()
+{
+    for (const auto &kv : global->syms) {
+        const TypeSym *s = kv.second;
+        if (!s->func || s->value_used)
+            continue;
+        FuncInfo *fi = s->func;
+        if (fi->is_template || !fi->decl || !fi->decl->desc)
+            continue;
+        /*
+         * ⛔ THE ESCAPE GATE, AND IT IS THE ONLY ONE LEFT. This used
+         * to read `fi->value_escaped` as well - a flag fed partly by
+         * the `finfos` ledger (#116 increment 3 deleted that half) and
+         * partly by a blanket "a template passed as an argument
+         * escapes" rule (the follow-up deleted the rest). Both are
+         * subsumed by the callee-set analysis, which says whether the
+         * function's value left the part of the program this pass can
+         * see - exactly the condition under which "never used as a
+         * value" stops being a proof, and what a C3 stamp every
+         * unboxed tier is built on depends on.
+         */
+        if (callee_escaped(fi))
+            continue;
+        FuncDescriptor *d =
+            const_cast<FuncDescriptor *>(fi->decl->desc);
+        const size_t n = std::min(fi->params.size(), d->params.size());
+        for (size_t i = 0; i < n; i++) {
+            const TypeSym *p = fi->params[i];
+            if (!p || p->dyn_decl || p->opt_decl
+                    || p->ann != DeclType::none || !p->type)
+                continue;
+            const StaticType *t = static_type_resolve(p->type);
+            if (!t || t->opt)
+                continue;
+            if (t->kind == StaticTypeKind::Int)
+                d->params[i].proven_type = DeclType::i;
+            else if (t->kind == StaticTypeKind::Float)
+                d->params[i].proven_type = DeclType::f;
+        }
+    }
 }
 
 /*
@@ -1367,9 +3079,17 @@ void Inferencer::infer_input(Block *rootBlock)
      * snapshotted here so a REJECTED input - whose clone bindings are rolled
      * back below - drops its cache entries too (self-heal would otherwise
      * rebuild on the next use; the snapshot makes it exact). The clone-name
-     * counter stays monotonic, so names never collide.
+     * counter stays monotonic, so names never collide. The snapshot is
+     * KEPT (last_input): an input the check accepts may still be refused
+     * by a later stage, and reject_input() restores the same state.
      */
-    auto tmpl_cache_snapshot = tmpl_cache;
+    last_input.tmpl_cache = tmpl_cache;
+    last_input.tmpl_inst_count = tmpl_inst_count;
+    /* the struct tables too: check_opt_struct_fields re-checks EVERY
+     * declared struct on every input, so a refused one left behind made
+     * the whole session refuse each later input with its error */
+    last_input.struct_by_name = struct_by_name;
+    last_input.declared_structs = declared_structs;
 
     /*
      * SCOPE THE NODE-KEYED MAPS TO ONE INPUT. id_sym / func_of_decl are keyed
@@ -1389,7 +3109,7 @@ void Inferencer::infer_input(Block *rootBlock)
     const size_t sym_base = all_syms.size();
     const size_t func_base = all_funcs.size();
     /* snapshot the global bindings so a rejected input commits nothing */
-    auto global_snapshot = global->syms;
+    last_input.globals = global->syms;
 
     auto pin_new = [&]() {
         for (size_t i = sym_base; i < all_syms.size(); i++) {
@@ -1421,13 +3141,69 @@ void Inferencer::infer_input(Block *rootBlock)
          * the instantiation cache (drop any clone this input registered), then
          * `pin` (i.e. skip henceforth) the half-built symbols so no later input
          * re-finalizes/re-enforces them. They stay in all_syms but inert. */
-        global->syms = std::move(global_snapshot);
-        tmpl_cache = std::move(tmpl_cache_snapshot);
+        restore_last_input();
         pin_new();
         throw;
     }
 
     pin_new();     /* success: commit this input's new globals */
+}
+
+void Inferencer::restore_last_input()
+{
+    global->syms = last_input.globals;
+    tmpl_cache = last_input.tmpl_cache;
+    tmpl_inst_count = last_input.tmpl_inst_count;
+    struct_by_name = last_input.struct_by_name;
+    declared_structs = last_input.declared_structs;
+}
+
+/*
+ * REPL: an input infer_input ACCEPTED was refused by a later stage (the
+ * optimizers raised while compiling it - `h(0)` folded to a division by
+ * zero) and never ran. Take back what its check committed, exactly as a
+ * refused check does: its globals are unbound again, and its template
+ * instances leave the cache - a later input reusing `h$0` by name would
+ * otherwise call a function that was never bound. Its symbols stay
+ * pinned, inert.
+ */
+void Inferencer::reject_input()
+{
+    if (global)
+        restore_last_input();
+}
+
+/*
+ * REPL: an input infer_input accepted RAN and failed part-way. The
+ * statements after the failing one - and the failing one, when it was a
+ * declaration whose value threw - never bound their names at run time,
+ * yet their types were committed: `var dyn? q5 = nope()` failed, and a
+ * later `q5.v` was refused as a possibly-none member base where the
+ * program deserved "Undefined variable 'q5'". Each global the input
+ * (re)bound in the scope and `ran` denies goes back to its binding before
+ * the input. The statements that completed keep theirs, as their run-time
+ * bindings stay.
+ */
+void Inferencer::forget_unbound(
+    const std::function<bool (const UniqueId *)> &ran)
+{
+    if (!global)
+        return;
+    std::vector<const UniqueId *> forget;
+    for (const auto &kv : global->syms) {
+        const auto it = last_input.globals.find(kv.first);
+        const bool bound_here =
+            it == last_input.globals.end() || it->second != kv.second;
+        if (bound_here && !ran(kv.first))
+            forget.push_back(kv.first);
+    }
+    for (const UniqueId *name : forget) {
+        const auto it = last_input.globals.find(name);
+        if (it == last_input.globals.end())
+            global->syms.erase(name);
+        else
+            global->syms[name] = it->second;
+    }
 }
 
 /* REPL `undef(x)`: drop a global from the committed set so a later `var x` of a
@@ -1447,6 +3223,11 @@ std::string Inferencer::global_type_str(const UniqueId *name)
     if (it == global->syms.end() || !it->second)
         return "";
     TypeSym *s = it->second;
+    /* a struct or class TYPE name has no inferred type: its symbol's `dyn`
+     * is a placeholder (its constructor and `.CONST` uses are typed before
+     * it is read), which `:type P` reported as `P : dyn?` */
+    if (s->struct_type)
+        return "";
     StaticTypeRef ty = s->func ? func_static_type(s->func) : s->type;
     return static_type_to_string(ty);
 }
@@ -1522,6 +3303,30 @@ bool Inferencer::type_has_dyn(StaticTypeRef t, bool deep)
 }
 
 /*
+ * True if `t` carries NO element information: a container whose element (or
+ * key/value) type is the BOTTOM `none` - what an empty `[]` / `{}` infers, and
+ * what a container symbol KEEPS for as long as nothing the inferencer can see
+ * writes into it (a callee filling it through its reference param contributes
+ * to the PARAM's symbol, never back to the caller's - so `var data = {}` filled
+ * only by a callee stays `dict<none,none>`). Such a type is a placeholder, not
+ * a settled signature: monomorphizing on it types every element READ in the
+ * clone as `none`. Recurses through containers; a Func carries no elements.
+ */
+bool Inferencer::type_has_bottom_elem(StaticTypeRef t)
+{
+    t = static_type_resolve(t);
+
+    if (t->kind == StaticTypeKind::Array)
+        return is_none(t->elem) || type_has_bottom_elem(t->elem);
+
+    if (t->kind == StaticTypeKind::Dict)
+        return is_none(t->key) || is_none(t->val)
+            || type_has_bottom_elem(t->key) || type_has_bottom_elem(t->val);
+
+    return false;
+}
+
+/*
  * Enforce the generic `array`/`dict` explicit-type annotations: the symbol must
  * actually be an array / dict (its element/key/value types are inferred, so only
  * the kind is constrained here). The scalar annotations (bool/int/float/str) are
@@ -1560,7 +3365,7 @@ void Inferencer::enforce_decl_types()
                          (s->ann == DeclType::arr ? "array" : "dict") +
                          "' but has type '" + static_type_to_string(s->type) +
                              "'",
-                     s->decl_loc, s->decl_loc);
+                     s->decl_loc, s->decl_end);
     }
 }
 
@@ -1580,9 +3385,11 @@ void Inferencer::enforce_concrete_decls()
          * descriptor, not a value), params (a never-called func's param is
          * legitimately `dyn` and has no `var` to annotate), foreach loop vars
          * (their type is derived from the container, which carries any `dyn`),
-         * and builtins (no decl loc). */
+         * builtins (no decl loc), and a local assigned only values of an
+         * unknowable type (untyped_dyn: its `dyn` is not the program's
+         * choice - see TypeSym::got_unknown). */
         if (s->dyn_decl || s->func || s->struct_type || s->is_param ||
-            s->is_loopvar || s->pinned || !s->decl_loc)
+            s->is_loopvar || s->pinned || !s->decl_loc || s->untyped_dyn)
             continue;
 
         if (!type_has_dyn(s->type, strict_deep))
@@ -1596,7 +3403,7 @@ void Inferencer::enforce_concrete_decls()
                 "'; declare it 'dyn' (e.g. '" +
                 (s->const_decl ? "const dyn " : "var dyn ") +
                 std::string(s->name->val) + " = ...')"),
-            s->decl_loc, s->decl_loc);
+            s->decl_loc, s->decl_end);
     }
 }
 
@@ -1627,14 +3434,14 @@ void Inferencer::enforce_nonnull_params()
                 "parameter '" + std::string(s->name->val) +
                 "' may be none; declare it '" + kw + "' (e.g. '" + kw + " " +
                 std::string(s->name->val) + "')"),
-            s->decl_loc, s->decl_loc);
+            s->decl_loc, s->decl_end);
     }
 }
 
 /*
  * --debug-ti: dump every declared identifier's inferred type and use sites in a
  * machine-readable, tab-separated form. Used to audit the corpus for spurious
- * `dyn`s (plans/type-driven-specialization.md). One `ti` record per symbol:
+ * `dyn`s (plans/archived/type-driven-specialization.md). One `ti` record per symbol:
  *   ti<TAB>name<TAB>kind<TAB>line<TAB>col<TAB>const<TAB>type<TAB>uses
  * where kind is var|const|param|func, const is 0|1, type is the rendered static
  * type (int, opt float, array<int>, array<dyn>, func(int)->int, dyn, ...), and
@@ -1686,51 +3493,887 @@ void Inferencer::dump_debug_ti(std::ostream &os)
     }
 }
 
+/*
+ * #51: under -nti no type is proven, and the codegen lowers a call ONLY on
+ * a proof - a user-function callee (vm_direct_func -> CallV), a struct
+ * constructor (vm_struct_ctor_def), or a `dyn` callee (vm_dyn_callee ->
+ * the generic CheckCallableV + CallValueGenericV, which dispatches on the
+ * RUNTIME callee: function, struct descriptor or builtin). With none of
+ * the three, every non-inlined, non-folded user call was a NotLoweredEx
+ * compile refusal. The honest -nti answer IS "a dyn callee": that is what
+ * the typed pipeline answers for any callee it cannot type (and for a
+ * builtin used by name - type_of of a builtin identifier is dyn, so a
+ * typed `len(a)` carries the same stamp; a DirectBuiltinCallExpr never
+ * reads it). The generic dispatch is the tree-walker's own
+ * dispatch_call_value, so both engines stay identical.
+ */
+void Inferencer::stamp_untyped_calls(Construct *n)
+{
+    if (!n)
+        return;
+    if (ctag(n) == ConstructType::call)
+        static_cast<CallExpr *>(n)->vm_dyn_callee = true;
+    for_each_child(n, [&](Construct *c) { stamp_untyped_calls(c); });
+}
+
+/* The base of a plain element store `a[k] = v` (null for anything else):
+ * where literal_into looks for a FIXED container's element type */
+static Construct *store_base_of(Expr14 *e)
+{
+    if (e->op != Op::assign
+        || ctag(e->lvalue.get()) != ConstructType::subscript)
+        return nullptr;
+    return static_cast<Subscript *>(e->lvalue.get())->what.get();
+}
+
+/*
+ * The storage an array of static type `ty` is built in (README, *flat
+ * storage*): flat int / float / bool for a non-opt such element, flat
+ * structs for a non-opt POD struct, the flat class references for a class
+ * (opt or not), and general for anything else - except array<str>, which
+ * keeps a value's own storage (false: no hint).
+ */
+static bool array_repr_hint(StaticTypeRef ty, ArrHint &hint,
+                            const StructTypeDef *&sdef)
+{
+    sdef = nullptr;
+    ty = static_type_resolve(ty);
+    if (ty->kind != StaticTypeKind::Array)
+        return false;
+    const StaticTypeRef el = static_type_resolve(ty->elem);
+    const auto *sd = static_cast<const StructTypeDef *>(el->struct_def);
+    if (!el->opt && el->kind == StaticTypeKind::Int)
+        hint = ArrHint::flat_i;
+    else if (!el->opt && el->kind == StaticTypeKind::Float)
+        hint = ArrHint::flat_f;
+    else if (!el->opt && el->kind == StaticTypeKind::Bool)
+        hint = ArrHint::flat_b;
+    else if (!el->opt && el->kind == StaticTypeKind::Struct && sd
+             && sd->is_pod()) {
+        /* array<POD struct>: flat storage (the def lets even an empty
+         * `[]` start flat); a boxed-struct array stays general. */
+        hint = ArrHint::flat_s;
+        sdef = sd;
+    } else if ((el->kind == StaticTypeKind::Struct && sd && sd->is_class)
+               || (el->kind == StaticTypeKind::Box && el->elem
+                   && static_type_resolve(el->elem)->kind
+                          == StaticTypeKind::Struct))
+        /* array<C> / array<opt C> of a class, or of a box<P>: the flat
+         * reference storage, one object per element (null for none) */
+        hint = ArrHint::flat_c;
+    else if (!el->opt && el->kind == StaticTypeKind::Str)
+        /* array<str> (top-10 #7): NO hint - the value keeps its natural
+         * storage (a split()/keys() result stays FLAT strs; a plain
+         * general literal stays general). Forcing `general` here used
+         * to general-ify a baked flat-strs literal; the strs promote-
+         * on-write model makes a later non-string element write safe
+         * without it. */
+        return false;
+    else
+        hint = ArrHint::general;
+    return true;
+}
+
+/* A destination type's shape, for widen_baked_value: its numbers and the
+ * storage of each array in it */
+static void widen_shape_of(StaticTypeRef t, WidenShape &w)
+{
+    t = static_type_resolve(t);
+    switch (t->kind) {
+    case StaticTypeKind::Float: w.k = 'f'; return;
+    case StaticTypeKind::Int:   w.k = 'i'; return;
+    case StaticTypeKind::Array:
+        w.k = 'a';
+        if (!array_repr_hint(t, w.hint, w.hint_struct))
+            w.hint = ArrHint::dflt;
+        w.sub = std::make_unique<WidenShape>();
+        widen_shape_of(t->elem, *w.sub);
+        return;
+    case StaticTypeKind::Dict:
+        w.k = 'd';
+        w.sub = std::make_unique<WidenShape>();
+        widen_shape_of(t->val, *w.sub);
+        w.key = std::make_unique<WidenShape>();
+        widen_shape_of(t->key, *w.key);
+        return;
+    default:
+        w.k = 0;
+        return;
+    }
+}
+
+/* The widening a value of static type `val` needs to be stored where the
+ * static type is `target` (#75 follow-up): f for an int or bool into a
+ * float, i for a bool into an int, else none. Opt-ness is ignored on both
+ * sides - every widening passes `none` through. */
+static DeclType numeric_widen(StaticTypeRef target, StaticTypeRef val)
+{
+    if (!target || !val)
+        return DeclType::none;
+    target = static_type_resolve(target);
+    val = static_type_resolve(val);
+    if (target->kind == StaticTypeKind::Float
+        && (val->kind == StaticTypeKind::Int
+            || val->kind == StaticTypeKind::Bool))
+        return DeclType::f;
+    if (target->kind == StaticTypeKind::Int
+        && val->kind == StaticTypeKind::Bool)
+        return DeclType::i;
+    return DeclType::none;
+}
+
+/* The conversion that makes an assignment's VALUE what README says it is -
+ * the right-hand side converted to the target's type - when the right-hand
+ * side is `dyn`: i/f for a numeric target, checked at run time as a
+ * concrete variable receiving a `dyn` is (a value that does not fit is a
+ * TypeErrorEx). numeric_widen answers the statically typed rvalues. */
+static DeclType assign_value_widen(StaticTypeRef target, StaticTypeRef val)
+{
+    if (!target || !val)
+        return DeclType::none;
+    if (static_type_resolve(val)->kind != StaticTypeKind::Dyn)
+        return numeric_widen(target, val);
+    target = static_type_resolve(target);
+    if (target->kind == StaticTypeKind::Float)
+        return DeclType::f;
+    if (target->kind == StaticTypeKind::Int)
+        return DeclType::i;
+    return DeclType::none;
+}
+
+/* Stamp a container literal's numeric widening from the type it has IN
+ * CONTEXT, and push that type down into the literals nested directly in
+ * it: `[[1, 2.5], [3, 4]]` is array<array<float>>, so the inner `[3, 4]`
+ * stores floats although its own type is array<int>. The nested literals
+ * are remembered so annotate_hints' own visit of them - before or after
+ * this one - does not restamp them from their narrower own type. */
+void Inferencer::stamp_literal_coerce(Construct *n, StaticTypeRef t)
+{
+    /* `t` is the literal's own type or a place's (literal_into's), never
+     * null */
+    t = static_type_resolve(t);
+    ML_CHECK(t);
+    StaticTypeRef el = nullptr;
+    if (t->kind == StaticTypeKind::Array)
+        el = static_type_resolve(t->elem);
+    else if (t->kind == StaticTypeKind::Dict)
+        el = static_type_resolve(t->val);
+    const DeclType dt =
+        !el ? DeclType::none
+        : el->kind == StaticTypeKind::Float ? DeclType::f
+        : el->kind == StaticTypeKind::Int ? DeclType::i
+        : DeclType::none;
+    const bool el_dyn = el && el->kind == StaticTypeKind::Dyn;
+    const auto nested = [&](Construct *c) {
+        /* a literal in a `dyn` element holds its values at its OWN type
+         * (annotate_hints' visit of it), as one in a `dyn` variable does:
+         * `[[1, 2.5], [true]]` for an array<dyn> holds 1.0 and true.
+         * Q2: a container made in a `dyn` element - a literal, a call
+         * that builds one, a sum - has no type of its own (only `dyn`
+         * reaches it), as a baked value's is (stamp_ctype_rec) */
+        if (el_dyn) {
+            ctype_untype(c);
+        } else if (el && (ctag(c) == ConstructType::lit_arr
+                          || ctag(c) == ConstructType::lit_dict)) {
+            lit_coerce_by_parent.insert(c);
+            stamp_literal_coerce(c, el);
+        }
+    };
+    /* Q2: the container is made with the type it is built for here -
+     * DYNAMIC where `dyn` is declared; untyped when nested under a `dyn`
+     * element, where only `dyn` reaches it (its storage is its own
+     * values', so a type would claim what the storage cannot hold) */
+    const bool dict = ctag(n) == ConstructType::lit_dict;
+    n->ctype = ctype_dyn_place.count(n)
+        ? (dict ? annot_dyn_dict() : annot_dyn_array())
+        : t->kind == StaticTypeKind::Dyn ? nullptr
+        : ctype_of(t, dict);
+    if (ctag(n) == ConstructType::lit_arr) {
+        auto *la = static_cast<LiteralArray *>(n);
+        la->elem_coerce = dt;
+        for (auto &e : la->elems)
+            nested(e.get());
+    } else {
+        auto *ld = static_cast<LiteralDict *>(n);
+        ld->val_coerce = dt;
+        const StaticTypeRef kt =
+            t->kind == StaticTypeKind::Dict
+                ? static_type_resolve(t->key) : nullptr;
+        ld->key_coerce =
+            !kt ? DeclType::none
+            : kt->kind == StaticTypeKind::Float ? DeclType::f
+            : kt->kind == StaticTypeKind::Int ? DeclType::i
+            : DeclType::none;
+        for (auto &kv : ld->elems)
+            nested(kv->value.get());
+    }
+}
+
+/*
+ * Is a struct of this def a VALUE all the way down (Construct::th_val)?
+ * Its fields are scalars, strings or such structs in turn; an array, dict
+ * or `dyn` field - or a struct field whose def is unknown here (a forward
+ * reference) - reaches storage another name can share. `depth` bounds the
+ * walk: a def nested that deep answers false, the safe direction.
+ */
+static bool struct_def_deep_value(const StructTypeDef *d, int depth)
+{
+    if (!d || d->is_class || depth > 16)      /* a class is a reference */
+        return false;
+    for (const FieldDef &f : d->fields) {
+        switch (f.kind) {
+            case FieldKind::f_bool: case FieldKind::f_int:
+            case FieldKind::f_float: case FieldKind::f_str:
+                break;
+            case FieldKind::f_struct:
+                if (!struct_def_deep_value(f.struct_def, depth + 1))
+                    return false;
+                break;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool static_type_deep_value(StaticTypeRef t)
+{
+    switch (t->kind) {
+        case StaticTypeKind::None: case StaticTypeKind::Bool:
+        case StaticTypeKind::Int: case StaticTypeKind::Float:
+        case StaticTypeKind::Str:
+            return true;
+        case StaticTypeKind::Struct:
+            return struct_def_deep_value(
+                static_cast<const StructTypeDef *>(t->struct_def), 0);
+        default:
+            return false;
+    }
+}
+
+/*
+ * #49: a parameter that carries a run-time fit check (ParamDesc::fit) -
+ * the rule param_fit_annot (syntax.h) applies to the declaration: a
+ * `bool`, `str`, struct, container or box annotation, not `dyn`.
+ */
+static bool param_has_fit(const TypeSym *p)
+{
+    if (p->dyn_decl)
+        return false;
+    switch (p->ann) {
+    case DeclType::b: case DeclType::s: case DeclType::arr:
+    case DeclType::dict: case DeclType::box:
+        return true;
+    case DeclType::strct:
+        return p->ann_struct != nullptr;
+    default:
+        return false;
+    }
+}
+
+/*
+ * #49: can a value of static type `v` misfit a place of static type `p`
+ * at run time? Only where the static check let a `dyn` through: `v`, or
+ * an element / key / value of it, is dyn (or not settled) where `p` has a
+ * type. At the TOP level an int / float place is the coercion's
+ * (it converts what fits and refuses the rest, without this check); an
+ * element of one is not converted, so there it counts.
+ */
+static bool fit_needed(StaticTypeRef v, StaticTypeRef p, bool top = true)
+{
+    /* (a null type cannot reach here: every caller passes one, and a
+     * component is never null - StaticTypeArena::array_of) */
+    p = static_type_resolve(p);
+    if (!p)                             /* INT-COV-EXEMPT: see above */
+        return false;
+    /* a `dyn` component takes anything but none (rule 3): a value whose
+     * component may be none - an unfilled or unsettled one - is
+     * checked. At the top level a parameter's bind and a variable's
+     * static check already refuse none. */
+    if (p->kind == StaticTypeKind::Dyn && !top && !p->opt) {
+        const StaticTypeRef vc = static_type_resolve(v);
+        /* (a `dyn?` component never meets a `dyn` one here: rule 1
+         * refuses that program - container types are exact) */
+        return vc->kind == StaticTypeKind::Unknown
+               || vc->kind == StaticTypeKind::None;
+    }
+    if (p->kind == StaticTypeKind::Dyn
+            || p->kind == StaticTypeKind::Unknown
+            || p->kind == StaticTypeKind::None)
+        return false;
+    if (top && (p->kind == StaticTypeKind::Int
+                || p->kind == StaticTypeKind::Float))
+        return false;
+    v = static_type_resolve(v);
+    if (!v)                             /* INT-COV-EXEMPT: see above */
+        return true;
+    /* Q2 increment 3: an UNFILLED component (question 9: an empty
+     * container nothing wrote) counts too - such a container is untyped,
+     * and the check is where it takes the place's type */
+    if (v->kind == StaticTypeKind::Dyn
+            || v->kind == StaticTypeKind::Unknown
+            || (!top && v->kind == StaticTypeKind::None))
+        return true;
+    switch (p->kind) {
+    case StaticTypeKind::Array: case StaticTypeKind::Box:
+        return v->kind == p->kind && fit_needed(v->elem, p->elem, false);
+    case StaticTypeKind::Dict:
+        return v->kind == StaticTypeKind::Dict
+               && (fit_needed(v->key, p->key, false)
+                   || fit_needed(v->val, p->val, false));
+    default:
+        return false;
+    }
+}
+
+/*
+ * #49: a static type as the run-time annotation value_fits checks a value
+ * against. `dyn` (and anything value_fits has no rule for - a function,
+ * an exception) checks nothing; so does a box's unknown element (null).
+ */
+static std::shared_ptr<TypeAnnot> fit_annot_of(StaticTypeRef t)
+{
+    auto a = std::make_shared<TypeAnnot>();
+    a->kind = DeclType::dyn;
+    /* a static type is as deep as the source that wrote it, and never
+     * null (fit_needed's note) */
+    t = static_type_resolve(t);
+    if (!t)                             /* INT-COV-EXEMPT: fit_needed's */
+        return a;
+    a->opt = t->opt;
+    switch (t->kind) {
+    case StaticTypeKind::Bool:  a->kind = DeclType::b; break;
+    case StaticTypeKind::Int:   a->kind = DeclType::i; break;
+    case StaticTypeKind::Float: a->kind = DeclType::f; break;
+    case StaticTypeKind::Str:   a->kind = DeclType::s; break;
+    case StaticTypeKind::Array:
+        a->kind = DeclType::arr;
+        a->elem = fit_annot_of(t->elem);
+        break;
+    case StaticTypeKind::Dict:
+        a->kind = DeclType::dict;
+        a->key = fit_annot_of(t->key);
+        a->val = fit_annot_of(t->val);
+        break;
+    case StaticTypeKind::Struct:
+        a->kind = DeclType::strct;
+        a->strct = static_cast<const StructTypeDef *>(t->struct_def);
+        break;
+    case StaticTypeKind::Box:
+        a->kind = DeclType::box;
+        a->elem = fit_annot_of(t->elem);
+        if (a->elem->kind == DeclType::dyn)
+            a->elem = nullptr;          /* any box */
+        break;
+    case StaticTypeKind::Dyn:
+        break;          /* dyn? takes anything, dyn all but none (rule 3) */
+    default:
+        a->opt = false;                 /* no check */
+        break;
+    }
+    return a;
+}
+
+/* #49: the check a value of static type `v` needs entering a place of
+ * static type `p` (a stored element, dict value or key), or null */
+static std::shared_ptr<const FitSpec>
+store_fit(StaticTypeRef p, StaticTypeRef v, FitSpec::Place where,
+          const UniqueId *name = nullptr)
+{
+    if (!fit_needed(v, p))
+        return nullptr;
+    auto f = std::make_shared<FitSpec>();
+    f->annot = fit_annot_of(p);
+    f->place = where;
+    f->name = name;
+    return f;
+}
+
+/* #49: a dyn or unsettled type anywhere in `t` */
+static bool fit_has_dyn(StaticTypeRef t)
+{
+    t = static_type_resolve(t);
+    if (!t)                             /* INT-COV-EXEMPT: fit_needed's */
+        return true;
+    switch (t->kind) {
+    case StaticTypeKind::Dyn: case StaticTypeKind::Unknown:
+        return true;
+    case StaticTypeKind::Array: case StaticTypeKind::Box:
+        return fit_has_dyn(t->elem);
+    case StaticTypeKind::Dict:
+        return fit_has_dyn(t->key) || fit_has_dyn(t->val);
+    default:
+        return false;
+    }
+}
+
+/*
+ * #49: may an argument of this call misfit its parameter's declared type
+ * at run time (CallExpr::fit_args)? A known callee: some argument whose
+ * parameter has a fit check and whose static type can misfit it. A
+ * struct construction: the same over the fields. A function VALUE of a
+ * known Func type: its arguments were checked against that type, so a
+ * dyn in an argument or in the type's parameters keeps the check. A
+ * builtin checks its own arguments; any other callee (a dyn) keeps it.
+ */
+bool Inferencer::call_fit_args(CallExpr *call)
+{
+    ExprList *args = call->args.get();     /* a call always has a list */
+    const size_t na = args->elems.size();
+    if (na == 0)
+        return false;
+    if (const StructTypeDef *def = cs_struct_callee(call->what.get())) {
+        const size_t nf = std::min(na, def->fields.size());
+        for (size_t i = 0; i < nf; i++) {
+            const FieldDef &fd = def->fields[i];
+            if (fd.kind != FieldKind::f_dyn
+                    && fit_needed(type_of(args->elems[i].get()),
+                                  field_static_type(fd)))
+                return true;
+        }
+        return false;
+    }
+    if (FuncInfo *fi = callee_funcinfo(call->what.get())) {
+        const size_t np = std::min(na, fi->params.size());
+        for (size_t i = 0; i < np; i++)
+            if (param_has_fit(fi->params[i])
+                    && fit_needed(type_of(args->elems[i].get()),
+                                  fi->params[i]->type))
+                return true;
+        return false;
+    }
+    if (cs_callee_is_builtin(call->what.get()))
+        return false;
+    StaticTypeRef ct = static_type_resolve(type_of(call->what.get()));
+    if (ct->kind != StaticTypeKind::Func)
+        return true;
+    /* a dyn (or unsettled) position in the callee's type: the function
+     * the value holds may declare anything there */
+    for (StaticTypeRef pt : ct->params)
+        if (fit_has_dyn(pt)
+                || static_type_resolve(pt)->kind == StaticTypeKind::None)
+            return true;
+    /* every position settled: the function declares that type there, so
+     * an argument is checked as against a known parameter - and an int
+     * or float one is the bind's coercion's (the arity was checked;
+     * min keeps a non-strict pass in range) */
+    const size_t np = std::min(na, ct->params.size());
+    for (size_t i = 0; i < np; i++)
+        if (fit_needed(type_of(args->elems[i].get()), ct->params[i]))
+            return true;
+    return false;
+}
+
 void Inferencer::annotate_hints(Construct *n)
 {
     if (!n)
         return;
 
     StaticTypeRef t = static_type_resolve(type_of(n));
+    n->th_val = static_type_deep_value(t);
     if (!t->opt) {
         /* bool is evaluated through the int (eval_int) path: it promotes to
          * 0/1, so a typed scalar over bool operands computes unboxed exactly
          * like int. The boxing in TypedScalarExpr::do_eval / LiteralBool keeps
          * the value bool where it must (a comparison/logical result, a bool
          * literal); arithmetic over bool correctly yields int. */
-        if (t->kind == StaticTypeKind::Int || t->kind == StaticTypeKind::Bool)
+        if (t->kind == StaticTypeKind::Int || t->kind == StaticTypeKind::Bool) {
             n->th = TypeHint::i;
+            /* ...and REMEMBER which of the two it was: a boxed consumer
+             * needs a bool to stay a bool (see Construct::th_bool). */
+            n->th_bool = t->kind == StaticTypeKind::Bool;
+        }
         else if (t->kind == StaticTypeKind::Float)
             n->th = TypeHint::f;
     }
 
-    if (auto *e = dynamic_cast<Expr14 *>(n))
+    if (auto *e = node_cast<Expr14>(n))
         set_array_repr_hint(e);
 
     /* Mark `a[i]` whose base is statically an ARRAY, so the VM only compiles a
      * native element load/store for arrays (a dict subscript stays a fallback -
      * see Subscript::base_array). */
-    if (auto *sub = dynamic_cast<Subscript *>(n)) {
+    if (ctag(n) == ConstructType::func_decl) {
+        /* a ReturnStmt below reads its function's return type */
+        FuncInfo *prev = hint_func;
+        auto *fd = static_cast<FuncDeclStmt *>(n);
+        auto it = func_of_decl.find(fd);
+        hint_func = it != func_of_decl.end() ? it->second : nullptr;
+        /* may a call's arguments key the pure-call cache? (see the field) */
+        bool safe = hint_func && !hint_func->is_template;
+        if (safe)
+            for (TypeSym *p : hint_func->params)
+                if (!p || !cache_key_safe(p->type))
+                    safe = false;
+        fd->args_cache_safe = safe;
+        for_each_child(n, [&](Construct *c) { annotate_hints(c); });
+        hint_func = prev;
+        return;
+    }
+    if (ctag(n) == ConstructType::ret) {
+        auto *r = static_cast<ReturnStmt *>(n);
+        if (hint_func && r->elem && !hint_func->is_template)
+            r->ret_coerce = numeric_widen(hint_func->ret,
+                                          type_of(r->elem.get()));
+    }
+    if (ctag(n) == ConstructType::expr14) {
+        auto *e = static_cast<Expr14 *>(n);
+        const Construct *lv = e->lvalue.get();
+        if (e->op == Op::assign && lv
+            && (ctag(lv) == ConstructType::subscript
+                || ctag(lv) == ConstructType::member)) {
+            const Construct *base =
+                ctag(lv) == ConstructType::subscript
+                    ? static_cast<const Subscript *>(lv)->what.get()
+                    : static_cast<const MemberExpr *>(lv)->what.get();
+            StaticTypeRef bt = static_type_resolve(
+                type_of(const_cast<Construct *>(base)));
+            StaticTypeRef rt = type_of(e->rvalue.get());
+            /* a dict's value converts before the store - a `dyn` one
+             * CHECKED, as a typed variable receiving one does (RULE 1: a
+             * dict<_, float> held the int, or the string, it was given) */
+            if (bt->kind == StaticTypeKind::Dict)
+                e->rv_coerce = assign_value_widen(bt->val, rt);
+            /* the store's VALUE: the right-hand side converted to the
+             * target's type (a dict's was, before the store) */
+            else
+                e->val_widen = assign_value_widen(
+                    type_of(const_cast<Construct *>(lv)), rt);
+            /* an ARRAY element converts before the store too, as a dict's
+             * value does: a general array<float?> stored an int, or a
+             * `dyn` string, where its static type says float. (So the
+             * value's conversion above never throws after a store: the
+             * tree-walker makes it in statement position too, the VM in
+             * its value form only.) */
+            if (ctag(lv) == ConstructType::subscript
+                && bt->kind == StaticTypeKind::Array)
+                e->rv_coerce = assign_value_widen(bt->elem, rt);
+            /* #49: and is CHECKED where it may misfit the place's declared
+             * type (a `dyn`, or a container with a `dyn` element): an
+             * element, a dict value and key, a container / box field. A
+             * struct / scalar field's own store refuses a misfit already
+             * (coerce_struct_field). */
+            e->rv_fit = nullptr;
+            if (bt->kind == StaticTypeKind::Array)
+                e->rv_fit = store_fit(bt->elem, rt, FitSpec::Place::elem);
+            else if (bt->kind == StaticTypeKind::Dict) {
+                e->rv_fit = store_fit(bt->val, rt,
+                                      FitSpec::Place::dict_val);
+                if (ctag(lv) == ConstructType::subscript) {
+                    auto *sub = static_cast<Subscript *>(
+                        const_cast<Construct *>(lv));
+                    sub->key_fit = store_fit(bt->key,
+                                             type_of(sub->index.get()),
+                                             FitSpec::Place::dict_key);
+                }
+            } else if (bt->kind == StaticTypeKind::Struct
+                       && ctag(lv) == ConstructType::member) {
+                /* (only a container field - an array, a dict, a box -
+                 * carries an annotation: pAcceptStructDecl) */
+                const auto *def =
+                    static_cast<const StructTypeDef *>(bt->struct_def);
+                const auto *mem = static_cast<const MemberExpr *>(lv);
+                const int fs = def ? def->slot_of(mem->memUid) : -1;
+                const FieldDef *fd = fs >= 0
+                    ? &def->fields[static_cast<size_t>(fs)] : nullptr;
+                if (fd && fd->annot
+                        && fit_needed(rt, field_static_type(*fd))) {
+                    auto f = std::make_shared<FitSpec>();
+                    f->annot = fd->annot;
+                    f->place = FitSpec::Place::field;
+                    f->name = fd->name;
+                    e->rv_fit = f;
+                }
+            }
+        }
+        /* #49: a variable whose type is DECLARED (an annotation, or a
+         * committed REPL global) given a value with a `dyn` INSIDE where
+         * the declaration has a type - an array<dyn> into an array<int>:
+         * the check pass accepts it (a dyn element fits any element
+         * type), so it is checked at run time, as a parameter is at its
+         * bind. A value that is a `dyn` itself is refused at compile
+         * time there, and an int / float variable converts its value. */
+        if (e->op == Op::assign && lv && ctag(lv) == ConstructType::id) {
+            auto *id = static_cast<Identifier *>(const_cast<Construct *>(lv));
+            e->rv_fit = nullptr;
+            if (StaticTypeRef d = declared_type_of(id))
+                e->rv_fit = store_fit(d, type_of(e->rvalue.get()),
+                                      FitSpec::Place::var, id->uid);
+        }
+        /* ... and each declared target of a multi-assignment, given what
+         * it receives (idlist_elem_types) */
+        if (e->op == Op::assign && lv && ctag(lv) == ConstructType::idlist) {
+            auto *idl = static_cast<IdList *>(const_cast<Construct *>(lv));
+            idl->fits.clear();
+            const std::vector<StaticTypeRef> els =
+                idlist_elem_types(idl, e->rvalue.get(), true);
+            std::vector<std::shared_ptr<const FitSpec>> fits(
+                idl->elems.size());
+            bool any = false;
+            for (size_t i = 0; i < idl->elems.size(); i++) {
+                Identifier *t = idl->elems[i].get();
+                if (t->is_underscore())
+                    continue;
+                if (StaticTypeRef d = declared_type_of(t))
+                    fits[i] = store_fit(d, els[i], FitSpec::Place::var,
+                                        t->uid);
+                any = any || fits[i];
+            }
+            if (any)
+                idl->fits = std::move(fits);
+            /* (an element literal that took its target's type is built
+             * for it - idlist_elem_types' `into`) */
+            auto *la = node_cast<LiteralArray>(e->rvalue.get());
+            if (la && la->elems.size() == idl->elems.size()) {
+                for (size_t i = 0; i < idl->elems.size(); i++) {
+                    if (idl->elems[i]->is_underscore())
+                        continue;
+                    Construct *el = la->elems[i].get();
+                    if (StaticTypeRef dt = literal_into(
+                            el, declared_type_of(idl->elems[i].get())))
+                        stamp_literal_into(el, dt);
+                }
+            }
+        }
+        /* a container literal stored into a FIXED array / dict type it
+         * fits has that type (literal_dest_type): its elements widen to
+         * the declared element, not to the literal's own join */
+        StaticTypeRef d = literal_dest_type(e);
+        if (!d)
+            d = literal_into(e->rvalue.get(),
+                             fixed_elem_dest(store_base_of(e), false));
+        if (d)
+            stamp_literal_into(e->rvalue.get(), d);
+    }
+    if (ctag(n) == ConstructType::subscript) {
+        auto *sub = static_cast<Subscript *>(n);
         StaticTypeRef bt = static_type_resolve(type_of(sub->what.get()));
+        if (bt->kind == StaticTypeKind::Dict)
+            sub->key_coerce = numeric_widen(bt->key,
+                                            type_of(sub->index.get()));
         sub->base_array = bt->kind == StaticTypeKind::Array;
         sub->base_dict = bt->kind == StaticTypeKind::Dict;
+        sub->base_str = bt->kind == StaticTypeKind::Str && !bt->opt;
+        if (sub->base_array && bt->elem) {
+            StaticTypeRef et = static_type_resolve(bt->elem);
+            sub->elem_bool = et->kind == StaticTypeKind::Bool && !et->opt;
+        }
+    }
+
+    /* Lever 3: a slice over a statically-proven non-opt array/string can
+     * only clamp, never throw (given int/absent bounds) - the hoist's
+     * zero-iteration safety fact. */
+    if (ctag(n) == ConstructType::slice) {
+        auto *sl = static_cast<Slice *>(n);
+        StaticTypeRef bt = static_type_resolve(type_of(sl->what.get()));
+        sl->base_sliceable = !bt->opt
+            && (bt->kind == StaticTypeKind::Array
+                || bt->kind == StaticTypeKind::Str);
+    }
+
+    /* `*b`: the box element the read checks (DerefExpr::want) */
+    if (ctag(n) == ConstructType::deref) {
+        auto *d = static_cast<DerefExpr *>(n);
+        StaticTypeRef bt = strip(static_type_resolve(type_of(d->elem.get())));
+        d->want = 0;
+        d->want_def = nullptr;
+        if (bt->kind == StaticTypeKind::Box && bt->elem) {
+            StaticTypeRef el = static_type_resolve(bt->elem);
+            switch (el->kind) {
+            case StaticTypeKind::Int:   d->want = 1; break;
+            case StaticTypeKind::Float: d->want = 2; break;
+            case StaticTypeKind::Bool:  d->want = 3; break;
+            case StaticTypeKind::Str:   d->want = 4; break;
+            case StaticTypeKind::Struct:
+                if (el->struct_def) {
+                    d->want = 5;
+                    d->want_def =
+                        static_cast<const StructTypeDef *>(el->struct_def);
+                }
+                break;
+            default: break;
+            }
+        }
     }
 
     /* Mark `d.k` whose base is statically a DICT (vs a struct), so the VM
      * compiles a native typed dict read (P3) rather than a boxed MemberV. */
-    if (auto *mem = dynamic_cast<MemberExpr *>(n)) {
+    if (ctag(n) == ConstructType::member) {
+        auto *mem = static_cast<MemberExpr *>(n);
         StaticTypeRef bt = static_type_resolve(type_of(mem->what.get()));
         mem->base_dict = bt->kind == StaticTypeKind::Dict;
-        /* a non-opt struct instance base -> native field store (StoreMemberV) */
-        mem->base_struct = bt->kind == StaticTypeKind::Struct && !bt->opt;
+        /* a non-opt struct instance base -> native field store (StoreMemberV)
+         * - and a non-opt box<P> (class step 4): the same StructObject, its
+         * def P's, so every def-guarded fast path serves it; base_boxed
+         * marks it a reference */
+        StaticTypeRef sbt = bt;
+        mem->base_boxed = false;
+        if (bt->kind == StaticTypeKind::Box && !bt->opt && bt->elem) {
+            StaticTypeRef el = static_type_resolve(bt->elem);
+            if (el->kind == StaticTypeKind::Struct && el->struct_def) {
+                sbt = el;
+                mem->base_boxed = true;
+            }
+        }
+        mem->base_struct = sbt->kind == StaticTypeKind::Struct && !bt->opt;
+        mem->base_struct_def = mem->base_struct
+            ? static_cast<const StructTypeDef *>(sbt->struct_def) : nullptr;
+        mem->field_slot = mem->base_struct_def && mem->memUid
+            ? mem->base_struct_def->slot_of(mem->memUid) : -1;
     }
 
     /* VM native-call hint: the callee is a user FUNCTION (Func static type -
      * not a struct constructor / builtin). With a global-slot callee this lets
      * the VM emit a CallV instead of node->eval-ing the call. */
-    if (auto *call = dynamic_cast<CallExpr *>(n)) {
+    if (ctag(n) == ConstructType::call) {
+        auto *call = static_cast<CallExpr *>(n);
         StaticTypeRef ct = static_type_resolve(type_of(call->what.get()));
         call->vm_direct_func = ct->kind == StaticTypeKind::Func;
+
+        /* append / push / insert of a container LITERAL into a FIXED
+         * array: the literal has the element type (literal_into) */
+        if (auto *cid = node_cast<Identifier>(call->what.get())) {
+            const bool builtin = cs_callee_is_builtin(cid);
+            const std::string_view nm = cid->uid->val;
+            const size_t vi = nm == "insert" ? 2 : 1;
+            if (builtin && call->args && call->args->elems.size() > vi
+                && (nm == "append" || nm == "push" || nm == "insert")) {
+                ExprList *al = call->args.get();
+                Construct *v = al->elems[vi].get();
+                if (StaticTypeRef d = literal_into(
+                        v, fixed_elem_dest(al->elems[0].get(), false)))
+                    stamp_literal_into(v, d);
+                /* the value (and an inserted dict key) is STORED: it
+                 * widens to the container's element type as `a[i] = v`
+                 * does (rv_coerce) - a general array<float?> appended an
+                 * int where its static type says float (#47) */
+                const StaticTypeRef bt =
+                    static_type_resolve(type_of(al->elems[0].get()));
+                const auto widen = [&](size_t i, StaticTypeRef to) {
+                    const DeclType w =
+                        numeric_widen(to, type_of(al->elems[i].get()));
+                    if (w == DeclType::none)
+                        return;
+                    if (al->arg_widen.size() <= i)
+                        al->arg_widen.resize(i + 1, DeclType::none);
+                    al->arg_widen[i] = w;
+                };
+                if (bt->kind == StaticTypeKind::Array)
+                    widen(vi, bt->elem);
+                else if (bt->kind == StaticTypeKind::Dict && vi == 2) {
+                    widen(1, bt->key);
+                    widen(2, bt->val);
+                }
+                /* #49: and CHECKED where it may misfit the declared
+                 * element / key / value type */
+                const auto fit = [&](size_t i, StaticTypeRef to,
+                                     FitSpec::Place where) {
+                    auto f = store_fit(to, type_of(al->elems[i].get()),
+                                       where);
+                    if (!f)
+                        return;
+                    if (al->arg_fit.size() <= i)
+                        al->arg_fit.resize(i + 1);
+                    al->arg_fit[i] = f;
+                };
+                al->arg_fit.clear();
+                if (bt->kind == StaticTypeKind::Array)
+                    fit(vi, bt->elem, FitSpec::Place::elem);
+                else if (bt->kind == StaticTypeKind::Dict && vi == 2) {
+                    fit(1, bt->key, FitSpec::Place::dict_key);
+                    fit(2, bt->val, FitSpec::Place::dict_val);
+                }
+            }
+        }
+        /* ...and one passed for a declared parameter or a struct field */
+        stamp_literal_args(call);
+
+        /*
+         * Which arguments could the call INVOKE? Bit i is set when argument
+         * i's static type is a `Func` or a `dyn` that might hold one - the
+         * higher-order builtins (map/filter/sort/make_array/make_dict/find)
+         * are exactly the calls that end up with a bit set. A caller that
+         * needs the callback to be harmless (the LICM hoist) then checks
+         * purity on just those arguments; everything else - `len(arr)`,
+         * `abs(x)`, `str(v)` - reads as a mask of 0. Only the TYPE question
+         * is answerable here: `effective_pure` is the resolver's, and the
+         * resolver has not run yet.
+         */
+        uint32_t cmask = 0;
+        const size_t na = call->args ? call->args->elems.size() : 0;
+        if (na > 32) {
+            cmask = ~0u;                /* no room to be precise: assume all */
+        } else {
+            for (size_t i = 0; i < na; i++) {
+                StaticTypeRef at = static_type_resolve(
+                    type_of(call->args->elems[i].get()));
+                if (at->kind == StaticTypeKind::Func
+                    || at->kind == StaticTypeKind::Dyn)
+                    cmask |= 1u << i;
+            }
+        }
+        call->callable_arg_mask = cmask;
+
+        /*
+         * Which arguments may bind `none` to a non-opt parameter (RULE 1 -
+         * CallExpr::none_arg_mask)? check_call refuses an opt-ish argument
+         * to a non-opt parameter of a known callee, but a `dyn` argument
+         * is non-opt by TYPE and may still hold none at run time, and an
+         * unknown callee (a function value, a dyn) may have any
+         * parameter non-opt. So a bit is set for a dyn / unresolved /
+         * opt-ish argument, and cleared where the callee is statically
+         * one function whose parameter is declared `opt`
+         * (callee_funcinfo refuses a rebound name, so the parameters
+         * read are the ones every call reaches), or where the argument
+         * names a parameter that is not `opt` and is never written - its
+         * own bind refused a none, so it holds none nowhere.
+         */
+        uint32_t nmask = 0;
+        if (na > 32) {
+            nmask = ~0u;
+        } else {
+            FuncInfo *fi = callee_funcinfo(call->what.get());
+            /* a known callee has a parameter per argument: the check pass
+             * refused a mismatched count before this runs */
+            const size_t np = fi ? fi->params.size() : 0;
+            for (size_t i = 0; i < na; i++) {
+                StaticTypeRef at = static_type_resolve(
+                    type_of(call->args->elems[i].get()));
+                const bool maybe_none = at->opt
+                    || at->kind == StaticTypeKind::Dyn
+                    || at->kind == StaticTypeKind::None
+                    || at->kind == StaticTypeKind::Unknown;
+                if (!maybe_none)
+                    continue;
+                if (i < np && fi->params[i]->opt_decl)
+                    continue;           /* an opt parameter takes none */
+                Construct *ae = call->args->elems[i].get();
+                if (ctag(ae) == ConstructType::id) {
+                    /* every identifier was resolved by walk_struct */
+                    const TypeSym *ps = id_sym[static_cast<Identifier *>(ae)];
+                    if (ps && ps->is_param && !ps->opt_decl
+                            && ps->writes == 0)
+                        continue;       /* a settled parameter: never none */
+                }
+                nmask |= 1u << i;
+            }
+        }
+        call->none_arg_mask = nmask;
+        call->fit_args = call_fit_args(call);
+        stamp_sum_identity(call);
+        /* lever 4b: len(x)'s arg proven a non-opt array/string - the
+         * BUILTIN-ness proof is codegen's (DirectBuiltinCallExpr + the
+         * `len` uid), so this stamp alone triggers nothing. */
+        if (call->args && call->args->elems.size() == 1) {
+            StaticTypeRef at = static_type_resolve(
+                type_of(call->args->elems[0].get()));
+            if (!at->opt) {
+                if (at->kind == StaticTypeKind::Array)
+                    call->vm_len_kind = 1;
+                else if (at->kind == StaticTypeKind::Str)
+                    call->vm_len_kind = 2;
+            }
+        }
         /* A `dyn` callee is resolved at runtime (func / builtin / struct desc /
          * non-callable): the VM dispatches it generically (CallValueGenericV). */
         call->vm_dyn_callee = ct->kind == StaticTypeKind::Dyn;
@@ -1742,7 +4385,8 @@ void Inferencer::annotate_hints(Construct *n)
      * indexed foreach stays the tree-walker fallback). The loop var's own `th`
      * is NOT enough - a single var over a dict binds the KEY (also int), so the
      * container kind must be checked here where the static type is known. */
-    if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
+    if (ctag(n) == ConstructType::foreach_stmt) {
+        auto *fe = static_cast<ForeachStmt *>(n);
         /* A single-var array foreach (ids = [elem]) OR an INDEXED 2-var one
          * (ids = [index, elem]) can go native: elem_th is keyed off the ARRAY
          * ELEMENT type either way (ids[0] vs ids[1] is a codegen detail). */
@@ -1771,6 +4415,16 @@ void Inferencer::annotate_hints(Construct *n)
                      * EvalValue into the loop var via LoadElemValue - box-free.
                      * Flat bool arrays are intentionally NOT here: their raw
                      * bool byte needs a scalar read, not LoadElemValue. */
+                    fe->container_is_array = true;
+                } else if (el->kind == StaticTypeKind::Box
+                           || (el->kind == StaticTypeKind::Struct
+                               && el->struct_def
+                               && static_cast<const StructTypeDef *>(
+                                      el->struct_def)->is_class)) {
+                    /* class step 4: a class instance or a box, `none`
+                     * allowed - a REFERENCE, bound by LoadElemValue (whose
+                     * objs arm reads an array<C> in place); the universal
+                     * dyn foreach served them before */
                     fe->container_is_array = true;
                 } else if (single && el->kind == StaticTypeKind::Struct
                            && el->struct_def) {
@@ -1816,7 +4470,7 @@ void Inferencer::annotate_hints(Construct *n)
          * list - any var count, the `indexed` form, `_` placeholders. It
          * dispatches at runtime and binds exactly as do_iter: an array
          * element (single var) or its STRICT unpack (multi-var); a dict key
-         * [, value [, none-padded]]; `indexed` counts in ids[0]. */
+         * [, value] (more: TypeErrorEx); `indexed` counts in ids[0]. */
         if (fe->ids && !fe->ids->elems.empty()
             && !fe->container_is_array && !fe->container_is_dict) {
             StaticTypeRef c = static_type_resolve(type_of(fe->container.get()));
@@ -1856,6 +4510,48 @@ void Inferencer::annotate_hints(Construct *n)
         }
     }
 
+    /* A container LITERAL's numeric widening (task #75): its static
+     * element (value) type decides - an array<float> literal stores its
+     * int elements as floats wherever it is written, not only in a
+     * position whose DESTINATION hint makes it flat. */
+    if ((ctag(n) == ConstructType::lit_arr
+         || ctag(n) == ConstructType::lit_dict)
+        && !lit_coerce_by_parent.count(n))
+        stamp_literal_coerce(n, type_of(n));
+
+    /* A multi-assign destructure `a, b, c = <rvalue>` whose rvalue is
+     * PROVEN a non-opt array: the codegen then lowers the strict unpack
+     * into a length test + one element read per target (a MultiUnpackV
+     * only on a length mismatch, which raises the strict error). The
+     * element kind picks the read: int/float read unboxed, anything else
+     * (bool included - a th==i read would lose the bool) boxed. */
+    if (ctag(n) == ConstructType::expr14) {
+        auto *e14 = static_cast<Expr14 *>(n);
+        if (ctag(e14->lvalue.get()) == ConstructType::idlist) {
+            /* A LITERAL unpacked here gives each target its element AS
+             * WRITTEN (README; spread_idlist types the targets that way):
+             * it is not widened to its joined type, and its elements are
+             * read untyped, since `[ri(12), 2.5]` holds an int beside a
+             * float. Its own element literals still widen, by their own
+             * types. */
+            const bool lit =
+                ctag(e14->rvalue.get()) == ConstructType::lit_arr;
+            if (lit)
+                lit_coerce_by_parent.insert(e14->rvalue.get());
+            StaticTypeRef r = static_type_resolve(
+                type_of(e14->rvalue.get()));
+            if (!r->opt && r->kind == StaticTypeKind::Array) {
+                StaticTypeRef el = static_type_resolve(r->elem);
+                e14->unpack_rv_array = true;
+                e14->unpack_rv_th =
+                    el->opt || lit ? TypeHint::none
+                    : el->kind == StaticTypeKind::Int ? TypeHint::i
+                    : el->kind == StaticTypeKind::Float ? TypeHint::f
+                    : TypeHint::none;
+            }
+        }
+    }
+
     for_each_child(n, [&](Construct *c) { annotate_hints(c); });
 }
 
@@ -1874,12 +4570,384 @@ void Inferencer::annotate_hints(Construct *n)
  * inferencer's one AST-mutation point. This replaces the old array(N) autofill:
  * a flat_i/flat_f hint makes array(N) born flat (0 / 0.0 fill), no rewrite.
  */
+/*
+ * #48: WHAT `sum()` OF AN EMPTY ARRAY RETURNS. The static type of a sum is
+ * the element type (the callback's return with a key_func; a bool counts
+ * as int), non-opt - and the runtime used to return `none`, so
+ * `int s = sum(empty)` put a none in a slot the unboxed tiers had been
+ * PROVEN to hold an int (RULE 1: the tree-walker threw TypeErrorEx, the VM
+ * tripped ML_VM_CHECK, the JIT read it as 0). The answer is decided HERE,
+ * from the result type the call was given: a numeric sum starts from its
+ * additive identity (int 0 / float 0.0), and every other kind - str,
+ * array, dyn, a struct - has none to offer, so the builtin throws
+ * InvalidArgumentEx instead (like `max` of an empty array, README).
+ *
+ * The answer rides the args list's `arr_hint` (flat_i -> 0, flat_f -> 0.0),
+ * the channel every engine and the .myv image already carry into a
+ * builtin's ArgLocs; nothing else reads it for `sum`. An unstamped call (no
+ * inference, a sum reached through a function VALUE) falls back to the
+ * array's own flat storage, and failing that throws.
+ */
+void Inferencer::stamp_sum_identity(CallExpr *call)
+{
+    auto *cid = node_cast<Identifier>(call->what.get());
+    if (!cid || !call->args || cid->uid->val != "sum")
+        return;
+    /* the builtin, not a user function of the same name */
+    if (!names_builtin(cid))
+        return;
+    StaticTypeRef rt = static_type_resolve(type_of(call));
+    if (rt->opt)
+        return;
+    if (rt->kind == StaticTypeKind::Int || rt->kind == StaticTypeKind::Bool)
+        call->args->arr_hint = ArrHint::flat_i;
+    else if (rt->kind == StaticTypeKind::Float)
+        call->args->arr_hint = ArrHint::flat_f;
+}
+
+/* Q2 increment 2: does a store into a place of static type `t` need
+ * its value checked against the container's own type at run time - the
+ * place is `dyn`, or its type is not known here? */
+static bool ct_unsettled(StaticTypeRef t)
+{
+    t = static_type_resolve(t);
+    return !t || t->kind == StaticTypeKind::Dyn
+        || t->kind == StaticTypeKind::Unknown;
+}
+
+/* the builtins that store a value into the container they are given */
+static bool in_place_store(std::string_view n)
+{
+    /* constexpr: no run-time initialisation (a static set's guard is a
+     * branch no run can take twice) */
+    static constexpr std::string_view names[] = {"append", "push",
+                                                 "insert"};
+    return std::find(std::begin(names), std::end(names), n)
+        != std::end(names);
+}
+
+/* the static type of what a store into a container of static type `c`
+ * puts there: an array's element, a dict's value; `dyn` otherwise */
+static StaticTypeRef elem_place_of(StaticTypeRef c)
+{
+    c = static_type_resolve(c);
+    if (c->kind == StaticTypeKind::Array)
+        return c->elem;
+    if (c->kind == StaticTypeKind::Dict)
+        return c->val;
+    return nullptr;
+}
+
+/* Q2: is a component of `t` unfilled (`none`) or not yet known? Such a
+ * container is made UNTYPED: its first typed place gives it its type. */
+static bool ctype_unfilled(StaticTypeRef t)
+{
+    t = static_type_resolve(t);
+    if (t->kind == StaticTypeKind::None
+           || t->kind == StaticTypeKind::Unknown)
+        return true;
+    if (t->kind == StaticTypeKind::Array || t->kind == StaticTypeKind::Box)
+        return ctype_unfilled(t->elem);
+    if (t->kind == StaticTypeKind::Dict)
+        return ctype_unfilled(t->key) || ctype_unfilled(t->val);
+    return false;
+}
+
+/*
+ * Q2 (plans/typed-containers.md): the type a container is MADE with, when
+ * it is built for the static type `t` - an interned array<T> / dict<K,
+ * V>, its top-level opt cleared; array<dyn> / dict<dyn, dyn> (DYNAMIC) for
+ * a `dyn` place; null (untyped) when `t` is no such container or has a
+ * component nothing filled.
+ */
+const TypeAnnot *Inferencer::ctype_of(StaticTypeRef t, bool dict)
+{
+    /* (a place's or a node's own type: never null) */
+    t = static_type_resolve(t);
+    ML_CHECK(t);
+    if (t->kind == StaticTypeKind::Dyn)
+        return dict ? annot_dyn_dict() : annot_dyn_array();
+    if (t->kind != (dict ? StaticTypeKind::Dict : StaticTypeKind::Array)
+            || ctype_unfilled(t))
+        return nullptr;
+    std::shared_ptr<TypeAnnot> a = fit_annot_of(t);
+    a->opt = false;
+    return annot_intern(*a);
+}
+
+/* Q2: a BAKED mutable value's containers take the type `t` gives them
+ * (eval.cpp: ctype_restamp, which copies a value another node already
+ * gave a different type) */
+void Inferencer::stamp_lit_obj_ctype(LiteralObj *lo, StaticTypeRef t)
+{
+    const EvalValue &v = lo->literal_value();
+    const bool dict = v.is<intrusive_ptr<DictObject>>();
+    if (lo->is_immutable() || (!dict && !v.is<SharedArrayObj>()))
+        return;
+    const TypeAnnot *ct = ctype_dyn_place.count(lo)
+        ? (dict ? annot_dyn_dict() : annot_dyn_array())
+        : ctype_of(t, dict);
+    if (ct)
+        lo->set_literal_value(ctype_restamp(v, ct));
+}
+
+/*
+ * Q2: give every node that MAKES a container the type it is made with.
+ * A literal got it from stamp_literal_coerce (the type it is built for);
+ * a baked mutable value and a building builtin's call get it here, from
+ * the variable it is assigned to (`dest`, set_array_repr_hint's rule: a
+ * direct right-hand side), else from the fixed place a baked value was
+ * rebuilt for, else from their own type. Runs after the late folds.
+ */
+void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
+{
+    if (!n)
+        return;
+    switch (ctag(n)) {
+    case ConstructType::lit_arr:
+    case ConstructType::lit_dict:
+        if (ctype_untyped.count(n)) {
+            /* what it holds is checked where it lands, and so are the
+             * literals nested in it */
+            n->ctype = nullptr;
+            if (ctag(n) == ConstructType::lit_arr) {
+                for (auto &el : static_cast<LiteralArray *>(n)->elems)
+                    ctype_untype(el.get());
+            } else {
+                for (auto &kv : static_cast<LiteralDict *>(n)->elems)
+                    ctype_untype(kv->value.get());
+            }
+        }
+        break;
+    case ConstructType::lit_obj: {
+        auto *lo = static_cast<LiteralObj *>(n);
+        /* a folded user function's result keeps the type it was made
+         * with (LiteralObj::typed_by_place) */
+        if (ctype_untyped.count(n) || !lo->typed_by_place)
+            return;
+        StaticTypeRef t = dest;
+        if (!t) {
+            auto it = lit_obj_dest.find(lo);
+            t = it != lit_obj_dest.end() ? it->second : type_of(lo);
+        }
+        stamp_lit_obj_ctype(lo, t);
+        return;
+    }
+    case ConstructType::call: {
+        auto *call = static_cast<CallExpr *>(n);
+        auto *cid = node_cast<Identifier>(call->what.get());
+        const bool builtin = cid && names_builtin(cid);
+        ML_CHECK(call->args);      /* every call has a (maybe empty) list */
+        ExprList *const args = call->args.get();
+        if (builtin && builtin_builds_container(cid->uid->val)) {
+            const StaticTypeRef own = static_type_resolve(type_of(call));
+            const bool dict = own->kind == StaticTypeKind::Dict;
+            /* choice 6: array(n) is made with its zero values, of the
+             * type of the variable it is assigned to - which it then has
+             * exactly, so it carries that type even where a fit check
+             * would have it take the place's type on entry */
+            const bool zero_fill =
+                cid->uid->val == std::string_view("array")
+                && args->elems.size() == 1 && dest;
+            /* made where only `dyn` reaches it (ctype_untype) */
+            const bool untyped = ctype_untyped.count(call) != 0;
+            args->ctype =
+                untyped && !zero_fill ? nullptr
+                : ctype_dyn_place.count(call)
+                    ? (dict ? annot_dyn_dict() : annot_dyn_array())
+                    : ctype_of(dest ? dest : own, dict);
+            /* rule 4: the storage follows the type. A variable's direct
+             * right-hand side got its storage from the variable
+             * (set_array_repr_hint); anywhere else - an argument, a
+             * result, a field, an element - the container is built for
+             * the type it has there, as its ctype is: an inline
+             * `keys(d)` of a dict<int, int> was a GENERAL array<int>.
+             * (One made where `dyn` is declared got `general` there.) */
+            ArrHint h;
+            const StructTypeDef *sd = nullptr;
+            if (builtin_takes_arr_hint(cid->uid->val)
+                    && args->arr_hint == ArrHint::dflt && !untyped
+                    && array_repr_hint(dest ? dest : own, h, sd)) {
+                args->arr_hint = h;
+                args->arr_hint_struct = sd;
+            }
+            /* choice 6: array(n) fills its element type's zero value,
+             * so an element type that has none is refused here - but in
+             * a template's base body, which is not checked (its
+             * instances are), it is made untyped and filled with none */
+            const TypeAnnot *ct = args->ctype;
+            /* (an array's ctype names its element type - annot_zero_value
+             * checks it; and stamping runs only in a checked run, an -nti
+             * one returns before it) */
+            if (zero_fill && ct
+                    && !annot_zero_value(ct->elem.get(), nullptr)) {
+                if (!stamp_in_tmpl_base)
+                    mismatch("array(n) fills its elements with their "
+                             "type's zero value, and '"
+                             + annot_type_text(ct->elem.get())
+                             + "' has none: give a fill value, array(n, "
+                             "v), or make the element type nullable",
+                             call->start, call->end);
+                args->ctype = nullptr;
+            }
+        }
+        /* an argument a fit check examines, or one whose parameter's type
+         * is unknown here (a call through a function value) */
+        auto &as = args->elems;
+        const bool known = builtin
+            || cs_struct_callee(call->what.get())
+            || callee_funcinfo(call->what.get());
+        /* an append / push / insert (its container is argument 0) */
+        const bool stores = builtin && !as.empty()
+            && in_place_store(cid->uid->val);
+        /* a value stored into a `dyn` container by an in-place builtin:
+         * its element type is unknown here */
+        const bool into_dyn = stores
+            && is_dyn(static_type_resolve(type_of(as[0].get())));
+        for (size_t i = 0; i < as.size(); i++)
+            if (!known || (into_dyn && i > 0) || arg_fit_checked(call, i))
+                ctype_untype(as[i].get());
+        /* Q2 increment 2: an append / push / insert whose element type
+         * the compiler does not know checks the value against the
+         * container's own type; so does a call that may reach one
+         * through a function value */
+        args->ct_store = !known
+            || (stores && ct_unsettled(elem_place_of(type_of(as[0].get()))));
+        break;
+    }
+    case ConstructType::expr04: {
+        /* `a + b` on arrays makes a NEW array (a copy of `a` that
+         * starts untyped, ctype_sum_copy): it gets the type the place it
+         * is written into has, else the sum's own (StampTypeV) */
+        const StaticTypeRef own = static_type_resolve(type_of(n));
+        if (own->kind == StaticTypeKind::Array)
+            n->ctype = ctype_untyped.count(n) ? nullptr
+                : ctype_dyn_place.count(n) ? annot_dyn_array()
+                : ctype_of(dest ? dest : own, false);
+        break;
+    }
+    case ConstructType::expr14: {
+        auto *e = static_cast<Expr14 *>(n);
+        /* Q2 increment 2: a store into an element, a dict value or a
+         * member whose type the compiler does not know - through a `dyn`
+         * name, into an array<dyn> - checks the value against the
+         * container's own type at run time */
+        if (ctag(e->lvalue.get()) == ConstructType::subscript
+                || ctag(e->lvalue.get()) == ConstructType::member)
+            e->lvalue->ct_store = ct_unsettled(type_of(e->lvalue.get()));
+        if (e->op == Op::assign) {
+            /* checked where it lands; or stored through a `dyn` container,
+             * whose element type is unknown here */
+            Construct *lv = e->lvalue.get();
+            Construct *base =
+                ctag(lv) == ConstructType::subscript
+                    ? static_cast<Subscript *>(lv)->what.get()
+                : ctag(lv) == ConstructType::member
+                    ? static_cast<MemberExpr *>(lv)->what.get()
+                    : nullptr;
+            if (e->rv_fit || (base && is_dyn(static_type_resolve(
+                                          type_of(base)))))
+                ctype_untype(e->rvalue.get());
+            if (auto *id = node_cast<Identifier>(e->lvalue.get())) {
+                if (TypeSym *sym = user_sym(id)) {
+                    stamp_ctypes(e->lvalue.get(), nullptr);
+                    stamp_ctypes(e->rvalue.get(), sym->type);
+                    return;
+                }
+            }
+        }
+        break;
+    }
+    case ConstructType::func_decl: {
+        /* a template's BASE body is not checked in isolation (its
+         * instances are), so neither is an array(n) in it: its elements
+         * are none there (stamp_in_tmpl_base) */
+        /* (the structural pass gave every function its FuncInfo) */
+        auto it = func_of_decl.find(n);
+        ML_CHECK(it != func_of_decl.end());
+        const bool base = it->second->is_template;
+        const bool was = stamp_in_tmpl_base;
+        stamp_in_tmpl_base = was || base;
+        for_each_child(n, [&](Construct *c) { stamp_ctypes(c, nullptr); });
+        stamp_in_tmpl_base = was;
+        return;
+    }
+    default:
+        break;
+    }
+    for_each_child(n, [&](Construct *c) { stamp_ctypes(c, nullptr); });
+}
+
+/* Q2: make the container node `n` makes UNTYPED (stamp_ctypes) - through
+ * a ternary's arms and a `??`'s sides, which are what the place gets */
+void Inferencer::ctype_untype(Construct *n)
+{
+    switch (ctag(n)) {           /* (ctag of a null is `other`) */
+    case ConstructType::ternary: {
+        auto *t = static_cast<TernaryExpr *>(n);
+        ctype_untype(t->thenExpr.get());
+        ctype_untype(t->elseExpr.get());
+        return;
+    }
+    case ConstructType::coalesce: {
+        auto *c = static_cast<CoalesceExpr *>(n);
+        ctype_untype(c->lhs.get());
+        ctype_untype(c->rhs.get());
+        return;
+    }
+    case ConstructType::lit_arr: case ConstructType::lit_dict:
+    case ConstructType::lit_obj: case ConstructType::call:
+    case ConstructType::expr04:
+        ctype_untyped.insert(n);
+        return;
+    default:
+        return;
+    }
+}
+
+/* the symbol a program declares that `id` names, or null: a builtin (or
+ * a name nothing declares, which the resolver refuses) */
+TypeSym *Inferencer::user_sym(const Identifier *id)
+{
+    auto it = id_sym.find(id);
+    return it == id_sym.end() ? nullptr : it->second;
+}
+
+/* `cid` names the builtin itself, not a function or a variable of the
+ * program that takes its name */
+bool Inferencer::names_builtin(const Identifier *cid)
+{
+    return is_builtin(cid->uid) && !user_sym(cid);
+}
+
+/* Q2: does a fit check (#49) examine argument `i` of `call` where it is
+ * bound - a struct field's, a typed parameter's, an in-place builtin's
+ * stored value? (call_fit_args, argument by argument) */
+bool Inferencer::arg_fit_checked(CallExpr *call, size_t i)
+{
+    ExprList *args = call->args.get();
+    Construct *a = args->elems[i].get();
+    if (args->fit_of(i))
+        return true;
+    if (const StructTypeDef *def = cs_struct_callee(call->what.get())) {
+        if (i >= def->fields.size())
+            return false;
+        const FieldDef &fd = def->fields[i];
+        return fd.kind != FieldKind::f_dyn
+            && fit_needed(type_of(a), field_static_type(fd));
+    }
+    if (FuncInfo *fi = callee_funcinfo(call->what.get()))
+        return i < fi->params.size() && param_has_fit(fi->params[i])
+            && fit_needed(type_of(a), fi->params[i]->type);
+    return false;
+}
+
 void Inferencer::set_array_repr_hint(Expr14 *e)
 {
     if (e->op != Op::assign)
         return;
 
-    auto *id = dynamic_cast<Identifier *>(e->lvalue.get());
+    auto *id = node_cast<Identifier>(e->lvalue.get());
     if (!id)
         return;
     auto it = id_sym.find(id);
@@ -1888,38 +4956,32 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
     StaticTypeRef ty = static_type_resolve(it->second->type);
 
     /*
+     * A container LITERAL assigned to a variable is built for the
+     * variable's final type, as one landing in a FIXED place is (#46,
+     * literal_into): `var a = [[1, 2]]; a[0][0] = 2.5;` types `a` as
+     * array<array<float>> (the store contributes a float element), and its
+     * inner literal, built as its own array<int>, refused the store at run
+     * time - a TypeErrorEx in a well-typed program. The types are final
+     * here, so the variable's no longer joins the literal's own.
+     */
+    if (StaticTypeRef d = literal_into(e->rvalue.get(), ty))
+        stamp_literal_into(e->rvalue.get(), d);
+
+    /*
      * A `dyn`-typed destination (`var dyn d = ...`) means "I want a polymorphic
      * array", so build it general - otherwise `var dyn d = [1,2,3]; d[0]="x"`
      * would wrongly hit the flat-array error even though `d` is already dyn.
      * Anything that is neither an array nor `dyn` has no array repr to pick.
      */
     ArrHint hint;
+    const StructTypeDef *sdef = nullptr;
     if (ty->kind == StaticTypeKind::Array) {
-        StaticTypeRef el = static_type_resolve(ty->elem);
-        if (!el->opt && el->kind == StaticTypeKind::Int)
-            hint = ArrHint::flat_i;
-        else if (!el->opt && el->kind == StaticTypeKind::Float)
-            hint = ArrHint::flat_f;
-        else if (!el->opt && el->kind == StaticTypeKind::Bool)
-            hint = ArrHint::flat_b;
-        else if (!el->opt && el->kind == StaticTypeKind::Struct &&
-                 static_cast<const StructTypeDef *>(el->struct_def) &&
-                 static_cast<const StructTypeDef *>(el->struct_def)->is_pod())
-            /* array<POD struct>: flat storage (the def lets even an empty
-             * `[]` start flat); a boxed-struct array stays general. */
-            hint = ArrHint::flat_s;
-        else if (!el->opt && el->kind == StaticTypeKind::Str)
-            /* array<str> (top-10 #7): NO hint - the value keeps its natural
-             * storage (a split()/keys() result stays FLAT strs; a plain
-             * general literal stays general). Forcing `general` here used
-             * to general-ify a baked flat-strs literal; the strs promote-
-             * on-write model makes a later non-string element write safe
-             * without it. */
+        if (!array_repr_hint(ty, hint, sdef))
             return;
-        else
-            hint = ArrHint::general;
     } else if (ty->kind == StaticTypeKind::Dyn) {
         hint = ArrHint::general;
+        /* Q2: a container made here is DYNAMIC (array<dyn>) */
+        ctype_dyn_place.insert(e->rvalue.get());
     } else {
         return;
     }
@@ -1929,44 +4991,59 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
                        : hint == ArrHint::flat_f ? "flat (floats)"
                        : hint == ArrHint::flat_b ? "flat (bools)"
                        : hint == ArrHint::flat_s ? "flat (structs)"
+                       : hint == ArrHint::flat_c ? "flat (classes)"
                                                  : "general";
-        TRACE(arrays, 0, std::string(id->get_str()) + "  dest " +
-              static_type_to_string(ty) + " -> " + hn);
+        trace_emit(TraceCat::arrays, 0,
+                   std::string(id->get_str()) + "  dest " +
+                   static_type_to_string(ty) + " -> " + hn);
     }
-
-    /* the element struct type, needed by an empty flat_s array literal */
-    const StructTypeDef *sdef =
-        hint == ArrHint::flat_s
-            ? static_cast<const StructTypeDef *>(
-                  static_type_resolve(ty->elem)->struct_def)
-            : nullptr;
 
     Construct *rv = e->rvalue.get();
 
-    if (auto *call = dynamic_cast<CallExpr *>(rv)) {
+    if (ctag(rv) == ConstructType::call) {
+        auto *call = static_cast<CallExpr *>(rv);
 
-        auto *cid = dynamic_cast<Identifier *>(call->what.get());
+        auto *cid = node_cast<Identifier>(call->what.get());
         if (!cid || !call->args)
             return;
         /* must be the builtin, not a user function of the same name */
-        auto sit = id_sym.find(cid);
-        if ((sit != id_sym.end() && sit->second) || !is_builtin(cid->uid))
+        if (!names_builtin(cid))
             return;
-        const std::string nm(cid->uid->val);
         /* keys()/values() honor a flat hint too: building keys/values of a
          * scalar dict into a flat array<int>/<float>/<bool> avoids per-element
          * boxing (a big win for keys()/values() of a large dict). */
-        if (nm == "range" || nm == "array" || nm == "make_array" ||
-            nm == "keys" || nm == "values") {
+        if (builtin_takes_arr_hint(cid->uid->val)) {
             call->args->arr_hint = hint;
             call->args->arr_hint_struct = sdef;
         }
 
+    } else if (ctag(rv) == ConstructType::lit_obj
+               && !static_cast<LiteralObj *>(rv)->takes_hint) {
+
+        /* a folded value whose unfolded node keeps its own storage
+         * (`clone(a)`, `sort(a)`, `a + b`): it keeps it folded too (#97) */
+        return;
+
     } else {
 
-        /* an array literal or a folded const literal (LiteralObj) */
+        /* an array literal, or a folded one / a folded call that builds
+         * to the hint (LiteralObj::takes_hint). A folded value is REBUILT
+         * in that storage, as its unfolded call builds at run time: the
+         * parse folded it with no destination, so a folded `keys(d)` /
+         * `map(f, a)` stayed general where -nc built it flat, and a store
+         * of another kind through a `dyn` alias was accepted in one and
+         * refused in the other (RULE 2). Nothing converts it later - a
+         * LiteralObj's own hint is read only by the decompiler. */
         rv->arr_hint = hint;
         rv->arr_hint_struct = sdef;
+        if (ctag(rv) == ConstructType::lit_obj) {
+            auto *lo = static_cast<LiteralObj *>(rv);
+            WidenShape w;
+            w.k = 'a';
+            w.hint = hint;
+            w.hint_struct = sdef;
+            lo->set_literal_value(widen_baked_value(lo->literal_value(), w));
+        }
     }
 }
 
@@ -1974,14 +5051,25 @@ void Inferencer::hoist_globals(Block *rootBlock)
 {
     for (auto &e : rootBlock->elems) {
         Construct *n = e.get();
-        if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
+        if (ctag(n) == ConstructType::func_decl) {
+            auto *fd = static_cast<FuncDeclStmt *>(n);
             declare_funcdecl(fd, global);
-        } else if (auto *sd = dynamic_cast<StructDeclStmt *>(n)) {
+        } else if (ctag(n) == ConstructType::struct_decl) {
+            auto *sd = static_cast<StructDeclStmt *>(n);
             declare_structdecl(sd, global);
-        } else if (auto *e14 = dynamic_cast<Expr14 *>(n)) {
+        } else if (ctag(n) == ConstructType::expr14) {
+            auto *e14 = static_cast<Expr14 *>(n);
             if (e14->fl & pFlags::pInDecl)
                 declare_target(e14->lvalue.get(), global,
                                e14->fl & pFlags::pInConstDecl);
+            /* a TYPE ALIAS names its struct from here on: a function's
+             * body is walked before the statement declaring the alias
+             * (functions come first in a block, question 21), and a
+             * catch clause in it is resolved in that walk
+             * (resolve_catch_types) - unbound, `catch (T)` in a function
+             * was "'T' is not a type here" */
+            if (e14->fl & pFlags::pInConstDecl)
+                bind_type_aliases(e14);
         }
     }
 }
@@ -1995,12 +5083,15 @@ void Inferencer::declare_structdecl(StructDeclStmt *sd, Scope *s)
 {
     StructTypeDef *def = sd->def;
     struct_by_name[def->name] = def;
+    declared_structs.insert(def);
 
     if (sd->id) {
         const UniqueId *nm = sd->id->uid;
         auto it = s->syms.find(nm);
-        TypeSym *sym = (it != s->syms.end()) ? it->second
-                                             : new_sym(nm, s, sd->start);
+        /* a REPL redefinition binds a fresh symbol (redeclare_fresh) */
+        TypeSym *sym = (it != s->syms.end() && !redeclare_fresh(it->second))
+                           ? it->second
+                           : new_sym(nm, s, sd->start, sd->id->end);
         sym->struct_type = def;
         sym->type = A.dyn_ty();
         id_sym[sd->id.get()] = sym;
@@ -2034,6 +5125,9 @@ StaticTypeRef Inferencer::annot_to_static_type(const TypeAnnot *ta)
             base = A.dict_of(annot_to_static_type(ta->key.get()),
                              annot_to_static_type(ta->val.get()));
             break;
+        case DeclType::box:
+            base = A.box_of(annot_to_static_type(ta->elem.get()));
+            break;
         default: base = A.dyn_ty();
     }
     return A.with_opt(base, ta->opt);
@@ -2043,10 +5137,9 @@ StaticTypeRef Inferencer::field_static_type(const FieldDef &fd)
 {
     StaticTypeRef base;
 
-    /* A parameterized container field (`array<int> xs`) carries its element
-     * type in `annot`; a generic `array`/`dict` field leaves it `dyn`. */
-    if (fd.annot &&
-        (fd.kind == FieldKind::f_array || fd.kind == FieldKind::f_dict)) {
+    /* A container or box field names its whole type in `annot` (rule 5:
+     * a field cannot be a bare `array` / `dict`) */
+    if (fd.annot) {
         base = annot_to_static_type(fd.annot.get());
         return fd.is_opt ? A.with_opt(base, true) : base;
     }
@@ -2056,11 +5149,16 @@ StaticTypeRef Inferencer::field_static_type(const FieldDef &fd)
         case FieldKind::f_int:    base = A.int_ty();   break;
         case FieldKind::f_float:  base = A.float_ty(); break;
         case FieldKind::f_str:    base = A.str_ty();   break;
-        case FieldKind::f_array:  base = A.array_of(A.dyn_ty()); break;
-        case FieldKind::f_dict:
-            base = A.dict_of(A.dyn_ty(), A.dyn_ty()); break;
         case FieldKind::f_dyn:    base = A.dyn_ty();   break;
         case FieldKind::f_struct: {
+            /* the struct the parser resolved the field's type to, when
+             * it was declared above (by identity: a name may be hidden,
+             * or be another struct's in this scope); a forward
+             * reference is found by name */
+            if (fd.struct_def) {
+                base = A.struct_ty(fd.struct_def, fd.struct_def->name);
+                break;
+            }
             auto it = struct_by_name.find(fd.struct_ty);
             base = (it != struct_by_name.end())
                        ? A.struct_ty(it->second, fd.struct_ty)
@@ -2087,17 +5185,19 @@ void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
         fd->body && fd->body->is_block() && !always_exits(fd->body.get());
     /*
      * A template iff it is a NAMED function with at least one *template
-     * parameter*: an un-annotated, non-`dyn`, non-`opt` param. Those are the
-     * params the instance signature is keyed by; any `opt`/typed/`dyn` params
-     * coexist and just `join` within each clone (handled by the concrete path).
-     * So `func f(a, opt b)` is a template over `a` (b joins), while `func
-     * f(opt x)` (no template param) keeps the join model. (A lambda has no name
-     * to redirect a call to, so it also keeps the join model - v1; see
-     * plans/function-templates.md.)
+     * parameter* (template_param): an un-annotated, non-`dyn` param, `opt`
+     * or not (rule 8.1), or one annotated with a bare `array` / `dict`.
+     * Those are the params the instance signature is keyed by; typed /
+     * `dyn` params coexist and just `join` within each clone (handled by
+     * the concrete path). So `func f(a, int b)` is a template over `a` (b
+     * joins), and `func f(opt x)` over `x`. (A lambda has no name to
+     * redirect a call to, so it keeps the join model - except a
+     * write-once, calls-only one, mark_lambda_templates; see
+     * plans/archived/function-templates.md.)
      */
     if (fd->id && fd->params)
         for (auto &p : fd->params->elems)
-            if (!p->opt_mod && !p->dyn_mod && p->decl_type == DeclType::none) {
+            if (template_param(p.get())) {
                 fi->is_template = true;
                 break;
             }
@@ -2107,10 +5207,117 @@ void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
         const UniqueId *nm = fd->id->uid;
         TypeSym *sym;
         auto it = s->syms.find(nm);
-        sym = (it != s->syms.end()) ? it->second : new_sym(nm, s, fd->start);
+        /* a REPL redefinition binds a fresh symbol (redeclare_fresh) */
+        sym = (it != s->syms.end() && !redeclare_fresh(it->second))
+                  ? it->second
+                  : new_sym(nm, s, fd->start, fd->id->end);
         sym->func = fi;
+        sym->named_func = true;
         id_sym[fd->id.get()] = sym;
     }
+}
+
+/* The struct a type alias's initializer names: the parser made it a
+ * literal of the descriptor (alias_literal) - a constant
+ * multi-declaration's element too, or one it spreads to every target -
+ * or it is an element of a baked array. Null for any other value. The
+ * index is in range: a constant multi-declaration unpacks at parse time,
+ * where a wrong count is an error. */
+static const StructTypeDef *alias_struct_of(const Construct *rv, size_t i,
+                                            bool element)
+{
+    if (element)
+        if (auto *la = node_cast<const LiteralArray>(rv)) {
+            ML_CHECK(i < la->elems.size());
+            return alias_struct_of(la->elems[i].get(), 0, false);
+        }
+    auto *lo = node_cast<const LiteralObj>(rv);
+    if (!lo)
+        return nullptr;
+    const EvalValue &v = lo->literal_value();
+    if (v.is<StructTypeDef *>())
+        return v.get<StructTypeDef *>();
+    if (!element || !v.is<SharedArrayObj>())
+        return nullptr;
+    const SharedArrayObj &a = v.get_ref<SharedArrayObj>();
+    /* a descriptor is a general element (get_view() would promote any
+     * other kind in place) */
+    if (a.skind() != SharedArrayObj::Storage::general)
+        return nullptr;
+    ML_CHECK(i < a.size());
+    const EvalValue &e = a.get_view()[i].get();
+    return e.is<StructTypeDef *>() ? e.get<StructTypeDef *>() : nullptr;
+}
+
+/* `const T = S;` - a TYPE ALIAS (README, *Type aliases*): T's symbol names
+ * S's struct as the struct's own name does, so a construction `T(5)`, a
+ * `T.CONST` and a named argument are typed as S's (the six readers of
+ * TypeSym::struct_type). Its value, a descriptor, is `dyn` like S's. */
+/*
+ * Question 25: a catch clause names a struct by IDENTITY - the struct the
+ * name resolves to where the clause is written, as the type in `Err e;`
+ * does (an alias included: its symbol carries the struct). A struct
+ * private to a function is then not caught by name outside it. A name no
+ * struct in scope takes must be a built-in exception's; otherwise it is
+ * not a type - in a closed world (a script). An open world (the REPL, a
+ * parse-time copy) may declare the struct later, so there the clause
+ * keeps matching by name. A syntactic rule: it runs under -nti too.
+ */
+void Inferencer::resolve_catch_types(AllowedExList &cl, Scope *s)
+{
+    cl.defs.clear();
+    if (!cl.exList)
+        return;
+    for (const auto &id : cl.exList->elems) {
+        TypeSym *ts = lookup(s, id->uid);
+        if (ts && ts->struct_type) {
+            cl.defs.push_back(ts->struct_type);
+            continue;
+        }
+        cl.defs.push_back(nullptr);
+        if (is_catchable_ex_name(id->get_str()))
+            continue;
+        if (!ts && !closed_world)
+            continue;
+        /* (built with +=: a `?:` of two string concatenations leaves a
+         * conditional cleanup per temporary, 16 branches no run takes) */
+        std::string msg("'");
+        msg += id->get_str();
+        msg += "' is not a type";
+        if (ts) {
+            msg += " here: a variable, a parameter or a function named '";
+            msg += id->get_str();
+            msg += "' is not a struct";
+        }
+        SyntaxErrorEx e(id->start, intern_msg(msg));
+        e.loc_end = id->end;
+        throw e;
+    }
+}
+
+void Inferencer::bind_type_aliases(Expr14 *e14)
+{
+    /* declare_target has just bound every target that is not `_` */
+    auto bind = [&](Identifier *id, const StructTypeDef *def) {
+        if (!def)
+            return;
+        auto it = id_sym.find(id);
+        ML_CHECK(it != id_sym.end() && it->second);
+        it->second->struct_type = def;
+        it->second->type_alias = true;
+        it->second->type = A.dyn_ty();
+    };
+    Construct *rv = e14->rvalue.get();
+    if (auto *id = node_cast<Identifier>(e14->lvalue.get())) {
+        bind(id, alias_struct_of(rv, 0, false));
+        return;
+    }
+    /* a declaration's target is a name or a list of names */
+    ML_CHECK(ctag(e14->lvalue.get()) == ConstructType::idlist);
+    auto *idl = static_cast<IdList *>(e14->lvalue.get());
+    for (size_t i = 0; i < idl->elems.size(); i++)
+        if (!idl->elems[i]->is_underscore())
+            bind(idl->elems[i].get(), alias_struct_of(rv, i, true));
 }
 
 void Inferencer::declare_target(Construct *lvalue, Scope *s, bool is_const)
@@ -2119,7 +5326,8 @@ void Inferencer::declare_target(Construct *lvalue, Scope *s, bool is_const)
         const UniqueId *nm = id->uid;
         auto it = s->syms.find(nm);
         TypeSym *sym = (it != s->syms.end()) ? it->second
-                                             : new_sym(nm, s, id->start);
+                                             : new_sym(nm, s, id->start,
+                                                       id->end);
         sym->opt_decl = sym->opt_decl || id->opt_mod;
         sym->dyn_decl = sym->dyn_decl || id->dyn_mod;
         sym->const_decl = sym->const_decl || is_const;
@@ -2134,9 +5342,9 @@ void Inferencer::declare_target(Construct *lvalue, Scope *s, bool is_const)
                                   * (declare_target runs twice via hoist) */
     };
 
-    if (auto *id = dynamic_cast<Identifier *>(lvalue))
+    if (auto *id = node_cast<Identifier>(lvalue))
         decl_one(id);
-    else if (auto *idl = dynamic_cast<IdList *>(lvalue))
+    else if (auto *idl = node_cast<IdList>(lvalue))
         for (auto &up : idl->elems)
             if (!up->is_underscore())   /* `_` placeholder: not declared */
                 decl_one(up.get());
@@ -2147,14 +5355,50 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
     if (!n)
         return;
 
-    if (auto *blk = dynamic_cast<Block *>(n)) {
+    if (ctag(n) == ConstructType::block) {
+        auto *blk = static_cast<Block *>(n);
         Scope *inner = new_scope(s);
+
+        /*
+         * PRE-DECLARE this block's NAMED func/struct declarations (#134/#136).
+         * They bind at SCOPE ENTRY at run time (bind_hoistable_decls /
+         * gen_stmts' decls-first emission), and the RESOLVER already hoists
+         * them (hoist_scoped_decls) - the inferencer was the one pass that
+         * still saw them in statement order, and only INSIDE a block:
+         * hoist_globals does exactly this for the root.
+         *
+         * That asymmetry was the bug. A call above the declaration got a
+         * callee whose static type had not settled to `Func`, so
+         * annotate_hints left `vm_direct_func` false and the codegen REFUSED
+         * to lower the call (NotLoweredEx) while the tree-walker ran it - and
+         * a struct used above its `struct` line typed as `none`, so `p.x`
+         * became a bogus NullabilityEx. Measurable as `typestr(inner)`:
+         * "func inner()" before the decl vs "func()->int" after it, where the
+         * top level said "func()->int" in both positions.
+         *
+         * Both declare_* are idempotent (declare_funcdecl returns early when
+         * func_of_decl already has the node; declare_structdecl re-finds the
+         * existing sym), so the in-order walk below is a no-op for these.
+         */
+        for (auto &e : blk->elems) {
+            if (ctag(e.get()) == ConstructType::func_decl) {
+                auto *fd = static_cast<FuncDeclStmt *>(e.get());
+                if (fd->id)
+                    declare_funcdecl(fd, inner);
+            } else if (ctag(e.get()) == ConstructType::struct_decl) {
+                auto *sd = static_cast<StructDeclStmt *>(e.get());
+                if (sd->id)
+                    declare_structdecl(sd, inner);
+            }
+        }
+
         for (auto &e : blk->elems)
             walk_struct(e.get(), inner);
         return;
     }
 
-    if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
+    if (ctag(n) == ConstructType::func_decl) {
+        auto *fd = static_cast<FuncDeclStmt *>(n);
         declare_funcdecl(fd, s);
         FuncInfo *fi = func_of_decl[fd];
         Scope *fscope = new_scope(global);   /* funcs see globals only */
@@ -2168,15 +5412,18 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         if (fd->captures)
             for (auto &cap : fd->captures->elems) {
                 TypeSym *outer = lookup(s, cap->uid);
-                if (outer)
+                if (outer) {
                     fscope->syms[cap->uid] = outer;
+                    fscope->capture_names.insert(cap->uid);
+                }
                 id_sym[cap.get()] = outer;
             }
 
         if (fd->params)
             for (auto &p : fd->params->elems) {
-                TypeSym *psym = new_sym(p->uid, fscope, p->start);
+                TypeSym *psym = new_sym(p->uid, fscope, p->start, p->end);
                 psym->is_param = true;
+                psym->const_param = p->const_param;
                 psym->opt_decl = p->opt_mod;
                 psym->dyn_decl = p->dyn_mod;
                 psym->ann = p->decl_type;
@@ -2192,12 +5439,14 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         return;
     }
 
-    if (auto *e14 = dynamic_cast<Expr14 *>(n)) {
+    if (ctag(n) == ConstructType::expr14) {
+        auto *e14 = static_cast<Expr14 *>(n);
         walk_struct(e14->rvalue.get(), s);   /* RHS before name exists */
         /* count a write to each target name (decl or assign), once - this walk
          * runs once per node (declare_target runs twice via hoist). */
         auto count_write = [&](Construct *lv) {
-            if (auto *lid = dynamic_cast<Identifier *>(lv)) {
+            if (ctag(lv) == ConstructType::id) {
+                auto *lid = static_cast<Identifier *>(lv);
                 auto it = id_sym.find(lid);
                 if (it != id_sym.end() && it->second)
                     it->second->writes++;
@@ -2208,29 +5457,44 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
                            e14->fl & pFlags::pInConstDecl);
             /* `var f = <lambda>`: bind f to the lambda's FuncInfo so calls to f
              * type the lambda's params and check its arity. */
-            auto *id = dynamic_cast<Identifier *>(e14->lvalue.get());
-            auto *fd = dynamic_cast<FuncDeclStmt *>(e14->rvalue.get());
+            auto *id = node_cast<Identifier>(e14->lvalue.get());
+            auto *fd = node_cast<FuncDeclStmt>(e14->rvalue.get());
             if (id && fd) {
                 TypeSym *sym = id_sym[id];
                 if (sym && !sym->func)
                     sym->func = func_of_decl[fd];
             }
+            if (e14->fl & pFlags::pInConstDecl)
+                bind_type_aliases(e14);
+        } else if (ctag(e14->lvalue.get()) == ConstructType::idlist) {
+            /* An IdList is a leaf to for_each_child, so resolve each target
+             * as a single target is resolved: unresolved, the write to it
+             * was not counted (`q, sq = [1, seven]` left `sq` "never
+             * rebound", so every call still ran the declared body) and
+             * spread_idlist's contributions went to a null symbol (`x, y
+             * = ["s", 2]` kept `x` typed int while it held "s"). */
+            for (auto &up : static_cast<IdList *>(e14->lvalue.get())->elems)
+                walk_struct(up.get(), s);
         } else {
             walk_struct(e14->lvalue.get(), s);
         }
-        if (auto *idl = dynamic_cast<IdList *>(e14->lvalue.get()))
+        if (auto *idl = node_cast<IdList>(e14->lvalue.get()))
             for (auto &up : idl->elems) count_write(up.get());
         else
             count_write(e14->lvalue.get());
         return;
     }
 
-    if (auto *call = dynamic_cast<CallExpr *>(n)) {
+    if (ctag(n) == ConstructType::call) {
+        auto *call = static_cast<CallExpr *>(n);
         /* The callee is a CALL use (not a value use); a bare-Identifier callee
          * resolves here without being marked value_used, so a var used only to
          * be called stays monomorphizable. Args are value uses. */
-        if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
-            id_sym[cid] = lookup(s, cid->uid);   /* always - see Identifier */
+        if (ctag(call->what.get()) == ConstructType::id) {
+            auto *cid = static_cast<Identifier *>(call->what.get());
+            /* always - see Identifier; a builtin_only callee is the
+             * builtin's, whatever a scope declares */
+            id_sym[cid] = cid->builtin_only ? nullptr : lookup(s, cid->uid);
         } else {
             walk_struct(call->what.get(), s);
         }
@@ -2238,7 +5502,8 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         return;
     }
 
-    if (auto *fs = dynamic_cast<ForStmt *>(n)) {
+    if (ctag(n) == ConstructType::for_stmt) {
+        auto *fs = static_cast<ForStmt *>(n);
         Scope *inner = new_scope(s);
         walk_struct(fs->init.get(), inner);
         walk_struct(fs->cond.get(), inner);
@@ -2247,7 +5512,8 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         return;
     }
 
-    if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
+    if (ctag(n) == ConstructType::foreach_stmt) {
+        auto *fe = static_cast<ForeachStmt *>(n);
         Scope *inner = new_scope(s);
         walk_struct(fe->container.get(), s);
         if (fe->ids)
@@ -2266,7 +5532,7 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
                             "visible here; write 'var " +
                             std::string(id->uid->val) + "' to shadow it"),
                         id->start, id->end);
-                TypeSym *sym = new_sym(id->uid, inner, id->start);
+                TypeSym *sym = new_sym(id->uid, inner, id->start, id->end);
                 sym->is_loopvar = true;   /* type derived from container */
                 id_sym[id.get()] = sym;
             }
@@ -2274,15 +5540,35 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         return;
     }
 
-    if (auto *tc = dynamic_cast<TryCatchStmt *>(n)) {
+    if (ctag(n) == ConstructType::try_catch) {
+        auto *tc = static_cast<TryCatchStmt *>(n);
         walk_struct(tc->tryBody.get(), s);
         for (auto &cs : tc->catchStmts) {
+            resolve_catch_types(cs.first, s);
             Scope *inner = new_scope(s);
             if (cs.first.asId) {
                 TypeSym *sym = new_sym(cs.first.asId->uid, inner,
-                                       cs.first.asId->start);
-                sym->type = A.exc_ty();
-                sym->dyn_decl = true;   /* exception payload is dynamic */
+                                       cs.first.asId->start,
+                                       cs.first.asId->end);
+                /* question 25: a clause that names ONE struct catches
+                 * that struct only, so its variable has that type, as if
+                 * declared `Err e;`; otherwise (a built-in exception, two
+                 * types, `catch (dyn as e)`) it is dynamic */
+                const StructTypeDef *one = nullptr;
+                bool single = !cs.first.defs.empty();
+                for (const StructTypeDef *d : cs.first.defs) {
+                    if (!d || (one && d != one))
+                        single = false;
+                    one = d;
+                }
+                if (single) {
+                    sym->ann = DeclType::strct;
+                    sym->ann_struct = one;
+                    sym->type = A.struct_ty(one, one->name);
+                } else {
+                    sym->type = A.exc_ty();
+                    sym->dyn_decl = true;   /* the payload is dynamic */
+                }
                 id_sym[cs.first.asId.get()] = sym;
             }
             walk_struct(cs.second.get(), inner);
@@ -2291,18 +5577,26 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         return;
     }
 
-    if (auto *sd = dynamic_cast<StructDeclStmt *>(n)) {
+    if (ctag(n) == ConstructType::struct_decl) {
+        auto *sd = static_cast<StructDeclStmt *>(n);
         declare_structdecl(sd, s);
         return;
     }
 
-    if (auto *id = dynamic_cast<Identifier *>(n)) {
+    if (ctag(n) == ConstructType::id) {
+        auto *id = static_cast<Identifier *>(n);
         /* ALWAYS (re)resolve - never `if (!id_sym.count(id))`. id_sym is keyed
          * by node pointer and persists for the session; a fresh node can reuse
          * a freed node's address, so a stale entry must be OVERWRITTEN, not
          * kept (keeping it bound a callee to a prior clone -> the bug).
          * walk_struct visits each node once, so this never double-resolves. */
-        id_sym[id] = lookup(s, id->uid);
+        /* a builtin_only reference is the builtin's (#94), whatever a
+         * scope declares */
+        id_sym[id] = id->builtin_only ? nullptr : lookup(s, id->uid);
+        if (!id->builtin_only && resolves_to_capture(s, id->uid))
+            capture_uses.insert(id);
+        else
+            capture_uses.erase(id);
         /* reached for every reference EXCEPT a call callee (handled above): a
          * value (non-callee) use. */
         if (TypeSym *sym = id_sym[id])
@@ -2331,7 +5625,8 @@ void Inferencer::lower_call_named_args(CallExpr *call)
         return;                               /* all positional */
 
     /* Struct construction: the "parameters" are the fields, in order. */
-    if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
+    if (ctag(call->what.get()) == ConstructType::id) {
+        auto *cid = static_cast<Identifier *>(call->what.get());
         auto it = id_sym.find(cid);
         if (it != id_sym.end() && it->second && it->second->struct_type) {
             const StructTypeDef *def = it->second->struct_type;
@@ -2364,7 +5659,7 @@ void Inferencer::lower_named_args(Construct *n)
 
     for_each_child(n, [this](Construct *c) { lower_named_args(c); });
 
-    if (auto *call = dynamic_cast<CallExpr *>(n))
+    if (auto *call = node_cast<CallExpr>(n))
         lower_call_named_args(call);
 }
 
@@ -2376,13 +5671,68 @@ void Inferencer::lower_named_args(Construct *n)
  * REPL / test runner. A user symbol of the same name (a `func show(){}` shadow)
  * has a non-null id_sym entry and is left alone - it is the user's function.
  */
+/*
+ * `isbound` takes ONLY an identifier (maintainer's call): `none` and `len`
+ * are identifiers, `3` and `"blah"` are not. A SYNTACTIC rule, so it runs
+ * ungated - not inside reject_dev_builtins (which the test runner and the
+ * REPL skip wholesale) and not behind `checks_enabled` (`-nti` must not turn
+ * it off), exactly like the named-argument lowering beside it.
+ *
+ * It has to be a COMPILE error rather than the runtime body's own throw: the
+ * tree-walker would answer TypeErrorEx while the no-fail codegen refuses to
+ * lower the shape at all (NotLoweredEx) - an engine divergence on top of a
+ * worse diagnostic.
+ *
+ * The same walk stamps CallExpr::user_callee on a call whose callee NAMES a
+ * lazy builtin but resolved to the program's own symbol, which the resolver
+ * and AutoConst then treat as an ordinary call (#133). Every call is
+ * stamped, either way: a REPL input's tree is walked once, but a node
+ * address may be reused, and the stamp must be this walk's answer.
+ */
+void Inferencer::stamp_lazy_calls(Construct *n)
+{
+    if (!n)
+        return;
+
+    if (ctag(n) == ConstructType::call) {
+        auto *call = static_cast<CallExpr *>(n);
+        if (ctag(call->what.get()) == ConstructType::id) {
+            auto *cid = static_cast<Identifier *>(call->what.get());
+            auto it = id_sym.find(cid);
+            const bool user_shadow = (it != id_sym.end() && it->second);
+            call->user_callee = user_shadow && is_lazy_builtin(cid->uid);
+            if (!user_shadow && cid->uid->val == "isbound") {
+                const size_t n_args =
+                    call->args ? call->args->elems.size() : 0;
+                if (n_args != 1)
+                    throw WrongArgCountEx(
+                        intern_msg("isbound() takes exactly 1 argument"),
+                        cid->start, cid->end);
+                /* `none` is name-SHAPED but parses to a LiteralNone, not an
+                 * Identifier - let it through and let try_fold_isbound
+                 * answer `true`. */
+                Construct *ba = call->args->elems[0].get();
+                if (ctag(ba) != ConstructType::id
+                        && ctag(ba) != ConstructType::lit_none)
+                    throw TypeMismatchEx(
+                        intern_msg("isbound() takes an identifier"),
+                        ba->start, ba->end);
+            }
+        }
+    }
+
+    for_each_child(n, [this](Construct *c) { stamp_lazy_calls(c); });
+}
+
 void Inferencer::reject_dev_builtins(Construct *n)
 {
     if (!n)
         return;
 
-    if (auto *call = dynamic_cast<CallExpr *>(n)) {
-        if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
+    if (ctag(n) == ConstructType::call) {
+        auto *call = static_cast<CallExpr *>(n);
+        if (ctag(call->what.get()) == ConstructType::id) {
+            auto *cid = static_cast<Identifier *>(call->what.get());
             auto it = id_sym.find(cid);
             const bool user_shadow = (it != id_sym.end() && it->second);
             if (!user_shadow && is_dev_builtin(cid->uid))
@@ -2391,8 +5741,9 @@ void Inferencer::reject_dev_builtins(Construct *n)
                         "' is a dev-only builtin (REPL / tests only); it is not "
                         "available in a script"));
             /* The CALLEE position is the one LEGAL use of a LAZY-ARG builtin
-             * (defined/isconst/isconstdecl): walk the args only, skipping the
-             * callee id, so the value-use check below doesn't fire on it. */
+             * (defined/isbound/isconst/isconstdecl): walk the args only,
+             * skipping the callee id, so the value-use check below doesn't
+             * fire on it. */
             reject_dev_builtins(call->args.get());
             return;
         }
@@ -2404,7 +5755,8 @@ void Inferencer::reject_dev_builtins(Construct *n)
      * compile error (fork F1, maintainer-decided). A user symbol shadowing
      * the name is untouched; the REPL (g_dev_builtins_allowed) keeps the
      * indirect form working via its retained AST. */
-    if (auto *id = dynamic_cast<Identifier *>(n)) {
+    if (ctag(n) == ConstructType::id) {
+        auto *id = static_cast<Identifier *>(n);
         auto it = id_sym.find(id);
         const bool user_shadow = (it != id_sym.end() && it->second);
         if (!user_shadow && is_lazy_builtin(id->uid))
@@ -2427,10 +5779,22 @@ StaticTypeRef Inferencer::func_static_type(FuncInfo *fi)
         ps.push_back(p->dyn_decl ? A.dyn_ty() : p->type);
         popt.push_back(p->opt_decl);
     }
-    StaticTypeRef t = A.func_of(ps, popt, fi->ret);
-    if (fi->is_template)
-        t->finfos.push_back(fi);   /* value-template tracking (see the plan) */
-    return t;
+    /*
+     * ⛔ THIS TYPE CARRIES NO IDENTITY, AND THAT IS THE POINT (#116
+     * increment 3). It used to end with `t->finfos.push_back(fi)` - a
+     * set of candidate FuncInfos stapled to the SHAPE object - so that
+     * an indirect call could name its callee. Two distinct functions
+     * routinely have equal types, so every equality-based path in the
+     * lattice was a place that identity died: `join`'s
+     * `static_type_equal` shortcut dropped one side's candidates
+     * whenever two functions shared a signature, and no `escaped_finfos`
+     * ledger could report members that never ENTERED.
+     *
+     * The identity question has its own answer now - the CALLEE-SET
+     * analysis (calleeset.cpp.h), keyed by PROGRAM LOCATION - so an
+     * StaticType is back to describing SHAPE and nothing else.
+     */
+    return A.func_of(ps, popt, fi->ret);
 }
 
 /*
@@ -2440,9 +5804,27 @@ StaticTypeRef Inferencer::func_static_type(FuncInfo *fi)
  * homogeneous const array is array<T>, a heterogeneous one array<dyn> (its
  * individual elements are still exact via const-folding of any constant-index
  * access at parse time). Same for dict keys/values.
+ *
+ * A constant may contain ITSELF (cyclewalk.h): a container already on this
+ * walk's path is a back edge and contributes `dyn` - so `const C = mk();`
+ * with `C` a ring holding an int is array<dyn>, which is what its type is
+ * (its element is an int and an array, at once).
  */
 StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v)
 {
+    CycStack st;
+    return static_type_from_value(v, st);
+}
+
+StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v,
+                                                 CycStack &st)
+{
+    CycKey k;
+    const bool keyed = cyc_key(v, k);
+    if (keyed && st.contains(k))
+        return A.dyn_ty();
+    CycGuard g(st, k, keyed);
+
     Type *t = v.get_type();
     switch (t->t) {
 
@@ -2453,10 +5835,18 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v)
         case Type::t_none:  return A.none_ty();
 
         case Type::t_struct: {
-            const StructTypeDef *def =
-                v.get<intrusive_ptr<StructObject>>()->def;
-            return A.struct_ty(def, def->name);
+            const StructObject &o = *v.get_ref<intrusive_ptr<StructObject>>();
+            StaticTypeRef st = A.struct_ty(o.def, o.def->name);
+            return o.boxed ? A.box_of(st) : st;
         }
+
+        case Type::t_box:
+            switch (v.get_ref<intrusive_ptr<BoxObj>>()->kind) {
+            case 'i': return A.box_of(A.int_ty());
+            case 'f': return A.box_of(A.float_ty());
+            case 'b': return A.box_of(A.bool_ty());
+            default:  return A.box_of(A.str_ty());
+            }
 
         case Type::t_arr: {
             const SharedArrayObj &arr = v.get<SharedArrayObj>();
@@ -2464,7 +5854,7 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v)
             /*
              * Flat (unboxed) storage already pins the element type, so read it
              * from the kind - crucially WITHOUT get_view(), which would promote
-             * the const value to general (see plans/typed-arrays.md).
+             * the const value to general (see plans/archived/typed-arrays.md).
              */
             if (arr.skind() == SharedArrayObj::Storage::bools)
                 return A.array_of(A.bool_ty());
@@ -2478,37 +5868,64 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v)
             }
             if (arr.skind() == SharedArrayObj::Storage::strs)
                 return A.array_of(A.str_ty());
+            if (arr.skind() == SharedArrayObj::Storage::objs) {
+                /* class references: the join of the elements' types */
+                const size_type n = arr.size();
+                if (n == 0)
+                    return A.array_of(A.none_ty());
+                const auto &ov = arr.flat_objs();
+                StaticTypeRef el = static_type_from_value(
+                    obj_elem_value(ov[arr.offset()]));
+                for (size_type i = 1; i < n; i++) {
+                    StaticTypeRef j = A.join(el, static_type_from_value(
+                        obj_elem_value(ov[arr.offset() + i])));
+                    el = j ? j : A.dyn_ty();
+                }
+                return A.array_of(held(el));
+            }
 
             ArrayConstView view = arr.get_view();
             if (view.size() == 0)
                 return A.array_of(A.none_ty());
-            StaticTypeRef el = static_type_from_value(view[0].get());
+            StaticTypeRef el = static_type_from_value(view[0].get(), st);
             for (size_type i = 1; i < view.size(); i++) {
                 StaticTypeRef j = A.join(el,
-                    static_type_from_value(view[i].get()));
+                    static_type_from_value(view[i].get(), st));
                 el = j ? j : A.dyn_ty();
             }
-            return A.array_of(el);
+            return A.array_of(held(el));
         }
 
         case Type::t_dict: {
-            const auto &m = v.get<intrusive_ptr<DictObject>>()->get_ref();
+            const DictObject &dobj = *v.get<intrusive_ptr<DictObject>>();
+            const auto &m = dobj.get_ref();
+            /* a DEFAULT dict's reads also yield its default: an empty one
+             * is what `dict(v)` is typed unfolded (builtin_result:
+             * dict<dyn, T>), a non-empty one joins T into its values. It
+             * was typed by its entries alone, so a folded `dict(0)` was
+             * dict<none,none> and `d.a + 1` a NullabilityEx that -nc
+             * did not raise (RULE 2). */
+            StaticTypeRef dft = dobj.get_has_default()
+                ? static_type_from_value(dobj.get_default(), st) : nullptr;
             if (m.empty())
-                return A.dict_of(A.none_ty(), A.none_ty());
-            StaticTypeRef k = nullptr, val = nullptr;
+                return dft ? A.dict_of(A.dyn_ty(), held(dft))
+                           : A.dict_of(A.none_ty(), A.none_ty());
+            StaticTypeRef kty = nullptr, val = nullptr;
             for (const auto &kv : m) {
-                StaticTypeRef kt = static_type_from_value(kv.first);
-                StaticTypeRef vt = static_type_from_value(kv.second.get());
-                if (!k) {
-                    k = kt; val = vt;
+                StaticTypeRef kt = static_type_from_value(kv.first, st);
+                StaticTypeRef vt = static_type_from_value(kv.second.get(), st);
+                if (!kty) {
+                    StaticTypeRef jv = dft ? A.join(dft, vt) : vt;
+                    kty = kt;
+                    val = jv ? jv : A.dyn_ty();
                 } else {
-                    StaticTypeRef jk = A.join(k, kt);
+                    StaticTypeRef jk = A.join(kty, kt);
                     StaticTypeRef jv = A.join(val, vt);
-                    k = jk ? jk : A.dyn_ty();
+                    kty = jk ? jk : A.dyn_ty();
                     val = jv ? jv : A.dyn_ty();
                 }
             }
-            return A.dict_of(k, val);
+            return A.dict_of(held(kty), held(val));
         }
 
         default:
@@ -2516,29 +5933,64 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v)
     }
 }
 
+StaticTypeRef Inferencer::component_read(StaticTypeRef c)
+{
+    return is_none(static_type_resolve(c)) ? bottom : c;
+}
+
+StaticTypeRef Inferencer::held(StaticTypeRef t)
+{
+    return static_type_resolve(t)->kind == StaticTypeKind::None
+        ? A.with_opt(A.dyn_ty(), true) : t;
+}
+
+/*
+ * The static type of an expression: type_of_node's, with `opt` taken off a
+ * node the parser proved is never none (Construct::never_none - the kept
+ * left side of a `??` it decided).
+ */
 StaticTypeRef Inferencer::type_of(const Construct *e)
+{
+    StaticTypeRef t = type_of_node(e);
+    if (e && e->never_none && t)
+        t = A.with_opt(t, false);
+    return t;
+}
+
+StaticTypeRef Inferencer::type_of_node(const Construct *e)
 {
     if (!e)
         return A.none_ty();
 
-    if (dynamic_cast<const LiteralBool *>(e))  return A.bool_ty();
-    if (dynamic_cast<const LiteralInt *>(e))   return A.int_ty();
-    if (dynamic_cast<const LiteralFloat *>(e)) return A.float_ty();
-    if (dynamic_cast<const LiteralStr *>(e))   return A.str_ty();
-    if (dynamic_cast<const LiteralNone *>(e))  return A.none_ty();
+    if (ctag(e) == ConstructType::lit_bool)  return A.bool_ty();
+    if (ctag(e) == ConstructType::lit_int)   return A.int_ty();
+    if (ctag(e) == ConstructType::lit_float) return A.float_ty();
+    if (ctag(e) == ConstructType::lit_str)   return A.str_ty();
+    if (ctag(e) == ConstructType::lit_none)  return A.none_ty();
 
-    if (auto *la = dynamic_cast<const LiteralArray *>(e)) {
+    if (ctag(e) == ConstructType::lit_arr) {
+        auto *la = static_cast<const LiteralArray *>(e);
         if (la->elems.empty())
             return A.array_of(A.none_ty());
+        /* (an element not settled yet leaves the literal's element type
+         * unsettled: the join would drop it - [1, ?] is not an
+         * array<int> yet, and a template instantiated for one is wrong
+         * once the element settles) */
         StaticTypeRef el = type_of(la->elems[0].get());
+        if (is_unknown(static_type_resolve(el)))
+            return A.array_of(bottom);
         for (size_t i = 1; i < la->elems.size(); i++) {
-            StaticTypeRef j = A.join(el, type_of(la->elems[i].get()));
+            const StaticTypeRef t = type_of(la->elems[i].get());
+            if (is_unknown(static_type_resolve(t)))
+                return A.array_of(bottom);
+            StaticTypeRef j = A.join(el, t);
             el = j ? j : A.dyn_ty();
         }
-        return A.array_of(el);
+        return A.array_of(held(el));
     }
 
-    if (auto *ld = dynamic_cast<const LiteralDict *>(e)) {
+    if (ctag(e) == ConstructType::lit_dict) {
+        auto *ld = static_cast<const LiteralDict *>(e);
         if (ld->elems.empty())
             return A.dict_of(A.none_ty(), A.none_ty());
         StaticTypeRef k = type_of(ld->elems[0]->key.get());
@@ -2549,13 +6001,14 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
             k = jk ? jk : A.dyn_ty();
             val = jv ? jv : A.dyn_ty();
         }
-        return A.dict_of(k, val);
+        return A.dict_of(held(k), held(val));
     }
 
-    if (auto *lo = dynamic_cast<const LiteralObj *>(e))
+    if (auto *lo = node_cast<const LiteralObj>(e))
         return static_type_from_value(lo->literal_value());
 
-    if (auto *id = dynamic_cast<const Identifier *>(e)) {
+    if (ctag(e) == ConstructType::id) {
+        auto *id = static_cast<const Identifier *>(e);
         auto it = id_sym.find(id);
         if (it != id_sym.end() && it->second) {
             TypeSym *s = it->second;
@@ -2584,15 +6037,16 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
         return bottom;
     }
 
-    if (auto *e1 = dynamic_cast<const Expr01 *>(e))
+    if (auto *e1 = node_cast<const Expr01>(e))
         return type_of(e1->elem.get());
 
-    if (auto *e2 = dynamic_cast<const Expr02 *>(e)) {
+    if (ctag(e) == ConstructType::expr02) {
+        auto *e2 = static_cast<const Expr02 *>(e);
         const auto &pr = e2->elems[0];
         return unary_result(pr.first, type_of(pr.second.get()));
     }
 
-    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(e)) {
+    if (auto *mo = node_cast<const MultiOpConstruct>(e)) {
         /* Expr03/04/06/07/11/12 */
         StaticTypeRef t = type_of(mo->elems[0].second.get());
         for (size_t i = 1; i < mo->elems.size(); i++)
@@ -2611,7 +6065,8 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
      * `kind` (int or float). Without this, such a node fell through to `dyn`,
      * spuriously forcing an accumulator var to `dyn` -> DynRequiredEx.
      */
-    if (auto *ts = dynamic_cast<const TypedScalarExpr *>(e)) {
+    if (ctag(e) == ConstructType::typed_scalar) {
+        auto *ts = static_cast<const TypedScalarExpr *>(e);
         if (ts->cat == TypedScalarExpr::Cat::cmp ||
             ts->cat == TypedScalarExpr::Cat::logical ||
             ts->cat == TypedScalarExpr::Cat::lnot)
@@ -2619,7 +6074,8 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
         return ts->kind == TypeHint::f ? A.float_ty() : A.int_ty();
     }
 
-    if (auto *idc = dynamic_cast<const IncDecExpr *>(e)) {
+    if (ctag(e) == ConstructType::incdec) {
+        auto *idc = static_cast<const IncDecExpr *>(e);
         /* `x++` / `++x` yields `x +/- 1` (int stays int, float stays float);
          * binop_result defers on an Unknown operand. The check pass enforces
          * the int/float-lvalue requirement. */
@@ -2627,17 +6083,30 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
                             type_of(idc->lvalue.get()), A.int_ty());
     }
 
-    if (auto *te = dynamic_cast<const TernaryExpr *>(e)) {
+    if (ctag(e) == ConstructType::ternary) {
+        auto *te = static_cast<const TernaryExpr *>(e);
         /* `c ? a : b` is the join of the two branches (the condition does not
-         * affect the result type). Defer on an Unknown branch. */
+         * affect the result type). Defer on an Unknown branch. INCOMPATIBLE
+         * arms (`i == 0 ? [1] : 7` - a null join) are a genuine runtime
+         * VARIANT: the type is `dyn` (opt if either arm is), the `int OP
+         * dyn` philosophy - so a plain var bound to it gets the ordinary
+         * DynRequiredEx "declare it dyn" and `var dyn q = ...` works. NOT a
+         * premature dyn (the defer invariant): both arms are SETTLED
+         * concrete kinds, a conflict cannot converge in a later round. (The
+         * null used to escape into contribute/is_dyn - a pre-existing
+         * SEGFAULT, found by the lever-1 step-5 sync-call test.) */
         StaticTypeRef tt = static_type_resolve(type_of(te->thenExpr.get()));
         StaticTypeRef el = static_type_resolve(type_of(te->elseExpr.get()));
         if (is_unknown(tt) || is_unknown(el))
             return bottom;
-        return A.join(tt, el);
+        StaticTypeRef j = A.join(tt, el);
+        if (!j)
+            j = A.with_opt(A.dyn_ty(), tt->opt || el->opt);
+        return j;
     }
 
-    if (auto *co = dynamic_cast<const CoalesceExpr *>(e)) {
+    if (ctag(e) == ConstructType::coalesce) {
+        auto *co = static_cast<const CoalesceExpr *>(e);
         /* `a ?? b`: a's non-none part, or b. */
         StaticTypeRef ta = static_type_resolve(type_of(co->lhs.get()));
         StaticTypeRef tb = static_type_resolve(type_of(co->rhs.get()));
@@ -2647,20 +6116,47 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
             return tb;                      /* a is always none -> b */
         if (!ta->opt)
             return ta;                      /* a is never none -> a (b dead) */
-        return A.join(A.with_opt(ta, false), tb);
+        StaticTypeRef j = A.join(A.with_opt(ta, false), tb);
+        if (!j)                             /* incompatible sides: a runtime
+                                             * variant - dyn (see ternary) */
+            j = A.with_opt(A.dyn_ty(), tb->opt);
+        return j;
     }
 
-    if (auto *e14 = dynamic_cast<const Expr14 *>(e)) {
-        if (e14->op == Op::assign)
-            return type_of(e14->rvalue.get());
+    if (ctag(e) == ConstructType::expr14) {
+        auto *e14 = static_cast<const Expr14 *>(e);
+        /* A multi-assignment's value is none (README), whatever it
+         * stored and whichever operator - Expr14::do_eval returns it. */
+        if (e14->lvalue->is_idlist())
+            return A.none_ty();
+        if (e14->op == Op::assign) {
+            /* The value is the STORED value: the rvalue converted to the
+             * target's static type (README *the value of an assignment*) -
+             * an int into a float variable, field or array<float> element
+             * is a float. Expr14::val_widen / rv_coerce and a typed
+             * variable's own coercion are the runtime half of this. The
+             * target is a variable, an element or a field: the parser
+             * admits no other single target (the assignable-shape rule),
+             * and a multi-assignment returned above. */
+            StaticTypeRef rt = type_of(e14->rvalue.get());
+            const DeclType w = numeric_widen(type_of(e14->lvalue.get()), rt);
+            const bool o = static_type_resolve(rt)->opt;
+            if (w == DeclType::f)
+                return A.float_ty(o);
+            if (w == DeclType::i)
+                return A.int_ty(o);
+            return rt;
+        }
         return binop_result(compound_binop(e14->op),
                             type_of(e14->lvalue.get()),
                             type_of(e14->rvalue.get()));
     }
 
-    if (auto *call = dynamic_cast<const CallExpr *>(e)) {
+    if (ctag(e) == ConstructType::call) {
+        auto *call = static_cast<const CallExpr *>(e);
         Construct *callee = call->what.get();
-        if (auto *cid = dynamic_cast<const Identifier *>(callee)) {
+        if (ctag(callee) == ConstructType::id) {
+            auto *cid = static_cast<const Identifier *>(callee);
             auto it = id_sym.find(cid);
             TypeSym *s = (it != id_sym.end()) ? it->second : nullptr;
             if (s && s->struct_type)   /* construction -> the struct type */
@@ -2695,22 +6191,38 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
         return is_func(ct) ? static_type_resolve(ct)->ret : A.dyn_ty();
     }
 
-    if (auto *sub = dynamic_cast<const Subscript *>(e)) {
+    if (ctag(e) == ConstructType::subscript) {
+        auto *sub = static_cast<const Subscript *>(e);
         StaticTypeRef w = static_type_resolve(type_of(sub->what.get()));
         /* Defer on Unknown OR None: a None base is a fixpoint transient (the
          * element of an array(N) before its element type is pinned); a genuine
          * non-subscriptable base is caught in the check pass. */
         if (is_unknown(w) || is_none(w)) return bottom;
-        if (w->kind == StaticTypeKind::Array) return w->elem;
+        if (w->kind == StaticTypeKind::Array) return component_read(w->elem);
         /* A dict read is non-opt: `d[k]` yields the value, the dict's default
          * (a default dict), or throws on a missing key - never none. Use
          * get()/get!() for explicit nullable / fail-fast lookup. */
-        if (w->kind == StaticTypeKind::Dict)  return w->val;
+        if (w->kind == StaticTypeKind::Dict)  return component_read(w->val);
         if (w->kind == StaticTypeKind::Str)   return A.str_ty();
         return A.dyn_ty();
     }
 
-    if (auto *sl = dynamic_cast<const Slice *>(e)) {
+    /* `cast<T>(x)`: exactly T (plans/cast.md) */
+    if (ctag(e) == ConstructType::cast)
+        return annot_to_static_type(static_cast<const CastExpr *>(e)->to);
+
+    /* `*b`: the value a box<T> holds, a T (a box holds no none) */
+    if (ctag(e) == ConstructType::deref) {
+        auto *d = static_cast<const DerefExpr *>(e);
+        StaticTypeRef bt = static_type_resolve(type_of(d->elem.get()));
+        if (is_unknown(bt) || is_none(bt)) return bottom;   /* defer */
+        if (bt->kind == StaticTypeKind::Box)
+            return bt->elem ? static_type_resolve(bt->elem) : A.dyn_ty();
+        return A.dyn_ty();       /* dyn, or a misuse the check pass reports */
+    }
+
+    if (ctag(e) == ConstructType::slice) {
+        auto *sl = static_cast<const Slice *>(e);
         StaticTypeRef w = static_type_resolve(type_of(sl->what.get()));
         if (is_unknown(w) || is_none(w)) return bottom;   /* defer */
         if (w->kind == StaticTypeKind::Array || w->kind == StaticTypeKind::Str)
@@ -2718,10 +6230,12 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
         return A.dyn_ty();
     }
 
-    if (auto *mem = dynamic_cast<const MemberExpr *>(e)) {
+    if (ctag(e) == ConstructType::member) {
+        auto *mem = static_cast<const MemberExpr *>(e);
 
         /* `Type.CONST` (a struct descriptor base): a const member's type. */
-        if (auto *cid = dynamic_cast<const Identifier *>(mem->what.get())) {
+        if (ctag(mem->what.get()) == ConstructType::id) {
+            auto *cid = static_cast<const Identifier *>(mem->what.get());
             auto it = id_sym.find(cid);
             if (it != id_sym.end() && it->second && it->second->struct_type) {
                 const StructTypeDef *def = it->second->struct_type;
@@ -2731,7 +6245,8 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
             }
         }
 
-        StaticTypeRef w = static_type_resolve(type_of(mem->what.get()));
+        StaticTypeRef w =
+            member_base(static_type_resolve(type_of(mem->what.get())));
         if (is_unknown(w) || is_none(w)) return bottom;   /* defer */
 
         StaticTypeRef mt;   /* the member's type, before optionality */
@@ -2748,7 +6263,9 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
                 mt = A.dyn_ty();
         } else if (w->kind == StaticTypeKind::Dict) {
             /* `d.key` mirrors `d[key]`: non-opt (value / default / throws). */
-            mt = w->val;
+            mt = component_read(w->val);
+            if (is_unknown(static_type_resolve(mt)))
+                return bottom;
         } else {
             mt = A.dyn_ty();
         }
@@ -2757,7 +6274,8 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
         return mem->optional ? A.with_opt(static_type_resolve(mt), true) : mt;
     }
 
-    if (auto *fd = dynamic_cast<const FuncDeclStmt *>(e)) {
+    if (ctag(e) == ConstructType::func_decl) {
+        auto *fd = static_cast<const FuncDeclStmt *>(e);
         auto it = func_of_decl.find(fd);
         if (it != func_of_decl.end())
             return func_static_type(it->second);
@@ -2861,20 +6379,23 @@ StaticTypeRef Inferencer::binop_result(Op op, StaticTypeRef a, StaticTypeRef b)
         return j;
     };
 
+    /* two numeric kinds always join (bool < int < float), and so do two
+     * arrays (mixed elements join to dyn): StaticTypeArena::join */
     switch (op) {
         case Op::plus:
-            /* str + anything -> str (the RHS is stringified); but int/float +
-             * str is an error (handled by falling through to dyn). */
-            if (au->kind == StaticTypeKind::Str)
-                return A.str_ty();
+            /* `str + anything` was answered above; int/float + str is an
+             * error (dyn here, refused by the check pass) */
+            ML_CHECK(au->kind != StaticTypeKind::Str);
             if (an && bn) {
                 StaticTypeRef j = arith_join(au, bu);
-                return j ? j : A.dyn_ty();
+                ML_CHECK(j);
+                return j;
             }
             if (au->kind == StaticTypeKind::Array && bu->kind ==
                 StaticTypeKind::Array) {
                 StaticTypeRef j = A.join(au, bu);
-                return j ? j : A.array_of(A.dyn_ty());
+                ML_CHECK(j);
+                return j;
             }
             return A.dyn_ty();
 
@@ -2884,7 +6405,8 @@ StaticTypeRef Inferencer::binop_result(Op op, StaticTypeRef a, StaticTypeRef b)
                 return A.str_ty();
             if (an && bn) {
                 StaticTypeRef j = arith_join(au, bu);
-                return j ? j : A.dyn_ty();
+                ML_CHECK(j);
+                return j;
             }
             return A.dyn_ty();
 
@@ -2893,7 +6415,8 @@ StaticTypeRef Inferencer::binop_result(Op op, StaticTypeRef a, StaticTypeRef b)
         case Op::mod:
             if (an && bn) {
                 StaticTypeRef j = arith_join(au, bu);
-                return j ? j : A.dyn_ty();
+                ML_CHECK(j);
+                return j;
             }
             return A.dyn_ty();
 
@@ -2919,7 +6442,7 @@ StaticTypeRef Inferencer::binop_result(Op op, StaticTypeRef a, StaticTypeRef b)
 /*
  * Result type of a builtin call. Precise where it matters downstream;
  * `dyn` otherwise (sound - the runtime still type-checks the call). See
- * plans/type-inference-questions.md Q8.
+ * plans/archived/type-inference-questions.md Q8.
  */
 StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
 {
@@ -2931,19 +6454,21 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     auto elem_of = [&](StaticTypeRef c) -> StaticTypeRef {
         c = static_type_resolve(c);
         if (is_unknown(c) || is_none(c)) return bottom;   /* defer */
-        if (c->kind == StaticTypeKind::Array) return c->elem;
+        if (c->kind == StaticTypeKind::Array) return component_read(c->elem);
         if (c->kind == StaticTypeKind::Str)   return A.str_ty();
-        if (c->kind == StaticTypeKind::Dict)  return c->key;
+        if (c->kind == StaticTypeKind::Dict)  return component_read(c->key);
         return A.dyn_ty();
     };
 
     /* int-returning */
     if (n == "len" || n == "hash" || n == "ord" || n == "rand" ||
-        n == "intptr" || n == "remove")
+        n == "intptr" || n == "refcount" || n == "remove" ||
+        n == "int_hits" || n == "int_live")
         return A.int_ty();
 
     /* bool-returning predicates */
-    if (n == "defined" || n == "isconst" || n == "isconstdecl" ||
+    if (n == "defined" || n == "isbound" || n == "isconst" ||
+        n == "isconstdecl" ||
         n == "ispure" || n == "ispuredecl" || n == "startswith" ||
         n == "endswith" || n == "isinf" || n == "isfinite" ||
         n == "isnormal" || n == "isnan")
@@ -2953,17 +6478,19 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     if (n == "float" || n == "exp" || n == "log" || n == "sqrt" ||
         n == "cbrt" || n == "pow" || n == "sin" || n == "cos" || n == "tan" ||
         n == "asin" || n == "acos" || n == "atan" || n == "ceil" ||
-        n == "floor" || n == "trunc" || n == "round" || n == "randf" ||
-        n == "math_e" || n == "math_pi" || n == "nan" || n == "inf" ||
-        n == "eps")
+        n == "floor" || n == "trunc" || n == "round" || n == "randf")
         return A.float_ty();
 
     if (n == "int")    return A.int_ty();
     if (n == "str" || n == "typestr" || n == "kindstr" || n == "chr" ||
         n == "join" || n == "lpad" || n == "rpad" || n == "lstrip" ||
-        n == "rstrip" || n == "strip" || n == "readln" || n == "read" ||
-        n == "tmpdir")
+        n == "rstrip" || n == "strip" || n == "read" ||
+        n == "tmpdir" || n == "int_ctype")
         return A.str_ty();
+
+    /* readln() is none at the end of input */
+    if (n == "readln")
+        return A.str_ty(true);
 
     /* type(x) / decltype(v) -> a Type reflection object (native composite) */
     if (n == "type" || n == "decltype") {
@@ -2971,7 +6498,8 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         return A.struct_ty(ty, ty->name);
     }
 
-    if (n == "split" || n == "splitlines" || n == "readlines")
+    if (n == "split" || n == "splitlines" || n == "readlines" ||
+        n == "int_events")
         return A.array_of(A.str_ty());
 
     /* layout(S) -> a StructLayout reflection object (native composite type) */
@@ -2990,14 +6518,29 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
          * that would defeat fill-based typing (see plans/type-driven-*.md).
          */
         if (args->elems.size() >= 2)
-            return A.array_of(arg(1));
+            return A.array_of(held(arg(1)));
         return A.array_of(A.none_ty());
     }
+    /*
+     * The callback's RETURN type, or bottom while it is not settled - the
+     * defer-on-Unknown invariant, applied to the callback as well as to the
+     * value: `array<?>` is not Unknown at its top level, so a premature one
+     * passed every deferral and failed a declared destination's check -
+     * `array<int> a = make_array(n, f)` was refused as assigning `array<?>`
+     * (until 2026-10-05) while `var a = ...` waited and settled.
+     */
+    auto cb_ret = [&](StaticTypeRef f) -> StaticTypeRef {
+        if (!is_func(f))
+            return A.dyn_ty();
+        return is_unknown(static_type_resolve(f->ret)) ? bottom : f->ret;
+    };
+
     if (n == "make_array") {
         /* make_array(N, gen) -> array of the callback's return type. */
         StaticTypeRef f = static_type_resolve(arg(1));
         if (is_unknown(f)) return bottom;   /* defer: callback not yet known */
-        return A.array_of(is_func(f) ? f->ret : A.dyn_ty());
+        StaticTypeRef r = cb_ret(f);
+        return is_unknown(r) ? bottom : A.array_of(held(r));
     }
     if (n == "make_dict") {
         /* make_dict(keys, gen) -> dict<K, V>: K = the keys array's element
@@ -3009,18 +6552,38 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
             return bottom;                  /* defer: args not yet known */
         StaticTypeRef k =
             ks->kind == StaticTypeKind::Array ? ks->elem : A.dyn_ty();
-        return A.dict_of(k, is_func(f) ? f->ret : A.dyn_ty());
+        StaticTypeRef v = cb_ret(f);
+        return is_unknown(v) ? bottom : A.dict_of(k, held(v));
     }
     if (n == "dict") {
-        /* dict(default_value) -> dict<dyn, typeof default> (a default dict, so
-         * d[k] is non-opt). dict(pairs) -> dict<dyn,dyn>. A non-array arg is
-         * the default value, which becomes the dict's value type. */
-        if (args && args->elems.size() == 1) {
+        /* dict(default_value) -> dict<?, typeof default> (a default dict,
+         * so d[k] is non-opt), the key UNFILLED: the stores fill it, as an
+         * empty literal's (rule 1 - a builtin's unknown component is never
+         * `dyn`, which would be a type of its own). A non-array arg is
+         * the default value, which becomes the dict's value type.
+         * dict(pairs) holds what its pairs hold: from an array<array<T>>
+         * a dict<T, T> (both unfilled for an empty one, dyn for pairs of
+         * no known type) - never unfilled while a pair holds something,
+         * or a later store would fill the key with a type the pairs'
+         * keys do not have. */
+        if (args->elems.size() == 1) {
             StaticTypeRef a0 = static_type_resolve(arg(0));
             if (is_unknown(a0)) return bottom;
             if (a0->kind != StaticTypeKind::Array && a0->kind !=
                 StaticTypeKind::None)
-                return A.dict_of(A.dyn_ty(), a0);
+                return A.dict_of(A.none_ty(), a0);
+            if (a0->kind == StaticTypeKind::Array) {
+                StaticTypeRef p = static_type_resolve(a0->elem);
+                if (is_unknown(p)) return bottom;
+                if (p->kind == StaticTypeKind::None)
+                    return A.dict_of(A.none_ty(), A.none_ty());
+                if (p->kind == StaticTypeKind::Array && !p->opt) {
+                    StaticTypeRef t = static_type_resolve(p->elem);
+                    if (is_unknown(t)) return bottom;
+                    if (t->kind != StaticTypeKind::None)
+                        return A.dict_of(p->elem, p->elem);
+                }
+            }
         }
         return A.dict_of(A.dyn_ty(), A.dyn_ty());
     }
@@ -3036,13 +6599,32 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
 
     if (n == "abs" || n == "clone" || n == "deepclone")
         return arg(0);
-    /* dynarray(a) -> array<dyn>: a polymorphic (general) copy. Typed array<dyn>
-     * (not bare dyn) so plain `var d = dynarray(a)` is accepted under the
-     * tolerant-array rule and d is built/typed general. */
-    if (n == "dynarray")
-        return A.array_of(A.dyn_ty());
+    /* box(v) (plans/class-and-box.md, step 3): a box<T> of a bool, an
+     * int, a float, a str or a struct value; a reference - an array, a
+     * dict, a function, a class instance, a box - is returned as it is.
+     * A possibly-none argument is the check pass's error (check_box_call). */
+    if (n == "box") {
+        StaticTypeRef t = static_type_resolve(arg(0));
+        if (is_unknown(t) || is_none(t)) return bottom;     /* defer */
+        if (is_dyn(t)) return A.dyn_ty();
+        StaticTypeRef s = strip(t);
+        switch (s->kind) {
+        case StaticTypeKind::Bool: case StaticTypeKind::Int:
+        case StaticTypeKind::Float: case StaticTypeKind::Str:
+            return A.box_of(s);
+        case StaticTypeKind::Struct: {
+            const auto *d = static_cast<const StructTypeDef *>(s->struct_def);
+            return d && d->is_class ? s : A.box_of(s);
+        }
+        default:
+            return s;
+        }
+    }
     if (n == "runtime")
-        return A.dyn_ty();   /* the documented opt-out: defer to runtime (Q) */
+        /* the documented opt-out: defer to runtime (Q) - keeping the
+         * argument's nullability (rule 3: `runtime(none)` is a `dyn?`) */
+        return A.with_opt(A.dyn_ty(), args->elems.size() == 1
+                                          && is_optish(arg(0)));
     if (n == "min" || n == "max") {
         /* min(array) -> the element type; min(a, b, ...) -> the join of args. */
         if (args->elems.size() == 1)
@@ -3063,8 +6645,16 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
 
     if (n == "sum") {
         /* sum returns the element type, except a bool array sums to an int
-         * (it counts the `true`s; bool promotes to int in arithmetic). */
+         * (it counts the `true`s; bool promotes to int in arithmetic).
+         * sum(array, key_func) sums the CALLBACK's results, so it returns
+         * the callback's return type instead (the same bool rule). */
         StaticTypeRef el = elem_of(arg(0));
+        if (args && args->elems.size() == 2) {
+            StaticTypeRef f = static_type_resolve(arg(1));
+            if (is_unknown(f))
+                return bottom;      /* defer: callback not yet known */
+            el = is_func(f) ? f->ret : A.dyn_ty();
+        }
         if (is_unknown(el))
             return bottom;
         return static_type_resolve(el)->kind == StaticTypeKind::Bool ?
@@ -3075,7 +6665,8 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         /* map(func, container) -> array of the callback's return type */
         StaticTypeRef f = static_type_resolve(arg(0));
         if (is_unknown(f)) return bottom;   /* defer: callback not yet known */
-        return A.array_of(is_func(f) ? f->ret : A.dyn_ty());
+        StaticTypeRef r = cb_ret(f);
+        return is_unknown(r) ? bottom : A.array_of(held(r));
     }
     if (n == "filter")              /* filter(func, container) -> container */
         return arg(1);
@@ -3116,12 +6707,22 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         return A.with_opt(A.dyn_ty(), true);
     }
 
-    if (n == "exception" || n == "ex")
-        return A.exc_ty();
+    /* The in-place builtins return what they worked on - append / push
+     * the array - or whether they did - insert / erase a bool (false: a
+     * dict key already there / not there). They were typed `none` until
+     * 2026-10-08, while the run time held the array or the bool:
+     * typestr(erase(d, k)) read "none", and "bool" under -nti. */
+    if (n == "append" || n == "push") {
+        const StaticTypeRef c = static_type_resolve(arg(0));
+        if (is_unknown(c) || is_none(c))
+            return bottom;                  /* defer */
+        return A.with_opt(c, false);
+    }
+    if (n == "insert" || n == "erase")
+        return A.bool_ty();
 
-    if (n == "print" || n == "writeln" || n == "assert" || n == "append" ||
-        n == "push" || n == "insert" || n == "exit" || n == "write" ||
-        n == "writelines" || n == "erase")
+    if (n == "print" || n == "writeln" || n == "assert" || n == "exit" ||
+        n == "write" || n == "writelines")
         return A.none_ty();
 
     return A.dyn_ty();
@@ -3136,6 +6737,10 @@ void Inferencer::reset_round()
         if (s->func || s->pinned)   /* pinned: a prior input's fixed type */
             continue;
         s->round_got_dyn = false;   /* dyn-into-concrete coercion tracking */
+        s->round_got_dyn_opt = false;
+        s->round_elem_dyn = 0;
+        s->round_got_unknown = false;
+        s->round_arg_kinds = 0;
         /* A scalar annotation pins the type: seed the accumulator with the
          * declared type so it stays fixed (contribute() keeps it and checks
          * assignability). dyn next, else bottom. */
@@ -3153,8 +6758,16 @@ void Inferencer::commit_round()
 {
     for (auto &up : all_syms) {
         TypeSym *s = up.get();
-        if (s->func || s->pinned)
+        /* A struct or class NAME is a value nothing assigns: its type is
+         * the `dyn` its declaration gives it (declare_structdecl), which
+         * the finalize loop keeps. Committed here, it took the round's
+         * empty accumulator and finalized as `none` (#95): a `dyn`
+         * parameter refused it, and a template given it was never
+         * instantiated */
+        if (s->func || s->pinned || s->struct_type)
             continue;
+        s->arg_kinds = s->round_arg_kinds;
+        s->got_unknown = s->round_got_unknown;
         /*
          * dyn-into-concrete coercion decision (see contribute): a dyn value was
          * assigned to this plain `var`. If the NON-dyn contributions gave a
@@ -3166,10 +6779,51 @@ void Inferencer::commit_round()
         if (s->round_got_dyn && !s->dyn_decl) {
             const StaticTypeRef ac = static_type_resolve(s->acc);
             if (ac->kind == StaticTypeKind::Int ||
-                ac->kind == StaticTypeKind::Float)
+                ac->kind == StaticTypeKind::Float) {
                 s->coerces_dyn = true;   /* keep numeric acc; runtime coerces */
-            else
-                s->acc = A.dyn_ty();     /* non-numeric / dyn-only -> dyn */
+                if (s->round_got_dyn_opt)
+                    s->acc = A.with_opt(ac, true);
+            } else {
+                /* non-numeric / dyn-only -> dyn (dyn? if one may be none) */
+                s->acc = A.with_opt(A.dyn_ty(), s->round_got_dyn_opt);
+            }
+        }
+        /* rule 1, the element twin of the decision above: a NUMERIC
+         * element (key) keeps its type and its stores coerce the `dyn`
+         * at run time; any other folds the `dyn` back in */
+        if (s->round_elem_dyn) {
+            const StaticTypeRef ac = static_type_resolve(s->acc);
+            const auto fold = [&](StaticTypeRef c) -> StaticTypeRef {
+                const StaticTypeRef r = static_type_resolve(c);
+                if (r->kind == StaticTypeKind::Int
+                        || r->kind == StaticTypeKind::Float)
+                    return c;
+                return A.with_opt(A.dyn_ty(), r->opt);
+            };
+            if (ac->kind == StaticTypeKind::Array && (s->round_elem_dyn & 1))
+                s->acc = A.array_of(fold(ac->elem), ac->opt);
+            else if (ac->kind == StaticTypeKind::Dict
+                     && (s->round_elem_dyn & 3))
+                s->acc = A.dict_of(
+                    (s->round_elem_dyn & 2) ? fold(ac->key) : ac->key,
+                    (s->round_elem_dyn & 1) ? fold(ac->val) : ac->val,
+                    ac->opt);
+            /* choice 7: a component a `none` was stored into is nullable
+             * (one nothing else filled: dyn?) */
+            const auto nul = [&](StaticTypeRef c) -> StaticTypeRef {
+                if (static_type_resolve(c)->kind == StaticTypeKind::None)
+                    return A.with_opt(A.dyn_ty(), true);
+                return A.with_opt(c, true);
+            };
+            const StaticTypeRef an = static_type_resolve(s->acc);
+            if (an->kind == StaticTypeKind::Array && (s->round_elem_dyn & 4))
+                s->acc = A.array_of(nul(an->elem), an->opt);
+            else if (an->kind == StaticTypeKind::Dict
+                     && (s->round_elem_dyn & 12))
+                s->acc = A.dict_of(
+                    (s->round_elem_dyn & 8) ? nul(an->key) : an->key,
+                    (s->round_elem_dyn & 4) ? nul(an->val) : an->val,
+                    an->opt);
         }
         if (!static_type_equal(s->acc, s->type)) {
             changed = true;
@@ -3196,7 +6850,8 @@ void Inferencer::commit_round()
     }
 }
 
-void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc)
+void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
+                             Loc loc_end)
 {
     /*
      * func-name syms derive their type from func_static_type(); never
@@ -3207,6 +6862,50 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc)
      */
     if (!s || s->func)
         return;
+
+    /* rule 8.1: a `none` given to an `opt` parameter adds nothing to its
+     * type - the declaration already lets it be none. One only `none`
+     * reaches is then unconstrained (a `dyn?`, as an omitted argument
+     * leaves it), not `none`, so its non-none branches type-check:
+     * `func f(opt x) { if (x != none) return x + 1; return 0; }` called
+     * with `none` is the instance keyed `none` (template_arg_key) */
+    ML_CHECK(t);
+    if (s->is_param && s->opt_decl && is_none(t))
+        return;
+
+    {
+        /* which scalar kinds reach the symbol (see TypeSym::arg_kinds): a
+         * param's decides its bind coercion, a local's its store one */
+        const StaticTypeRef k = static_type_resolve(t);
+        if (k && k->kind == StaticTypeKind::Unknown)
+            s->round_got_unknown = true;    /* see TypeSym::got_unknown */
+        if (k && k->kind == StaticTypeKind::Bool)
+            s->round_arg_kinds |= ARGK_BOOL;
+        else if (k && k->kind == StaticTypeKind::Int)
+            s->round_arg_kinds |= ARGK_INT;
+        else if (k && k->kind == StaticTypeKind::Float)
+            s->round_arg_kinds |= ARGK_FLOAT;
+        else if (k && k->kind == StaticTypeKind::Dyn)
+            s->round_arg_kinds |= ARGK_DYN;
+    }
+
+    /*
+     * Rule 3 (plans/strict-container-types.md): a `dyn` variable or
+     * parameter is never none - its type stays the `dyn` reset_round
+     * seeded, and a value that may be none is refused (in the converged
+     * round, like any conflict: a type can still climb). It used to widen
+     * to `dyn?`, so `dyn a = 1; a = none;` compiled.
+     */
+    if (s->dyn_decl && !s->opt_decl) {
+        const StaticTypeRef rt = static_type_resolve(t);
+        if (strict_dyn && !has_unknown(rt)
+                && (rt->opt || rt->kind == StaticTypeKind::None))
+            conflict("'" + std::string(s->name->val) +
+                         "' is declared 'dyn' and cannot be none "
+                         "(declare it 'dyn?')",
+                     loc, loc_end, true);
+        return;
+    }
 
     /*
      * REPL incremental: a symbol committed by a prior input has a FIXED type.
@@ -3221,14 +6920,14 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc)
         if (strict_dyn && !s->is_param) {
             StaticTypeRef rt = static_type_resolve(t);
             StaticTypeRef pt = static_type_resolve(s->type);
-            if (!is_unknown(rt) && !is_none(rt) && !static_type_assignable(rt,
+            if (!has_unknown(rt) && !is_none(rt) && !static_type_assignable(rt,
                 pt))
-                mismatch("'" + std::string(s->name->val) + "' " +
+                conflict("'" + std::string(s->name->val) + "' " +
                              (s->ann != DeclType::none ? "is declared '"
                                                        : "has type '") +
                              static_type_to_string(pt) + "' but is assigned '" +
                              static_type_to_string(t) + "'",
-                         loc, Loc());
+                         loc, loc_end);
         }
         return;
     }
@@ -3247,13 +6946,13 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc)
     if (StaticTypeRef d = ann_scalar_static_type(s)) {
         if (strict_dyn && !s->is_param) {
             StaticTypeRef rt = static_type_resolve(t);
-            if (!is_unknown(rt) && !is_none(rt) && !static_type_assignable(rt,
+            if (!has_unknown(rt) && !is_none(rt) && !static_type_assignable(rt,
                 d))
-                mismatch("'" + std::string(s->name->val) +
+                conflict("'" + std::string(s->name->val) +
                              "' is declared '" + static_type_to_string(d) +
                              "' but is assigned '" + static_type_to_string(t)
                                  + "'",
-                         loc, Loc());
+                         loc, loc_end);
         }
         s->acc = d;                  /* pinned: never widens */
         return;
@@ -3273,19 +6972,24 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc)
      */
     if (!s->dyn_decl && is_dyn(t)) {
         s->round_got_dyn = true;
+        if (static_type_resolve(t)->opt)
+            s->round_got_dyn_opt = true;
         return;
     }
 
     StaticTypeRef nw = A.join(s->acc, t);
-    if (!nw)
-        mismatch("'" + std::string(s->name->val) + "' has type '" +
+    if (!nw) {
+        conflict("'" + std::string(s->name->val) + "' has type '" +
                      static_type_to_string(s->acc) + "' but is assigned '" +
                      static_type_to_string(t) + "'",
-                 loc, Loc());
+                 loc, loc_end);
+        return;              /* the accumulator keeps what it had */
+    }
     s->acc = nw;
 }
 
-void Inferencer::contribute_arg(TypeSym *param, StaticTypeRef argT, Loc loc)
+void Inferencer::contribute_arg(TypeSym *param, StaticTypeRef argT, Loc loc,
+                                Loc loc_end)
 {
     if (!param || param->dyn_decl)
         return;
@@ -3295,7 +6999,7 @@ void Inferencer::contribute_arg(TypeSym *param, StaticTypeRef argT, Loc loc)
             return;                  /* none->non-opt: flagged in check */
         argT = strip(argT);
     }
-    contribute(param, argT, loc);
+    contribute(param, argT, loc, loc_end);
 }
 
 void Inferencer::contribute_ret(StaticTypeRef t)
@@ -3311,7 +7015,8 @@ void Inferencer::accumulate(Construct *n)
     if (!n)
         return;
 
-    if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
+    if (ctag(n) == ConstructType::func_decl) {
+        auto *fd = static_cast<FuncDeclStmt *>(n);
         FuncInfo *fi = func_of_decl[fd];
         if (fi && fi->is_template)
             return;   /* a template: inferred per instantiation, not here */
@@ -3329,12 +7034,14 @@ void Inferencer::accumulate(Construct *n)
         return;
     }
 
-    if (auto *e14 = dynamic_cast<Expr14 *>(n)) {
+    if (ctag(n) == ConstructType::expr14) {
+        auto *e14 = static_cast<Expr14 *>(n);
         accumulate_assign(e14);
         return;
     }
 
-    if (auto *idc = dynamic_cast<IncDecExpr *>(n)) {
+    if (ctag(n) == ConstructType::incdec) {
+        auto *idc = static_cast<IncDecExpr *>(n);
         accumulate(idc->lvalue.get());
         /* Only a CONTAINER element accrues a type from `++` - so `d[k]++` pins
          * a `dict(0)`'s value type to int exactly as `d[k] += 1` does. A scalar
@@ -3342,22 +7049,25 @@ void Inferencer::accumulate(Construct *n)
          * widening it here (`b = b + 1` -> int for a bool) would mask the
          * "++ requires int/float" check, which must still reject `b++`. */
         Construct *lv = idc->lvalue.get();
-        if (dynamic_cast<Subscript *>(lv) || dynamic_cast<MemberExpr *>(lv))
-            contribute_to_lvalue(lv, type_of(idc), idc->start);
+        if (ctag(lv) == ConstructType::subscript || ctag(lv) == ConstructType::member)
+            contribute_to_lvalue(lv, type_of(idc));
         return;
     }
 
-    if (auto *call = dynamic_cast<CallExpr *>(n)) {
+    if (ctag(n) == ConstructType::call) {
+        auto *call = static_cast<CallExpr *>(n);
         accumulate_call(call);
         return;
     }
 
-    if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
+    if (ctag(n) == ConstructType::foreach_stmt) {
+        auto *fe = static_cast<ForeachStmt *>(n);
         accumulate_foreach(fe);
         return;
     }
 
-    if (auto *r = dynamic_cast<ReturnStmt *>(n)) {
+    if (ctag(n) == ConstructType::ret) {
+        auto *r = static_cast<ReturnStmt *>(n);
         accumulate(r->elem.get());
         contribute_ret(r->elem ? type_of(r->elem.get()) : A.none_ty());
         return;
@@ -3381,12 +7091,56 @@ void Inferencer::accumulate_call(CallExpr *call)
             return;   /* a template call: handled by instantiation (redirect) */
         size_t n = std::min(fi->params.size(), args->elems.size());
         for (size_t i = 0; i < n; i++)
-            contribute_arg(fi->params[i], type_of(args->elems[i].get()),
-                           args->elems[i]->start);
+            contribute_arg(fi->params[i],
+                           arg_type(args->elems[i].get(), fi->params[i]),
+                           args->elems[i]->start, args->elems[i]->end);
         return;
     }
 
-    auto *cid = dynamic_cast<Identifier *>(call->what.get());
+    /*
+     * #115: an INDIRECT call whose callee TYPE names exactly one
+     * function - the factory-returned closure:
+     *
+     *     func make_adder(n) {
+     *         var base = n * 10;
+     *         return func [base] (x) { return base + x; };
+     *     }
+     *     var add = make_adder(i);
+     *     add(i);                    // always an int
+     *
+     * `callee_funcinfo` cannot resolve this (the callee is a var, not a
+     * named function or an inline lambda), so `x` finalized to `dyn`
+     * and the closure ran fully boxed - a three-load ctx chain, a
+     * 32-byte capture read and two runtime type checks per call. The
+     * finfo set carried the answer the whole way: the lambda's type
+     * flows into make_adder's `ret`, out of the call, and into `add`'s
+     * symbol, `join` unioning the sets as it goes.
+     *
+     * ⛔ EXACTLY ONE CANDIDATE, and the restriction is about PRECISION,
+     * not soundness. Contributing to every member of a larger set is
+     * sound - the value may be any of them, so each may receive these
+     * arguments - but it WIDENS params that a different call site will
+     * then have to live with, and a param widened to dyn costs every
+     * unboxed tier built on it. One candidate is exact.
+     *
+     * A TEMPLATE is excluded here for the same reason the direct branch
+     * excludes it: its calls are handled by instantiation, which
+     * redirects them to a typed clone.
+     */
+    {
+        auto ic = indirect_callee.find(call);
+        if (ic != indirect_callee.end()) {
+            FuncInfo *ifi = ic->second;
+            size_t n = std::min(ifi->params.size(), args->elems.size());
+            for (size_t i = 0; i < n; i++)
+                contribute_arg(ifi->params[i],
+                               arg_type(args->elems[i].get(), ifi->params[i]),
+                               args->elems[i]->start, args->elems[i]->end);
+            return;
+        }
+    }
+
+    auto *cid = node_cast<Identifier>(call->what.get());
     if (!cid)
         return;
 
@@ -3402,14 +7156,17 @@ void Inferencer::accumulate_call(CallExpr *call)
     auto contribute_container = [&](size_t base_i, int key_i, size_t val_i) {
         if (base_i >= args->elems.size() || val_i >= args->elems.size())
             return;
-        auto *bid = dynamic_cast<Identifier *>(args->elems[base_i].get());
+        auto *bid = node_cast<Identifier>(args->elems[base_i].get());
         if (!bid)
             return;
         auto bit = id_sym.find(bid);
         TypeSym *bs = (bit != id_sym.end()) ? bit->second : nullptr;
         if (!bs)
             return;
-        StaticTypeRef vt = type_of(args->elems[val_i].get());
+        StaticTypeRef vt = literal_into(args->elems[val_i].get(),
+                                        fixed_elem_dest(bid, false));
+        if (!vt)
+            vt = type_of(args->elems[val_i].get());
         StaticTypeRef bt = static_type_resolve(bs->type);
         /* Defer if the element type isn't settled yet (the defer-on-Unknown
          * invariant): contributing `array<?>` to a PINNED global array would
@@ -3425,9 +7182,9 @@ void Inferencer::accumulate_call(CallExpr *call)
                             ? type_of(args->elems[key_i].get()) : A.dyn_ty();
             if (is_unknown(static_type_resolve(kt)))
                 return;
-            contribute(bs, A.dict_of(kt, vt), bid->start);
+            contribute_elem(bs, A.dict_of(kt, vt), bid->start, bid->end);
         } else if (bt->kind == StaticTypeKind::Array) {
-            contribute(bs, A.array_of(vt), bid->start);
+            contribute_elem(bs, A.array_of(vt), bid->start, bid->end);
         }
         /* unknown/other base kind: skip (don't guess) */
     };
@@ -3445,6 +7202,9 @@ void Inferencer::accumulate_call(CallExpr *call)
             func_i = 0; cont_i = 1;
         } else if (nm == "sort" || nm == "rev_sort") {
             func_i = 1; cont_i = 0; comparator = true;
+        } else if (nm == "sum") {
+            /* sum(array, key): the key's param is an ELEMENT. */
+            func_i = 1; cont_i = 0;
         } else if (nm == "make_array") {
             /* make_array(N, gen): the callback's param is the int index, not a
              * container element - type it int directly and return. */
@@ -3452,13 +7212,29 @@ void Inferencer::accumulate_call(CallExpr *call)
                 FuncInfo *cb = callee_funcinfo(args->elems[1].get());
                 if (cb && !cb->params.empty())
                     contribute_arg(cb->params[0], A.int_ty(),
-                                   args->elems[1]->start);
+                                   args->elems[1]->start,
+                                   args->elems[1]->end);
             }
             return;
         } else if (nm == "make_dict") {
             /* make_dict(keys, gen): the callback's param is a KEY, so feed it
              * the keys array's element type via the general path below. */
             func_i = 1; cont_i = 0;
+        } else if (nm == "find") {
+            /* #49: find(array, what, key): the key's param is an ELEMENT,
+             * exactly as for sum's. It used to be missing here, so the
+             * param finalized `dyn` - boxed, and visibly so
+             * (`find(a, "int", func(x) => typestr(x))` never matched,
+             * while the same lambda under map() said "int"). Only an
+             * ARRAY container ever calls the key (find on a dict or a
+             * string ignores it), so a dict does not feed its key type. */
+            func_i = 2; cont_i = 0;
+            if (args->elems.size() > 0) {
+                StaticTypeRef c0 =
+                    static_type_resolve(type_of(args->elems[0].get()));
+                if (!is_unknown(c0) && c0->kind != StaticTypeKind::Array)
+                    return;
+            }
         } else {
             return;
         }
@@ -3479,31 +7255,87 @@ void Inferencer::accumulate_call(CallExpr *call)
             return;
         StaticTypeRef el = ct->kind == StaticTypeKind::Array ? ct->elem
                   : ct->kind == StaticTypeKind::Dict  ? ct->key : A.dyn_ty();
-        Loc fl = args->elems[func_i]->start;
+        const Loc fl = args->elems[func_i]->start;
+        const Loc fle = args->elems[func_i]->end;
         auto &ps = cb->params;
         if (!ps.empty())
-            contribute_arg(ps[0], el, fl);
+            contribute_arg(ps[0], el, fl, fle);
         if (comparator && ps.size() >= 2)
-            contribute_arg(ps[1], el, fl);
+            contribute_arg(ps[1], el, fl, fle);
     }
 }
 
-void Inferencer::spread_idlist(IdList *idl, Construct *rvalue)
+void Inferencer::spread_idlist(IdList *idl, Construct *rvalue, Op op)
 {
-    StaticTypeRef rt = static_type_resolve(type_of(rvalue));
+    /* each target receives its element - or, for a compound `a, b OP= rhs`,
+     * the result of `target OP element`, as a single compound target does
+     * (accumulate_assign), invalid-op rule included */
+    const auto give = [&](Identifier *t, StaticTypeRef el) {
+        StaticTypeRef ct = el;
+        if (op != Op::assign) {
+            StaticTypeRef l = type_of(t);
+            ct = binop_result(compound_binop(op), l, el);
+            if (is_dyn(ct) && !is_dyn(strip(l)) && !is_dyn(strip(el)))
+                ct = l;
+        }
+        contribute(id_sym[t], ct, t->start, t->end);
+    };
 
-    if (auto *la = dynamic_cast<LiteralArray *>(rvalue)) {
-        if (la->elems.size() == idl->elems.size()) {
-            for (size_t i = 0; i < idl->elems.size(); i++)
-                contribute(id_sym[idl->elems[i].get()],
-                           type_of(la->elems[i].get()), idl->elems[i]->start);
-            return;
+    const std::vector<StaticTypeRef> els =
+        idlist_elem_types(idl, rvalue, op == Op::assign);
+    for (size_t i = 0; i < idl->elems.size(); i++)
+        give(idl->elems[i].get(), els[i]);
+}
+
+/* What each target of `a, b, ... = rvalue` receives: a literal of the
+ * same length element by element, as written; else an array's element
+ * type, the same for every target; else the scalar itself, spread. The
+ * fixpoint (spread_idlist) and the check pass agree through this.
+ * `into` (a plain `=`): an element that is itself a container literal
+ * fitting a declared target has the target's type, as in `a = [d]`
+ * (literal_into) - the literal is unpacked as written. */
+std::vector<StaticTypeRef>
+Inferencer::idlist_elem_types(IdList *idl, Construct *rvalue, bool into)
+{
+    const size_t n = idl->elems.size();
+    if (ctag(rvalue) == ConstructType::lit_arr) {
+        auto *la = static_cast<LiteralArray *>(rvalue);
+        if (la->elems.size() == n) {
+            std::vector<StaticTypeRef> out;
+            for (size_t i = 0; i < n; i++) {
+                Construct *el = la->elems[i].get();
+                StaticTypeRef d = nullptr;
+                if (into && !idl->elems[i]->is_underscore())
+                    d = literal_into(el,
+                                     declared_type_of(idl->elems[i].get()));
+                out.push_back(d ? d : type_of(el));
+            }
+            return out;
         }
     }
+    StaticTypeRef rt = static_type_resolve(type_of(rvalue));
+    return std::vector<StaticTypeRef>(
+        n, rt->kind == StaticTypeKind::Array ? rt->elem : rt);
+}
 
-    StaticTypeRef each = rt->kind == StaticTypeKind::Array ? rt->elem : rt;
-    for (auto &id : idl->elems)
-        contribute(id_sym[id.get()], each, id->start);
+/* A compound assignment's implied binary op, validated: `l OP= r` with
+ * neither side dyn and no result is a compile error, as `l OP r` is. */
+void Inferencer::check_compound_op(Op op, StaticTypeRef l, StaticTypeRef r,
+                                   Construct *lv, Construct *rv,
+                                   Construct *at)
+{
+    require_nonopt(l, lv->start, lv->end, "in a compound assignment");
+    require_nonopt(r, rv->start, rv->end, "in a compound assignment");
+    StaticTypeRef res = binop_result(compound_binop(op), l, r);
+    StaticTypeRef ls = strip(static_type_resolve(l)), rs =
+        strip(static_type_resolve(r));
+    if (!is_dyn(ls) && !is_dyn(rs) && is_dyn(res))
+        mismatch("operator does not apply to '" +
+            static_type_to_string(l) +
+                     "' and '" + static_type_to_string(r) + "'" +
+                     (rs->kind == StaticTypeKind::Box ? box_use_hint(r, rv)
+                                                      : box_use_hint(l, lv)),
+                 at->start, at->end);
 }
 
 void Inferencer::accumulate_assign(Expr14 *e)
@@ -3514,7 +7346,12 @@ void Inferencer::accumulate_assign(Expr14 *e)
 
     StaticTypeRef ct;
     if (e->op == Op::assign) {
-        ct = type_of(e->rvalue.get());
+        ct = literal_dest_type(e);
+        if (!ct)
+            ct = literal_into(e->rvalue.get(),
+                              fixed_elem_dest(store_base_of(e), false));
+        if (!ct)
+            ct = type_of(e->rvalue.get());
     } else {
         StaticTypeRef l = type_of(e->lvalue.get());
         StaticTypeRef r = type_of(e->rvalue.get());
@@ -3528,12 +7365,946 @@ void Inferencer::accumulate_assign(Expr14 *e)
 
     Construct *lv = e->lvalue.get();
 
-    if (auto *idl = dynamic_cast<IdList *>(lv)) {
-        spread_idlist(idl, e->rvalue.get());
+    if (ctag(lv) == ConstructType::idlist) {
+        auto *idl = static_cast<IdList *>(lv);
+        spread_idlist(idl, e->rvalue.get(), e->op);
         return;
     }
 
-    contribute_to_lvalue(lv, ct, e->start);
+    contribute_to_lvalue(lv, ct);
+}
+
+/*
+ * A symbol whose type is FIXED: a committed REPL global, or one an
+ * annotation pins (a scalar, a struct, a parameterized container -
+ * ann_scalar_static_type). A contribution to it is CHECKED against that
+ * type, never joined into it (contribute). Null otherwise.
+ */
+StaticTypeRef Inferencer::fixed_type(const TypeSym *s)
+{
+    if (!s || s->func)
+        return nullptr;
+    if (s->pinned)
+        return static_type_resolve(s->type);
+    if (StaticTypeRef d = ann_scalar_static_type(s))
+        return static_type_resolve(d);
+    return nullptr;
+}
+
+/*
+ * An ELEMENT contribution to a container symbol - an element or dict
+ * store, an append / push / insert - given as the container type it
+ * implies (`array<V>`, `dict<K, V>`). To a FIXED container type it is
+ * checked element by element: `a[0] = 5` and `append(a, 5)` into an
+ * `array<int?>`, or an int into an `array<float>`, are a value fitting
+ * the declared element, while the implied `array<int>` is not assignable
+ * to the declared array (arrays are invariant, for an alias's sake - and
+ * an element store is no alias). A misfit is checked whole, as before,
+ * for the same message.
+ */
+void Inferencer::contribute_elem(TypeSym *s, StaticTypeRef cont, Loc loc,
+                                 Loc loc_end)
+{
+    const StaticTypeRef d = fixed_type(s);
+    const StaticTypeRef c = static_type_resolve(cont);
+    if (d && c->kind == d->kind) {
+        /* the value stored IS a none here (an unfilled component is a
+         * container's, never a stored value's): a non-opt element - a
+         * `dyn` one included (rule 3) - refuses it */
+        const StaticTypeRef de = static_type_resolve(
+            d->kind == StaticTypeKind::Array ? d->elem : d->val);
+        const StaticTypeRef ce = static_type_resolve(
+            d->kind == StaticTypeKind::Array ? c->elem : c->val);
+        /* (a fixed type - declared, or a committed REPL global's - has no
+         * unknown component) */
+        if (strict_dyn && ce->kind == StaticTypeKind::None
+                && !de->opt && de->kind != StaticTypeKind::None)
+            conflict("an element of '" + std::string(s->name->val) +
+                         "' ('" + static_type_to_string(d) +
+                         "') cannot be none",
+                     loc, loc_end, true);
+        /* ...and a value that MAY be none (a `T?`, a `dyn?`) is refused
+         * the same way, as a field's is (rule 3) */
+        else if (strict_dyn && ce->opt && !de->opt
+                 && de->kind != StaticTypeKind::None && !has_unknown(ce))
+            conflict("an element of '" + std::string(s->name->val) +
+                         "' ('" + static_type_to_string(d) +
+                         "') cannot be none, and the value may be",
+                     loc, loc_end, true);
+        /* ...and a dict KEY the same two ways (rule 6: `none` is a key
+         * only of a dict whose keys may be none) */
+        if (d->kind == StaticTypeKind::Dict && strict_dyn) {
+            const StaticTypeRef dk = static_type_resolve(d->key);
+            const StaticTypeRef ck = static_type_resolve(c->key);
+            const bool may_none = ck->kind == StaticTypeKind::None
+                || ck->opt;
+            if (may_none && !dk->opt && dk->kind != StaticTypeKind::None
+                    && !has_unknown(ck))
+                conflict("a key of '" + std::string(s->name->val) +
+                             "' ('" + static_type_to_string(d) +
+                             "') cannot be none" +
+                             (ck->kind == StaticTypeKind::None
+                                  ? "" : ", and the key may be"),
+                         loc, loc_end, true);
+        }
+        /* (a `dyn` value fits - a `dyn?` one an element that may be
+         * none: the store checks it at run time, as `int x = d` does) */
+        const auto fits = [&](StaticTypeRef v, StaticTypeRef into) {
+            const StaticTypeRef r = static_type_resolve(v);
+            const StaticTypeRef i = static_type_resolve(into);
+            return has_unknown(r)
+                || (r->kind == StaticTypeKind::Dyn && (!r->opt || i->opt))
+                || static_type_assignable(r, i);
+        };
+        /* (an element contribution is an array or a dict's) */
+        const bool ok =
+            d->kind == StaticTypeKind::Array ? fits(c->elem, d->elem)
+                : fits(c->key, d->key) && fits(c->val, d->val);
+        if (ok) {
+            contribute(s, d, loc, loc_end);
+            return;
+        }
+    }
+    /* rule 1: a non-opt `dyn` element (key) value does not widen an
+     * inferred container's element type (round_elem_dyn) - contributed
+     * as an unfilled component, which join_elem absorbs */
+    if (!d) {
+        /* choice 7: an explicit `none` element (key) value - recorded
+         * (round_elem_dyn), its component contributed unfilled */
+        const auto is_none_val = [](StaticTypeRef t) {
+            return static_type_resolve(t)->kind == StaticTypeKind::None;
+        };
+        if (c->kind == StaticTypeKind::Array && is_none_val(c->elem))
+            s->round_elem_dyn |= 4;
+        if (c->kind == StaticTypeKind::Dict) {
+            if (is_none_val(c->key))
+                s->round_elem_dyn |= 8;
+            if (is_none_val(c->val))
+                s->round_elem_dyn |= 4;
+        }
+        const auto is_dyn_val = [](StaticTypeRef t) {
+            const StaticTypeRef r = static_type_resolve(t);
+            return r->kind == StaticTypeKind::Dyn && !r->opt;
+        };
+        if (c->kind == StaticTypeKind::Array && is_dyn_val(c->elem)) {
+            s->round_elem_dyn |= 1;
+            contribute(s, A.array_of(A.none_ty(), c->opt), loc, loc_end);
+            return;
+        }
+        if (c->kind == StaticTypeKind::Dict
+                && (is_dyn_val(c->key) || is_dyn_val(c->val))) {
+            const bool k = is_dyn_val(c->key);
+            const bool v = is_dyn_val(c->val);
+            s->round_elem_dyn |= (v ? 1 : 0) | (k ? 2 : 0);
+            contribute(s, A.dict_of(k ? A.none_ty() : c->key,
+                                    v ? A.none_ty() : c->val, c->opt),
+                       loc, loc_end);
+            return;
+        }
+    }
+    contribute(s, cont, loc, loc_end);
+}
+
+/*
+ * Does a container LITERAL fit the type `d`, element by element (and its
+ * nested literals likewise)? A literal is a fresh value nothing else
+ * holds, so `[1, 2]` may be an `array<float>` and `[5]` an
+ * `array<int?>` - the invariance that refuses an array VARIABLE of
+ * another element type protects an alias, which a literal has none of.
+ */
+bool Inferencer::literal_fits(Construct *lit, StaticTypeRef d)
+{
+    d = static_type_resolve(d);
+    /* any literal fits a `dyn` place (an element of an array<dyn>) */
+    if (d->kind == StaticTypeKind::Dyn)
+        return true;
+    if (ctag(lit) == ConstructType::lit_arr) {
+        if (d->kind != StaticTypeKind::Array)
+            return false;
+        for (auto &el : static_cast<LiteralArray *>(lit)->elems)
+            if (!literal_fits(el.get(), d->elem))
+                return false;
+        return true;
+    }
+    if (ctag(lit) == ConstructType::lit_dict) {
+        if (d->kind != StaticTypeKind::Dict)
+            return false;
+        for (auto &kv : static_cast<LiteralDict *>(lit)->elems)
+            if (!literal_fits(kv->key.get(), d->key) ||
+                !literal_fits(kv->value.get(), d->val))
+                return false;
+        return true;
+    }
+    /* a baked constant literal (LiteralObj) fits by its value's type,
+     * element by element (annotate_hints widens the value) */
+    if (ctag(lit) == ConstructType::lit_obj)
+        return static_cast<LiteralObj *>(lit)->from_literal
+            && value_fits_type(static_cast<LiteralObj *>(lit)
+                                   ->literal_value(), d);
+    /* (a `dyn` element fits - a `dyn?` one an element that may be none:
+     * the place's fit check examines it at run time, rule 1) */
+    const StaticTypeRef t = static_type_resolve(type_of(lit));
+    return has_unknown(t)
+        || (t->kind == StaticTypeKind::Dyn
+            && (!t->opt || static_type_resolve(d)->opt))
+        || static_type_assignable(t, d);
+}
+
+/* literal_fits for a baked literal's VALUE, element by element: a
+ * `none` element fits a component that may be none (its type is `dyn?`
+ * in the value's own type, which says nothing of where it may go - `[none]`
+ * fits an array<int?>), a flat array or anything else by its type.
+ * A written literal is never cyclic (from_literal). */
+bool Inferencer::value_fits_type(const EvalValue &v, StaticTypeRef d)
+{
+    d = static_type_resolve(d);
+    if (v.is<NoneVal>())
+        return d->opt;
+    if (d->kind == StaticTypeKind::Dyn)
+        return true;
+    if (v.is<SharedArrayObj>() && d->kind == StaticTypeKind::Array) {
+        const SharedArrayObj &arr = v.get<SharedArrayObj>();
+        /* (a flat array's elements have its storage's type) */
+        if (arr.skind() != SharedArrayObj::Storage::general)
+            return static_type_assignable(
+                static_type_resolve(static_type_from_value(v))->elem,
+                d->elem);
+        ArrayConstView view = arr.get_view();
+        for (size_type i = 0; i < view.size(); i++)
+            if (!value_fits_type(view[i].get(), d->elem))
+                return false;
+        return true;
+    }
+    /* (a written literal is never a default dict: `dict(v)` is a call) */
+    if (v.is<intrusive_ptr<DictObject>>() && d->kind == StaticTypeKind::Dict) {
+        for (const auto &kv : v.get_ref<intrusive_ptr<DictObject>>()
+                                  ->get_ref())
+            if (!value_fits_type(kv.first, d->key)
+                    || !value_fits_type(kv.second.get(), d->val))
+                return false;
+        return true;
+    }
+    return static_type_assignable(static_type_from_value(v), d);
+}
+
+/*
+ * A container LITERAL (a LiteralArray, a LiteralDict, or one baked at
+ * parse time - a LiteralObj) landing in a place whose static type `dest`
+ * it fits (literal_fits): it HAS that type there - its elements are stored
+ * at it (stamp_literal_into), and the contribution is `dest` itself.
+ * Null for anything else, or a literal that does not fit.
+ */
+StaticTypeRef Inferencer::literal_into(Construct *rv, StaticTypeRef dest)
+{
+    if (!rv || !dest)
+        return nullptr;
+    const ConstructType t = ctag(rv);
+    dest = static_type_resolve(dest);
+    if (dest->kind != StaticTypeKind::Array
+        && dest->kind != StaticTypeKind::Dict)
+        return nullptr;
+    /* rule 1: a builtin's NEW container (map, make_array, array(n, v),
+     * values ...) whose components are `dyn` or unfilled is made for the
+     * place - its values are examined by the place's fit check at run
+     * time, as a literal's `dyn` elements are */
+    if (t == ConstructType::call) {
+        auto *call = static_cast<CallExpr *>(rv);
+        auto *cid = node_cast<Identifier>(call->what.get());
+        if (!cid || !names_builtin(cid)
+                || !builtin_builds_container(cid->uid->val))
+            return nullptr;
+        return fresh_fits(type_of(rv), dest) ? dest : nullptr;
+    }
+    if (t != ConstructType::lit_arr && t != ConstructType::lit_dict
+        && t != ConstructType::lit_obj)
+        return nullptr;
+    return literal_fits(rv, dest) ? dest : nullptr;
+}
+
+/* rule 1: does a builtin's new container of type `t` fit `d` - each
+ * component the same type, unfilled, or a `dyn` (a `dyn?` only where the
+ * place's component may be none; checked where it lands)? */
+bool Inferencer::fresh_fits(StaticTypeRef t, StaticTypeRef d)
+{
+    t = static_type_resolve(t);
+    d = static_type_resolve(d);
+    if (has_unknown(t))
+        return true;
+    if (t->kind != d->kind || (t->opt && !d->opt))
+        return false;
+    const auto comp = [&](StaticTypeRef c, StaticTypeRef p) {
+        c = static_type_resolve(c);
+        p = static_type_resolve(p);
+        return c->kind == StaticTypeKind::None
+            || (c->kind == StaticTypeKind::Dyn && (!c->opt || p->opt))
+            || static_type_equal(c, p);
+    };
+    if (t->kind == StaticTypeKind::Array)
+        return comp(t->elem, d->elem);
+    return comp(t->key, d->key) && comp(t->val, d->val);
+}
+
+/* The runtime half of literal_into: the literal's elements widen to
+ * `dest`'s - stamped on a LiteralArray / LiteralDict (their own type's
+ * stamp then leaves them alone), applied once to a baked value. */
+void Inferencer::stamp_literal_into(Construct *rv, StaticTypeRef dest)
+{
+    if (ctag(rv) == ConstructType::call)
+        return;             /* a builtin's new container (literal_into) */
+    if (ctag(rv) == ConstructType::lit_obj) {
+        stamp_literal_repr(rv, dest);    /* the value rebuilt, once */
+        return;
+    }
+    lit_coerce_by_parent.insert(rv);
+    stamp_literal_coerce(rv, dest);
+    stamp_literal_repr(rv, dest);
+}
+
+/*
+ * The STORAGE half of stamp_literal_into: a written array literal is built
+ * in the storage its destination type gives it (array_repr_hint), at every
+ * level - `[1.5]` landing in an `array<float?>` is general, so a later
+ * `none` element fits, where its own values would make it flat floats. A
+ * literal baked inside one is rebuilt (widen_baked_value). Only for a
+ * literal literal_fits accepted: each element fits the type it is given.
+ */
+void Inferencer::stamp_literal_repr(Construct *lit, StaticTypeRef dest)
+{
+    if (!lit)
+        return;
+    dest = static_type_resolve(dest);
+    switch (ctag(lit)) {
+    case ConstructType::lit_arr:
+        if (dest->kind == StaticTypeKind::Array) {
+            ArrHint h;
+            const StructTypeDef *sd;
+            if (array_repr_hint(dest, h, sd)) {
+                lit->arr_hint = h;
+                lit->arr_hint_struct = sd;
+            }
+            for (auto &el : static_cast<LiteralArray *>(lit)->elems)
+                stamp_literal_repr(el.get(), dest->elem);
+        }
+        return;
+    case ConstructType::lit_dict:
+        if (dest->kind == StaticTypeKind::Dict)
+            for (auto &kv : static_cast<LiteralDict *>(lit)->elems)
+                stamp_literal_repr(kv->value.get(), dest->val);
+        return;
+    case ConstructType::lit_obj: {
+        auto *lo = static_cast<LiteralObj *>(lit);
+        if (!lo->from_literal)
+            return;
+        lit_obj_dest[lo] = dest;            /* Q2: stamp_ctypes */
+        WidenShape w;
+        widen_shape_of(dest, w);
+        /* and its storage: widen_baked_value rebuilds an array in the
+         * storage w.hint names, so the node needs no hint of its own
+         * (a value that cannot take it is one this pass refuses) */
+        lo->set_literal_value(widen_baked_value(lo->literal_value(), w));
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+/*
+ * The DECLARED static type of a location (#48), or null: an identifier
+ * whose type is fixed (fixed_type), a field of a struct value (its
+ * declared type; a `dyn` field has none), and an element or dict value of
+ * a location whose container type is declared. A store into such a place
+ * is CHECKED against it, whatever path reaches the place - where an
+ * inferred type is only joined, and a nested path (`m[0][0] = v`,
+ * `s.a = v`) contributed to nothing and was checked by nothing.
+ */
+StaticTypeRef Inferencer::declared_type_of(Construct *e)
+{
+    if (!e)
+        return nullptr;
+    switch (ctag(e)) {
+    case ConstructType::id: {
+        auto it = id_sym.find(static_cast<Identifier *>(e));
+        return it != id_sym.end() ? fixed_type(it->second) : nullptr;
+    }
+    case ConstructType::member: {
+        auto *m = static_cast<MemberExpr *>(e);
+        const StaticTypeRef bt =
+            strip(member_base(static_type_resolve(type_of(m->what.get()))));
+        if (bt->kind != StaticTypeKind::Struct || !bt->struct_def)
+            return nullptr;
+        const auto *def = static_cast<const StructTypeDef *>(bt->struct_def);
+        for (const FieldDef &fd : def->fields)
+            if (fd.name == m->memUid)
+                return fd.kind == FieldKind::f_dyn
+                    ? nullptr : static_type_resolve(field_static_type(fd));
+        return nullptr;
+    }
+    case ConstructType::subscript: {
+        const StaticTypeRef d =
+            declared_type_of(static_cast<Subscript *>(e)->what.get());
+        if (d && d->kind == StaticTypeKind::Array)
+            return static_type_resolve(d->elem);
+        if (d && d->kind == StaticTypeKind::Dict)
+            return static_type_resolve(d->val);
+        return nullptr;
+    }
+    case ConstructType::deref: {
+        /* a box's element type is fixed when the box is made */
+        const StaticTypeRef bt = strip(static_type_resolve(
+            type_of(static_cast<DerefExpr *>(e)->elem.get())));
+        if (bt->kind != StaticTypeKind::Box || !bt->elem)
+            return nullptr;
+        const StaticTypeRef el = static_type_resolve(bt->elem);
+        return is_dyn(el) ? nullptr : el;
+    }
+    default:
+        return nullptr;
+    }
+}
+
+/*
+ * Can a value of static type `t` be a per-frame pure-call cache KEY? The
+ * cache compares argument VALUES with ==, and keeps the key alive: a value
+ * compared by value is protected by copy-on-write - a later write through
+ * the caller's name detaches it from the key - but one compared by
+ * IDENTITY (a class instance, a box, a function) stays equal to itself
+ * while its fields change, so a cached result would be stale
+ * (FuncDeclStmt::args_cache_safe). Unknown and `dyn` are not safe.
+ */
+bool Inferencer::cache_key_safe(StaticTypeRef t, int depth)
+{
+    t = static_type_resolve(t);
+    if (!t || depth > 16)
+        return false;
+    switch (t->kind) {
+    case StaticTypeKind::None: case StaticTypeKind::Bool:
+    case StaticTypeKind::Int: case StaticTypeKind::Float:
+    case StaticTypeKind::Str:
+        return true;
+    case StaticTypeKind::Array:
+        return cache_key_safe(t->elem, depth + 1);
+    case StaticTypeKind::Dict:
+        return cache_key_safe(t->key, depth + 1)
+            && cache_key_safe(t->val, depth + 1);
+    case StaticTypeKind::Struct: {
+        const auto *d = static_cast<const StructTypeDef *>(t->struct_def);
+        if (!d || d->is_class)
+            return false;
+        for (const FieldDef &f : d->fields)
+            if (f.kind == FieldKind::f_dyn
+                    || !cache_key_safe(field_static_type(f), depth + 1))
+                return false;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+StaticTypeRef Inferencer::member_base(StaticTypeRef t)
+{
+    if (!t || t->kind != StaticTypeKind::Box || !t->elem)
+        return t;
+    const StaticTypeRef el = static_type_resolve(t->elem);
+    return el->kind == StaticTypeKind::Struct ? A.with_opt(el, t->opt) : t;
+}
+
+std::string Inferencer::box_use_hint(StaticTypeRef t, const Construct *e,
+                                     StaticTypeRef want)
+{
+    t = strip(static_type_resolve(t));
+    if (!t || t->kind != StaticTypeKind::Box)
+        return "";
+    /* With a destination type, `*e` must be what fixes it: the box's
+     * value has to fit there. A box<int> handed to a box<float>
+     * parameter is not fixed by reading it (it said so) */
+    if (want && !(t->elem
+                  && static_type_assignable(static_type_resolve(t->elem),
+                                            static_type_resolve(want))))
+        return "";
+    if (e && e->is_id()) {
+        const std::string nm(static_cast<const Identifier *>(e)->uid->val);
+        return " ('" + nm + "' is a box: read its value with *" + nm + ")";
+    }
+    return " (a box: read its value with '*')";
+}
+
+/* `*b`: the base must be a non-opt box (or a dyn, checked at run time) */
+void Inferencer::check_deref(DerefExpr *d)
+{
+    check(d->elem.get());
+    StaticTypeRef t = type_of(d->elem.get());
+    require_nonopt(t, d->elem->start, d->elem->end, "with '*'");
+    StaticTypeRef s = strip(static_type_resolve(t));
+    if (!is_dyn(s) && !is_unknown(s) && s->kind != StaticTypeKind::Box)
+        mismatch("'*' needs a box, not '" + static_type_to_string(t) +
+                     "' (box(v) makes one)",
+                 d->start, d->end);
+}
+
+/*
+ * plans/cast.md 1.7: may SOME value of static type `src` become a `t`?
+ * An unknown or `dyn` source - or component - is decided at run time.
+ * `comp`: `src` is a container's component, where `none` is an UNFILLED
+ * component (an empty container casts to any container type), not the
+ * value none.
+ */
+bool Inferencer::cast_possible(StaticTypeRef src, const TypeAnnot *t,
+                               bool comp)
+{
+    src = static_type_resolve(src);
+    /* (a cast's type is complete - pCastExpr - and a container type has
+     * its components) */
+    if (!t || !src)                     /* INT-COV-EXEMPT: see above */
+        return true;
+    if (is_unknown(src) || is_dyn(src))
+        return true;
+    if (is_none(src))
+        return comp || t->opt;
+    if (t->kind == DeclType::dyn)
+        return true;
+    const StaticTypeRef s = strip(src);
+    const auto scalar = [&]() {
+        return s->kind == StaticTypeKind::Bool
+               || s->kind == StaticTypeKind::Int
+               || s->kind == StaticTypeKind::Float
+               || s->kind == StaticTypeKind::Str;
+    };
+    switch (t->kind) {
+    case DeclType::strct:
+        return s->kind == StaticTypeKind::Struct
+               && s->struct_def == t->strct;
+    case DeclType::box: {
+        if (s->kind != StaticTypeKind::Box)
+            return false;
+        /* (a box type has its element, and a box holds a bool, an int,
+         * a float, a str or a struct - box() and pTypeAnnot) */
+        const StaticTypeRef e = s->elem ? static_type_resolve(s->elem)
+                                        : nullptr;
+        const TypeAnnot *te = t->elem.get();
+        if (!e || !te || is_unknown(e) || is_dyn(e)) /* INT-COV-EXEMPT: above */
+            return true;
+        if (te->kind == DeclType::strct)
+            return e->kind == StaticTypeKind::Struct
+                   && e->struct_def == te->strct;
+        return e->kind == (te->kind == DeclType::b ? StaticTypeKind::Bool
+                           : te->kind == DeclType::i ? StaticTypeKind::Int
+                           : te->kind == DeclType::f ? StaticTypeKind::Float
+                                                     : StaticTypeKind::Str);
+    }
+    case DeclType::arr:
+        return s->kind == StaticTypeKind::Array
+               && cast_possible(s->elem, t->elem.get(), true);
+    case DeclType::dict:
+        return s->kind == StaticTypeKind::Dict
+               && cast_possible(s->key, t->key.get(), true)
+               && cast_possible(s->val, t->val.get(), true);
+    default:                /* bool, int, float, str (dyn returned above) */
+        return scalar();
+    }
+}
+
+/* `cast<T>(x)`: a cast no value of x's type can survive is refused */
+void Inferencer::check_cast(CastExpr *c)
+{
+    check(c->elem.get());
+    const StaticTypeRef src = type_of(c->elem.get());
+    if (cast_possible(src, c->to, false))
+        return;
+    const std::string tt = annot_type_text(c->to);
+    const char *art = std::strchr("aeiouAEIOU", tt[0]) ? "an" : "a";
+    mismatch("cast<" + tt + ">: a value of type '"
+                 + static_type_to_string(src) + "' never becomes "
+                 + art + " '" + tt + "'",
+             c->elem->start, c->elem->end);
+}
+
+/* box(v): `v` may not be none - box the value it holds */
+void Inferencer::check_box_call(CallExpr *call)
+{
+    ExprList *al = call->args.get();
+    if (!al || al->elems.size() != 1)
+        return;                         /* the arity is a run-time error */
+    Construct *a = al->elems[0].get();
+    if (is_optish(type_of(a)))
+        nullability("box() of a possibly-none value (type '" +
+                        static_type_to_string(type_of(a)) +
+                        "'): box the value it holds",
+                    a->start, a->end);
+}
+
+/*
+ * abs(x) and round(x, [digits]) (README): x must be an int or a float,
+ * digits an int. Any other type the compiler can see - a bool included
+ * (decided 2026-11-13) - is refused here: the call was typed as its
+ * argument (abs) or as a float (round), and the run time raised
+ * TypeErrorEx. A dyn argument is checked when the call runs.
+ */
+void Inferencer::check_num_builtin_call(CallExpr *call, bool is_round)
+{
+    /* every call has an argument list; one with no argument is evaluated
+     * while parsing (its arguments are all constant), so never gets here */
+    const auto &args = call->args->elems;
+    if (args.size() > (is_round ? 2u : 1u))
+        return;                         /* the arity is a run-time error */
+    for (size_t i = 0; i < args.size(); i++) {
+        Construct *a = args[i].get();
+        const StaticTypeRef t = static_type_resolve(type_of(a));
+        /* an unknown type is a name the resolver reports as undefined */
+        if (is_unknown(t) || is_dyn(t))
+            continue;
+        const StaticTypeKind k = strip(t)->kind;
+        if (k == StaticTypeKind::Int ||
+                (i == 0 && k == StaticTypeKind::Float))
+            continue;
+        const std::string what =
+            i == 1 ? "round()'s digit count is an int"
+                   : (is_round ? "round() needs an int or a float"
+                               : "abs() needs an int or a float");
+        mismatch(what + ", not '" + static_type_to_string(t) + "'",
+                 a->start, a->end);
+    }
+}
+
+/*
+ * The element (or, `key`, the dict key) type of the DECLARED container a
+ * store or an append writes into (declared_type_of `base`): an array or a
+ * dict. Null otherwise.
+ */
+StaticTypeRef Inferencer::fixed_elem_dest(Construct *base, bool key)
+{
+    const StaticTypeRef d = declared_type_of(base);
+    if (!d)
+        return nullptr;
+    if (d->kind == StaticTypeKind::Array)
+        return key ? nullptr : d->elem;
+    if (d->kind == StaticTypeKind::Dict)
+        return key ? d->key : d->val;
+    return nullptr;
+}
+
+/*
+ * The parameter symbols of the function a call names - a named function,
+ * a func-var bound to a lambda, an inline lambda, or #115's one indirect
+ * callee - or null (anything else, or a template: each instance checks).
+ */
+std::vector<TypeSym *> *Inferencer::known_params(CallExpr *call)
+{
+    FuncInfo *fi = callee_funcinfo(call->what.get());
+    if (!fi) {
+        auto ic = indirect_callee.find(call);
+        if (ic != indirect_callee.end())
+            fi = ic->second;
+    }
+    if (!fi && ctag(call->what.get()) == ConstructType::id) {
+        auto it = id_sym.find(static_cast<Identifier *>(call->what.get()));
+        if (it != id_sym.end() && it->second)
+            fi = it->second->func;
+    }
+    return fi && !fi->is_template ? &fi->params : nullptr;
+}
+
+/* An argument's type for `param`: a container literal for a declared
+ * container parameter has the parameter's type (literal_into) */
+StaticTypeRef Inferencer::arg_type(Construct *arg, TypeSym *param)
+{
+    if (StaticTypeRef d = literal_into(arg, fixed_type(param)))
+        return d;
+    return type_of(arg);
+}
+
+/* The runtime half of arg_type, and its twin for a struct construction's
+ * field values: each such literal's elements widen to the declared type */
+void Inferencer::stamp_literal_args(CallExpr *call)
+{
+    ExprList *args = call->args.get();
+    if (!args)
+        return;
+    if (ctag(call->what.get()) == ConstructType::id) {
+        auto it = id_sym.find(static_cast<Identifier *>(call->what.get()));
+        if (it != id_sym.end() && it->second && it->second->struct_type) {
+            const StructTypeDef *def = it->second->struct_type;
+            const size_t n = std::min(args->elems.size(), def->fields.size());
+            for (size_t i = 0; i < n; i++) {
+                const FieldDef &fd = def->fields[i];
+                if (fd.kind == FieldKind::f_dyn)
+                    continue;
+                Construct *a = args->elems[i].get();
+                if (StaticTypeRef d = literal_into(a, field_static_type(fd)))
+                    stamp_literal_into(a, d);
+            }
+            return;
+        }
+    }
+    std::vector<TypeSym *> *ps = known_params(call);
+    if (!ps)
+        return;
+    const size_t n = std::min(args->elems.size(), ps->size());
+    for (size_t i = 0; i < n; i++) {
+        Construct *a = args->elems[i].get();
+        if (StaticTypeRef d = literal_into(a, fixed_type((*ps)[i])))
+            stamp_literal_into(a, d);
+    }
+}
+
+/* `x = <literal>` / `s.f = <literal>` (literal_into) into the DECLARED
+ * type of the variable or the field */
+/* Rule 1: does `e` make a NEW container - one no other name holds yet: a
+ * literal, a cast, a slice, an array sum, a builtin's new container (not
+ * sort / rev_sort / reverse, which return the array they were given), or
+ * a ternary / `??` both of whose arms do? */
+bool Inferencer::new_container_expr(Construct *e)
+{
+    switch (ctag(e)) {
+    case ConstructType::lit_arr:
+    case ConstructType::lit_dict:
+    case ConstructType::lit_obj:
+    case ConstructType::cast:
+    case ConstructType::slice:
+    case ConstructType::expr04:
+        return true;
+    case ConstructType::ternary: {
+        auto *t = static_cast<TernaryExpr *>(e);
+        return new_container_expr(t->thenExpr.get())
+            && new_container_expr(t->elseExpr.get());
+    }
+    case ConstructType::call: {
+        auto *call = static_cast<CallExpr *>(e);
+        auto *cid = node_cast<Identifier>(call->what.get());
+        if (!cid || !names_builtin(cid))
+            return false;
+        /* (sort, rev_sort and reverse return the array they were
+         * given: an alias, not a new container) */
+        static constexpr std::string_view returns_arg[] = {
+            "sort", "rev_sort", "reverse"};
+        const std::string_view n = cid->uid->val;
+        return builtin_builds_container(n)
+            && std::find(std::begin(returns_arg), std::end(returns_arg), n)
+                   == std::end(returns_arg);
+    }
+    default:
+        return false;
+    }
+}
+
+/*
+ * Rule 1 (plans/strict-container-types.md): a container VALUE that flows
+ * into a variable - one another name may hold, not a new one - has exactly
+ * the variable's type. `var x = [1]; var y = ["s"]; var c = x; c = y;`
+ * would make `c` an array<dyn> while it holds `x`'s array<int>, and `var b
+ * = a; b[0] = "s"` an array<dyn> aliasing `a`: one container seen as two
+ * types. The variable's components may be unfilled (an empty literal's),
+ * and its top level may be `?`. cast<T>(x) converts, as a new container.
+ */
+void Inferencer::check_alias_exact(Construct *rv, Identifier *to)
+{
+    check_flow_exact(rv, type_of(to), "'" + std::string(to->uid->val) + "'");
+}
+
+/* The flow behind check_alias_exact: `rv` lands where the type is `dest`
+ * (`what` names the place) - a variable, a function's result (a return),
+ * a ternary's value (an arm). */
+void Inferencer::check_flow_exact(Construct *rv, StaticTypeRef dest,
+                                  const std::string &what)
+{
+    /* (`return;` has no value; every caller has the destination) */
+    if (!rv || new_container_expr(rv))
+        return;
+    StaticTypeRef r = strip(static_type_resolve(type_of(rv)));
+    StaticTypeRef l = strip(static_type_resolve(dest));
+    if ((r->kind != StaticTypeKind::Array && r->kind != StaticTypeKind::Dict)
+            || r->kind != l->kind || has_unknown(r))
+        return;
+    /* (the place's type joins what flows into it, so it has no unsettled
+     * component when the value has none) */
+    ML_CHECK(!has_unknown(l));
+    /* (two container types are assignable both ways or neither: they
+     * are exact, rule 1) */
+    if (static_type_assignable(r, l))
+        return;
+    mismatch(what + " has type '" + static_type_to_string(l)
+                 + "' but the container it is given is an '"
+                 + static_type_to_string(r) + "' - a container's type is "
+                 "exact (write cast<" + static_type_to_string(l)
+                 + ">(...) to convert it)",
+             rv->start, rv->end);
+}
+
+StaticTypeRef Inferencer::literal_dest_type(Expr14 *e)
+{
+    const ConstructType lt = ctag(e->lvalue.get());
+    if (e->op != Op::assign
+        || (lt != ConstructType::id && lt != ConstructType::member))
+        return nullptr;
+    return literal_into(e->rvalue.get(), declared_type_of(e->lvalue.get()));
+}
+
+/*
+ * A value of static type `vt` stored where the type is DECLARED `dest`
+ * (#48): it must fit, as a construction's field value must. `field` names
+ * a struct field for the message, else it is an element. A `dyn` value is
+ * not checked here (plans: a dyn into a typed container).
+ */
+void Inferencer::check_value_into(StaticTypeRef dest, StaticTypeRef vt,
+                                  const std::string &field, Construct *at)
+{
+    dest = static_type_resolve(dest);
+    vt = static_type_resolve(vt);
+    if (has_unknown(vt))
+        return;
+    const std::string what = field.empty()
+        ? "an element of type '" + static_type_to_string(dest) + "'"
+        : "field '" + field + "'";
+    /* a `dyn` place refuses none too (rule 3) */
+    if (!dest->opt && is_optish(vt))
+        nullability(what + " is not 'opt' but the value may be none",
+                    at->start, at->end);
+    if (is_dyn(dest) || is_dyn(vt))
+        return;
+    if (!static_type_assignable(dest->opt ? vt : strip(vt), dest))
+        mismatch(field.empty()
+                     ? what + " cannot hold '" +
+                           static_type_to_string(vt) + "'"
+                     : what + " expects '" + static_type_to_string(dest) +
+                           "' but got '" + static_type_to_string(vt) + "'",
+                 at->start, at->end);
+}
+
+/* #49: `place OP= v` whose result may misfit the place's type (null: no
+ * declared type) - the value is computed inside the store, past any
+ * point a run-time check could stand, so it is refused */
+void Inferencer::refuse_compound_misfit(Op op, StaticTypeRef place,
+                                        StaticTypeRef v, Construct *at)
+{
+    /* only a dyn makes the result's type unknown here: with none in
+     * either operand, a dyn result means the operator does not apply,
+     * which the operator check reports in its own words */
+    if (!place || (!fit_has_dyn(place) && !fit_has_dyn(v)))
+        return;
+    const StaticTypeRef res = binop_result(compound_binop(op), place, v);
+    if (fit_needed(res, place))
+        mismatch("a compound assignment's value may not fit '" +
+                     static_type_to_string(place) +
+                     "' and cannot be checked: write it as a plain "
+                     "'=' (x = x OP v), which is checked",
+                 at->start, at->end);
+}
+
+/*
+ * A store into a struct field, or into an element reached through
+ * something other than a plain variable (`m[0][0] = v`, `s.a[0] = v`),
+ * checked against the declared type of the place (declared_type_of). A
+ * store whose container is a plain variable is its contribution's to
+ * check (contribute_elem), as before.
+ */
+void Inferencer::check_declared_store(Expr14 *e)
+{
+    Construct *lv = e->lvalue.get();
+    std::string field;
+    /* #49: a COMPOUND store computes its value inside the store, where no
+     * fit check (CheckFitV) can stand - a value that may misfit the
+     * place's type (`a[0] += d`, `d` a dyn, into an array<array<int>>; a
+     * declared variable's `v += r`) is refused here. A plain `=` is
+     * checked at run time. */
+    if (e->op != Op::assign) {
+        if (ctag(lv) == ConstructType::subscript
+                || ctag(lv) == ConstructType::member)
+            refuse_compound_misfit(e->op, type_of(lv),
+                                   type_of(e->rvalue.get()), e);
+        else if (ctag(lv) == ConstructType::id)
+            refuse_compound_misfit(e->op, declared_type_of(lv),
+                                   type_of(e->rvalue.get()), e);
+    }
+    if (ctag(lv) == ConstructType::deref) {
+        /* `*b = v` / `*b OP= v`: v must fit the box's element type */
+        const StaticTypeRef dest = declared_type_of(lv);
+        if (!dest)
+            return;
+        StaticTypeRef vt = e->op == Op::assign
+            ? type_of(e->rvalue.get())
+            : binop_result(compound_binop(e->op), type_of(lv),
+                           type_of(e->rvalue.get()));
+        vt = static_type_resolve(vt);
+        if (is_dyn(vt) || has_unknown(vt))
+            return;
+        const std::string what =
+            "a box<" + static_type_to_string(dest) + ">";
+        if (is_optish(vt))
+            nullability(what + " cannot hold none", e->rvalue->start,
+                        e->rvalue->end);
+        if (!static_type_assignable(strip(vt), dest))
+            mismatch(what + " cannot hold '" + static_type_to_string(vt) +
+                         "'" + box_use_hint(vt, e->rvalue.get(), dest),
+                     e->rvalue->start, e->rvalue->end);
+        return;
+    }
+    if (ctag(lv) == ConstructType::member)
+        field = static_cast<MemberExpr *>(lv)->memUid->val;
+    else if (ctag(lv) != ConstructType::subscript
+             || ctag(static_cast<Subscript *>(lv)->what.get())
+                    == ConstructType::id)
+        return;
+    StaticTypeRef dest = declared_type_of(lv);
+    if (!dest) {
+        /* an element reached through something whose type was INFERRED
+         * (`var a = [["x"]]; a[0][0] = none;`): no contribution reaches
+         * it - only a store into a plain variable's element joins into
+         * that variable's type - so its type is final here, and a value
+         * that does not fit it is refused like one into a declared place.
+         * It compiled, and the array<array<str>> held the none (RULE 1:
+         * `len(a[0][0])` gave 0 in the VM and a TypeErrorEx in the
+         * tree-walker). An unfilled element (question 9) or a `dyn` one
+         * takes anything. */
+        dest = static_type_resolve(type_of(lv));
+        if (has_unknown(dest) || is_none(dest))
+            return;
+    }
+    StaticTypeRef vt;
+    if (e->op == Op::assign) {
+        vt = literal_into(e->rvalue.get(), dest);
+        if (!vt)
+            vt = type_of(e->rvalue.get());
+    } else {
+        vt = binop_result(compound_binop(e->op), type_of(lv),
+                          type_of(e->rvalue.get()));
+    }
+    check_value_into(dest, vt, field, e->rvalue.get());
+}
+
+/* check_declared_store's twin for append / push / insert into a container
+ * reached through a field or an element (`append(s.a, v)`) */
+void Inferencer::check_builtin_store(CallExpr *call)
+{
+    auto *cid = static_cast<Identifier *>(call->what.get());
+    const std::string_view nm = cid->uid->val;
+    ExprList *al = call->args.get();
+    const size_t vi = nm == "insert" ? 2 : 1;
+    if (!in_place_store(nm) || !al || al->elems.size() <= vi
+        || ctag(al->elems[0].get()) == ConstructType::id)
+        return;
+    StaticTypeRef d = declared_type_of(al->elems[0].get());
+    if (!d) {
+        /* a container reached through something whose type was INFERRED
+         * - its type is final here (check_declared_store's note) */
+        d = static_type_resolve(type_of(al->elems[0].get()));
+        if (has_unknown(d) || is_none(d))
+            return;
+    }
+    const auto value = [&](size_t i, StaticTypeRef into) {
+        /* an unfilled element (question 9) takes what is put in */
+        if (has_unknown(into) || is_none(static_type_resolve(into)))
+            return;
+        Construct *v = al->elems[i].get();
+        StaticTypeRef vt = literal_into(v, into);
+        check_value_into(into, vt ? vt : type_of(v), "", v);
+    };
+    if (d->kind == StaticTypeKind::Array)
+        value(vi, d->elem);
+    else if (d->kind == StaticTypeKind::Dict && vi == 2) {
+        value(1, d->key);
+        value(2, d->val);
+    }
 }
 
 /*
@@ -3545,38 +8316,48 @@ void Inferencer::accumulate_assign(Expr14 *e)
  * (a struct field leaves the struct's fixed type alone). An IdList spread is
  * caller-specific (only assignment has one).
  */
-void Inferencer::contribute_to_lvalue(Construct *lv, StaticTypeRef ct, Loc loc)
+void Inferencer::contribute_to_lvalue(Construct *lv, StaticTypeRef ct)
 {
-    if (auto *id = dynamic_cast<Identifier *>(lv)) {
+    if (ctag(lv) == ConstructType::id) {
+        auto *id = static_cast<Identifier *>(lv);
         auto it = id_sym.find(id);
         if (it != id_sym.end())
-            contribute(it->second, ct, loc);
+            contribute(it->second, ct, id->start, id->end);
         return;
     }
 
-    if (auto *sub = dynamic_cast<Subscript *>(lv)) {
-        if (auto *bid = dynamic_cast<Identifier *>(sub->what.get())) {
+    if (ctag(lv) == ConstructType::subscript) {
+        auto *sub = static_cast<Subscript *>(lv);
+        if (ctag(sub->what.get()) == ConstructType::id) {
+            auto *bid = static_cast<Identifier *>(sub->what.get());
             auto it = id_sym.find(bid);
             if (it != id_sym.end() && it->second) {
                 StaticTypeRef bt = static_type_resolve(it->second->type);
                 if (bt->kind == StaticTypeKind::Dict)
-                    contribute(it->second,
-                               A.dict_of(type_of(sub->index.get()), ct),
-                               bid->start);
+                    contribute_elem(it->second,
+                                    A.dict_of(type_of(sub->index.get()), ct),
+                                    bid->start, bid->end);
                 else if (bt->kind == StaticTypeKind::Array)
-                    contribute(it->second, A.array_of(ct), bid->start);
+                    contribute_elem(it->second, A.array_of(ct), bid->start,
+                                    bid->end);
             }
         }
         return;
     }
 
-    if (auto *mem = dynamic_cast<MemberExpr *>(lv)) {
-        if (auto *bid = dynamic_cast<Identifier *>(mem->what.get())) {
+    if (ctag(lv) == ConstructType::member) {
+        auto *mem = static_cast<MemberExpr *>(lv);
+        if (ctag(mem->what.get()) == ConstructType::id) {
+            auto *bid = static_cast<Identifier *>(mem->what.get());
             auto it = id_sym.find(bid);
+            /* an element store, as `d["k"] = v` is (contribute_elem): a
+             * plain contribution refused `d.k = 1` into a declared
+             * dict<str, float> as "assigned dict<str,int>" */
             if (it != id_sym.end() && it->second &&
                 static_type_resolve(it->second->type)->kind ==
                     StaticTypeKind::Dict)
-                contribute(it->second, A.dict_of(A.str_ty(), ct), bid->start);
+                contribute_elem(it->second, A.dict_of(A.str_ty(), ct),
+                                bid->start, bid->end);
         }
         return;
     }
@@ -3612,7 +8393,7 @@ void Inferencer::accumulate_foreach(ForeachStmt *fe)
          * matching do_iter (id_start=1 then the same tuple-unpack the
          * non-indexed 2+-var path does). Types the vars as the sub-array's
          * ELEMENT type, not the sub-array itself. */
-        contribute(sym_of(0), A.int_ty(), ids[0]->start);
+        contribute(sym_of(0), A.int_ty(), ids[0]->start, ids[0]->end);
         if (c->kind == StaticTypeKind::Dict) {
             /* A dict's "element" is the (key, value) PAIR - do_iter binds
              * ids[1]=key, ids[2]=value (count==2), NOT a destructured single
@@ -3620,43 +8401,52 @@ void Inferencer::accumulate_foreach(ForeachStmt *fe)
              * both the key. (Fixing a latent front-end mis-typing the
              * tree-walker hid because it binds dynamically at runtime.) */
             if (ids.size() >= 2)
-                contribute(sym_of(1), c->key, ids[1]->start);
+                contribute(sym_of(1), component_read(c->key), ids[1]->start,
+                           ids[1]->end);
             if (ids.size() >= 3)
-                contribute(sym_of(2), c->val, ids[2]->start);
+                contribute(sym_of(2), component_read(c->val), ids[2]->start,
+                           ids[2]->end);
             return;
         }
-        StaticTypeRef el = c->kind == StaticTypeKind::Array ? c->elem
+        StaticTypeRef el = c->kind == StaticTypeKind::Array
+                    ? component_read(c->elem)
                     : c->kind == StaticTypeKind::Str ? A.str_ty()
                     : A.dyn_ty();
         StaticTypeRef bind = el;
         if (ids.size() > 2) {   /* index + 2+ targets -> unpack the element */
             StaticTypeRef re = static_type_resolve(el);
-            bind = re->kind == StaticTypeKind::Array ? re->elem : el;
+            bind = re->kind == StaticTypeKind::Array ? component_read(re->elem)
+                                                     : el;
         }
         for (size_t i = 1; i < ids.size(); i++)
-            contribute(sym_of(i), bind, ids[i]->start);
+            contribute(sym_of(i), bind, ids[i]->start, ids[i]->end);
         return;
     }
 
     if (c->kind == StaticTypeKind::Dict && ids.size() >= 2) {
-        contribute(sym_of(0), c->key, ids[0]->start);
-        contribute(sym_of(1), c->val, ids[1]->start);
+        contribute(sym_of(0), component_read(c->key), ids[0]->start,
+                   ids[0]->end);
+        contribute(sym_of(1), component_read(c->val), ids[1]->start,
+                   ids[1]->end);
         return;
     }
 
-    StaticTypeRef el = c->kind == StaticTypeKind::Array ? c->elem
+    StaticTypeRef el = c->kind == StaticTypeKind::Array
+                    ? component_read(c->elem)
                 : c->kind == StaticTypeKind::Str ? A.str_ty()
-                : c->kind == StaticTypeKind::Dict ? c->key : A.dyn_ty();
+                : c->kind == StaticTypeKind::Dict ? component_read(c->key)
+                : A.dyn_ty();
 
     if (ids.size() == 1) {
-        contribute(sym_of(0), el, ids[0]->start);
+        contribute(sym_of(0), el, ids[0]->start, ids[0]->end);
     } else {
         /* tuple-unpack each element (an array) into the ids */
         StaticTypeRef inner = static_type_resolve(el)->kind ==
             StaticTypeKind::Array
-                           ? static_type_resolve(el)->elem : el;
+                           ? component_read(static_type_resolve(el)->elem)
+                           : el;
         for (size_t i = 0; i < ids.size(); i++)
-            contribute(sym_of(i), inner, ids[i]->start);
+            contribute(sym_of(i), inner, ids[i]->start, ids[i]->end);
     }
 }
 
@@ -3665,6 +8455,13 @@ void Inferencer::accumulate_foreach(ForeachStmt *fe)
 void Inferencer::mismatch(const std::string &m, Loc s, Loc e)
 {
     throw TypeMismatchEx(intern_msg(m), s, e ? e : s);
+}
+/* (a contribution is made only inside run_fixpoint, which reports the
+ * converged round's conflicts) */
+void Inferencer::conflict(const std::string &m, Loc s, Loc e, bool null)
+{
+    ML_CHECK(in_fixpoint);
+    round_conflicts.push_back({ m, s, e, null });
 }
 void Inferencer::nullability(const std::string &m, Loc s, Loc e)
 {
@@ -3716,7 +8513,13 @@ void Inferencer::check_binops(MultiOpConstruct *mo, bool comparison,
                                "in a comparison");
                 StaticTypeRef l = strip(static_type_resolve(left));
                 StaticTypeRef r = strip(static_type_resolve(right));
-                if (!is_dyn(l) && !is_dyn(r)) {
+                /* an operand the fixpoint could not type (an undefined
+                 * name - the resolver's error, or a `defined()`-guarded
+                 * one whose branch is deleted) decides nothing, as in the
+                 * arithmetic and unary checks: "cannot compare '?'" was
+                 * reported first */
+                if (!is_dyn(l) && !is_dyn(r)
+                        && !is_unknown(l) && !is_unknown(r)) {
                     bool ok = (is_num(l) && is_num(r)) ||
                               (l->kind == StaticTypeKind::Str &&
                                r->kind == StaticTypeKind::Str);
@@ -3740,7 +8543,12 @@ void Inferencer::check_binops(MultiOpConstruct *mo, bool comparison,
                 /* binop_result returns dyn for an invalid combination */
                 mismatch("operator does not apply to '" +
                     static_type_to_string(left) +
-                             "' and '" + static_type_to_string(right) + "'",
+                             "' and '" + static_type_to_string(right) + "'" +
+                             (r->kind == StaticTypeKind::Box
+                                  ? box_use_hint(r, rnode)
+                                  : box_use_hint(l, i == 1
+                                        ? mo->elems[0].second.get()
+                                        : nullptr)),
                          mo->start, rnode->end);
             }
         }
@@ -3757,7 +8565,7 @@ void Inferencer::check_binops(MultiOpConstruct *mo, bool comparison,
 TypeSym *Inferencer::narrow_target(Construct *cond, bool &in_then)
 {
     auto sym_of = [&](Construct *c) -> TypeSym * {
-        auto *id = dynamic_cast<Identifier *>(c);
+        auto *id = node_cast<Identifier>(c);
         if (!id)
             return nullptr;
         auto it = id_sym.find(id);
@@ -3775,17 +8583,17 @@ TypeSym *Inferencer::narrow_target(Construct *cond, bool &in_then)
     }
 
     /* `x != none` / `x == none` (Expr07, two operands) */
-    auto *mo = dynamic_cast<MultiOpConstruct *>(cond);
-    if (mo && (dynamic_cast<Expr07 *>(cond)) && mo->elems.size() == 2) {
+    auto *mo = node_cast<MultiOpConstruct>(cond);
+    if (mo && (node_cast<Expr07>(cond)) && mo->elems.size() == 2) {
         const Op op = mo->elems[1].first;
         if (op != Op::eq && op != Op::noteq)
             return nullptr;
         Construct *a = mo->elems[0].second.get();
         Construct *b = mo->elems[1].second.get();
         TypeSym *s = nullptr;
-        if (dynamic_cast<LiteralNone *>(b))
+        if (ctag(b) == ConstructType::lit_none)
             s = sym_of(a);
-        else if (dynamic_cast<LiteralNone *>(a))
+        else if (ctag(a) == ConstructType::lit_none)
             s = sym_of(b);
         if (!s)
             return nullptr;
@@ -3836,7 +8644,12 @@ static const char *static_type_kind_string(StaticTypeRef t)
         case StaticTypeKind::Dict:      return "dict";
         case StaticTypeKind::Func:      return "func";
         case StaticTypeKind::Exception: return "exception";
-        case StaticTypeKind::Struct:    return "struct";
+        case StaticTypeKind::Struct: {
+            auto *d = static_cast<const StructTypeDef *>(
+                static_type_resolve(t)->struct_def);
+            return d && d->is_class ? "class" : "struct";
+        }
+        case StaticTypeKind::Box:       return "box";
         default:                 return "dyn";   /* Dyn / Unknown */
     }
 }
@@ -3884,7 +8697,7 @@ static EvalValue build_type_value(StaticTypeRef t)
  */
 bool Inferencer::fold_type_query(CallExpr *call)
 {
-    auto *cid = dynamic_cast<Identifier *>(call->what.get());
+    auto *cid = node_cast<Identifier>(call->what.get());
     if (!cid)
         return false;
     const std::string_view fn = cid->uid->val;
@@ -3906,9 +8719,22 @@ bool Inferencer::fold_type_query(CallExpr *call)
         argcount(std::string(fn) + " expects exactly one argument",
                  call->start, call->end);
 
+    /* a type query INSIDE the operand is folded first, and so checked:
+     * the operand is retired below without the check pass ever reaching
+     * it, so `typestr(decltype(len))` printed "Type" where `decltype(len)`
+     * alone is refused (a builtin is not a variable) */
+    std::function<void(Construct *)> fold_inner = [&](Construct *c) {
+        if (!c)
+            return;
+        for_each_child(c, fold_inner);
+        if (ctag(c) == ConstructType::call)
+            fold_type_query(static_cast<CallExpr *>(c));
+    };
+    fold_inner(args->elems[0].get());
+
     StaticTypeRef t;
     if (is_decltype) {
-        auto *argid = dynamic_cast<Identifier *>(args->elems[0].get());
+        auto *argid = node_cast<Identifier>(args->elems[0].get());
         if (!argid)
             mismatch("decltype expects a variable (an identifier)",
                      args->elems[0]->start, args->elems[0]->end);
@@ -3924,6 +8750,10 @@ bool Inferencer::fold_type_query(CallExpr *call)
             return false;   /* type not determined yet: leave for runtime */
     }
 
+    t = A.fill_unfilled(t);   /* `type([]).elem` is dyn (question 9) */
+
+    /* the argument leaves the tree but not memory: see `retired` */
+    retired.push_back(std::move(args->elems[0]));
     if (is_type || is_decltype)              /* -> a baked Type object */
         args->elems[0] = make_unique<LiteralObj>(build_type_value(t), true);
     else                                     /* typestr / kindstr -> string */
@@ -3936,12 +8766,106 @@ bool Inferencer::fold_type_query(CallExpr *call)
     return true;
 }
 
+/*
+ * A store INTO the struct a `const` PARAMETER holds - its target reached
+ * from the parameter through member steps whose bases are all structs
+ * (`c.x = v`, `c.inner.x += 1`, `c.x++`). A struct is a value, and a
+ * `const` parameter's value does not change - C#'s `in`. A step into an
+ * array or a dict (`c.a[0] = v`, `c.d.k = v`) writes into that container,
+ * a reference, and is allowed; so is a mutating builtin on a field
+ * (`append(c.a, x)`). A `dyn` or unknown base decides nothing: at run
+ * time a const parameter is the call's copy like any other, in every
+ * engine, so only a known struct is refused.
+ */
+void Inferencer::check_const_param_store(const Construct *target)
+{
+    /*
+     * The walk goes from the target toward its root while every step
+     * stays INSIDE a struct VALUE. A step into a REFERENCE - a box's
+     * value (`*b`), a field of a box<P> or of a class instance - writes
+     * the object that reference reaches, not the struct's own value: it
+     * is refused only when that reference IS the const parameter (README:
+     * a const parameter's box is read-only), and allowed when the struct
+     * merely holds it (`*c.b = v`, `c.k.n = v` - README: "through struct
+     * fields only"; a box or a class instance is a reference, like the
+     * struct's arrays and dicts). The member step used to follow a box or
+     * a class field as a struct field, and refused both.
+     */
+    const Construct *t = target;
+    bool through_member = false;
+    for (;;) {
+        if (ctag(t) == ConstructType::member) {
+            const Construct *base =
+                static_cast<const MemberExpr *>(t)->what.get();
+            StaticTypeRef bt = static_type_resolve(type_of(base));
+            const bool box = bt && bt->kind == StaticTypeKind::Box;
+            bt = member_base(bt);
+            if (!bt || bt->kind != StaticTypeKind::Struct)
+                return;
+            const auto *def =
+                static_cast<const StructTypeDef *>(bt->struct_def);
+            if (box || (def && def->is_class)) {
+                /* a field of the object a reference reaches */
+                const_param_ref_store(base, target, box);
+                return;
+            }
+            through_member = true;
+            t = base;
+            continue;
+        }
+        if (ctag(t) == ConstructType::deref) {
+            /* `*b = v`: the value of the box `b` reaches */
+            const_param_ref_store(
+                static_cast<const DerefExpr *>(t)->elem.get(), target, true);
+            return;
+        }
+        break;
+    }
+    if (!through_member || !is_const_param(t))
+        return;
+    const std::string nm(static_cast<const Identifier *>(t)->uid->val);
+    mismatch("cannot change a field of '" + nm +
+                 "': a const parameter's struct is read-only",
+             target->start, target->end);
+}
+
+/* `e` names a const parameter (a capture of one is the closure's own
+ * binding, never const) */
+bool Inferencer::is_const_param(const Construct *e)
+{
+    if (ctag(e) != ConstructType::id || capture_uses.count(e))
+        return false;
+    auto it = id_sym.find(e);
+    return it != id_sym.end() && it->second && it->second->const_param;
+}
+
+/* A store into the object the reference `ref` reaches (a box's value, a
+ * field of a box<P> or of a class instance): refused when `ref` is a
+ * const parameter itself - its box (or instance) is read-only - and a
+ * write into a reference otherwise. */
+void Inferencer::const_param_ref_store(const Construct *ref,
+                                       const Construct *target, bool box)
+{
+    if (!is_const_param(ref))
+        return;
+    const std::string nm(static_cast<const Identifier *>(ref)->uid->val);
+    if (ctag(target) == ConstructType::deref
+            && ref == static_cast<const DerefExpr *>(target)->elem.get())
+        mismatch("cannot change the value of '" + nm +
+                     "': a const parameter's box is read-only",
+                 target->start, target->end);
+    mismatch("cannot change a field of '" + nm + "': a const parameter's " +
+                 (box ? "box" : "struct") + " is read-only",
+             target->start, target->end);
+}
+
 void Inferencer::check(Construct *n)
 {
     if (!n)
         return;
 
-    if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
+    if (ctag(n) == ConstructType::func_decl) {
+        auto *fd = static_cast<FuncDeclStmt *>(n);
         auto it = func_of_decl.find(fd);
         FuncInfo *fi = (it != func_of_decl.end()) ? it->second : nullptr;
         if (fi && fi->is_template)
@@ -3953,18 +8877,33 @@ void Inferencer::check(Construct *n)
         return;
     }
 
-    if (auto *i = dynamic_cast<IfStmt *>(n)) {
+    if (ctag(n) == ConstructType::if_stmt) {
+        auto *i = static_cast<IfStmt *>(n);
         check_if(i);
         return;
     }
 
-    if (auto *b = dynamic_cast<Block *>(n)) {
+    /* rule 1: a container a name may hold, returned or picked by a
+     * ternary, has exactly the type of the result it becomes */
+    /* (a `return` is always inside a function: cur_func is set) */
+    if (strict_dyn && ctag(n) == ConstructType::ret) {
+        check_flow_exact(static_cast<ReturnStmt *>(n)->elem.get(),
+                         cur_func->ret, "the function's result");
+    }
+    if (strict_dyn && ctag(n) == ConstructType::ternary) {
+        auto *te = static_cast<TernaryExpr *>(n);
+        check_flow_exact(te->thenExpr.get(), type_of(te), "the ternary");
+        check_flow_exact(te->elseExpr.get(), type_of(te), "the ternary");
+    }
+
+    if (ctag(n) == ConstructType::block) {
+        auto *b = static_cast<Block *>(n);
         /* guard-clause narrowing: after `if (x == none) <return/throw>`, x is
          * non-none for the rest of this block. */
         std::vector<const TypeSym *> added;
         for (auto &st : b->elems) {
             check(st.get());
-            auto *gi = dynamic_cast<IfStmt *>(st.get());
+            auto *gi = node_cast<IfStmt>(st.get());
             if (!gi || gi->elseBlock || !always_exits(gi->thenBlock.get()))
                 continue;
             bool in_then = false;
@@ -3979,31 +8918,33 @@ void Inferencer::check(Construct *n)
         return;
     }
 
-    if (auto *call = dynamic_cast<CallExpr *>(n)) {
+    if (ctag(n) == ConstructType::call) {
+        auto *call = static_cast<CallExpr *>(n);
         if (fold_type_query(call))
             return;
         check_call(call);
         return;
     }
 
-    if (dynamic_cast<Expr03 *>(n) || dynamic_cast<Expr04 *>(n) ||
-        dynamic_cast<Expr05 *>(n) || dynamic_cast<Expr08 *>(n) ||
-        dynamic_cast<Expr09 *>(n) || dynamic_cast<Expr10 *>(n)) {
+    if (ctag(n) == ConstructType::expr03 || ctag(n) == ConstructType::expr04 ||
+        ctag(n) == ConstructType::expr05 || ctag(n) == ConstructType::expr08 ||
+        ctag(n) == ConstructType::expr09 || ctag(n) == ConstructType::expr10) {
         /* arith path: require non-opt operands and flag an invalid combination
          * (binop_result returns dyn for e.g. a float bitwise operand). */
         check_binops(static_cast<MultiOpConstruct *>(n), false, false, true);
         return;
     }
-    if (dynamic_cast<Expr06 *>(n) || dynamic_cast<Expr07 *>(n)) {
+    if (ctag(n) == ConstructType::expr06 || ctag(n) == ConstructType::expr07) {
         check_binops(static_cast<MultiOpConstruct *>(n), true, false, false);
         return;
     }
-    if (dynamic_cast<Expr11 *>(n) || dynamic_cast<Expr12 *>(n)) {
+    if (ctag(n) == ConstructType::expr11 || ctag(n) == ConstructType::expr12) {
         check_binops(static_cast<MultiOpConstruct *>(n), false, true, false);
         return;
     }
 
-    if (auto *e2 = dynamic_cast<Expr02 *>(n)) {
+    if (ctag(n) == ConstructType::expr02) {
+        auto *e2 = static_cast<Expr02 *>(n);
         check(e2->elems[0].second.get());
         Op op = e2->elems[0].first;
         if (op == Op::plus || op == Op::minus) {
@@ -4012,8 +8953,9 @@ void Inferencer::check(Construct *n)
             StaticTypeRef u = strip(static_type_resolve(t));
             if (!is_dyn(u) && !is_unknown(u) && !is_num(u))
                 mismatch("unary +/- needs a number, got '" +
-                    static_type_to_string(t) +
-                             "'", n->start, n->end);
+                    static_type_to_string(t) + "'" +
+                    box_use_hint(t, e2->elems[0].second.get()),
+                    n->start, n->end);
         } else if (op == Op::bnot) {
             StaticTypeRef t = type_of(e2->elems[0].second.get());
             require_nonopt(t, n->start, n->end, "with a unary ~");
@@ -4029,7 +8971,8 @@ void Inferencer::check(Construct *n)
         return;
     }
 
-    if (auto *sub = dynamic_cast<Subscript *>(n)) {
+    if (ctag(n) == ConstructType::subscript) {
+        auto *sub = static_cast<Subscript *>(n);
         check(sub->what.get());
         check(sub->index.get());
         StaticTypeRef w = type_of(sub->what.get());
@@ -4045,7 +8988,8 @@ void Inferencer::check(Construct *n)
         return;
     }
 
-    if (auto *sl = dynamic_cast<Slice *>(n)) {
+    if (ctag(n) == ConstructType::slice) {
+        auto *sl = static_cast<Slice *>(n);
         check(sl->what.get());
         check(sl->start_idx.get());
         check(sl->end_idx.get());
@@ -4060,11 +9004,13 @@ void Inferencer::check(Construct *n)
         return;
     }
 
-    if (auto *mem = dynamic_cast<MemberExpr *>(n)) {
+    if (ctag(n) == ConstructType::member) {
+        auto *mem = static_cast<MemberExpr *>(n);
         check(mem->what.get());
 
         /* struct descriptor base: only a const member (`Type.CONST`). */
-        if (auto *cid = dynamic_cast<Identifier *>(mem->what.get())) {
+        if (ctag(mem->what.get()) == ConstructType::id) {
+            auto *cid = static_cast<Identifier *>(mem->what.get());
             auto it = id_sym.find(cid);
             if (it != id_sym.end() && it->second && it->second->struct_type) {
                 const StructTypeDef *def = it->second->struct_type;
@@ -4089,7 +9035,7 @@ void Inferencer::check(Construct *n)
         if (!mem->optional)
             require_nonopt(w, mem->what->start, mem->what->end,
                            "as a member-access base");
-        StaticTypeRef wr = strip(static_type_resolve(w));
+        StaticTypeRef wr = strip(member_base(static_type_resolve(w)));
 
         /* struct instance base: validate the field/const exists. */
         if (wr->kind == StaticTypeKind::Struct) {
@@ -4110,34 +9056,66 @@ void Inferencer::check(Construct *n)
         return;
     }
 
-    if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
+    if (ctag(n) == ConstructType::foreach_stmt) {
+        auto *fe = static_cast<ForeachStmt *>(n);
         check(fe->container.get());
         check(fe->body.get());
         StaticTypeRef c = type_of(fe->container.get());
         require_nonopt(c, fe->container->start, fe->container->end,
                        "as a foreach container");
+        /* A dict entry is a key and a value: a loop over a dict binds
+         * one or two variables (after an `indexed` counter). More is the
+         * strict unpack's error, decided here when the container is
+         * proven a dict, and at run time otherwise (README *The foreach
+         * loop*). */
+        const size_t nkv = fe->ids ? fe->ids->elems.size()
+                                     - (fe->indexed ? 1 : 0) : 0;
+        if (nkv > 2 && static_type_resolve(c)->kind == StaticTypeKind::Dict)
+            throw TypeMismatchEx(
+                intern_msg("foreach: a dict entry is a key and a value, "
+                           "which cannot be unpacked into "
+                           + std::to_string(nkv) + " variables"),
+                fe->container->start, fe->container->end);
         return;
     }
 
-    if (auto *idc = dynamic_cast<IncDecExpr *>(n)) {
+    if (ctag(n) == ConstructType::deref) {
+        check_deref(static_cast<DerefExpr *>(n));
+        return;
+    }
+
+    if (ctag(n) == ConstructType::cast) {
+        check_cast(static_cast<CastExpr *>(n));
+        return;
+    }
+
+    if (ctag(n) == ConstructType::incdec) {
+        auto *idc = static_cast<IncDecExpr *>(n);
         check(idc->lvalue.get());
         Construct *opnd = idc->lvalue.get();
 
-        /* the operand must be an lvalue: a variable, an array element, or a
-         * struct field (not a literal, an expression, or a call result). */
-        auto *id = dynamic_cast<Identifier *>(opnd);
-        if (!id && !dynamic_cast<Subscript *>(opnd)
-                && !dynamic_cast<MemberExpr *>(opnd)) {
-            mismatch("'++'/'--' needs a variable, array element, or field",
-                     idc->start, idc->end);
-            return;
-        }
+        /* the operand is an lvalue: a variable, an array element, a struct
+         * field or a box's value - the PARSER refuses any other shape (a
+         * literal, an expression, a call result: pRefuseUnassignable), in
+         * every configuration, before inference runs */
+        auto *id = node_cast<Identifier>(opnd);
+        ML_CHECK(id || ctag(opnd) == ConstructType::subscript
+                 || ctag(opnd) == ConstructType::member
+                 || ctag(opnd) == ConstructType::deref);
 
-        /* not a const target (when the const survived as a symbol). */
-        if (id) {
+        check_const_param_store(opnd);
+
+        /* not a const target (when the const survived as a symbol) - a
+         * capture of one is the closure's own binding. It is the rebind
+         * error README states and the resolver's check_rebind raises
+         * (what -nti reports), with its caret - the target name; it was
+         * a TypeMismatchEx over the whole `K++` here, before the resolver
+         * could answer. (A const SCALAR never gets here: its name folds
+         * to its value, which is not an assignable location.) */
+        if (id && !capture_uses.count(id)) {
             auto it = id_sym.find(id);
             if (it != id_sym.end() && it->second && it->second->const_decl)
-                mismatch("cannot '++'/'--' a const", idc->start, idc->end);
+                throw CannotRebindConstEx(id->start, id->end);
         }
 
         StaticTypeRef t = type_of(opnd);
@@ -4150,15 +9128,30 @@ void Inferencer::check(Construct *n)
                 && ts->kind != StaticTypeKind::Int && ts->kind !=
                     StaticTypeKind::Float)
             mismatch("'++'/'--' requires an int or float, got '" +
-                         static_type_to_string(t) + "'",
+                         static_type_to_string(t) + "'" +
+                         (ts->kind == StaticTypeKind::Box && opnd->is_id()
+                              ? " (write (*" + std::string(
+                                    static_cast<Identifier *>(opnd)
+                                        ->uid->val) + ")" +
+                                    (idc->is_inc ? "++" : "--") +
+                                    " for its value)"
+                              : std::string()),
                      opnd->start, opnd->end);
         return;
     }
 
-    if (auto *e14 = dynamic_cast<Expr14 *>(n)) {
+    if (ctag(n) == ConstructType::expr14) {
+        auto *e14 = static_cast<Expr14 *>(n);
         check(e14->rvalue.get());
-        if (!(e14->fl & pFlags::pInDecl))
+        if (!(e14->fl & pFlags::pInDecl)) {
             check(e14->lvalue.get());
+            if (ctag(e14->lvalue.get()) == ConstructType::idlist) {
+                for (auto &t : static_cast<IdList *>(e14->lvalue.get())->elems)
+                    check_const_param_store(t.get());
+            } else {
+                check_const_param_store(e14->lvalue.get());
+            }
+        }
 
         /* An explicitly-typed NON-opt variable must never become none: reject
          * `int a = none`, a later `a = none`, or assigning any nullable value
@@ -4168,7 +9161,8 @@ void Inferencer::check(Construct *n)
          * none during the fixpoint (e.g. an array(N) element before a write
          * pins it) is not misflagged. */
         if (strict_dyn && e14->op == Op::assign) {
-            if (auto *lid = dynamic_cast<Identifier *>(e14->lvalue.get())) {
+            if (ctag(e14->lvalue.get()) == ConstructType::id) {
+                auto *lid = static_cast<Identifier *>(e14->lvalue.get());
                 auto it = id_sym.find(lid);
                 if (it != id_sym.end() && it->second) {
                     StaticTypeRef d = ann_scalar_static_type(it->second);
@@ -4183,37 +9177,60 @@ void Inferencer::check(Construct *n)
             }
         }
 
+        if (!(e14->fl & pFlags::pInDecl))
+            check_declared_store(e14);
+
+        if (strict_dyn && e14->op == Op::assign
+                && ctag(e14->lvalue.get()) == ConstructType::id)
+            check_alias_exact(e14->rvalue.get(),
+                              static_cast<Identifier *>(e14->lvalue.get()));
+
         if (e14->op != Op::assign) {
-            /* compound assign: validate the implied binary op */
-            StaticTypeRef l = type_of(e14->lvalue.get());
-            StaticTypeRef r = type_of(e14->rvalue.get());
-            require_nonopt(l, e14->lvalue->start, e14->lvalue->end,
-                           "in a compound assignment");
-            require_nonopt(r, e14->rvalue->start, e14->rvalue->end,
-                           "in a compound assignment");
-            StaticTypeRef res = binop_result(compound_binop(e14->op), l, r);
-            StaticTypeRef ls = strip(static_type_resolve(l)), rs =
-                strip(static_type_resolve(r));
-            if (!is_dyn(ls) && !is_dyn(rs) && is_dyn(res))
-                mismatch("operator does not apply to '" +
-                    static_type_to_string(l) +
-                             "' and '" + static_type_to_string(r) + "'",
-                         e14->start, e14->end);
+            /* compound assign: validate the implied binary op - for each
+             * target of `a, b OP= rhs` against what it receives, as a
+             * single compound target is (it was a run-time TypeErrorEx
+             * until 2026-10-06 where `a OP= v` is refused here) */
+            if (ctag(e14->lvalue.get()) == ConstructType::idlist) {
+                auto *idl = static_cast<IdList *>(e14->lvalue.get());
+                const std::vector<StaticTypeRef> els =
+                    idlist_elem_types(idl, e14->rvalue.get());
+                for (size_t i = 0; i < idl->elems.size(); i++) {
+                    check_compound_op(e14->op,
+                                      type_of(idl->elems[i].get()), els[i],
+                                      idl->elems[i].get(),
+                                      e14->rvalue.get(), e14);
+                    if (!idl->elems[i]->is_underscore())
+                        refuse_compound_misfit(
+                            e14->op, declared_type_of(idl->elems[i].get()),
+                            els[i], e14);
+                }
+            } else {
+                check_compound_op(e14->op, type_of(e14->lvalue.get()),
+                                  type_of(e14->rvalue.get()),
+                                  e14->lvalue.get(), e14->rvalue.get(),
+                                  e14);
+            }
         }
         return;
     }
 
-    if (auto *th = dynamic_cast<ThrowStmt *>(n)) {
+    if (ctag(n) == ConstructType::throw_stmt) {
+        auto *th = static_cast<ThrowStmt *>(n);
         check(th->elem.get());
-        StaticTypeRef t = strip(static_type_resolve(type_of(th->elem.get())));
+        const StaticTypeRef full = type_of(th->elem.get());
+        StaticTypeRef t = strip(static_type_resolve(full));
         /* A struct instance is the custom-exception value; a caught built-in
-         * exception (Exception) can be re-thrown; dyn/Unknown/None defer. */
+         * exception (Exception) can be re-thrown; dyn and Unknown defer to
+         * the run-time check. A value that can only be `none` (`throw
+         * none`, a variable only ever none, a call to a function that
+         * returns nothing) is no struct instance either (2026-11-09). One
+         * that MAY be none (`opt P`, `var dyn saved = none` holding a
+         * caught exception later) is checked when it is thrown. */
         if (!is_dyn(t) && t->kind != StaticTypeKind::Struct &&
             t->kind != StaticTypeKind::Exception &&
-            t->kind != StaticTypeKind::Unknown && t->kind !=
-                StaticTypeKind::None)
+            t->kind != StaticTypeKind::Unknown)
             mismatch("can only throw a struct instance, got '" +
-                         static_type_to_string(type_of(th->elem.get())) + "'",
+                         static_type_to_string(full) + "'",
                      th->elem->start, th->elem->end);
         return;
     }
@@ -4258,7 +9275,10 @@ void Inferencer::check_struct_construction(CallExpr *call,
 
     for (size_t i = 0; i < nargs && i < nfields; i++) {
         const FieldDef &fd = def->fields[i];
-        StaticTypeRef at = type_of(args->elems[i].get());
+        StaticTypeRef at = fd.kind == FieldKind::f_dyn ? nullptr
+            : literal_into(args->elems[i].get(), field_static_type(fd));
+        if (!at)
+            at = type_of(args->elems[i].get());
 
         if (!fd.is_opt && is_optish(at))
             nullability("field '" + std::string(fd.name->val) +
@@ -4287,10 +9307,12 @@ void Inferencer::check_call(CallExpr *call)
     ExprList *args = call->args.get();
 
     /* Struct construction: validate the args against the field types. */
-    if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
+    if (ctag(call->what.get()) == ConstructType::id) {
+        auto *cid = static_cast<Identifier *>(call->what.get());
         auto it = id_sym.find(cid);
         if (it != id_sym.end() && it->second && it->second->struct_type) {
             check_struct_construction(call, it->second->struct_type);
+            call->ctor_alias = it->second->type_alias;
             return;
         }
     }
@@ -4308,7 +9330,8 @@ void Inferencer::check_call(CallExpr *call)
         fparams = &fi->params;
         callable_known = true;
         template_call = fi->is_template;
-    } else if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
+    } else if (ctag(call->what.get()) == ConstructType::id) {
+        auto *cid = static_cast<Identifier *>(call->what.get());
         auto it = id_sym.find(cid);
         TypeSym *s = (it != id_sym.end()) ? it->second : nullptr;
         if (s && s->func) {
@@ -4320,6 +9343,13 @@ void Inferencer::check_call(CallExpr *call)
         } else if (s && is_dyn(s->type)) {
             return;                       /* dyn callee: no checks */
         } else if (!s && is_builtin(cid->uid)) {
+            check_builtin_store(call);
+            if (cid->uid->val == std::string_view("box"))
+                check_box_call(call);
+            else if (cid->uid->val == std::string_view("abs"))
+                check_num_builtin_call(call, false);
+            else if (cid->uid->val == std::string_view("round"))
+                check_num_builtin_call(call, true);
             return;                       /* builtin arity checked at runtime */
         } else if (s) {
             mismatch("'" + std::string(cid->uid->val) +
@@ -4377,9 +9407,11 @@ void Inferencer::check_call(CallExpr *call)
     if (template_call)
         return;   /* per-argument checking happens in each instantiation */
 
+    std::vector<TypeSym *> *kp = known_params(call);
     for (size_t i = 0; i < nargs && i < nparams; i++) {
         Construct *anode = args->elems[i].get();
-        StaticTypeRef at = type_of(anode);
+        StaticTypeRef at = kp && i < kp->size() ? arg_type(anode, (*kp)[i])
+                                                : type_of(anode);
 
         bool p_dyn, p_opt;
         StaticTypeRef ptype;
@@ -4412,8 +9444,11 @@ void Inferencer::check_call(CallExpr *call)
         }
 
         /* TYPE check: a dyn parameter or a dyn argument accepts any type (the
-         * variant use-case), so skip assignability for those. */
-        if (p_dyn || is_dyn(at))
+         * variant use-case), so skip assignability for those - a parameter
+         * typed `dyn` too (an un-annotated one nothing settled): its
+         * nullability is the check above, not a type mismatch (rule 3 made
+         * `none` unassignable to a `dyn`) */
+        if (p_dyn || is_dyn(at) || is_dyn(ptype))
             continue;
 
         StaticTypeRef src = p_opt ? at : strip(at);
@@ -4421,7 +9456,8 @@ void Inferencer::check_call(CallExpr *call)
             mismatch("argument " + std::to_string(i + 1) + " has type '" +
                          static_type_to_string(at) +
                              "' but the parameter is '" +
-                         static_type_to_string(ptype) + "'",
+                         static_type_to_string(ptype) + "'" +
+                         box_use_hint(at, anode, ptype),
                      anode->start, anode->end);
     }
 }
@@ -4445,10 +9481,10 @@ static TypeHint operand_th(const Construct *n)
 {
     if (n->th == TypeHint::i || n->th == TypeHint::f)
         return n->th;
-    if (dynamic_cast<const LiteralInt *>(n)
-        || dynamic_cast<const LiteralBool *>(n))
+    if (ctag(n) == ConstructType::lit_int
+        || ctag(n) == ConstructType::lit_bool)
         return TypeHint::i;
-    if (dynamic_cast<const LiteralFloat *>(n))
+    if (ctag(n) == ConstructType::lit_float)
         return TypeHint::f;
     return n->th;
 }
@@ -4482,6 +9518,41 @@ make_typed(TypedScalarExpr::Cat cat, TypeHint kind, TypeHint result_th,
     return t;
 }
 
+/*
+ * A FLOAT arithmetic chain whose LEADING operands are ints: the operators
+ * between them are INT operators. The operators apply left to right, so
+ * `i / 3 * 0.5` divides two ints (truncating) and only then meets the
+ * float, and `big * 4 * 0.5` wraps before it halves - the boxed ladder
+ * (num_bin_op) computes exactly that. A typed float chain reads every
+ * operand as a float, so it computed 2.0 / 3.0. The int prefix becomes an
+ * int TypedScalarExpr, the chain's first operand; the float loop then
+ * starts at the first float operand, and an int operand AFTER it converts
+ * as num_bin_op converts it (float OP int is float OP float(int)).
+ */
+static void split_int_prefix(MultiOpConstruct *mo)
+{
+    size_t k = 0;
+    while (k < mo->elems.size()
+           && operand_th(mo->elems[k].second.get()) != TypeHint::f)
+        k++;
+    if (k < 2)
+        return;             /* no int operator before the first float */
+    auto pre = std::make_unique<TypedScalarExpr>(
+        TypedScalarExpr::Cat::arith, TypeHint::i);
+    mo->copy_base_fields(*pre);
+    pre->th = TypeHint::i;
+    pre->th_bool = false;            /* arithmetic yields an int */
+    pre->start = mo->elems[0].second->start;
+    pre->end = mo->elems[k - 1].second->end;
+    for (size_t x = 0; x < k; x++)
+        pre->elems.push_back(std::move(mo->elems[x]));
+    mo->elems.erase(mo->elems.begin(),
+                    mo->elems.begin() + static_cast<std::ptrdiff_t>(k));
+    mo->elems.insert(mo->elems.begin(),
+                     std::make_pair(Op::invalid,
+                                    unique_ptr<Construct>(std::move(pre))));
+}
+
 /* Rewrite a single node into a TypedScalarExpr when its operands are statically
  * int/float; else return it unchanged. Children are already specialized. */
 static unique_ptr<Construct> try_specialize(unique_ptr<Construct> n)
@@ -4490,22 +9561,24 @@ static unique_ptr<Construct> try_specialize(unique_ptr<Construct> n)
      * (<< >> >>>), Expr08 (&), Expr09 (^), Expr10 (|). The bitwise ones are
      * int-only (always th==i), and share the unboxed int arith loop in
      * TypedScalarExpr::eval_int. */
-    if (dynamic_cast<Expr03 *>(n.get()) || dynamic_cast<Expr04 *>(n.get()) ||
-        dynamic_cast<Expr05 *>(n.get()) || dynamic_cast<Expr08 *>(n.get()) ||
-        dynamic_cast<Expr09 *>(n.get()) || dynamic_cast<Expr10 *>(n.get())) {
+    if (node_cast<Expr03>(n.get()) || node_cast<Expr04>(n.get()) ||
+        node_cast<Expr05>(n.get()) || node_cast<Expr08>(n.get()) ||
+        node_cast<Expr09>(n.get()) || node_cast<Expr10>(n.get())) {
         auto *mo = static_cast<MultiOpConstruct *>(n.get());
         if (n->th == TypeHint::i && ops_scalar(mo, false))
             return make_typed(TypedScalarExpr::Cat::arith, TypeHint::i,
                               TypeHint::i, mo);
-        if (n->th == TypeHint::f && ops_scalar(mo, true))
+        if (n->th == TypeHint::f && ops_scalar(mo, true)) {
+            split_int_prefix(mo);
             return make_typed(TypedScalarExpr::Cat::arith, TypeHint::f,
                               TypeHint::f, mo);
+        }
         return n;
     }
 
     /* comparison: Expr06 (< > <= >=), Expr07 (== !=). Only the simple
      * two-operand form (the overwhelmingly common case). Result is int. */
-    if (dynamic_cast<Expr06 *>(n.get()) || dynamic_cast<Expr07 *>(n.get())) {
+    if (node_cast<Expr06>(n.get()) || node_cast<Expr07>(n.get())) {
         auto *mo = static_cast<MultiOpConstruct *>(n.get());
         if (mo->elems.size() == 2 && ops_scalar(mo, true)) {
             const bool anyf =
@@ -4519,7 +9592,7 @@ static unique_ptr<Construct> try_specialize(unique_ptr<Construct> n)
     }
 
     /* logical: Expr11 (&&), Expr12 (||). Int operands, int result. */
-    if (dynamic_cast<Expr11 *>(n.get()) || dynamic_cast<Expr12 *>(n.get())) {
+    if (node_cast<Expr11>(n.get()) || node_cast<Expr12>(n.get())) {
         auto *mo = static_cast<MultiOpConstruct *>(n.get());
         if (ops_scalar(mo, false))
             return make_typed(TypedScalarExpr::Cat::logical, TypeHint::i,
@@ -4528,7 +9601,7 @@ static unique_ptr<Construct> try_specialize(unique_ptr<Construct> n)
     }
 
     /* unary: Expr02 (+ - !), exactly one operand (elems[0]). */
-    if (dynamic_cast<Expr02 *>(n.get())) {
+    if (node_cast<Expr02>(n.get())) {
         auto *mo = static_cast<MultiOpConstruct *>(n.get());
         if (mo->elems.size() != 1)
             return n;
@@ -4552,115 +9625,149 @@ static unique_ptr<Construct> try_specialize(unique_ptr<Construct> n)
     return n;
 }
 
-static unique_ptr<Construct> specialize(unique_ptr<Construct> n);
+static unique_ptr<Construct> specialize(unique_ptr<Construct> n,
+                                        int *fsize);
 
 /* Recurse into every unique_ptr<Construct> child, specializing it in place. */
-static void specialize_children(Construct *n)
+static void specialize_children(Construct *n, int *fsize)
 {
-    if (auto *e = dynamic_cast<Expr14 *>(n)) {
-        e->lvalue = specialize(std::move(e->lvalue));
-        e->rvalue = specialize(std::move(e->rvalue));
+    if (ctag(n) == ConstructType::expr14) {
+        auto *e = static_cast<Expr14 *>(n);
+        e->lvalue = specialize(std::move(e->lvalue), fsize);
+        e->rvalue = specialize(std::move(e->rvalue), fsize);
         return;
     }
-    if (auto *c = dynamic_cast<CallExpr *>(n)) {
-        c->what = specialize(std::move(c->what));
+    if (ctag(n) == ConstructType::call) {
+        auto *c = static_cast<CallExpr *>(n);
+        c->what = specialize(std::move(c->what), fsize);
         for (auto &a : c->args->elems)
-            a = specialize(std::move(a));
+            a = specialize(std::move(a), fsize);
         return;
     }
-    if (auto *m = dynamic_cast<MemberExpr *>(n)) {
-        m->what = specialize(std::move(m->what));
+    if (ctag(n) == ConstructType::member) {
+        auto *m = static_cast<MemberExpr *>(n);
+        m->what = specialize(std::move(m->what), fsize);
         return;
     }
-    if (auto *s = dynamic_cast<Subscript *>(n)) {
-        s->what = specialize(std::move(s->what));
-        s->index = specialize(std::move(s->index));
+    if (ctag(n) == ConstructType::deref) {
+        auto *d = static_cast<DerefExpr *>(n);
+        d->elem = specialize(std::move(d->elem), fsize);
         return;
     }
-    if (auto *s = dynamic_cast<Slice *>(n)) {
-        s->what = specialize(std::move(s->what));
-        if (s->start_idx) s->start_idx = specialize(std::move(s->start_idx));
-        if (s->end_idx)   s->end_idx = specialize(std::move(s->end_idx));
+    if (ctag(n) == ConstructType::cast) {
+        auto *d = static_cast<CastExpr *>(n);
+        d->elem = specialize(std::move(d->elem), fsize);
         return;
     }
-    if (auto *i = dynamic_cast<IfStmt *>(n)) {
-        i->condExpr = specialize(std::move(i->condExpr));
-        i->thenBlock = specialize(std::move(i->thenBlock));
-        if (i->elseBlock) i->elseBlock = specialize(std::move(i->elseBlock));
+    if (ctag(n) == ConstructType::subscript) {
+        auto *s = static_cast<Subscript *>(n);
+        s->what = specialize(std::move(s->what), fsize);
+        s->index = specialize(std::move(s->index), fsize);
         return;
     }
-    if (auto *w = dynamic_cast<WhileStmt *>(n)) {
-        w->condExpr = specialize(std::move(w->condExpr));
-        if (w->body) w->body = specialize(std::move(w->body));
+    if (ctag(n) == ConstructType::slice) {
+        auto *s = static_cast<Slice *>(n);
+        s->what = specialize(std::move(s->what), fsize);
+        if (s->start_idx)
+            s->start_idx = specialize(std::move(s->start_idx), fsize);
+        if (s->end_idx)
+            s->end_idx = specialize(std::move(s->end_idx), fsize);
         return;
     }
-    if (auto *f = dynamic_cast<ForStmt *>(n)) {
-        if (f->init) f->init = specialize(std::move(f->init));
-        if (f->cond) f->cond = specialize(std::move(f->cond));
-        if (f->inc)  f->inc = specialize(std::move(f->inc));
-        if (f->body) f->body = specialize(std::move(f->body));
+    if (ctag(n) == ConstructType::if_stmt) {
+        auto *i = static_cast<IfStmt *>(n);
+        i->condExpr = specialize(std::move(i->condExpr), fsize);
+        i->thenBlock = specialize(std::move(i->thenBlock), fsize);
+        if (i->elseBlock)
+            i->elseBlock = specialize(std::move(i->elseBlock), fsize);
         return;
     }
-    if (auto *fe = dynamic_cast<ForeachStmt *>(n)) {
-        fe->container = specialize(std::move(fe->container));
-        if (fe->body) fe->body = specialize(std::move(fe->body));
+    if (ctag(n) == ConstructType::while_stmt) {
+        auto *w = static_cast<WhileStmt *>(n);
+        w->condExpr = specialize(std::move(w->condExpr), fsize);
+        if (w->body) w->body = specialize(std::move(w->body), fsize);
         return;
     }
-    if (auto *t = dynamic_cast<TryCatchStmt *>(n)) {
-        if (t->tryBody) t->tryBody = specialize(std::move(t->tryBody));
+    if (ctag(n) == ConstructType::for_stmt) {
+        auto *f = static_cast<ForStmt *>(n);
+        if (f->init) f->init = specialize(std::move(f->init), fsize);
+        if (f->cond) f->cond = specialize(std::move(f->cond), fsize);
+        if (f->inc)  f->inc = specialize(std::move(f->inc), fsize);
+        if (f->body) f->body = specialize(std::move(f->body), fsize);
+        return;
+    }
+    if (ctag(n) == ConstructType::foreach_stmt) {
+        auto *fe = static_cast<ForeachStmt *>(n);
+        fe->container = specialize(std::move(fe->container), fsize);
+        if (fe->body) fe->body = specialize(std::move(fe->body), fsize);
+        return;
+    }
+    if (ctag(n) == ConstructType::try_catch) {
+        auto *t = static_cast<TryCatchStmt *>(n);
+        if (t->tryBody) t->tryBody = specialize(std::move(t->tryBody), fsize);
         for (auto &cs : t->catchStmts)
-            if (cs.second) cs.second = specialize(std::move(cs.second));
+            if (cs.second) cs.second = specialize(std::move(cs.second), fsize);
         if (t->finallyBody)
-            t->finallyBody = specialize(std::move(t->finallyBody));
+            t->finallyBody = specialize(std::move(t->finallyBody), fsize);
         return;
     }
-    if (auto *r = dynamic_cast<ReturnStmt *>(n)) {
-        if (r->elem) r->elem = specialize(std::move(r->elem));
+    if (ctag(n) == ConstructType::ret) {
+        auto *r = static_cast<ReturnStmt *>(n);
+        if (r->elem) r->elem = specialize(std::move(r->elem), fsize);
         return;
     }
-    if (auto *te = dynamic_cast<TernaryExpr *>(n)) {
+    if (ctag(n) == ConstructType::ternary) {
+        auto *te = static_cast<TernaryExpr *>(n);
         /* Previously ABSENT - a ternary's cond/arms were never M8-specialized
          * (both engines ran them boxed; the recursion-unroll's guard ternaries
          * were the visible cost). Same for `??` below. */
-        te->condExpr = specialize(std::move(te->condExpr));
-        te->thenExpr = specialize(std::move(te->thenExpr));
-        te->elseExpr = specialize(std::move(te->elseExpr));
+        te->condExpr = specialize(std::move(te->condExpr), fsize);
+        te->thenExpr = specialize(std::move(te->thenExpr), fsize);
+        te->elseExpr = specialize(std::move(te->elseExpr), fsize);
         return;
     }
-    if (auto *co = dynamic_cast<CoalesceExpr *>(n)) {
-        co->lhs = specialize(std::move(co->lhs));
-        co->rhs = specialize(std::move(co->rhs));
+    if (ctag(n) == ConstructType::coalesce) {
+        auto *co = static_cast<CoalesceExpr *>(n);
+        co->lhs = specialize(std::move(co->lhs), fsize);
+        co->rhs = specialize(std::move(co->rhs), fsize);
         return;
     }
-    if (auto *fd = dynamic_cast<FuncDeclStmt *>(n)) {
+    if (ctag(n) == ConstructType::func_decl) {
+        auto *fd = static_cast<FuncDeclStmt *>(n);
         /* A base template's body is a monomorphization shell - never
          * specialized (see FuncDeclStmt::is_template): it is cloned per concrete
          * signature (each clone specializes separately) and, when value-used,
          * run boxed for indirect dispatch. Specializing it would corrupt those. */
+        /* A nested function owns a SEPARATE frame: walk its body with that
+         * function's frame size, so a hoisted LICM temp lands in the right
+         * frame (nullptr when unresolved - no frame to grow, no hoisting). */
         if (fd->body && !fd->is_template)
-            fd->body = specialize(std::move(fd->body));
+            fd->body = specialize(std::move(fd->body),
+                                  fd->desc->resolved ? &fd->desc->frame_size
+                                                     : nullptr);
         return;
     }
-    if (auto *ld = dynamic_cast<LiteralDict *>(n)) {
+    if (ctag(n) == ConstructType::lit_dict) {
+        auto *ld = static_cast<LiteralDict *>(n);
         for (auto &kv : ld->elems) {
-            kv->key = specialize(std::move(kv->key));
-            kv->value = specialize(std::move(kv->value));
+            kv->key = specialize(std::move(kv->key), fsize);
+            kv->value = specialize(std::move(kv->value), fsize);
         }
         return;
     }
-    if (auto *sc = dynamic_cast<SingleChildConstruct *>(n)) {
-        if (sc->elem) sc->elem = specialize(std::move(sc->elem));
+    if (auto *sc = node_cast<SingleChildConstruct>(n)) {
+        if (sc->elem) sc->elem = specialize(std::move(sc->elem), fsize);
         return;
     }
-    if (auto *mo = dynamic_cast<MultiOpConstruct *>(n)) {
+    if (auto *mo = node_cast<MultiOpConstruct>(n)) {
         for (auto &pr : mo->elems)
-            pr.second = specialize(std::move(pr.second));
+            pr.second = specialize(std::move(pr.second), fsize);
         return;
     }
     if (auto *me = dynamic_cast<MultiElemConstruct<> *>(n)) {
         /* Block, LiteralArray, ExprList */
         for (auto &e : me->elems)
-            e = specialize(std::move(e));
+            e = specialize(std::move(e), fsize);
         return;
     }
 }
@@ -4672,13 +9779,18 @@ static void specialize_children(Construct *n)
 static const UniqueId *fr_base_id(const Construct *lv)
 {
     while (lv) {
-        if (auto *id = dynamic_cast<const Identifier *>(lv))
+        if (auto *id = node_cast<const Identifier>(lv))
             return id->uid;
-        if (auto *s = dynamic_cast<const Subscript *>(lv)) {
+        if (ctag(lv) == ConstructType::subscript) {
+            auto *s = static_cast<const Subscript *>(lv);
             lv = s->what.get(); continue;
         }
-        if (auto *m = dynamic_cast<const MemberExpr *>(lv)) {
+        if (ctag(lv) == ConstructType::member) {
+            auto *m = static_cast<const MemberExpr *>(lv);
             lv = m->what.get(); continue;
+        }
+        if (ctag(lv) == ConstructType::deref) {
+            lv = static_cast<const DerefExpr *>(lv)->elem.get(); continue;
         }
         return nullptr;
     }
@@ -4690,7 +9802,7 @@ static const UniqueId *fr_base_id(const Construct *lv)
  * arg (e.g. `len(arr)`) is safe to evaluate once for the loop. */
 static bool fr_is_const_builtin(const Construct *callee)
 {
-    auto *id = dynamic_cast<const Identifier *>(callee);
+    auto *id = node_cast<const Identifier>(callee);
     return id && EvalContext::const_builtins.count(id->uid) != 0;
 }
 
@@ -4710,7 +9822,7 @@ static void fr_collect_pure_funcs(Construct *c)
 {
     if (!c)
         return;
-    if (auto *fd = dynamic_cast<FuncDeclStmt *>(c))
+    if (auto *fd = node_cast<FuncDeclStmt>(c))
         if (fd->id && fd->desc->effective_pure)
             g_fr_pure.insert(fd->id->uid);
     Inferencer::for_each_child(c, fr_collect_pure_funcs);
@@ -4718,7 +9830,7 @@ static void fr_collect_pure_funcs(Construct *c)
 
 static bool fr_is_pure_func(const Construct *callee)
 {
-    auto *id = dynamic_cast<const Identifier *>(callee);
+    auto *id = node_cast<const Identifier>(callee);
     return id && g_fr_pure.count(id->uid) != 0;
 }
 
@@ -4730,69 +9842,174 @@ static bool fr_is_scalar(const Construct *e)
 }
 
 /*
+ * A builtin that changes its first argument IN PLACE. Not the same set as
+ * "not const": sort / rev_sort / reverse are CONST builtins (a constant
+ * argument folds) and still sort the array a variable holds, so a loop
+ * calling one changes it - `for (i; i < a[0]; i++) sort(a);` cached the
+ * bound until 2026-10-08. intptr / refcount take an lvalue and change
+ * nothing.
+ */
+/* the name of the builtin `callee` calls; empty for anything else (a
+ * user function, a value, a name a program declared over a builtin's) */
+static std::string_view fr_builtin_name(const Construct *callee)
+{
+    auto *id = node_cast<const Identifier>(callee);
+    if (!id || id->sym.kind != SymKind::builtin)
+        return {};
+    return id->get_str();
+}
+
+static bool fr_builtin_mutates(const Construct *callee)
+{
+    const std::string_view n = fr_builtin_name(callee);
+    return n == "append" || n == "push" || n == "pop" || n == "insert"
+        || n == "erase" || n == "sort" || n == "rev_sort" || n == "reverse";
+}
+
+/*
  * The mutations a loop body performs, split so `len(arr)` (depends only on the
  * LENGTH/identity of arr) can stay constant through an element write that does
  * NOT change the length (the common fill pattern `arr[i] = f(i)`):
- *   - `mut_len`     : identifiers whose value or length/identity may change -
- *                     a direct reassign (`x =`, `x++`), or a NON-const-builtin
- *                     call passed the container (append/pop/insert/erase/... or
- *                     any user func, which by reference can do anything to it);
- *   - `mut_content` : identifiers whose ELEMENT/FIELD may change - an
- *                     `arr[i] = v` / `obj.f = v` / `arr[i]++`, PLUS everything
- *                     in mut_len (reassign/impure call changes content too).
+ *   - `len`     : identifiers whose value or length/identity may change -
+ *                 a direct reassign (`x =`, `x++`), or a call that may
+ *                 change the container passed to it (a mutating builtin,
+ *                 any impure user function, which by reference can do
+ *                 anything to it);
+ *   - `content` : identifiers whose ELEMENT/FIELD may change - an
+ *                 `arr[i] = v` / `obj.f = v` / `arr[i]++`, PLUS everything
+ *                 in `len` (reassign/impure call changes content too).
+ *
+ * Those two are by NAME, and a name is not the storage: arrays and dicts
+ * are references, so `b[0] = 9` changes `a[0]` when `b = a`, and an impure
+ * function can pop a global that aliases a local. So two more facts, about
+ * EVERY container rather than one name (2026-10-08 - a for-range bound and
+ * a hoisted slice each gave a different answer from `--no-opt all`):
+ *   - `alias_content` : some write in the loop goes INTO storage another
+ *                       name may share - an element or field store whose
+ *                       chain passes through an array, a dict, a class
+ *                       instance or a `dyn`
+ *                       (a struct field of a struct VALUE is the struct's
+ *                       own copy and does not count), or a call that may
+ *                       change anything (below);
+ *   - `alias_len`     : some container's LENGTH may change behind a name -
+ *                       a mutating builtin applied to a shared container,
+ *                       or a call that may change anything: an impure user
+ *                       function or function value (it reaches globals), a
+ *                       builtin given a callback.
+ * A read through a shared container is loop-invariant only when the
+ * matching flag is clear (fr_immutable).
+ *
  * NOT descended into nested functions. Reuses the complete for_each_child so no
  * mutating node is ever missed - the immutability proof depends on this.
  */
-static void fr_collect_mutated(
-    Construct *c,
-    std::unordered_set<const UniqueId *> &mut_len,
-    std::unordered_set<const UniqueId *> &mut_content)
+struct FrMut {
+    std::unordered_set<const UniqueId *> len, content;
+    bool alias_len = false;
+    bool alias_content = false;
+
+    void taint(const UniqueId *b) { len.insert(b); content.insert(b); }
+    void taint_all() { alias_len = alias_content = true; }
+};
+
+/* A member read or store through a struct VALUE - not a dict, not a
+ * `dyn`, not a CLASS instance or a box<P>, each of which another name may
+ * share. */
+static bool fr_member_of_value(const MemberExpr *m)
 {
-    if (!c || dynamic_cast<FuncDeclStmt *>(c))
+    return m->base_struct && m->base_struct_def
+        && !m->base_struct_def->is_class && !m->base_boxed;
+}
+
+/* Does a store to the lvalue chain `lv` write into storage another name may
+ * share? Every level whose base is an array, a dict, a class instance or a
+ * `dyn` is such a store; a member of a struct VALUE is the variable's own
+ * copy. */
+static bool fr_store_reaches_shared(const Construct *lv)
+{
+    while (lv) {
+        if (ctag(lv) == ConstructType::subscript
+                || ctag(lv) == ConstructType::deref)
+            return true;     /* into an array or a dict (a string is never
+                                stored into), or into a box */
+        if (ctag(lv) == ConstructType::member) {
+            auto *m = static_cast<const MemberExpr *>(lv);
+            if (!fr_member_of_value(m))
+                return true;
+            lv = m->what.get();
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
+static void fr_collect_mutated(Construct *c, FrMut &m)
+{
+    if (!c || ctag(c) == ConstructType::func_decl)
         return;
-    if (auto *e = dynamic_cast<Expr14 *>(c)) {
+    if (ctag(c) == ConstructType::expr14) {
+        auto *e = static_cast<Expr14 *>(c);
         if (!(e->fl & pFlags::pInDecl)) {
-            if (auto *il = dynamic_cast<IdList *>(e->lvalue.get())) {
-                for (auto &p : il->elems) {
-                    mut_len.insert(p->uid);
-                    mut_content.insert(p->uid);
-                }
-            } else if (dynamic_cast<Identifier *>(e->lvalue.get())) {
-                const UniqueId *b = fr_base_id(e->lvalue.get());
-                mut_len.insert(b);          /* `x = ...` : reassign */
-                mut_content.insert(b);
-            } else if (const UniqueId *b = fr_base_id(e->lvalue.get())) {
-                mut_content.insert(b);      /* `arr[i] =`/`obj.f =` : content */
+            if (ctag(e->lvalue.get()) == ConstructType::idlist) {
+                auto *il = static_cast<IdList *>(e->lvalue.get());
+                for (auto &p : il->elems)
+                    m.taint(p->uid);
+            } else if (node_cast<Identifier>(e->lvalue.get())) {
+                m.taint(fr_base_id(e->lvalue.get()));   /* `x = ...` */
+            } else {
+                if (const UniqueId *b = fr_base_id(e->lvalue.get()))
+                    m.content.insert(b);  /* `arr[i] =`/`obj.f =` */
+                if (fr_store_reaches_shared(e->lvalue.get()))
+                    m.alias_content = true;
             }
         }
-    } else if (auto *idc = dynamic_cast<IncDecExpr *>(c)) {
-        if (dynamic_cast<Identifier *>(idc->lvalue.get())) {
-            const UniqueId *b = fr_base_id(idc->lvalue.get());
-            mut_len.insert(b);
-            mut_content.insert(b);
-        } else if (const UniqueId *b = fr_base_id(idc->lvalue.get())) {
-            mut_content.insert(b);          /* `arr[i]++` : content */
+    } else if (ctag(c) == ConstructType::incdec) {
+        auto *idc = static_cast<IncDecExpr *>(c);
+        if (node_cast<Identifier>(idc->lvalue.get())) {
+            m.taint(fr_base_id(idc->lvalue.get()));
+        } else {
+            if (const UniqueId *b = fr_base_id(idc->lvalue.get()))
+                m.content.insert(b);      /* `arr[i]++` : content */
+            if (fr_store_reaches_shared(idc->lvalue.get()))
+                m.alias_content = true;
         }
-    } else if (auto *ce = dynamic_cast<CallExpr *>(c)) {
-        /* A PURE call (const builtin or pure user func) cannot mutate an
-         * argument - `pure` now forbids writing a reference parameter. Only an
-         * IMPURE call may change a container passed to it (append/pop/`a[i]=v`/
-         * a deeper call), so it taints both the length and the content of every
-         * non-scalar argument (a scalar is by value, never mutated). */
-        if (!fr_is_const_builtin(ce->what.get()) &&
-            !fr_is_pure_func(ce->what.get()) && ce->args) {
+    } else if (ctag(c) == ConstructType::call) {
+        auto *ce = static_cast<CallExpr *>(c);
+        const Construct *callee = ce->what.get();
+        /* A PURE call (a const builtin that changes nothing, or a pure user
+         * func) cannot mutate an argument - `pure` forbids writing a
+         * reference parameter. Anything else may change a container passed
+         * to it (append/pop/`a[i]=v`/a deeper call), so it taints both the
+         * length and the content of every non-scalar argument (a scalar is
+         * by value, never mutated) - and, through the aliasing above, of
+         * every container. */
+        const bool mutates = fr_builtin_mutates(callee);
+        /* a struct construction runs no program code and changes nothing */
+        const bool pure = !mutates
+            && (fr_is_const_builtin(callee) || fr_is_pure_func(callee)
+                || ce->vm_struct_ctor_def);
+        if (!pure && ce->args)
             for (auto &a : ce->args->elems) {
                 if (fr_is_scalar(a.get()))
                     continue;
-                if (const UniqueId *b = fr_base_id(a.get())) {
-                    mut_len.insert(b);
-                    mut_content.insert(b);
-                }
+                if (const UniqueId *b = fr_base_id(a.get()))
+                    m.taint(b);
+            }
+        if (!pure) {
+            auto *id = node_cast<const Identifier>(callee);
+            const bool builtin = id && id->sym.kind == SymKind::builtin;
+            if (!builtin || ce->callable_arg_mask != 0) {
+                /* a user function, a function value, or a builtin handed
+                 * something it may call: it may change anything */
+                m.taint_all();
+            } else if (mutates && ce->args && !ce->args->elems.empty()
+                       && !ce->args->elems[0]->th_val) {
+                m.taint_all();      /* append(b, x) with b shared */
             }
         }
     }
     Inferencer::for_each_child(c, [&](Construct *ch) {
-        fr_collect_mutated(ch, mut_len, mut_content);
+        fr_collect_mutated(ch, m);
     });
 }
 
@@ -4800,67 +10017,82 @@ static void fr_collect_mutated(
  * True if `e` is a side-effect-free INT expression whose value cannot change
  * across the loop:
  *   - a literal int, or a SLOTTED-LOCAL identifier (not the loop var, whose
- *     length/identity is stable - not in `mut_len`);
+ *     length/identity is stable - not in `len`);
  *   - an arith/bitwise/unary chain of immutable operands;
  *   - a subscript / member READ whose base + index are immutable AND whose base
- *     has no element/field write (`mut_content`) - the element is then stable;
+ *     has no element/field write (`content`) - the element is then stable.
+ *     A read THROUGH a shared container (an array, a dict, a class
+ *     instance, a `dyn` - not a string, not a member of a struct value)
+ *     also needs `alias_content`
+ *     clear: a write through another name would change it;
  *   - a call to a CONST (pure) builtin with all-immutable arguments - e.g.
  *     `len(arr)` when arr's length is stable (an `arr[i] = v` is fine: it does
- *     not change the length).
+ *     not change the length). A shared-container argument needs
+ *     `alias_len` clear for `len`, `alias_content` clear for anything else.
  */
-static bool fr_immutable(
-    const Construct *e,
-    const std::unordered_set<const UniqueId *> &mut_len,
-    const std::unordered_set<const UniqueId *> &mut_content,
-    const UniqueId *i_uid)
+static bool fr_immutable(const Construct *e, const FrMut &m,
+                         const UniqueId *i_uid)
 {
     if (!e)
         return false;
-    if (dynamic_cast<const LiteralInt *>(e))
+    if (ctag(e) == ConstructType::lit_int)
         return true;
-    if (auto *id = dynamic_cast<const Identifier *>(e))
+    if (auto *id = node_cast<const Identifier>(e))
         return id->sym.kind == SymKind::local && id->uid != i_uid &&
-               mut_len.find(id->uid) == mut_len.end();
-    if (auto *sc = dynamic_cast<const SingleChildConstruct *>(e))  /* Expr01 */
-        return fr_immutable(sc->elem.get(), mut_len, mut_content, i_uid);
-    if (auto *sub = dynamic_cast<const Subscript *>(e)) {
+               m.len.find(id->uid) == m.len.end();
+    /* No SingleChildConstruct is immutable: the parser builds no Expr01,
+     * an InlinedCallExpr's child is a Block, and a ThrowStmt is not an
+     * expression - so the family falls to the `return false` below. */
+    if (ctag(e) == ConstructType::subscript) {
+        auto *sub = static_cast<const Subscript *>(e);
         const UniqueId *b = fr_base_id(sub->what.get());
-        return b && mut_content.find(b) == mut_content.end() &&
-               fr_immutable(sub->what.get(), mut_len, mut_content, i_uid) &&
-               fr_immutable(sub->index.get(), mut_len, mut_content, i_uid);
+        return b && m.content.find(b) == m.content.end() &&
+               (sub->base_str || !m.alias_content) &&
+               fr_immutable(sub->what.get(), m, i_uid) &&
+               fr_immutable(sub->index.get(), m, i_uid);
     }
-    if (auto *m = dynamic_cast<const MemberExpr *>(e)) {
-        const UniqueId *b = fr_base_id(m->what.get());
-        return b && mut_content.find(b) == mut_content.end() &&
-               fr_immutable(m->what.get(), mut_len, mut_content, i_uid);
+    if (ctag(e) == ConstructType::member) {
+        auto *mem = static_cast<const MemberExpr *>(e);
+        const UniqueId *b = fr_base_id(mem->what.get());
+        return b && m.content.find(b) == m.content.end() &&
+               (fr_member_of_value(mem) || !m.alias_content) &&
+               fr_immutable(mem->what.get(), m, i_uid);
     }
-    if (auto *ce = dynamic_cast<const CallExpr *>(e)) {
+    if (ctag(e) == ConstructType::call) {
+        auto *ce = static_cast<const CallExpr *>(e);
         /* A call's result is constant across the loop iff the callee is pure
          * (a const builtin, or an effectively-pure user function) and every
          * argument is immutable. `pure` now forbids mutating a reference
          * parameter (see func_mutates_input in the resolver), so a pure call
          * neither has side effects nor changes its own result between
          * iterations - so even a container arg (`len(arr)`, `compute(arr)`) is
-         * safe to evaluate once. */
-        if (!fr_is_const_builtin(ce->what.get()) &&
-            !fr_is_pure_func(ce->what.get()))
+         * safe to evaluate once, unless a write through another name may
+         * reach that container. */
+        if (fr_builtin_mutates(ce->what.get())
+            || (!fr_is_const_builtin(ce->what.get())
+                && !fr_is_pure_func(ce->what.get())))
             return false;
+        const bool is_len = fr_builtin_name(ce->what.get()) == "len";
         if (ce->args)
-            for (auto &a : ce->args->elems)
-                if (!fr_immutable(a.get(), mut_len, mut_content, i_uid))
+            for (auto &a : ce->args->elems) {
+                if (!fr_immutable(a.get(), m, i_uid))
                     return false;
+                if (!a->th_val
+                    && (is_len ? m.alias_len : m.alias_content))
+                    return false;
+            }
         return true;
     }
-    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(e)) {
+    if (auto *mo = node_cast<const MultiOpConstruct>(e)) {
         /* arith (Expr02/03/04) + bitwise (Expr05/08/09/10) only - not a
          * comparison/logical (bool result, not an int bound). */
-        if (dynamic_cast<const Expr06 *>(e) ||
-            dynamic_cast<const Expr07 *>(e) ||
-            dynamic_cast<const Expr11 *>(e) ||
-            dynamic_cast<const Expr12 *>(e))
+        if (ctag(e) == ConstructType::expr06 ||
+            node_cast<const Expr07>(e) ||
+            node_cast<const Expr11>(e) ||
+            node_cast<const Expr12>(e))
             return false;
         for (auto &p : mo->elems)
-            if (!fr_immutable(p.second.get(), mut_len, mut_content, i_uid))
+            if (!fr_immutable(p.second.get(), m, i_uid))
                 return false;
         return true;
     }
@@ -4873,51 +10105,59 @@ static bool fr_immutable(
  * unchanged. Matched on the RAW for (before its cond/inc are specialized), so
  * the pattern is a plain Expr06 / Expr14 / IncDecExpr.
  */
-static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n)
+static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n,
+                                          int *fsize)
 {
-    auto *f = dynamic_cast<ForStmt *>(n.get());
+    auto *f = node_cast<ForStmt>(n.get());
     if (!f || !f->init || !f->cond || !f->inc || !f->body)
         return n;
 
     /* init: `var i = start`, with i a slotted-local int */
-    auto *init = dynamic_cast<Expr14 *>(f->init.get());
-    if (!init || !(init->fl & pFlags::pInDecl) || init->op != Op::assign)
+    auto *init = node_cast<Expr14>(f->init.get());
+    if (!init || !(init->fl & pFlags::pInDecl))
         return n;
-    auto *ivar = dynamic_cast<Identifier *>(init->lvalue.get());
+    ML_CHECK(init->op == Op::assign);   /* `var i += 1` does not parse */
+    auto *ivar = node_cast<Identifier>(init->lvalue.get());
     if (!ivar || ivar->sym.kind != SymKind::local || ivar->th != TypeHint::i)
         return n;
     const UniqueId *i_uid = ivar->uid;
     const int i_slot = ivar->sym.slot;
 
     /* cond: `i </<= bound` (asc) or `i >=/> bound` (desc), bound int */
-    auto *cond = dynamic_cast<Expr06 *>(f->cond.get());
+    auto *cond = node_cast<Expr06>(f->cond.get());
     if (!cond || cond->elems.size() != 2)
         return n;
-    auto *cleft = dynamic_cast<Identifier *>(cond->elems[0].second.get());
+    auto *cleft = node_cast<Identifier>(cond->elems[0].second.get());
     if (!cleft || cleft->uid != i_uid)
         return n;
     const Op cmp_op = cond->elems[1].first;
     bool cmp_asc;
-    if (cmp_op == Op::lt || cmp_op == Op::le)      cmp_asc = true;
-    else if (cmp_op == Op::ge || cmp_op == Op::gt) cmp_asc = false;
-    else return n;
+    if (cmp_op == Op::lt || cmp_op == Op::le) {
+        cmp_asc = true;
+    } else {
+        /* Expr06 holds the four orderings only */
+        ML_CHECK(cmp_op == Op::ge || cmp_op == Op::gt);
+        cmp_asc = false;
+    }
     Construct *bound = cond->elems[1].second.get();
     if (bound->th != TypeHint::i)
         return n;
 
     /* inc: `i += step` / `i++` (asc) or `i -= step` / `i--` (desc) */
     bool inc_asc;
-    Expr14 *inc14 = dynamic_cast<Expr14 *>(f->inc.get());
+    Expr14 *inc14 = node_cast<Expr14>(f->inc.get());
     Construct *step = nullptr;
-    if (auto *idc = dynamic_cast<IncDecExpr *>(f->inc.get())) {
-        auto *iid = dynamic_cast<Identifier *>(idc->lvalue.get());
+    if (ctag(f->inc.get()) == ConstructType::incdec) {
+        auto *idc = static_cast<IncDecExpr *>(f->inc.get());
+        auto *iid = node_cast<Identifier>(idc->lvalue.get());
         if (!iid || iid->uid != i_uid)
             return n;
         inc_asc = idc->is_inc;
     } else if (inc14) {
-        if (inc14->fl & pFlags::pInDecl)
-            return n;
-        auto *iid = dynamic_cast<Identifier *>(inc14->lvalue.get());
+        /* a declaration is not an increment: `for (..; ..; var j = 1)`
+         * does not parse */
+        ML_CHECK(!(inc14->fl & pFlags::pInDecl));
+        auto *iid = node_cast<Identifier>(inc14->lvalue.get());
         if (!iid || iid->uid != i_uid)
             return n;
         if (inc14->op == Op::addeq)       inc_asc = true;
@@ -4936,11 +10176,11 @@ static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n)
         return n;
 
     /* bound and step must be loop-immutable */
-    std::unordered_set<const UniqueId *> mut_len, mut_content;
-    fr_collect_mutated(f->body.get(), mut_len, mut_content);
-    if (!fr_immutable(bound, mut_len, mut_content, i_uid))
+    FrMut mut;
+    fr_collect_mutated(f->body.get(), mut);
+    if (!fr_immutable(bound, mut, i_uid))
         return n;
-    if (step && !fr_immutable(step, mut_len, mut_content, i_uid))
+    if (step && !fr_immutable(step, mut, i_uid))
         return n;
 
     /* Build the ForRangeStmt; specialize the kept sub-trees (the body is the
@@ -4950,11 +10190,11 @@ static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n)
     fr->end = f->end;
     fr->i_slot = i_slot;
     fr->cmp_op = cmp_op;
-    fr->bound = specialize(std::move(cond->elems[1].second));
+    fr->bound = specialize(std::move(cond->elems[1].second), fsize);
     if (step)
-        fr->step = specialize(std::move(inc14->rvalue));
-    fr->init = specialize(std::move(f->init));
-    fr->body = specialize(std::move(f->body));
+        fr->step = specialize(std::move(inc14->rvalue), fsize);
+    fr->init = specialize(std::move(f->init), fsize);
+    fr->body = specialize(std::move(f->body), fsize);
 
     /* -a/--analyze: green the `for` keyword of a specialized counted loop. */
     if (g_specialize_analyze)
@@ -4963,18 +10203,781 @@ static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n)
     return fr;
 }
 
-static unique_ptr<Construct> specialize(unique_ptr<Construct> n)
+/* Does `c` reference identifier `uid` anywhere? (The hoist's cond/inc
+ * guard - a use of the slice var BEFORE its decl must keep the original
+ * undefined-read semantics.) Complete via for_each_child. */
+static bool hoist_refs_uid(Construct *c, const UniqueId *uid)
+{
+    if (!c)
+        return false;
+    if (auto *id = node_cast<Identifier>(c))
+        if (id->uid == uid)
+            return true;
+    bool found = false;
+    Inferencer::for_each_child(c, [&](Construct *ch) {
+        if (!found && hoist_refs_uid(ch, uid))
+            found = true;
+    });
+    return found;
+}
+
+/*
+ * Is every use of the slice variable `uid` in `c` one that cannot let the
+ * slice ESCAPE - an element read `sl[i]`, a slice of it `sl[a:b]`,
+ * `len(sl)`, or the container of a foreach? Question 3 (Python's rule)
+ * made a slice's IDENTITY observable: a copy of it - stored, passed,
+ * assigned, captured, returned - is the SAME array, so a hoisted slice
+ * would be one array shared by every iteration where the loop wrote a
+ * fresh one each time, and a later write through any copy would show in
+ * all of them. Any other use refuses the hoist. Complete via
+ * for_each_child: the bare name is a contained use only in a PLACE - a
+ * subscript, slice or foreach base, or an argument of len(), which keeps
+ * and returns none of them - and everything below a place is checked
+ * like any other child.
+ */
+static bool hoist_slice_contained(Construct *c, const UniqueId *uid)
+{
+    if (!c)
+        return true;
+    const Construct *place = nullptr;
+    bool every = false;                 /* every child is a place */
+    switch (ctag(c)) {
+    case ConstructType::id:
+        return static_cast<Identifier *>(c)->uid != uid;
+    case ConstructType::subscript:
+        place = static_cast<Subscript *>(c)->what.get();
+        break;
+    case ConstructType::slice:
+        place = static_cast<Slice *>(c)->what.get();
+        break;
+    case ConstructType::foreach_stmt:
+        place = static_cast<ForeachStmt *>(c)->container.get();
+        break;
+    case ConstructType::call: {
+        auto *ce = static_cast<CallExpr *>(c);
+        if (fr_builtin_name(ce->what.get()) == "len") {
+            c = ce->args.get();
+            every = true;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    bool ok = true;
+    Inferencer::for_each_child(c, [&](Construct *ch) {
+        const bool at_place = every || ch == place;
+        ok &= (at_place && ctag(ch) == ConstructType::id)
+            || hoist_slice_contained(ch, uid);
+    });
+    return ok;
+}
+
+/*
+ * LEVER 3 increment 2 (plans/archived/native-gap-roadmap.md) - LOOP-INVARIANT
+ * SLICE HOISTING. `for (...) { var sl = base[a:b]; ...reads... }`
+ * evaluates an identical slice VIEW every iteration - the registration/
+ * refcount churn is the loop's cost (the pooled set halved it; this
+ * removes it). The decl statement hoists ABOVE the loop when every part
+ * is provably iteration-independent AND the transform is unobservable:
+ *
+ *  - base: a slotted LOCAL, not in mut.len (reassign/impure-call: the
+ *    view would rebind per iteration) AND NOT IN mut.content - the
+ *    subtle one: an element write to a base with a LIVE slice COWs the
+ *    BASE AWAY (clone_aliased_slices), so a hoisted view would keep
+ *    reading the detached OLD storage while per-iteration fresh views
+ *    see the new one. The same write through ANOTHER name sharing the
+ *    base does the same, so an array base also needs
+ *    `mut.alias_content` clear (FrMut);
+ *  - bounds: absent, or fr_immutable (side-effect-free, loop-stable)
+ *    AND int-proven (th == i / an int literal) - with base_sliceable
+ *    (a statically non-opt array/str) the slice then CANNOT throw
+ *    (pure clamping), so hoisting is safe even for a ZERO-iteration
+ *    loop (the throw would otherwise move from "never" to "before");
+ *  - sl: written exactly by its decl (not in mut.len/mut.content - no
+ *    reassign, no write-through, no mutating builtin), and not
+ *    referenced by the loop's cond/inc (a pre-decl read must keep its
+ *    original undefined-read semantics);
+ *  - NOTHING the slice reads is DECLARED IN THE BODY (licm_collect_decls,
+ *    LICM's own rule): above the loop such a slot holds its previous
+ *    value, or nothing at all. fr_collect_mutated skips a declaration, so
+ *    a body-local `var m = [..]; var sl = m[1:3];` looked invariant and
+ *    the hoisted slice read `m` before the loop set it (TypeErrorEx where
+ *    `--no-opt all` answered; found 2026-11-16) - and a `const` declared
+ *    BELOW the slice, which binds at the body's entry (question 21), is
+ *    the same read. A slice OF a hoisted slice still hoists, one visit
+ *    later: specialize() runs again on the wrapper block's children, and
+ *    by then the first slice is declared above the loop;
+ *  - and an ARRAY slice must not ESCAPE (hoist_slice_contained): since
+ *    question 3 (Python's rule) a copy of a slice is the same array, so
+ *    one hoisted slice stored by every iteration would be ONE array
+ *    where the loop stored a fresh one each time. A STRING slice may
+ *    escape: a string is immutable, its identity unobservable.
+ *
+ * The transform: Block{decl..., loop} with scope_free (the decl's slot
+ * is function-frame-wide; resolution already happened). Both engines
+ * benefit (the VM compiles the block as decl-then-loop). Only DIRECT
+ * body statements are considered (no try-crossing, no nested blocks).
+ */
+static void licm_collect_decls(Construct *c,
+                               std::unordered_set<const UniqueId *> &out);
+static bool licm_refs_any(const Construct *e,
+                          const std::unordered_set<const UniqueId *> &names);
+
+/* every body statement but the declaration `skip` keeps the slice
+ * `uid` contained (hoist_slice_contained) */
+static bool hoist_slice_uses_contained(Block *body, size_t skip,
+                                       const UniqueId *uid)
+{
+    for (size_t k = 0; k < body->elems.size(); k++)
+        if (k != skip && !hoist_slice_contained(body->elems[k].get(), uid))
+            return false;
+    return true;
+}
+
+static unique_ptr<Construct> try_hoist_loop_slices(unique_ptr<Construct> n)
+{
+    Construct *body_c = nullptr;
+    Construct *cond1 = nullptr, *cond2 = nullptr;
+    if (ctag(n.get()) == ConstructType::for_stmt) {
+        auto *f = static_cast<ForStmt *>(n.get());
+        body_c = f->body.get();
+        cond1 = f->cond.get();
+        cond2 = f->inc.get();
+    } else if (ctag(n.get()) == ConstructType::while_stmt) {
+        auto *w = static_cast<WhileStmt *>(n.get());
+        body_c = w->body.get();
+        cond1 = w->condExpr.get();
+    } else {
+        return n;
+    }
+    Block *body = node_cast<Block>(body_c);
+    if (!body)
+        return n;
+
+    FrMut mut;
+    fr_collect_mutated(n.get(), mut);
+    std::unordered_set<const UniqueId *> body_decls;
+    licm_collect_decls(body, body_decls);
+
+    std::vector<unique_ptr<Construct>> hoisted;
+    for (size_t i = 0; i < body->elems.size(); ) {
+        auto *e14 = node_cast<Expr14>(body->elems[i].get());
+        const Identifier *lhs;
+        const Slice *sl;
+        if (e14 && e14->op == Op::assign && (e14->fl & pFlags::pInDecl)
+            && !(e14->fl & pFlags::pInConstDecl)
+            && (lhs = node_cast<Identifier>(e14->lvalue.get()))
+            && lhs->sym.kind == SymKind::local
+            && lhs->decl_type != DeclType::i && lhs->decl_type != DeclType::f
+            && !lhs->is_underscore()
+            && (sl = node_cast<Slice>(e14->rvalue.get()))
+            && sl->base_sliceable
+            /* base: an inlined scalar LITERAL (an auto-const string -
+             * bench 29's shape) is trivially invariant; else the
+             * identifier must be length- AND content-stable (content:
+             * the COW-detach hazard - see the header comment) */
+            && (node_cast<LiteralStr>(sl->what.get()) != nullptr
+                || (fr_base_id(sl->what.get())
+                    && mut.len.find(fr_base_id(sl->what.get()))
+                           == mut.len.end()
+                    && mut.content.find(fr_base_id(sl->what.get()))
+                           == mut.content.end()
+                    /* a write through ANOTHER name may reach a shared
+                     * base and detach the view just the same */
+                    && (sl->what->th_val || !mut.alias_content)
+                    && fr_immutable(sl->what.get(), mut, nullptr)))
+            /* nothing it reads is declared in the body */
+            && !licm_refs_any(sl->what.get(), body_decls)
+            && !licm_refs_any(sl->start_idx.get(), body_decls)
+            && !licm_refs_any(sl->end_idx.get(), body_decls)
+            && mut.len.find(lhs->uid) == mut.len.end()
+            && mut.content.find(lhs->uid) == mut.content.end()
+            && !hoist_refs_uid(cond1, lhs->uid)
+            && !hoist_refs_uid(cond2, lhs->uid)
+            /* a STRING slice (a value) may escape - see the header
+             * comment */
+            && (sl->th_val
+                || hoist_slice_uses_contained(body, i, lhs->uid))) {
+            const auto bound_ok = [&](const Construct *b) {
+                if (!b)
+                    return true;              /* absent -> clamp */
+                if (!fr_immutable(b, mut, nullptr))
+                    return false;
+                return b->th == TypeHint::i
+                    || ctag(b) == ConstructType::lit_int;
+            };
+            if (bound_ok(sl->start_idx.get()) && bound_ok(sl->end_idx.get())) {
+                hoisted.push_back(std::move(body->elems[i]));
+                body->elems.erase(body->elems.begin()
+                                  + static_cast<long>(i));
+                continue;
+            }
+        }
+        i++;
+    }
+    if (hoisted.empty())
+        return n;
+
+    auto blk = make_unique<Block>();
+    n->copy_base_fields(*blk);            /* the loop's loc for carets */
+    blk->scope_free = true;
+    for (auto &h : hoisted)
+        blk->elems.push_back(std::move(h));
+    blk->elems.push_back(std::move(n));
+    return blk;
+}
+
+/* ------------- loop-invariant CONTAINER-SUBSCRIPT hoisting (LICM) -------- */
+
+/*
+ * The synthetic temps are named `$licm<N>` (the `f$0` / `name$sN` convention -
+ * `$` cannot occur in a source identifier, so a collision is impossible).
+ * Monotonic per specialize_types run; only ever read back through the resolved
+ * slot, never by name.
+ */
+static int g_licm_counter = 0;
+
+/* The frame-slot ceiling for a hoist, matching the tail inliner's cap. */
+static const int LICM_MAX_FRAME_SLOTS = 64;
+
+/*
+ * Structural equality over the side-effect-free expression grammar
+ * `fr_immutable` admits - enough to recognize two occurrences of the SAME
+ * invariant subscript (`a[i]` written twice in one body) so both share one
+ * hoisted temp. Deliberately conservative: an unrecognized node kind compares
+ * UNEQUAL, which costs a duplicate temp, never a wrong substitution.
+ */
+static bool licm_expr_equal(const Construct *x, const Construct *y)
+{
+    if (x == y)
+        return true;
+    if (!x || !y)
+        return false;
+    if (ctag(x) == ConstructType::id) {
+        auto *ix = static_cast<const Identifier *>(x);
+        auto *iy = node_cast<const Identifier>(y);
+        return iy && ix->uid == iy->uid && ix->sym.kind == iy->sym.kind
+               && ix->sym.slot == iy->sym.slot;
+    }
+    if (ctag(x) == ConstructType::lit_int) {
+        auto *lx = static_cast<const LiteralInt *>(x);
+        auto *ly = node_cast<const LiteralInt>(y);
+        return ly && lx->ival() == ly->ival();
+    }
+    if (ctag(x) == ConstructType::subscript) {
+        auto *sx = static_cast<const Subscript *>(x);
+        auto *sy = node_cast<const Subscript>(y);
+        return sy && licm_expr_equal(sx->what.get(), sy->what.get())
+               && licm_expr_equal(sx->index.get(), sy->index.get());
+    }
+    if (ctag(x) == ConstructType::member) {
+        auto *mx = static_cast<const MemberExpr *>(x);
+        auto *my = node_cast<const MemberExpr>(y);
+        return my && mx->memUid == my->memUid
+               && licm_expr_equal(mx->what.get(), my->what.get());
+    }
+    /* (no SingleChildConstruct arm: a candidate passed fr_immutable, which
+     * admits none - see there) */
+    if (auto *ox = node_cast<const MultiOpConstruct>(x)) {
+        auto *oy = node_cast<const MultiOpConstruct>(y);
+        if (!oy || ctag(x) != ctag(y) || ox->elems.size()
+                                             != oy->elems.size())
+            return false;
+        for (size_t i = 0; i < ox->elems.size(); i++)
+            if (ox->elems[i].first != oy->elems[i].first
+                || !licm_expr_equal(ox->elems[i].second.get(),
+                                    oy->elems[i].second.get()))
+                return false;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Is `f` a function VALUE this pass can prove harmless - one that cannot reach
+ * the enclosing function's locals at all? `effective_pure` (the resolver's
+ * `func_body_is_pure`) is exactly that proof: a pure function has NO capture
+ * list, reads only consts + its own params + other pure functions, and does
+ * not mutate a reference parameter. So it cannot see, let alone rebind, the
+ * array a hoisted row was read from.
+ *
+ * Two spellings reach here - an INLINE lambda (`map(func(x) => x*2, a)`, a
+ * FuncDeclStmt sitting in the argument list) and a NAME (`sort(a, cmp)`).
+ */
+static bool licm_pure_callback(const Construct *arg)
+{
+    if (auto *fd = node_cast<const FuncDeclStmt>(arg))
+        return fd->desc && fd->desc->effective_pure;
+    return fr_is_pure_func(arg);
+}
+
+/*
+ * `fr_is_const_builtin` matches the NAME against const_builtins without
+ * checking that the builtin is unshadowed - a `func len(x)` of one's own still
+ * answers true there (a pre-existing looseness in try_for_range's bound
+ * analysis, left alone: tightening it would also change the REPL, where
+ * builtins are map-resident and carry no `builtin` SymKind). This pass wants
+ * the real proof, so it additionally requires the resolver's verdict.
+ */
+static bool licm_is_const_builtin(const Construct *callee)
+{
+    auto *id = node_cast<const Identifier>(callee);
+    return id && id->sym.kind == SymKind::builtin
+           && fr_is_const_builtin(callee);
+}
+
+/*
+ * Does `c` contain a call this pass cannot vouch for?
+ *
+ * Allowed: a call to an effectively-pure USER function, and a call to a CONST
+ * BUILTIN whose callable arguments are all provably pure. The second clause is
+ * why `len(arr)` / `abs(x)` / `str(v)` in a loop body cost nothing - their
+ * `callable_arg_mask` is 0, so there is nothing to prove.
+ *
+ * The mask is what makes this safe rather than optimistic. A HIGHER-ORDER
+ * builtin (map/filter/sort/make_array/make_dict/find) runs a callback that
+ * `fr_collect_mutated` cannot see - it stops at a FuncDeclStmt - so a lambda
+ * that appends to the base array would taint nothing and the base would look
+ * invariant. The inferencer stamps which arguments could BE that callback
+ * (a `Func` or a `dyn` static type); each one must then be provably pure.
+ * A callback that is neither an inline lambda nor a named pure function - a
+ * local variable holding one, say - is unprovable here, and refused.
+ *
+ * fr_collect_mutated answers the same question for try_for_range by
+ * assuming the worst (FrMut::taint_all on any call that may run program
+ * code). This pass keeps a live REFERENCE across every iteration, so it
+ * refuses the loop outright.
+ */
+static bool licm_has_opaque_call(Construct *c)
+{
+    if (!c || ctag(c) == ConstructType::func_decl)
+        return false;
+    if (ctag(c) == ConstructType::call) {
+        auto *ce = static_cast<CallExpr *>(c);
+        if (!fr_is_pure_func(ce->what.get())) {
+            if (!licm_is_const_builtin(ce->what.get()))
+                return true;
+            const uint32_t m = ce->callable_arg_mask;
+            const size_t na = ce->args ? ce->args->elems.size() : 0;
+            if (na > 31)
+                return true;
+            /* A bit OUTSIDE the argument range means the mask was never
+             * stamped (it defaults to ~0u) - treat the call as opaque. */
+            const uint32_t valid = na ? ((1u << na) - 1u) : 0u;
+            if (m & ~valid)
+                return true;
+            for (size_t i = 0; i < na; i++)
+                if ((m & (1u << i))
+                    && !licm_pure_callback(ce->args->elems[i].get()))
+                    return true;
+        }
+        /* fall through: the ARGUMENTS still get walked below - an impure call
+         * nested inside a pure call's argument list must still disqualify. */
+    }
+    bool found = false;
+    Inferencer::for_each_child(c, [&](Construct *ch) {
+        if (!found && licm_has_opaque_call(ch))
+            found = true;
+    });
+    return found;
+}
+
+/*
+ * Every name DECLARED inside the loop body - a `var`/`const` decl, a foreach
+ * loop var, a catch variable, a nested func/struct name. A hoisted expression
+ * may not reference one: the hoist runs BEFORE the loop, where such a slot
+ * still holds its previous (or default `none`) value.
+ *
+ * This is NOT covered by fr_collect_mutated, which deliberately SKIPS a
+ * pInDecl assignment - so a body-local `var m = ...` taints nothing and `m[1]`
+ * looked perfectly invariant. That is exactly what the -rt suite caught.
+ */
+static void licm_collect_decls(Construct *c,
+                               std::unordered_set<const UniqueId *> &out)
+{
+    if (!c)
+        return;
+    if (ctag(c) == ConstructType::func_decl) {
+        auto *fd = static_cast<FuncDeclStmt *>(c);
+        if (fd->id)
+            out.insert(fd->id->uid);
+        return;                       /* its params/locals are not visible */
+    }
+    if (ctag(c) == ConstructType::struct_decl) {
+        auto *sd = static_cast<StructDeclStmt *>(c);
+        if (sd->id)
+            out.insert(sd->id->uid);
+        return;
+    }
+    if (ctag(c) == ConstructType::expr14) {
+        auto *e = static_cast<Expr14 *>(c);
+        if (e->fl & pFlags::pInDecl) {
+            if (ctag(e->lvalue.get()) == ConstructType::idlist) {
+                auto *il = static_cast<IdList *>(e->lvalue.get());
+                for (auto &p : il->elems)
+                    out.insert(p->uid);
+            } else if (ctag(e->lvalue.get()) == ConstructType::id) {
+                auto *id = static_cast<Identifier *>(e->lvalue.get());
+                out.insert(id->uid);
+            }
+        }
+    } else if (ctag(c) == ConstructType::foreach_stmt) {
+        auto *fe = static_cast<ForeachStmt *>(c);
+        if (fe->ids)
+            for (auto &p : fe->ids->elems)
+                out.insert(p->uid);
+    } else if (ctag(c) == ConstructType::try_catch) {
+        auto *tc = static_cast<TryCatchStmt *>(c);
+        for (auto &cs : tc->catchStmts)
+            if (cs.first.asId)
+                out.insert(cs.first.asId->uid);
+    }
+    Inferencer::for_each_child(c, [&](Construct *ch) {
+        licm_collect_decls(ch, out);
+    });
+}
+
+/* Does `e` reference any of `names`? */
+static bool licm_refs_any(const Construct *e,
+                          const std::unordered_set<const UniqueId *> &names)
+{
+    if (!e)
+        return false;
+    if (auto *id = node_cast<const Identifier>(e))
+        return names.find(id->uid) != names.end();
+    bool found = false;
+    Inferencer::for_each_child(const_cast<Construct *>(e), [&](Construct *ch) {
+        if (!found && licm_refs_any(ch, names))
+            found = true;
+    });
+    return found;
+}
+
+/* Is `sub` worth hoisting, and provably the same value every iteration? */
+static bool licm_candidate(
+    const Subscript *sub,
+    const FrMut &mut,
+    const std::unordered_set<const UniqueId *> &body_decls,
+    const UniqueId *i_uid)
+{
+    /* Only an ARRAY read: a dict read has vivify/`for_write` subtleties and a
+     * string subscript yields a fresh 1-char string (nothing to share). */
+    if (!sub->base_array)
+        return false;
+    /* Only a CONTAINER result - the win is the intrusive_ptr copy + the boxed
+     * element materialization. A proven scalar element is already a raw slot
+     * read; hoisting one would buy a load and cost a slot. */
+    if (sub->th == TypeHint::i || sub->th == TypeHint::f)
+        return false;
+    /* Nothing declared INSIDE the body: above the loop its slot is stale. */
+    if (licm_refs_any(sub, body_decls))
+        return false;
+    /* Loop-invariant: base and index unchanged, and NO element/field write to
+     * the base anywhere in the loop (mut.content, checked inside fr_immutable)
+     * - that is also what rules out the COW-detach hazard the slice hoister
+     * documents, since any write reachable to the base taints it. Passing
+     * i_uid rejects any use of the loop variable, at any depth. */
+    return fr_immutable(sub, mut, i_uid);
+}
+
+/*
+ * Collect the hoistable subscript SLOTS of one statement. Descends only through
+ * positions that are evaluated UNCONDITIONALLY whenever the statement runs: a
+ * ternary arm, a `??` rhs and a `&&`/`||` tail are short-circuited, so hoisting
+ * out of one could evaluate - and throw on - something the loop never would.
+ * Stops at a chosen subscript (does not descend into it), so the collected
+ * slots are pairwise disjoint and substituting one cannot dangle another.
+ */
+static void licm_collect(
+    unique_ptr<Construct> &slot,
+    const FrMut &mut,
+    const std::unordered_set<const UniqueId *> &body_decls,
+    const UniqueId *i_uid,
+    std::vector<unique_ptr<Construct> *> &out)
+{
+    Construct *c = slot.get();
+    if (!c)
+        return;
+    if (ctag(c) == ConstructType::ternary || ctag(c) == ConstructType::coalesce
+        || ctag(c) == ConstructType::expr11 || ctag(c) == ConstructType::expr12
+        || ctag(c) == ConstructType::func_decl || ctag(c) == ConstructType::block)
+        return;
+    if (auto *sub = node_cast<Subscript>(c))
+        if (licm_candidate(sub, mut, body_decls, i_uid)) {
+            out.push_back(&slot);
+            return;
+        }
+    for_each_child_slot(c, [&](unique_ptr<Construct> &ch) {
+        licm_collect(ch, mut, body_decls, i_uid, out);
+    });
+}
+
+/* Build a use of the hoisted temp: a resolved-local Identifier at the
+ * subscript's own source location (so a caret inside the loop is unmoved). */
+static unique_ptr<Construct>
+licm_make_use(const UniqueId *name, int slot, const Construct *at)
+{
+    auto id = make_unique<Identifier>(name->val);
+    id->sym.kind = SymKind::local;
+    id->sym.slot = slot;
+    id->start = at->start;
+    id->end = at->end;
+    return id;
+}
+
+/*
+ * LOOP-INVARIANT CONTAINER-SUBSCRIPT HOISTING. A nested-container read whose
+ * base and index do not change across the loop - `a[i]` in
+ * `for (var k = 0; k < n; k++) s += a[i][k] * b[k][j];` - re-materializes a
+ * boxed row EvalValue (an intrusive_ptr retain/release plus the element read)
+ * on every iteration. Roughly half of 46_matrix_mult's inner loop was that.
+ * The read is hoisted into a synthetic temp above the loop:
+ *
+ *     Block(scope_free) {
+ *         if (0 < n) { var $licm0 = a[i]; }          // the GUARD
+ *         for (var k = 0; k < n; k++) s += $licm0[k] * b[k][j];
+ *     }
+ *
+ * THE GUARD is what makes this sound. `a[i]` CAN throw (OOB), unlike the slice
+ * hoister's pure-clamping slice, so an unguarded hoist would turn "never
+ * evaluated" into "throws before the loop" for a ZERO-iteration loop. The guard
+ * is the loop's own entry test with the loop variable replaced by the init
+ * value - `COND[k := INIT]` - so:
+ *   - the loop runs >= 1 time -> the guard holds and `a[i]` is evaluated once,
+ *     exactly as it was on iteration 1;
+ *   - the loop runs 0 times   -> the guard fails, `a[i]` is not evaluated, and
+ *     an OOB index still throws never.
+ * The temp is READ only inside the body, which runs only when the guard held.
+ *
+ * Restricted to the counted shape `for (var k = INIT; k CMP BOUND; ...)` with
+ * INIT and BOUND both `fr_immutable` (hence side-effect-free), which makes the
+ * guard exactly `INIT CMP BOUND` - no general substitution, and no risk of
+ * duplicating a side effect into it. A `while` loop is not handled (its
+ * condition would have to be proven side-effect-free separately).
+ *
+ * The ForStmt itself is left UNTOUCHED and merely wrapped: try_for_range runs
+ * next and must still recognize the counted shape, and losing ForRangeStmt
+ * would cost more than the hoist gains.
+ */
+static unique_ptr<Construct>
+try_hoist_loop_subscripts(unique_ptr<Construct> n, int *fsize)
+{
+    if (!fsize || *fsize >= LICM_MAX_FRAME_SLOTS)
+        return n;                     /* no frame to grow, or no room in it */
+    auto *f = node_cast<ForStmt>(n.get());
+    if (!f || !f->init || !f->cond || !f->inc || !f->body)
+        return n;
+
+    /* init: `var k = INIT`, k a slotted-local int */
+    auto *init = node_cast<Expr14>(f->init.get());
+    if (!init || !(init->fl & pFlags::pInDecl) || init->op != Op::assign)
+        return n;
+    auto *ivar = node_cast<Identifier>(init->lvalue.get());
+    if (!ivar || ivar->sym.kind != SymKind::local || ivar->th != TypeHint::i)
+        return n;
+    const UniqueId *i_uid = ivar->uid;
+
+    /* cond: `k CMP BOUND` (the raw pre-specialization form, as try_for_range
+     * matches it) */
+    auto *cond = node_cast<Expr06>(f->cond.get());
+    if (!cond || cond->elems.size() != 2)
+        return n;
+    auto *cleft = node_cast<Identifier>(cond->elems[0].second.get());
+    if (!cleft || cleft->uid != i_uid)
+        return n;
+    const Op cmp = cond->elems[1].first;
+    if (cmp != Op::lt && cmp != Op::le && cmp != Op::gt && cmp != Op::ge)
+        return n;
+
+    /* A call this pass cannot vouch for can invalidate the hoisted reference
+     * through a route the mutation sets do not model. */
+    if (licm_has_opaque_call(f->body.get()))
+        return n;
+
+    FrMut mut;
+    fr_collect_mutated(n.get(), mut);
+    std::unordered_set<const UniqueId *> body_decls;
+    licm_collect_decls(f->body.get(), body_decls);
+
+    /* Both halves of the guard must be side-effect-free (it is evaluated once
+     * BEFORE the loop's own init) and free of the loop variable. */
+    Construct *bound = cond->elems[1].second.get();
+    Construct *init_rv = init->rvalue.get();
+    if (!fr_immutable(bound, mut, i_uid)
+        || !fr_immutable(init_rv, mut, i_uid))
+        return n;
+
+    /*
+     * A guard over two int LITERALS is decidable here (the bounds are const but
+     * AutoConst has already run, so nothing else would fold it): false means
+     * the loop body never runs, so there is nothing to hoist; true means the
+     * guard is unconditional and can be dropped entirely.
+     */
+    bool guard_needed = true;
+    if (auto *li = node_cast<LiteralInt>(init_rv))
+        if (ctag(bound) == ConstructType::lit_int) {
+            auto *lb = static_cast<LiteralInt *>(bound);
+            const int_type x = li->ival(), y = lb->ival();
+            const bool enters = cmp == Op::lt ? x <  y
+                              : cmp == Op::le ? x <= y
+                              : cmp == Op::gt ? x >  y
+                                              : x >= y;
+            if (!enters)
+                return n;
+            guard_needed = false;
+        }
+
+    /*
+     * Scan the body's DIRECT statements in order, stopping at the first one
+     * that is not a plain expression statement: anything else (an `if`, a
+     * nested loop, a `return`/`break`, a `try`) either evaluates its parts
+     * conditionally or can skip the statements after it, so nothing beyond it
+     * is guaranteed to run on every iteration.
+     */
+    std::vector<unique_ptr<Construct> *> sites;
+    std::vector<unique_ptr<Construct> *> stmts;
+    if (ctag(f->body.get()) == ConstructType::block) {
+        auto *b = static_cast<Block *>(f->body.get());
+        for (auto &e : b->elems)
+            stmts.push_back(&e);
+    } else {
+        stmts.push_back(&f->body);
+    }
+    for (unique_ptr<Construct> *sp : stmts) {
+        Construct *s = sp->get();
+        if (ctag(s) != ConstructType::expr14 && ctag(s) != ConstructType::incdec)
+            break;
+        licm_collect(*sp, mut, body_decls, i_uid, sites);
+    }
+    if (sites.empty())
+        return n;
+
+    /* One temp per DISTINCT expression; every occurrence reads that temp. */
+    struct Group {
+        const Construct *rep;      /* owned by the decl below - stable */
+        const UniqueId *name;
+        int slot;
+    };
+    std::vector<Group> groups;
+    std::vector<unique_ptr<Construct>> decls;
+
+    for (unique_ptr<Construct> *sp : sites) {
+        int gi = -1;
+        for (size_t g = 0; g < groups.size(); g++)
+            if (licm_expr_equal(groups[g].rep, sp->get())) {
+                gi = static_cast<int>(g);
+                break;
+            }
+        if (gi >= 0) {
+            *sp = licm_make_use(groups[gi].name, groups[gi].slot, sp->get());
+            continue;
+        }
+        if (*fsize >= LICM_MAX_FRAME_SLOTS)
+            break;                              /* frame budget exhausted */
+
+        const int slot = (*fsize)++;
+        const std::string nm = "$licm" + std::to_string(g_licm_counter++);
+        auto decl_id = licm_make_use(UniqueId::get(nm), slot, sp->get());
+        const UniqueId *name =
+            static_cast<Identifier *>(decl_id.get())->uid;
+
+        auto d = make_unique<Expr14>();
+        d->op = Op::assign;
+        d->fl = pFlags::pInDecl;
+        d->start = (*sp)->start;
+        d->end = (*sp)->end;
+        d->lvalue = std::move(decl_id);
+        auto use = licm_make_use(name, slot, sp->get());
+        d->rvalue = std::move(*sp);            /* the subscript itself */
+        groups.push_back({d->rvalue.get(), name, slot});
+        decls.push_back(std::move(d));
+        *sp = std::move(use);
+    }
+    if (decls.empty())
+        return n;
+
+    auto blk = make_unique<Block>();
+    n->copy_base_fields(*blk);            /* the loop's loc for carets */
+    blk->scope_free = true;
+
+    if (guard_needed) {
+        /* The guard: the loop's condition with the loop variable replaced by
+         * the init value. Cloned, so the loop's own cond is untouched. */
+        auto guard = f->cond->clone();
+        auto *gm = static_cast<MultiOpConstruct *>(guard.get());
+        gm->elems[0].second = init->rvalue->clone();
+
+        auto then_blk = make_unique<Block>();
+        then_blk->scope_free = true;
+        then_blk->start = f->start;
+        then_blk->end = f->end;
+        for (auto &d : decls)
+            then_blk->elems.push_back(std::move(d));
+
+        auto iff = make_unique<IfStmt>();
+        iff->start = f->start;
+        iff->end = f->end;
+        iff->condExpr = std::move(guard);
+        iff->thenBlock = std::move(then_blk);
+        blk->elems.push_back(std::move(iff));
+    } else {
+        for (auto &d : decls)
+            blk->elems.push_back(std::move(d));
+    }
+
+    blk->elems.push_back(std::move(n));
+    return blk;
+}
+
+static unique_ptr<Construct> specialize(unique_ptr<Construct> n, int *fsize)
 {
     if (!n)
         return n;
+    /* lever 3: hoist loop-invariant slice decls FIRST (the loop keeps its
+     * raw form for try_for_range below; the wrapper block's children then
+     * specialize individually). */
+    /* #107: each pass FIRED iff it changed the node's kind (a wrapper
+     * Block, a ForRangeStmt) - recorded here, outside the passes' gates */
+    ML_INT_ONLY(const Loc int_at = n->start;)
+    if (node_cast<ForStmt>(n.get())
+            || node_cast<WhileStmt>(n.get())) {
+        if (!(g_opt_disabled & opt_slice_hoist)) {
+            n = try_hoist_loop_slices(std::move(n));
+            ML_INT_ONLY(if (ctag(n.get()) == ConstructType::block)
+                            ML_INT(ast_transform, "slice_hoist",
+                                   int_at.line, int_at.col);)
+        }
+        /* then the invariant container reads INSIDE the loop (a `for` only).
+         * If the slice hoist already produced a wrapper Block, the recursion
+         * below re-enters specialize() on the loop and it gets its turn. */
+        if (!(g_opt_disabled & opt_licm)
+            && node_cast<ForStmt>(n.get())) {
+            n = try_hoist_loop_subscripts(std::move(n), fsize);
+            ML_INT_ONLY(if (ctag(n.get()) == ConstructType::block)
+                            ML_INT(ast_transform, "licm",
+                                   int_at.line, int_at.col);)
+        }
+        if (ctag(n.get()) == ConstructType::block) {
+            auto *blk = static_cast<Block *>(n.get());
+            for (auto &e : blk->elems)
+                e = specialize(std::move(e), fsize);
+            return n;
+        }
+    }
     /* a counted for-loop -> ForRangeStmt (matched on the raw form, BEFORE its
      * cond/inc are specialized away). */
-    if (dynamic_cast<ForStmt *>(n.get())) {
-        n = try_for_range(std::move(n));
-        if (dynamic_cast<ForRangeStmt *>(n.get()))
+    if (!(g_opt_disabled & opt_for_range)
+        && node_cast<ForStmt>(n.get())) {
+        n = try_for_range(std::move(n), fsize);
+        if (node_cast<ForRangeStmt>(n.get())) {
+            ML_INT(ast_transform, "for_range", int_at.line, int_at.col);
             return n;     /* matched: sub-trees already specialized */
+        }
     }
-    specialize_children(n.get());     /* bottom-up: children first */
+    specialize_children(n.get(), fsize);     /* bottom-up: children first */
+    if (g_opt_disabled & opt_typed)
+        return n;
     return try_specialize(std::move(n));
 }
 
@@ -4990,7 +10993,53 @@ void infer_types(Construct *root, bool enable, bool strict)
     /* -nti still lowers named-arg calls (syntactic, required for correctness),
      * but skips the fixpoint / type checking / strict enforcement. */
     inf.checks_enabled = enable;
+    inf.closed_world = true;
+    /* containers take types only in a typed run (fit_adopt) */
+    g_ctype_adopt = enable;
     inf.run();
+}
+
+/*
+ * Question 5 (plans/open-language-questions.md): type a parse-time call's
+ * synthetic program (pt_typed_call, parser.cpp) exactly as a compile
+ * types the program, then carry each declaration's decl_type to its uses,
+ * as resolve_names does for a compile - a parse-time run does not go
+ * through the resolver, and `x = 1` into a `float x` must coerce there
+ * too. Inference's trace is not the program's: it is silenced.
+ */
+void infer_parse_time(Construct *root)
+{
+    struct Quiet {
+        unsigned saved = g_trace_mask;
+        Quiet() { g_trace_mask = 0; }
+        ~Quiet() { g_trace_mask = saved; }
+    } quiet;
+    Inferencer inf(root);
+    inf.strict_dyn = true;
+    inf.checks_enabled = true;
+    inf.run();
+    inf.propagate_decl_types();
+}
+
+void Inferencer::propagate_decl_types()
+{
+    for (const auto &kv : id_sym) {
+        const TypeSym *s = kv.second;
+        if (!s || !s->decl_id || ctag(kv.first) != ConstructType::id)
+            continue;
+        auto *id = const_cast<Identifier *>(
+            static_cast<const Identifier *>(kv.first));
+        if (id->decl_type == DeclType::none)
+            id->decl_type = s->decl_id->decl_type;
+    }
+}
+
+/* The static type inference gives a parse-time VALUE (a literal of it),
+ * rendered: what a typed parse-time run's instance depends on */
+std::string static_type_key(const EvalValue &v)
+{
+    Inferencer inf;
+    return inf.value_type_key(v);
 }
 
 /*
@@ -5005,7 +11054,7 @@ void Inferencer::collect_arrays(AnalysisInfo &out)
 {
     for (const auto &kv : id_sym) {
 
-        const Identifier *id = dynamic_cast<const Identifier *>(kv.first);
+        const Identifier *id = node_cast<const Identifier>(kv.first);
         TypeSym *s = kv.second;
         if (!id || !s)
             continue;
@@ -5039,6 +11088,19 @@ void dump_type_info(Construct *root, std::ostream &os)
     inf.strict_dyn = false;
     inf.run();
     inf.dump_debug_ti(os);
+}
+
+void dump_callee_sets(Construct *root, std::ostream &os)
+{
+    if (!root)
+        return;
+
+    /* Non-strict, exactly like -dti: the point is to SEE what the
+     * analysis concluded, not to refuse the program first. */
+    Inferencer inf(root);
+    inf.strict_dyn = false;
+    inf.run();
+    inf.dump_callee_sets(os);
 }
 
 void collect_array_analysis(Construct *root, AnalysisInfo &out)
@@ -5076,7 +11138,7 @@ static const FuncDeclStmt *
 show_named_func(const Block *root, const UniqueId *uid)
 {
     for (const auto &e : root->elems)
-        if (auto *fd = dynamic_cast<const FuncDeclStmt *>(e.get()))
+        if (auto *fd = node_cast<const FuncDeclStmt>(e.get()))
             if (fd->id && fd->id->uid == uid)
                 return fd;
     return nullptr;
@@ -5092,17 +11154,18 @@ fold_show_slot(unique_ptr<Construct> &slot, const Block *root)
     for_each_child_slot(slot.get(),
         [&](unique_ptr<Construct> &ch) { fold_show_slot(ch, root); });
 
-    auto *ce = dynamic_cast<CallExpr *>(slot.get());
+    auto *ce = node_cast<CallExpr>(slot.get());
     if (!ce || !ce->args || ce->args->elems.size() != 1)
         return;
-    auto *callee = dynamic_cast<Identifier *>(ce->what.get());
+    auto *callee = node_cast<Identifier>(ce->what.get());
     if (!callee || callee->sym.kind != SymKind::builtin
             || callee->get_str() != "show")
         return;
 
     Construct *arg = ce->args->elems[0].get();
     std::string code;
-    if (auto *id = dynamic_cast<Identifier *>(arg)) {
+    if (ctag(arg) == ConstructType::id) {
+        auto *id = static_cast<Identifier *>(arg);
         const FuncDeclStmt *fd = show_named_func(root, id->uid);
         if (!fd)
             return;              /* not a named func: leave for the runtime */
@@ -5115,7 +11178,7 @@ fold_show_slot(unique_ptr<Construct> &slot, const Block *root)
     lit->start = ce->start;
     lit->end = ce->end;
     lit->inline_ctx = ce->inline_ctx;
-    slot = move(lit);
+    slot = std::move(lit);
 }
 
 static void fold_show_calls(Block *root)
@@ -5124,17 +11187,57 @@ static void fold_show_calls(Block *root)
         fold_show_slot(e, root);
 }
 
+unsigned g_opt_disabled = 0;
+/* `--strict` (step 7): every non-local must be DECLARED ABOVE its first use.
+ * Off by default - it refuses programs that are correct today, so it is the
+ * place for rules too aggressive to impose on everyone. Read by the resolver
+ * (strict_forward_globals); a global for the same reason g_opt_disabled is -
+ * threading a flag through run_optimizers' callers buys nothing. */
+bool g_strict_mode = false;
+
+int g_tmpl_max_instances = 64;        /* --max-instances (inferencer.h) */
+
+std::vector<CompileWarning> g_warnings;
+
+void compile_warn(const char *msg, Loc start, Loc end)
+{
+    g_warnings.push_back(CompileWarning{ msg, start, end });
+}
+
+bool opt_pass_bit(const std::string &name, unsigned &bit)
+{
+    static const struct { const char *n; unsigned b; } tbl[] = {
+        { "licm",        opt_licm        },
+        { "slice-hoist", opt_slice_hoist },
+        { "for-range",   opt_for_range   },
+        { "typed",       opt_typed       },
+        { "all",         opt_all_passes  },
+    };
+    for (const auto &e : tbl)
+        if (name == e.n) { bit = e.b; return true; }
+    return false;
+}
+
+const char *opt_pass_names()
+{
+    return "licm, slice-hoist, for-range, typed, all";
+}
+
 void specialize_types(Construct *root, bool enable, EvalContext *prior_scope,
                       AnalysisInfo *analyze)
 {
     if (!enable || !root)
         return;
 
-    auto *blk = dynamic_cast<Block *>(root);
+    auto *blk = node_cast<Block>(root);
     if (!blk)
         return;
 
     g_specialize_analyze = analyze;   /* null in a normal run (no recording) */
+    /* Reset per run, NOT monotonic across the process: two compiles of the
+     * same program must produce byte-identical trees (the .myv determinism
+     * property, and cross_compile_specialize_stable). */
+    g_licm_counter = 0;
 
     /* a for-range bound may call a pure user function (with scalar args) -
      * collect this program's effectively-pure functions first, plus (in the
@@ -5155,8 +11258,11 @@ void specialize_types(Construct *root, bool enable, EvalContext *prior_scope,
         }
     }
 
+    /* Top-level statements run in "main", whose frame is the root block's
+     * slot_count - the frame a LICM hoist there grows (Block::do_eval and the
+     * codegen both size main's frame from it). */
     for (auto &e : blk->elems)
-        e = specialize(std::move(e));
+        e = specialize(std::move(e), &blk->slot_count);
 
     /* The tree is FINAL now - fold every foldable show() (see above), so the
      * codegen never sees the one remaining node-ABI builtin. */
@@ -5171,6 +11277,9 @@ void specialize_types(Construct *root, bool enable, EvalContext *prior_scope,
 struct ReplInfer::Impl {
     Inferencer inf;            /* root == nullptr; fed one input at a time */
     bool did_setup = false;
+    /* the last check_input accepted its input, which reject_input may
+     * still take back (never an earlier one: its snapshot is gone) */
+    bool can_reject = false;
 
     Impl() {
         inf.strict_dyn = true;     /* faithful: the real strict checks */
@@ -5183,7 +11292,8 @@ ReplInfer::~ReplInfer() = default;
 
 void ReplInfer::check_input(Construct *input)
 {
-    auto *blk = dynamic_cast<Block *>(input);
+    impl->can_reject = false;
+    auto *blk = node_cast<Block>(input);
     if (!blk)
         return;
 
@@ -5192,11 +11302,27 @@ void ReplInfer::check_input(Construct *input)
         impl->did_setup = true;
     }
     impl->inf.infer_input(blk);
+    impl->can_reject = true;
 }
 
 void ReplInfer::undef_global(const UniqueId *name)
 {
     impl->inf.undef_global(name);
+}
+
+void ReplInfer::reject_input()
+{
+    if (impl->can_reject)
+        impl->inf.reject_input();
+    impl->can_reject = false;
+}
+
+void ReplInfer::forget_unbound(
+    const std::function<bool (const UniqueId *)> &ran)
+{
+    if (impl->can_reject)
+        impl->inf.forget_unbound(ran);
+    impl->can_reject = false;
 }
 
 std::string ReplInfer::global_type(const UniqueId *name)
@@ -5219,11 +11345,37 @@ bool ReplInfer::instance_has_consumer(const FuncDeclStmt *fn)
     return impl->inf.instance_has_consumer(fn);
 }
 
+/* The exported form of alias_struct_of (inferencer.h): the resolver's
+ * warning tier asks it which top-level constants are type aliases. */
+const StructTypeDef *type_alias_struct(const Construct *rv, size_t i,
+                                       bool element)
+{
+    return alias_struct_of(rv, i, element);
+}
+
 /* The exported COMPLETE child visitor (inferencer.h) - a thin wrapper over
  * Inferencer::for_each_child so external walks (the VM's AOT precompile /
  * ownership transfer) cannot miss a node. */
 void for_each_child_of(Construct *c,
                        const std::function<void (Construct *)> &f)
 {
+    /*
+     * #47: its callers walk the FINAL tree - after specialize_types - and
+     * there a TypedScalarExpr is an ordinary interior node: `sum(xs, func
+     * (int x) => x * 2) + 1`, or an inlined `f(x) + 1` whose `f` was a
+     * lambda argument, puts a FUNCTION LITERAL under one. The inferencer's
+     * own walker keeps it a leaf (its passes run before M8), and this
+     * wrapper used to inherit that: collect_funcs never saw such a lambda,
+     * so vm_compile neither compiled its body nor took its descriptor, the
+     * AST teardown freed it, and the first MakeClosureV read freed memory
+     * (ASan: heap-use-after-free under -nj and the JIT; -tw keeps its AST).
+     */
+    if (c && c->ct == ConstructType::typed_scalar) {
+        for (auto &pr : static_cast<TypedScalarExpr *>(c)->elems)
+            f(pr.second.get());
+        return;
+    }
     Inferencer::for_each_child(c, f);
 }
+
+#include "calleeset.cpp.h"

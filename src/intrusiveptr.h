@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <utility>
 #include <cstddef>
+#include <vector>
 
 /*
  * A minimal intrusive, NON-atomic reference-counted smart pointer.
@@ -42,12 +43,106 @@ struct RefCounted {
     RefCounted &operator=(RefCounted &&) { return *this; }
 };
 
+/*
+ * BOUNDED DESTRUCTION (2026-10-12). Freeing an object releases what it
+ * holds, so a CHAIN of values - a linked list of class nodes, arrays or
+ * dicts nested 100k deep - is freed by recursion, several C++ frames per
+ * link: a 20000-node list overflowed the stack of a debug build and a
+ * 1M-deep one a release build, wherever its head was dropped (program
+ * exit included). Every last release comes here: up to DESTROY_MAX_DEPTH
+ * deletions run nested as before, a deeper one is QUEUED, and the
+ * outermost deletion empties the queue before it returns. The recursion
+ * is bounded, everything is still freed before the release that started
+ * it returns, and only the ORDER of destruction changes - no destructor
+ * here runs program code or has an observable effect.
+ */
+struct DeferredDestroy {
+    void *obj;
+    void (*del)(void *) noexcept;
+};
+
+constexpr int DESTROY_MAX_DEPTH = 32;
+inline int g_destroy_depth = 0;
+
+/* never destroyed: a release during static destruction may still queue */
+inline std::vector<DeferredDestroy> &destroy_queue()
+{
+    /* its branches are the static's initialization guard (INT-COV-EXEMPT
+     * on the line): the C++ runtime's, taken once per process */
+    static auto *q = new std::vector<DeferredDestroy>(); /* INT-COV-EXEMPT */
+    return *q;
+}
+
+ML_NOINLINE inline void destroy_drain() noexcept
+{
+    std::vector<DeferredDestroy> &q = destroy_queue();
+    while (!q.empty()) {
+        const DeferredDestroy d = q.back();
+        q.pop_back();
+        ++g_destroy_depth;
+        d.del(d.obj);
+        --g_destroy_depth;
+    }
+}
+
+/* the one typed step: run or queued, by destroy_any */
+template <class T>
+void destroy_delete(void *o) noexcept
+{
+    delete static_cast<T *>(o);    /* INT-COV-EXEMPT: the null test */
+}
+
+/*
+ * The depth rule lives in ONE function, not in the template: a branch in
+ * destroy_counted<T> is a separate coverage element per counted type, and
+ * the queue arm of most of them is reached by no program (a chain of
+ * strings does not exist). Inlined into destroy_counted<T>, `del` is a
+ * constant, so an optimized build calls the typed delete directly.
+ */
+inline void destroy_any(void *p, void (*del)(void *) noexcept) noexcept
+{
+    if (g_destroy_depth >= DESTROY_MAX_DEPTH) {
+        destroy_queue().push_back({p, del});
+        return;
+    }
+    ++g_destroy_depth;
+    del(p);
+    --g_destroy_depth;
+    if (g_destroy_depth == 0 && !destroy_queue().empty())
+        destroy_drain();
+}
+
+/* delete a counted object whose count reached 0 (see above) */
+template <class T>
+void destroy_counted(T *p) noexcept
+{
+    destroy_any(p, &destroy_delete<T>);
+}
+
 template <class T>
 class intrusive_ptr final {
 
     T *ptr;
 
     void retain() { if (ptr) ++ptr->intr_refcount; }
+
+    /*
+     * #109: the COLD half of release(), kept OUT OF LINE on purpose.
+     *
+     * `delete ptr` drags in T's whole destructor - for SharedStr::StrObj that
+     * is ~std::string -> free - which makes release() big enough that GCC
+     * out-lines the WHOLE function. Every reference drop in the interpreter
+     * then pays a call frame to perform a three-instruction decrement: 90M Ir
+     * on 75_indexed_unpack alone (callgrind, DEBUG_INFO=1, OPT=1 ASSERTS=0),
+     * ~9 Ir per release where the inline form is 3-4.
+     *
+     * Splitting it lets the hot half inline at the call site and leaves the
+     * destroy - which is a real free, and rare - behind one call. The
+     * ML_CHECK stays in the INLINE half: it is the over-release tripwire and
+     * must fire at the exact point the balance breaks, not one frame away.
+     */
+    ML_NOINLINE void destroy() { destroy_counted(ptr); }
+
     void release()
     {
         if (ptr) {
@@ -56,7 +151,7 @@ class intrusive_ptr final {
              * catch it at the exact point the balance breaks. */
             ML_CHECK(ptr->intr_refcount > 0);
             if (--ptr->intr_refcount == 0)
-                delete ptr;
+                destroy();
         }
     }
 

@@ -25,6 +25,8 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <map>
+#include <unordered_set>
 #include <algorithm>
 #include <iterator>
 #include <cctype>
@@ -37,7 +39,7 @@
 using std::string;
 
 /* Is stdout a terminal (for color)? The REPL is non-interactive on Windows
- * (see plans/repl.md), so there it is always "not a tty" - no color. */
+ * (see plans/archived/repl.md), so there it is always "not a tty" - no color. */
 static bool
 repl_out_is_tty()
 {
@@ -51,26 +53,190 @@ repl_out_is_tty()
 /* Syntax-highlight a (possibly multi-line) rendered block (defined below). */
 static string show_colorize(const string &s, bool color);
 
+/* Past the bracket that closes the one at toks[i] (end if unbalanced). */
+static size_t
+repl_skip_bracket(const std::vector<Tok> &toks, size_t i, size_t end)
+{
+    int depth = 0;
+    for (; i < end; i++) {
+        const Tok &t = toks[i];
+        if (t == Op::parenL || t == Op::bracketL || t == Op::braceL)
+            depth++;
+        else if (t == Op::parenR || t == Op::bracketR || t == Op::braceR)
+            if (--depth == 0)
+                return i + 1;
+    }
+    return end;
+}
+
+/*
+ * Is the statement WRITTEN as toks[i, end) a plain VALUE LOOKUP - a bare
+ * variable, the `none`/`null` literal, or a member/subscript access (`a.b`,
+ * `a?.b`, `f()[0]`)? Decided on the tokens, i.e. on what the user typed:
+ * the tree has been folded by then, and a call folded to a literal (`w()`
+ * of a void `func w() { }`, by the optimizers or by the parser's const
+ * evaluation) reads exactly like a written `none`.
+ */
+static bool
+repl_value_lookup(const std::vector<Tok> &toks, size_t i, size_t end)
+{
+    if (i >= end)
+        return false;
+
+    /* a parenthesized whole: what is inside it */
+    if (toks[i] == Op::parenL && repl_skip_bracket(toks, i, end) == end)
+        return repl_value_lookup(toks, i + 1, end - 1);
+
+    /* the primary: a name, none / null, a bracketed literal, or a
+     * parenthesized expression a step follows (`(d)["k"]`) */
+    const Tok &first = toks[i];
+    size_t k;
+    if (first == TokType::id || first == Keyword::kw_none
+            || first == Keyword::kw_null)
+        k = i + 1;
+    else if (first == Op::bracketL || first == Op::braceL
+             || first == Op::parenL)
+        k = repl_skip_bracket(toks, i, end);
+    else
+        return false;
+    const bool bare = (first == TokType::id || first == Keyword::kw_none
+                       || first == Keyword::kw_null);
+
+    /* then postfix steps; the LAST one decides (a call is not a lookup) */
+    bool last_is_access = false;
+    while (k < end) {
+        if ((toks[k] == Op::dot || toks[k] == Op::qmdot) && k + 1 < end
+                && toks[k + 1] == TokType::id) {
+            k += 2;
+            last_is_access = true;
+        } else if (toks[k] == Op::bracketL) {
+            k = repl_skip_bracket(toks, k, end);
+            last_is_access = true;
+        } else if (toks[k] == Op::parenL) {
+            k = repl_skip_bracket(toks, k, end);
+            last_is_access = false;
+        } else {
+            return false;                /* an operator: not a lookup */
+        }
+    }
+    return k == i + 1 ? bare : last_is_access;
+}
+
 /*
  * Should a `none`-valued result be echoed? A `none` is normally suppressed (a
  * func/struct decl, a `print`, an `if`/loop, a void call all yield it - echoing
  * `=> none` for them would be noise). But when the last statement is a plain
- * VALUE LOOKUP - a bare variable, a member/subscript access, or the `none`/
- * `null` literal - the user asked to SEE that value, so show `=> none`.
+ * VALUE LOOKUP (repl_value_lookup) the user asked to SEE that value, so show
+ * `=> none`. `last` is the last top-level statement, after the optimizers -
+ * only its START is used, to find its tokens.
  */
 static bool
-repl_echo_none(const Construct *c)
+repl_echo_none(const Construct *last, const std::vector<Tok> &toks)
 {
-    return c &&
-           (c->is_id() ||                                /* a bare variable */
-            dynamic_cast<const MemberExpr *>(c) ||        /* obj.field */
-            dynamic_cast<const Subscript *>(c) ||         /* a[i] */
-            dynamic_cast<const LiteralNone *>(c));        /* none / null */
+    /* the node is a lookup or a literal (never a declaration, whose node
+     * starts at the declared NAME), and its tokens are a lookup */
+    if (!last || !last->start
+            || !(last->is_id() || node_cast<const MemberExpr>(last)
+                 || node_cast<const Subscript>(last)
+                 || node_cast<const LiteralNone>(last)))
+        return false;
+    const Loc s = last->start;
+    size_t i = 0;
+    while (i < toks.size()
+           && (toks[i].loc.line < s.line
+               || (toks[i].loc.line == s.line && toks[i].loc.col < s.col)))
+        i++;
+    /* a parenthesized statement's node starts INSIDE its parentheses (a
+     * `(` before a top-level statement's start can only be its own) */
+    while (i > 0 && toks[i - 1] == Op::parenL)
+        i--;
+    /* the statement ends at the first `;` outside brackets */
+    size_t end = i;
+    int depth = 0;
+    for (; end < toks.size(); end++) {
+        const Tok &t = toks[end];
+        if (t == Op::parenL || t == Op::bracketL || t == Op::braceL)
+            depth++;
+        else if (t == Op::parenR || t == Op::bracketR || t == Op::braceR)
+            depth--;
+        else if (t == Op::semicolon && depth <= 0)
+            break;
+    }
+    return repl_value_lookup(toks, i, end);
+}
+
+/* The global names a top-level statement binds when it runs: a function or
+ * struct declaration's name, a `var`/`const` declaration's targets. */
+static void
+repl_declared_names(const Construct *c,
+                    std::unordered_set<const UniqueId *> &out)
+{
+    if (const auto *fd = node_cast<const FuncDeclStmt>(c)) {
+        if (fd->id)
+            out.insert(fd->id->uid);
+    } else if (const auto *sd = node_cast<const StructDeclStmt>(c)) {
+        if (sd->id)
+            out.insert(sd->id->uid);
+    } else if (const auto *e = node_cast<const Expr14>(c)) {
+        if (!(e->fl & pFlags::pInDecl))
+            return;
+        if (const auto *id = node_cast<const Identifier>(
+                e->lvalue.get()))
+            out.insert(id->uid);
+        else if (const auto *il = node_cast<const IdList>(
+                     e->lvalue.get()))
+            for (const auto &x : il->elems)
+                out.insert(x->uid);
+    }
 }
 
 /* Width budget for the `=>` echo's pretty-printer: a value whose single-line
  * form is wider than this is expanded across lines. */
 static const int REPL_PRETTY_WIDTH = 80;
+
+/*
+ * The persistent CONST context as it was before an input was parsed. The
+ * parser commits to it while it parses - a const's value, a struct's
+ * descriptor, a `pure func` - so an input REFUSED before it runs (a
+ * syntax, type or optimizer error) must give those back, or the refused
+ * declaration stays in force: a refused `pure func pf() => 2` was what a
+ * later `pf()` folded to, a refused struct redefinition what a later
+ * `S1 p` resolved as its type. A name the input bound is erased, and
+ * every saved binding gets its saved value back IN PLACE, rebound or
+ * not. Telling a rebound slot by its ADDRESS (the first version) failed
+ * in an optimized build: a redefinition erases and re-binds the name,
+ * and the allocator handed the freed map node straight back, so the
+ * refused struct looked untouched ("'sp1' is declared 'S1' but is
+ * assigned 'S1'" - rel-hard only; the debug build's ASan quarantine
+ * never reuses an address that soon).
+ */
+struct ConstSnapshot {
+    std::map<const UniqueId *, LValue> entries;
+
+    explicit ConstSnapshot(const EvalContext &c) {
+        std::vector<std::pair<const UniqueId *, const LValue *>> syms;
+        c.collect_symbols(syms);
+        for (const auto &kv : syms)
+            entries.emplace(kv.first, *kv.second);
+    }
+
+    void restore(EvalContext &c) const {
+        std::vector<std::pair<const UniqueId *, const LValue *>> syms;
+        c.collect_symbols(syms);
+        for (const auto &kv : syms)
+            if (!entries.count(kv.first)) {
+                Identifier id(kv.first->val);   /* bound by the input */
+                c.erase(&id);
+            }
+        for (const auto &kv : entries) {
+            if (LValue *cur = c.lookup(kv.first))
+                *cur = kv.second;
+            else
+                c.emplace(kv.first, EvalValue(kv.second.get()),
+                          kv.second.is_const_var());
+        }
+    }
+};
 
 /*
  * Persistent interpreter state for the REPL. The const context and the runtime
@@ -103,12 +269,44 @@ struct ReplEngine::Impl {
          * `var`'s TYPE still sticks - the inferencer's job, not this.) */
         runtime_ctx->allow_redeclare = true;
         const_ctx->allow_redeclare = true;
+        /* a pure call the parser runs is type-inferred first (question 5) */
+        const_ctx->parse_typed = true;
     }
 
     string format_error(const Exception &e) const {
         std::ostringstream o;
         format_exception(o, e, lines);
         return o.str();
+    }
+
+    /* an error raised while an input is compiled: one a constant
+     * expression raised says so (question 6) */
+    string format_compile_error(const Exception &e) const {
+        std::ostringstream o;
+        format_exception(o, e, lines, std::string(), /*compiling=*/true);
+        return o.str();
+    }
+
+    /* Point an input's parser at the persistent const scope, and tell it
+     * which const builtins' names an EARLIER input gave the program's own
+     * function (or struct): the parser learns that from `func NAME` in its
+     * token stream (ParseContext::shadowed, #133), which a later input's
+     * stream does not hold - after `func abs(x) => 42`, a later `abs(-3)`
+     * folded to the builtin's 3 while `abs(runtime(-3))` gave 42. */
+    void bind_parser(ParseContext &pc) const {
+        pc.const_ctx = const_ctx.get();
+        std::vector<std::pair<const UniqueId *, const LValue *>> s;
+        runtime_ctx->collect_symbols(s);
+        /* the program's own binding is a function or a struct (a const
+         * builtin cannot be rebound to anything else); a builtin's own
+         * entry is a Builtin or a value - `inf`, `math_pi` */
+        for (const auto &kv : s) {
+            const EvalValue &v = kv.second->get();
+            if (EvalContext::const_builtins.count(kv.first)
+                    && (v.is<intrusive_ptr<FuncObject>>()
+                        || v.is<StructTypeDef *>()))
+                pc.shadow_add(kv.first);
+        }
     }
 
     /* The interned names currently bound in the global scope (sorted), used to
@@ -170,6 +368,27 @@ ReplEngine::set_color(bool on)
     impl->color = on;
 }
 
+/*
+ * The command word of a `:` meta-command input (`quit` for ":quit  "), or
+ * "" when the input is not one. The ONE reading of it: run_repl's exit
+ * test and meta_command's dispatch both ask, so an input cannot run as
+ * `:quit` and fail the exit test - the loop compared the whole input with
+ * ":quit", so `:quit ` (a trailing space) neither exited nor did anything.
+ */
+static string
+repl_meta_word(const string &input)
+{
+    const size_t s = input.find_first_not_of(" \t\r\n");
+    if (s == string::npos || input[s] != ':')
+        return "";
+    string word;
+    for (size_t i = s + 1;
+         i < input.size() && !isspace(static_cast<unsigned char>(input[i]));
+         i++)
+        word += input[i];
+    return word;
+}
+
 string
 ReplEngine::eval_input(const string &src)
 {
@@ -185,7 +404,11 @@ ReplEngine::eval_input(const string &src)
 
 /* Is `op` a token after which a statement clearly continues (so no `;` should
  * be auto-inserted at a line end)? Binary/assign operators, comma/dot/arrow/
- * colon, an open bracket, or a semicolon already present. */
+ * colon, an open bracket, or a semicolon already present. The ternary's `?`
+ * and `??` count: a value follows them, so a `{` there opens a dict literal
+ * (`c ? {"a": 1} : d` got a `;` inside its dict). A `?` that is a type's
+ * nullable suffix is followed by the declared name, never by a `{` or the
+ * end of the line. */
 static bool
 repl_continuation_op(Op op)
 {
@@ -193,14 +416,16 @@ repl_continuation_op(Op op)
         case Op::plus:  case Op::minus: case Op::times: case Op::div:
         case Op::mod:   case Op::lt:    case Op::gt:    case Op::le:
         case Op::ge:    case Op::eq:    case Op::noteq: case Op::land:
-        case Op::lor:   case Op::band:  case Op::bor:   case Op::assign:
-        case Op::addeq: case Op::subeq: case Op::muleq: case Op::diveq:
-        case Op::modeq: case Op::comma: case Op::dot:   case Op::arrow:
+        case Op::lor:   case Op::band:  case Op::bor:   case Op::bxor:
+        case Op::shl:   case Op::shr:   case Op::ushr:  case Op::assign:
+        case Op::comma: case Op::dot:   case Op::arrow: case Op::qmdot:
+        case Op::questionmark:          case Op::coalesce:
         case Op::colon: case Op::parenL: case Op::braceL: case Op::bracketL:
         case Op::semicolon:
             return true;
         default:
-            return false;
+            /* every compound assignment, via the single map (operators.h) */
+            return compound_assign_base(op) != Op::invalid;
     }
 }
 
@@ -212,7 +437,10 @@ repl_continuation_op(Op op)
  * (a binary operator, comma, an open bracket, ...). Inside a `{}` block, each
  * statement line is terminated, so a multi-line func/if body works without
  * typing `;`. A `;` after a `}` is a harmless empty statement (and is needed
- * after a dict literal), so it is added.
+ * after a dict literal), so it is added. The `;` goes where the line's CODE
+ * ends - before a trailing `#` comment - and a block closed on the line of
+ * its last statement (`if (c) { print(3) }`) gets that statement's `;`
+ * before its `}`.
  */
 /*
  * Find the "code" span [begin, end) of one physical line, given the running
@@ -273,6 +501,99 @@ repl_scan_line(const string &line, bool &in_string, bool &in_comment,
     return begin;
 }
 
+/* `else` / `catch` / `finally`: a token that continues an if or try chain */
+static bool repl_chain_kw(const Tok &t)
+{
+    return t == Keyword::kw_else || t == Keyword::kw_catch
+        || t == Keyword::kw_finally;
+}
+
+/* how a token moves the bracket depth: +1 opens, -1 closes, 0 neither */
+static int repl_depth_delta(const Tok &t)
+{
+    if (t == Op::parenL || t == Op::bracketL || t == Op::braceL)
+        return 1;
+    if (t == Op::parenR || t == Op::bracketR || t == Op::braceR)
+        return -1;
+    return 0;
+}
+
+/*
+ * A statement HEADER that wants its body next: the `(` of an if / while /
+ * for / foreach / catch, and a trailing `else` / `try` / `finally`. A line
+ * ending in one must neither get a `;` - that gave the statement an EMPTY
+ * body and ran the next line on its own, so `if (k == 2)` / `print(x)`
+ * printed whatever k was, where a script does not - nor be submitted.
+ */
+static bool repl_header_kw(const Tok &t)
+{
+    return t == Keyword::kw_if || t == Keyword::kw_while
+        || t == Keyword::kw_for || t == Keyword::kw_foreach
+        || t == Keyword::kw_catch;
+}
+
+static bool repl_body_kw(const Tok &t)
+{
+    return t == Keyword::kw_else || t == Keyword::kw_try
+        || t == Keyword::kw_finally;
+}
+
+/* Is toks[i], a `(`, a header's - a statement keyword's, or a function's
+ * parameter list (`func f(`, a lambda's `func (`, `func [c] (`)? A body
+ * follows that `)`, as it follows `if (c)`: a script may put the `{` on
+ * the next line, and a `;` at the line's end gave the function no body. */
+static bool repl_header_paren(const std::vector<Tok> &toks, size_t i)
+{
+    if (i == 0)
+        return false;
+    const Tok &b = toks[i - 1];
+    if (repl_header_kw(b) || b == Keyword::kw_func)
+        return true;
+    if (b == TokType::id)
+        return i >= 2 && toks[i - 2] == Keyword::kw_func;
+    if (!(b == Op::bracketR))
+        return false;
+    /* a capture list: the `[` that `]` closes follows `func` */
+    int depth = 0;
+    for (size_t j = i - 1; j-- > 0;) {
+        if (toks[j] == Op::bracketR)
+            depth++;
+        else if (toks[j] == Op::bracketL && depth-- == 0)
+            return j > 0 && toks[j - 1] == Keyword::kw_func;
+    }
+    return false;
+}
+
+/* the tokens end in `struct NAME` / `class NAME`: its `{ fields }` may be
+ * on the next line */
+static bool repl_ends_in_type_name(const std::vector<Tok> &toks)
+{
+    const size_t n = toks.size();
+    return n >= 2 && toks[n - 1] == TokType::id
+        && (toks[n - 2] == Keyword::kw_struct
+            || toks[n - 2] == Keyword::kw_class);
+}
+
+/* the whole input ends in a header (is_incomplete's test) */
+static bool repl_ends_in_header(const std::vector<Tok> &toks)
+{
+    if (toks.empty())
+        return false;
+    if (repl_body_kw(toks.back()) || repl_ends_in_type_name(toks))
+        return true;
+    if (!(toks.back() == Op::parenR))
+        return false;
+    int depth = 0;
+    for (size_t i = toks.size(); i-- > 0;) {
+        if (toks[i] == Op::parenR) {
+            depth++;
+        } else if (toks[i] == Op::parenL && --depth == 0) {
+            return repl_header_paren(toks, i);
+        }
+    }
+    return false;
+}
+
 static string
 repl_auto_terminate(const string &src)
 {
@@ -295,10 +616,32 @@ repl_auto_terminate(const string &src)
      */
     std::vector<char> stack;
     bool expects_value = false;       /* statement position at the start */
+    /* the last code token ENDS a value no `;` terminates yet - so a block's
+     * `}` right after it needs one (across lines too: a value on a line
+     * that got no `;`, e.g. the end of a call spanning lines) */
+    bool open_value = false;
     bool in_string = false;           /* a string spanning physical lines */
     bool in_comment = false;          /* a block comment spanning lines */
 
-    for (const string &line : phys) {
+    /* the next line holding code starts with `else` / `catch` / `finally`:
+     * the block a line closes is then not the statement's end (`}` on one
+     * line, `else {` on the next, as a script may have it) */
+    const auto next_continues = [&](size_t i) {
+        for (size_t j = i + 1; j < phys.size(); j++) {
+            std::vector<Tok> t;
+            try {
+                lexer(phys[j], 1, t);
+            } catch (...) {
+                return false;
+            }
+            if (!t.empty())
+                return repl_chain_kw(t[0]);
+        }
+        return false;
+    };
+
+    for (size_t li = 0; li < phys.size(); li++) {
+        const string &line = phys[li];
 
         /* A line wholly inside a multi-line string / comment is passed through
          * verbatim - never lex it (it is not code) or terminate it. */
@@ -331,45 +674,114 @@ repl_auto_terminate(const string &src)
             continue;
         }
 
+        /* Where a `;` goes in front of position `pos` of the line: right
+         * after the last code character before it, so a `#` comment or the
+         * spaces that follow the statement stay after its `;`. */
+        const auto semi_before = [&](size_t pos) {
+            while (pos > code_begin
+                   && isspace(static_cast<unsigned char>(line[pos - 1])))
+                pos--;
+            return pos;
+        };
+        std::vector<size_t> semis;        /* `;` positions, left to right */
+
+        if (closed_string) {
+            open_value = true;
+            expects_value = false;        /* the string is the value */
+        }
+
         const Tok *last = nullptr;
+        bool closed_block = false;        /* the last `}` closed a block */
+        bool header_end = false;          /* the last `)` ended a header */
         for (const auto &t : toks) {
+            header_end = false;
             if (t == Op::braceL) {
                 const char kind = expects_value ? 'D' : 'B';
                 stack.push_back(kind);
                 expects_value = (kind == 'D');
+                open_value = false;
             } else if (t == Op::parenL) {
-                stack.push_back('(');
+                /* 'H': a statement header's or a function's parameter
+                 * list's parentheses, an expression bracket until the `)`
+                 * that ends the header */
+                const size_t ti = static_cast<size_t>(&t - toks.data());
+                stack.push_back(repl_header_paren(toks, ti) ? 'H' : '(');
                 expects_value = true;
+                open_value = false;
             } else if (t == Op::bracketL) {
                 stack.push_back('[');
                 expects_value = true;
-            } else if (t == Op::parenR || t == Op::bracketR ||
-                       t == Op::braceR) {
+                open_value = false;
+            } else if (t == Op::braceR) {
+                /* a block closing right after a statement on the SAME line
+                 * (`if (c) { print(3) }`): that statement's `;` goes before
+                 * the `}`, since no line end follows it */
+                const char kind = stack.empty() ? 'B' : stack.back();
+                if (kind == 'B' && open_value)
+                    semis.push_back(semi_before(
+                        code_begin + static_cast<size_t>(t.loc.col - 1)));
                 if (!stack.empty())
                     stack.pop_back();
                 expects_value = false;
+                open_value = (kind == 'D');   /* a dict literal is a value */
+                closed_block = (kind == 'B');
+            } else if (t == Op::parenR || t == Op::bracketR) {
+                header_end = !stack.empty() && stack.back() == 'H';
+                if (!stack.empty())
+                    stack.pop_back();
+                expects_value = false;
+                open_value = !header_end;     /* a header is not a value */
             } else if (t == Keyword::kw_return) {
                 expects_value = true;
+                open_value = true;            /* a bare `return` ends too */
+            } else if (t == Keyword::kw_in || t == Keyword::kw_indexed) {
+                /* a foreach's container follows: `in {"a": 1}` is a
+                 * dict literal (it got a `;` before its `}`) */
+                expects_value = true;
+                open_value = false;
+            } else if (t == Op::semicolon) {
+                /* a `;` the user typed ends the statement: a `{` after
+                 * it opens a block (`x = 1; { f() }` was read as a dict
+                 * and its statement got no `;`) */
+                expects_value = false;
+                open_value = false;
             } else {
                 /* an operator that takes a RHS keeps us in value position */
                 expects_value =
                     t.op != Op::invalid && repl_continuation_op(t.op);
+                open_value = !expects_value;
             }
             last = &t;
         }
-
-        out += line;
 
         const char ctx = stack.empty() ? 'B' : stack.back();
         const bool stmt_ctx = (ctx == 'B');     /* not 'D'/'('/'[' */
         /* The line ends in a value (so a `;` terminates the statement) when its
          * last code token isn't a continuation, or - with no code token - when
          * a multi-line string just closed here. No `;` when the line instead
-         * opens a string/comment that continues onto the next line. */
+         * opens a string/comment that continues onto the next line. The `;`
+         * goes at the end of the CODE, never after a trailing `#` comment
+         * (where it was part of the comment, and the statement went on into
+         * the next line). */
         const bool ends_in_value =
             last ? !repl_continuation_op(last->op) : closed_string;
-        if (!open_at_end && stmt_ctx && ends_in_value)
+        const bool chain_goes_on = last && *last == Op::braceR
+            && closed_block && next_continues(li);
+        const bool wants_body = last && (header_end || repl_body_kw(*last)
+                                         || repl_ends_in_type_name(toks));
+        if (!open_at_end && stmt_ctx && ends_in_value && !chain_goes_on
+            && !wants_body) {
+            semis.push_back(semi_before(code_end));
+            open_value = false;
+        }
+
+        size_t from = 0;
+        for (const size_t at : semis) {
+            out.append(line, from, at - from);
             out += ';';
+            from = at;
+        }
+        out.append(line, from, string::npos);
         out += '\n';
     }
 
@@ -424,6 +836,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
      *    line is number base + 1, continuing across inputs. */
     std::vector<Tok> tokens;
     unique_ptr<Construct> root;
+    const ConstSnapshot const_before(*const_ctx);
     try {
         lexer(source, static_cast<int>(base + 1), tokens);
 
@@ -431,13 +844,25 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
             return "";
 
         ParseContext pc(TokenStream(tokens), true);
-        pc.const_ctx = const_ctx.get();
+        bind_parser(pc);
         root = pBlock(pc, 0, /*push_const_scope=*/false);
         if (!pc.eoi())
             throw SyntaxErrorEx(Loc(pc.get_tok().loc),
                                 "Unexpected token at the end", &pc.get_tok());
-    } catch (const Exception &e) {
+    } catch (const SyntaxErrorEx &caught) {
+        const_before.restore(*const_ctx);
+        /* An error at the END of the input carries the EOF sentinel, which
+         * has no location: point it past the last token, as main() does
+         * for a script. (It rendered "SyntaxError" with no line at all.) */
+        SyntaxErrorEx e = caught;
+        if (e.tok == &invalid_tok && !tokens.empty()) {
+            e.loc_start = tokens.back().loc + 1;
+            e.loc_end = tokens.back().loc + 2;
+        }
         return format_error(e);
+    } catch (const Exception &e) {
+        const_before.restore(*const_ctx);
+        return format_compile_error(e);
     }
 
     /* 2a-bis. Implicit top-level `var`: a bare `name = expr` to a name not
@@ -466,10 +891,11 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
     try {
         infer.check_input(root.get());
     } catch (const Exception &e) {
-        retained.push_back(move(root));   /* keep the AST alive (id_sym refs) */
+        const_before.restore(*const_ctx);
+        retained.push_back(std::move(root));   /* keep the AST alive (id_sym refs) */
         /* keep any trace lines emitted before the error (the reasoning that
          * led up to it), then the error itself. */
-        return out.str() + format_error(e);
+        return out.str() + format_compile_error(e);
     }
 
     /* 2c. Run the real optimizers so the REPL is the true interpreter (and the
@@ -479,18 +905,54 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
     /* The SAME optimizer pipeline the script driver runs (run_optimizers), so
      * the REPL's tree transformation is on par with a script's - just with
      * repl_mode (top-level decls stay map globals) and the prior-input scope
-     * seeded for cross-input fold / inline / specialize. */
-    run_optimizers(root.get(), /*enable_inline=*/true, /*inline_threshold=*/24,
-                   /*enable_specialize=*/true, /*repl_mode=*/true,
-                   /*prior_scope=*/runtime_ctx.get());
+     * seeded for cross-input fold / inline / specialize.
+     *
+     * It can RAISE: a constant call is evaluated here (`h(0)` with
+     * `func h(x) => 10 / x` folds to a division by zero - a script's
+     * compile error). That refuses the input like a type error does:
+     * report it, and take back what the check above committed (its
+     * globals, its template instances), since nothing of it ran. Uncaught,
+     * it ended the session - and, for a thrown struct, was rendered by
+     * main() after ~ReplEngine had freed the struct's definition (a
+     * use-after-free). */
+    try {
+        run_optimizers(root.get(), /*enable_inline=*/true,
+                       /*inline_threshold=*/24, /*enable_specialize=*/true,
+                       /*repl_mode=*/true,
+                       /*prior_scope=*/runtime_ctx.get());
+    } catch (const Exception &e) {
+        infer.reject_input();
+        const_before.restore(*const_ctx);
+        retained.push_back(std::move(root));   /* keep the AST alive */
+        return out.str() + format_compile_error(e);
+    }
 
     /* 3. Evaluate each top-level statement directly in the persistent global
      *    scope, capturing print() output and the last statement's value. */
-    Block *blk = dynamic_cast<Block *>(root.get());
+    Block *blk = node_cast<Block>(root.get());
     EvalValue last;
     const Construct *last_elem = nullptr;   /* the last top-level statement */
+    size_t ran = 0;                         /* statements that completed */
     const std::vector<const UniqueId *> names_before = global_names();
     std::streambuf *old_cout = std::cout.rdbuf(out.rdbuf());
+
+    /*
+     * The input's "main" FRAME. The REPL's own globals live in the map, so
+     * the top level declares no slot - but the inliner may give it some: a
+     * call inlined into a top-level statement takes its callee's locals and
+     * its argument temps (`$a0 = k` for `rt(k)`) as new slots of main's
+     * frame (root->slot_count), exactly as in a script, whose root
+     * Block::do_eval builds that frame. The statements below run straight in
+     * the persistent scope, so build it here, for this input's run only.
+     * Without it such a call read "Undefined variable '$a0'".
+     */
+    std::unique_ptr<Frame> frame;
+    Frame *const prev_frame = runtime_ctx->frame;
+    if (blk && blk->slot_count) {
+        frame = std::make_unique<Frame>();
+        frame->init(blk->slot_count);
+        runtime_ctx->frame = frame.get();
+    }
 
     try {
         if (blk) {
@@ -499,19 +961,31 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
                 if (v.is<UndefinedId>())
                     throw UndefinedVariableEx(
                         v.get<UndefinedId>().id, e->start, e->end);
-                last = move(v);
+                last = std::move(v);
                 last_elem = e.get();
+                ran++;
             }
         }
     } catch (const Exception &e) {
+        runtime_ctx->frame = prev_frame;
         std::cout.rdbuf(old_cout);
-        retained.push_back(move(root));   /* keep partial defs alive */
+        /* the statements that completed keep what they defined; the
+         * declarations the run never reached bound nothing, so their
+         * committed types go back */
+        std::unordered_set<const UniqueId *> bound;
+        for (size_t i = 0; i < ran; i++)
+            repl_declared_names(blk->elems[i].get(), bound);
+        infer.forget_unbound([&bound](const UniqueId *n) {
+            return bound.count(n) != 0;
+        });
+        retained.push_back(std::move(root));   /* keep partial defs alive */
         out << format_error(e);
         return out.str();
     }
 
+    runtime_ctx->frame = prev_frame;
     std::cout.rdbuf(old_cout);
-    retained.push_back(move(root));
+    retained.push_back(std::move(root));
 
     /* (Removing a global from the type environment is the `:undef` command's
      * job now - there is no runtime undef() builtin to detect here.) */
@@ -526,7 +1000,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
      *    is not echoed, so the prompt stays uncluttered. */
     if (echo) {
         const EvalValue r = RValue(last);
-        if (!r.is<NoneVal>() || repl_echo_none(last_elem)) {
+        if (!r.is<NoneVal>() || repl_echo_none(last_elem, tokens)) {
             /* Pretty-print: a container too wide for one line expands across
              * lines, indented (structs/dicts/arrays, recursively). Colored
              * line-by-line via the highlighter when color is on. */
@@ -545,11 +1019,10 @@ string
 ReplEngine::Impl::meta_command(const string &src)
 {
     /* Split into the command word and the rest (the argument). */
-    string cmd, arg;
+    const string cmd = repl_meta_word(src);
+    string arg;
     {
-        size_t i = 1;                       /* skip the ':' */
-        while (i < src.size() && !isspace(static_cast<unsigned char>(src[i])))
-            cmd += src[i++];
+        size_t i = 1 + cmd.size();          /* past the ':' and the word */
         while (i < src.size() && isspace(static_cast<unsigned char>(src[i])))
             i++;
         arg = src.substr(i);
@@ -615,7 +1088,7 @@ ReplEngine::Impl::cmd_tree(const string &code)
     try {
         lexer(source, 1, toks);   /* one pass; views point into `source` */
         ParseContext pc(TokenStream(toks), true);
-        pc.const_ctx = const_ctx.get();
+        bind_parser(pc);
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
         std::ostringstream o;
         o << *root << "\n";
@@ -652,7 +1125,7 @@ ReplEngine::Impl::cmd_analyze(const string &code)
         lex_stable(source, local_lines, toks);
         AnalysisInfo info;
         ParseContext pc(TokenStream(toks), true);
-        pc.const_ctx = const_ctx.get();
+        bind_parser(pc);
         pc.analysis = &info;        /* record parse-time folds / dead code */
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
 
@@ -773,20 +1246,54 @@ ReplEngine::Impl::cmd_globals()
     std::vector<Row> rows;
     std::set<const UniqueId *> seen;
 
+    /*
+     * A function's row: its declared signature - except for a CLONE, whose
+     * row says what it is FOR (README: `:globals` shows what each clone
+     * specializes on): a TEMPLATE INSTANCE (`f$0`) each parameter with its
+     * inferred type, and the return type; a const-argument SPECIALIZATION
+     * (`f$s0`) the values it was built for (`with mode = 1`). Both printed
+     * the base's generic signature, `f$0 : func f(a, int b)`.
+     */
+    auto func_row = [&](const FuncDescriptor *d) -> string {
+        const FuncDeclStmt *decl = d->decl;   /* the REPL retains its ASTs */
+        if (decl && !decl->spec_args.empty())
+            return reflect_func_sig(d) + decl->spec_args_str();
+        const std::vector<string> pt =
+            !d->display_name.empty() && decl ? infer.func_param_types(decl)
+                                             : std::vector<string>();
+        if (pt.size() != d->params.size() || pt.empty())
+            return reflect_func_sig(d);
+        string s = d->explicit_pure ? "pure func " : "func ";
+        s += d->display_name + "(";
+        for (size_t i = 0; i < pt.size(); i++) {
+            if (i)
+                s += ", ";
+            if (d->params[i].cnst)
+                s += "const ";
+            s += pt[i] + " " + string(d->params[i].name->val);
+        }
+        s += ")";
+        const string ret = infer.func_return_type(decl);
+        if (!ret.empty())
+            s += " -> " + ret;
+        return s;
+    };
+
     auto classify = [&](const UniqueId *uid, const EvalValue &v,
                         bool is_const) -> Row {
         Row r;
         r.name = string(uid->val);
         if (v.is<intrusive_ptr<FuncObject>>()) {
             r.kind = "func";
-            r.type = reflect_func_sig(v.get<intrusive_ptr<FuncObject>>()->func);
+            r.type = func_row(v.get<intrusive_ptr<FuncObject>>()->func);
         } else if (v.is<StructTypeDef *>()) {
-            r.kind = "struct type";
+            r.kind = v.get<StructTypeDef *>()->is_class ? "class type"
+                                                        : "struct type";
             r.type = reflect_struct_ctor(v.get<StructTypeDef *>());
         } else if (v.is<intrusive_ptr<StructObject>>()) {
             r.kind = is_const ? "const" : "var";
-            r.type = string(
-                v.get<intrusive_ptr<StructObject>>()->def->name->val);
+            /* the struct's or class's name - or box<P> for a box */
+            r.type = reflect_typeof(v);
         } else {
             r.kind = is_const ? "const" : "var";
             /* the inferred/declared static type (richer than the runtime kind:
@@ -798,25 +1305,26 @@ ReplEngine::Impl::cmd_globals()
         return r;
     };
 
+    /* the const context first: a const scalar is folded out of the
+     * run-time scope, and one a closure captured has a run-time `var` of
+     * its name there (the capture's source) - the name is still a const */
+    std::vector<std::pair<const UniqueId *, const LValue *>> csyms;
+    const_ctx->collect_symbols(csyms);
+    for (const auto &kv : csyms) {
+        if (EvalContext::const_builtins.count(kv.first))
+            continue;
+        seen.insert(kv.first);
+        rows.push_back(classify(kv.first, kv.second->get(), true));
+    }
+
     std::vector<std::pair<const UniqueId *, const LValue *>> rsyms;
     runtime_ctx->collect_symbols(rsyms);
     for (const auto &kv : rsyms) {
         if (EvalContext::const_builtins.count(kv.first) ||
-            EvalContext::builtins.count(kv.first))
+            EvalContext::builtins.count(kv.first) || seen.count(kv.first))
             continue;
-        seen.insert(kv.first);
         rows.push_back(classify(kv.first, kv.second->get(),
                                 kv.second->is_const_var()));
-    }
-
-    /* const scalars: present in the const context, folded out of runtime */
-    std::vector<std::pair<const UniqueId *, const LValue *>> csyms;
-    const_ctx->collect_symbols(csyms);
-    for (const auto &kv : csyms) {
-        if (EvalContext::const_builtins.count(kv.first) ||
-            seen.count(kv.first))
-            continue;
-        rows.push_back(classify(kv.first, kv.second->get(), true));
     }
 
     if (rows.empty())
@@ -888,16 +1396,16 @@ ReplEngine::Impl::cmd_type(const string &code)
     try {
         lex_stable(source, local_lines, toks);
         ParseContext pc(TokenStream(toks), true);
-        pc.const_ctx = const_ctx.get();
+        bind_parser(pc);
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
-        Block *blk = dynamic_cast<Block *>(root.get());
+        Block *blk = node_cast<Block>(root.get());
         if (!blk || blk->elems.empty())
             return "(empty)\n";
 
         /* a single bare identifier that is a committed global -> its inferred
          * static type (no evaluation needed, richer than the value kind). */
         if (blk->elems.size() == 1) {
-            if (auto *id = dynamic_cast<Identifier *>(blk->elems[0].get())) {
+            if (auto *id = node_cast<Identifier>(blk->elems[0].get())) {
                 const string st = infer.global_type(id->uid);
                 if (!st.empty())
                     return string(id->get_str()) + " : " + st +
@@ -1004,11 +1512,11 @@ ReplEngine::Impl::cmd_show(const string &arg)
     try {
         lex_stable(source, local_lines, toks);
         ParseContext pc(TokenStream(toks), true);
-        pc.const_ctx = const_ctx.get();
+        bind_parser(pc);
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
         resolve_names(root.get(), /*inline=*/true, 24, nullptr, /*repl=*/true);
 
-        Block *blk = dynamic_cast<Block *>(root.get());
+        Block *blk = node_cast<Block>(root.get());
         string r;
         if (blk) {
             for (const auto &el : blk->elems)
@@ -1042,7 +1550,7 @@ ReplEngine::Impl::gc_redefined_instances(
      */
     std::set<string> redefined;
     for (const auto &e : blk->elems)
-        if (auto *fd = dynamic_cast<FuncDeclStmt *>(e.get()))
+        if (auto *fd = node_cast<FuncDeclStmt>(e.get()))
             if (fd->id && fd->desc->display_name.empty() &&
                 before.count(fd->id->uid))
                 redefined.insert(string(fd->id->get_str()));
@@ -1177,27 +1685,118 @@ ReplEngine::is_incomplete(const string &src)
     /* Net unclosed (){}/[] depth (>0 wants more). A string's / comment's own
      * brackets aren't here - they're inside a single string token / skipped. */
     int depth = 0;
-    for (const auto &t : toks) {
-        if (t == Op::parenL || t == Op::braceL || t == Op::bracketL)
-            depth++;
-        else if (t == Op::parenR || t == Op::braceR || t == Op::bracketR)
-            depth--;
-    }
+    for (const auto &t : toks)
+        depth += repl_depth_delta(t);
     if (depth > 0)
         return true;
 
-    /* A line ending on a binary/continuation operator wants more. */
-    switch (toks.back().op) {
-        case Op::plus:    case Op::minus:   case Op::times:
-        case Op::div:     case Op::mod:     case Op::lt:
-        case Op::gt:      case Op::le:      case Op::ge:
-        case Op::eq:      case Op::noteq:   case Op::land:
-        case Op::lor:     case Op::assign:  case Op::comma:
-        case Op::dot:     case Op::arrow:
-            return true;
-        default:
+    /* a statement header wants its body (`if (c)` / `else` at the end) */
+    if (repl_ends_in_header(toks))
+        return true;
+
+    /* A line ending on a binary/continuation operator wants more - the
+     * set repl_auto_terminate asks, so the two cannot drift: this was a
+     * second hand-copy of it, which missed `+=` once and later `?`, `??`,
+     * `?.` and `:` (a trailing `c ?` submitted, and its next line ran on
+     * its own). An open bracket already answered through the depth, and a
+     * `;` the user typed ends the input. */
+    const Op last = toks.back().op;
+    return last != Op::semicolon && repl_continuation_op(last);
+}
+
+bool
+ReplEngine::continues_chain(const string &line)
+{
+    std::vector<Tok> toks;
+    try {
+        lexer(line, 1, toks);
+    } catch (const Exception &) {
+        return false;
+    }
+    return !toks.empty() && repl_chain_kw(toks[0]);
+}
+
+/*
+ * may_continue's brace-less half: the input's last statement is an `if`
+ * whose last branch is a brace-less statement on a later line (`if (c)` /
+ * `print(x)`), which an `else` on the next line continues, as in a script.
+ * Read off the TERMINATED text, where each statement ends at its `;`: the
+ * last statement starts after the last top-level `;` or block `}` that no
+ * `else` / `catch` / `finally` follows. A bare `else` in it ends the chain.
+ */
+static bool brace_less_if_open(const string &src)
+{
+    /* may_continue lexed `src`, and terminating it adds only `;`, so this
+     * lexes too and ends in that `;` - the catch is defensive: an
+     * exception out of the Joiner would end the line editor */
+    std::vector<Tok> t;
+    try {
+        lexer(repl_auto_terminate(src), 1, t); /* INT-COV-EXEMPT: lexes */
+    } catch (const Exception &) {
+        return false;                   /* INT-COV-EXEMPT: see above */
+    }
+    size_t start = 0;
+    int depth = 0;
+    for (size_t i = 0; i + 1 < t.size(); i++) {
+        depth += repl_depth_delta(t[i]);
+        if (depth == 0 && (t[i] == Op::braceR || t[i] == Op::semicolon)
+            && !repl_chain_kw(t[i + 1]))
+            start = i + 1;
+    }
+    if (!(t[start] == Keyword::kw_if)
+        || t[start].loc.line == t.back().loc.line)
+        return false;
+    depth = 0;
+    for (size_t i = start; i + 1 < t.size(); i++) {
+        depth += repl_depth_delta(t[i]);
+        if (depth == 0 && t[i] == Keyword::kw_else
+            && !(t[i + 1] == Keyword::kw_if))
             return false;
     }
+    return true;
+}
+
+bool
+ReplEngine::may_continue(const string &src)
+{
+    std::vector<Tok> toks;
+    try {
+        lexer(src, 1, toks);
+    } catch (const Exception &) {
+        return false;
+    }
+    if (toks.empty())
+        return false;
+    if (!(toks.back() == Op::braceR))
+        return brace_less_if_open(src);
+
+    /* the `{` the final `}` closes, and what stands before it */
+    const auto open_of = [&](size_t close, Op l, Op r) -> size_t {
+        int depth = 0;
+        for (size_t i = close + 1; i-- > 0;) {
+            if (toks[i] == r)
+                depth++;
+            else if (toks[i] == l && --depth == 0)
+                return i;
+        }
+        return string::npos;
+    };
+    const size_t ob = open_of(toks.size() - 1, Op::braceL, Op::braceR);
+    if (ob == string::npos || ob == 0)
+        return false;
+    if (toks[ob].loc.line == toks.back().loc.line)
+        return false;
+
+    const Tok &before = toks[ob - 1];
+    if (before == Keyword::kw_try || before == Keyword::kw_catch)
+        return true;                        /* `try {` / `catch {` */
+    if (!(before == Op::parenR))
+        return false;                       /* `else {`, `finally {`, ... */
+    const size_t op = open_of(ob - 1, Op::parenL, Op::parenR);
+    if (op == string::npos || op == 0)
+        return false;
+    return toks[op - 1] == Keyword::kw_if          /* if / else if */
+        || toks[op - 1] == Keyword::kw_catch;      /* catch (T as e) */
 }
 
 /* ------------------------------------------------------------------ */
@@ -1214,34 +1813,89 @@ history_path()
 
 static const size_t HISTORY_CAP = 2000;
 
-static void
-load_history(std::vector<string> &history)
+/*
+ * An entry is one INPUT, which may span lines (a block, a paste): written
+ * one per line, its newlines as `\n`, its carriage returns as `\r` and its
+ * backslashes as `\\`. Written raw, a block came back after a restart as
+ * one entry per line (Up recalled a lone `}`), and an empty line inside it
+ * was lost. The file is written in BINARY, so it holds the same bytes on
+ * every platform (Windows' text mode wrote each line end as CRLF), and a
+ * line read back drops a trailing CR, so a file an editor saved with CRLF
+ * line ends still loads - no entry ends in a raw CR, since it is escaped.
+ */
+static const char *const HISTORY_HEADER = "#mylang-history 2";
+
+static string
+history_encode(const string &e)
 {
-    const string path = history_path();
-    if (path.empty())
-        return;
-    std::ifstream f(path);
+    string out;
+    for (const char c : e) {
+        if (c == '\\')
+            out += "\\\\";
+        else if (c == '\n')
+            out += "\\n";
+        else if (c == '\r')
+            out += "\\r";
+        else
+            out += c;
+    }
+    return out;
+}
+
+static string
+history_decode(const string &l)
+{
+    string out;
+    for (size_t i = 0; i < l.size(); i++) {
+        if (l[i] == '\\' && i + 1 < l.size()) {
+            i++;
+            out += l[i] == 'n' ? '\n' : l[i] == 'r' ? '\r' : l[i];
+        } else {
+            out += l[i];
+        }
+    }
+    return out;
+}
+
+void
+repl_load_history(const string &path, std::vector<string> &history)
+{
+    std::ifstream f(path, std::ios::binary);
     string line;
-    while (std::getline(f, line))
-        if (!line.empty())
+    const auto next_line = [&]() {
+        if (!std::getline(f, line))
+            return false;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        return true;
+    };
+    /* the first line names the format: a file written before entries were
+     * escaped (repl_save_history) has one entry per line, as written */
+    bool escaped = false;
+    if (next_line()) {
+        if (line == HISTORY_HEADER)
+            escaped = true;
+        else if (!line.empty())
             history.push_back(line);
+    }
+    while (next_line())
+        if (!line.empty())
+            history.push_back(escaped ? history_decode(line) : line);
     if (history.size() > HISTORY_CAP)
         history.erase(history.begin(), history.end() - HISTORY_CAP);
 }
 
-static void
-save_history(const std::vector<string> &history)
+void
+repl_save_history(const string &path, const std::vector<string> &history)
 {
-    const string path = history_path();
-    if (path.empty())
-        return;
-    std::ofstream f(path, std::ios::trunc);
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f.is_open())
         return;
     const size_t from =
         history.size() > HISTORY_CAP ? history.size() - HISTORY_CAP : 0;
+    f << HISTORY_HEADER << "\n";
     for (size_t i = from; i < history.size(); i++)
-        f << history[i] << "\n";
+        f << history_encode(history[i]) << "\n";
 }
 
 int
@@ -1249,7 +1903,9 @@ run_repl()
 {
     ReplEngine engine;
     std::vector<string> history;
-    load_history(history);
+    const string hpath = history_path();
+    if (!hpath.empty())
+        repl_load_history(hpath, history);
 
     /* Colors on a TTY unless NO_COLOR is set (https://no-color.org). */
     const bool color = repl_out_is_tty() && !env_get("NO_COLOR");
@@ -1275,12 +1931,26 @@ run_repl()
         return !ReplEngine::is_incomplete(s);
     };
 
+    /* An `if` / `try` chain whose last block closes over several lines
+     * stays open for an `else` / `catch` / `finally` on the next line, as
+     * in a script: an empty line (Enter) runs it, and so does any other
+     * line, which then runs with it (Python's REPL asks the same blank
+     * line after a block). A chain closed on one line runs at once. */
+    LineEditor::Joiner joiner = [](const string &s, const string *next) {
+        const size_t i = s.find_first_not_of(" \t\r\n");
+        if (i != string::npos && s[i] == ':')
+            return false;
+        if (!next)
+            return ReplEngine::may_continue(s);
+        return ReplEngine::continues_chain(*next);
+    };
+
     std::cout << "MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.\n";
 
     while (true) {
 
-        ReadLineResult r =
-            read_line(">> ", ".. ", history, hl, completer, submitter);
+        ReadLineResult r = read_line(">> ", ".. ", history, hl, completer,
+                                     submitter, joiner);
 
         if (r.eof)
             break;                          /* Ctrl-D at the prompt exits */
@@ -1293,17 +1963,16 @@ run_repl()
 
         /* A leading ':' meta-command (`:quit` exits; others run via eval_input,
          * which dispatches them). The whole input is one history entry. */
-        const size_t s = input.find_first_not_of(" \t");
-        const bool is_meta = (s != string::npos && input[s] == ':');
-        if (is_meta && (input.substr(s) == ":quit" || input.substr(s) == ":q"))
+        const string word = repl_meta_word(input);
+        if (word == "quit" || word == "q")
             break;
 
-        if (input != ":quit" && input != ":q")
-            history.push_back(input);
+        history.push_back(input);
 
         std::cout << engine.eval_input(input);
     }
 
-    save_history(history);
+    if (!hpath.empty())
+        repl_save_history(hpath, history);
     return 0;
 }

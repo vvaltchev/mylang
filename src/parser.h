@@ -7,9 +7,13 @@
 #include "lexer.h"
 #include <vector>
 #include <memory>
+#include <unordered_map>
 #include <string_view>
 
 class EvalContext;
+class LValue;
+class Construct;
+class UniqueId;
 class Block;
 struct AnalysisInfo;
 struct StructTypeDef;
@@ -68,7 +72,42 @@ class ParseContext {
 public:
 
     TokenStream ts;
-    const bool const_eval;
+
+    /*
+     * #54 - FOLDING, NOT CONST-EVALUATION. `-nc` clears this, and it turns
+     * off exactly one thing: REPLACING a constant expression by its value
+     * (a call, a subscript, an operator chain, an expression statement or
+     * a `var` initializer baked into a literal, and the CSE that shares
+     * those). Everything else the parse-time evaluator does is part of the
+     * program's MEANING and runs either way, because RULE 2 forbids a
+     * switch from changing whether a program compiles or what it does:
+     *  - a `const` declaration is evaluated and bound (a struct const
+     *    member or another const may read it; a scalar const NAME still
+     *    denotes its value, which is what a const scalar IS);
+     *  - a `struct` registers its descriptor (so its name is a TYPE in a
+     *    declaration, and a nested POD field embeds inline - one layout);
+     *  - a `pure func` registers itself (a const initializer may call it);
+     *  - a statically-dead branch (`if`/`while`/`foreach`/`?:`/`??` on a
+     *    constant) is discarded, since what it holds is not checked;
+     *  - a constant expression is still EVALUATED, so an error it raises
+     *    is the same compile-time error.
+     * It was one flag, `const_eval`, until #54: `-nc` then refused
+     * `struct S { const Z = K * 2; }`, called `P p;` "not a type" and
+     * boxed a nested POD field.
+     */
+    const bool fold;
+
+    /*
+     * Inside a `pure func` body the parse-time evaluator folds with or
+     * without `-nc`: the body is the const evaluator's OWN code, and a
+     * const container it reads is reachable at compile time only through a
+     * folded use (`len(NAMES)`, `NAMES[1]`) - un-folded, `const T = f(5);`
+     * failed under -nc with "Undefined variable 'NAMES' while evaluating a
+     * PURE function" where the default compiled. So `-nc` shows a pure
+     * body folded; everything else stays as written.
+     */
+    int pure_depth = 0;
+    bool folding() const { return fold || pure_depth > 0; }
     EvalContext *const_ctx; // points to const_ctx_owner's object
     unique_ptr<CseCache> cse; // const-expr de-dup cache (per-block scopes)
 
@@ -80,8 +119,85 @@ public:
      */
     AnalysisInfo *analysis = nullptr;
 
-    ParseContext(const TokenStream &ts, bool const_eval);
+    ParseContext(const TokenStream &ts, bool fold);
     ~ParseContext(); // out-of-line: CseCache is incomplete here (PIMPL)
+
+    /*
+     * #133 - THE SHADOWED-CONST SET. A declaration may name a const builtin
+     * (`func abs(x) { return 42; }`, a param, a foreach var), and the
+     * parse-time const evaluator used to ignore it completely: `abs(-1)`
+     * folded through to the BUILTIN while `abs(runtime(-1))` called the user's
+     * function - the same call spelled two ways giving two answers, and a
+     * RULE 2 violation (`-nc` disagreed with the default).
+     *
+     * The same holds for a USER const (2026-10-06): a parameter, a foreach
+     * or catch variable, or a capture named like an outer `const`, `pure
+     * func` or struct is its own binding, and `const K = 5; func f(K) =>
+     * K + 1;` folded `K` to 5 - a wrong answer in every engine.
+     *
+     * So each such name is recorded here for the extent of its scope, and
+     * pAcceptId refuses to const-resolve it. A flat vector with per-scope
+     * MARKS, not a map: an entry is only ever added for a name the const
+     * scope binds, so in nearly every program the set is EMPTY and
+     * `shadowed.empty()` short-circuits the lookup to one compare.
+     *
+     * NOT for a `pure func`'s own name: that IS the const evaluator's own
+     * binding (it registers itself in const_ctx and must keep folding).
+     */
+    std::vector<const UniqueId *> shadowed;
+    std::vector<size_t> shadow_marks;
+
+    void shadow_push() { shadow_marks.push_back(shadowed.size()); }
+    void shadow_pop()
+    {
+        ML_CHECK(!shadow_marks.empty());   /* an unbalanced push/pop */
+        shadowed.resize(shadow_marks.back());
+        shadow_marks.pop_back();
+    }
+    /* Record `uid` iff the const scope binds it - a const builtin, or a
+     * const, pure func or struct in scope (else a no-op, so the set stays
+     * empty for normal code). Defined out-of-line: const_builtins. */
+    void shadow_add(const UniqueId *uid);
+    /* The const scope's binding of `uid`, or null - a const builtin
+     * included */
+    LValue *const_binding(const UniqueId *uid) const;
+
+    /*
+     * A closure capturing a const SCALAR (`const K = 5; func [K] () ..`)
+     * needs a run-time value to snapshot, and a const scalar has no run-time
+     * symbol. The capture list therefore declares `var K = 5` just before
+     * the statement (through baked_funcs, re-inserted by the enclosing
+     * pBlock), at most once per block: this stack holds, per pBlock in
+     * progress, the names it has declared so.
+     */
+    std::vector<std::vector<const UniqueId *>> cap_const_decls;
+    bool is_shadowed(const UniqueId *uid) const
+    {
+        if (shadowed.empty())
+            return false;
+        for (const UniqueId *s : shadowed)
+            if (s == uid)
+                return true;
+        return false;
+    }
+
+    /*
+     * A const subscript whose fold raised a MISSING-LOCATION error - a key
+     * the const dict lacks, an index past the const array - is not thrown
+     * at once: the parser cannot yet tell `K["z"] = 1` (a store, refused as
+     * not an assignable location, as `K["k"] = 1` is) from `print(K["z"])`
+     * (a read, whose compile-time KeyNotFoundEx stands). The error waits
+     * here, the node is marked `nc_folds` (so pRefuseUnassignable refuses
+     * it as a target), and pExpr14 rethrows it when the expression holding
+     * it ends - unless refusing the target came first. Each pExpr14 owns
+     * the entries added inside it (a mark), so an index expression parsed
+     * inside `K["z"][i]` cannot rethrow its base's error. Out-of-line
+     * (parser.cpp): RuntimeException is incomplete here.
+     */
+    std::vector<std::pair<const Construct *,
+                          std::unique_ptr<RuntimeException>>> pending_fold;
+    void pending_fold_check(size_t mark);
+    void pending_fold_drop(size_t mark);
 
     /*
      * A declaration's pending explicit-type annotation (e.g. the `int` in
@@ -96,6 +212,10 @@ public:
     /* When pending_decl_type == strct, the struct type of the pending decl
      * (`A obj`); nullptr otherwise. Transient, like pending_decl_type. */
     const StructTypeDef *pending_decl_struct = nullptr;
+    /* The struct or class whose fields are being parsed: a field's type
+     * annotation may name it (`class Tree { array<Tree> kids; }`) though
+     * its descriptor is bound only when the declaration ends. */
+    const StructTypeDef *decl_self = nullptr;
 
     /* When the pending decl is a PARAMETERIZED container (`array<int>`,
      * `dict<str, Point>`), its recursive element/key/value type; nullptr for a
@@ -110,6 +230,43 @@ public:
      * pAcceptCloseAngle (parser.cpp). 0 outside a type parse.
      */
     int pending_gt = 0;
+
+    /*
+     * #137: NESTING DEPTH. The parser is recursive descent, so a deeply
+     * nested source recurses the C stack once per level - and `(((...1...)))`
+     * at ~800 levels BLEW IT: a SIGSEGV in the release build, an ASan
+     * DEADLYSIGNAL in the debug one. A crash is never an acceptable answer to
+     * an input file (RULE 1), so the depth is capped and a program past it is
+     * REFUSED with an ordinary syntax error.
+     *
+     * 256 is far above anything written or generated in practice (the corpus
+     * peaks in single digits) and far below the smallest stack this runs on -
+     * MSVC's debug frames are the fattest, which is why the margin is large
+     * rather than tuned to the measured Linux threshold.
+     */
+    int nest_depth = 0;
+    /* pBlocks being parsed: the outermost one's exit empties the typed
+     * parse-time runs (pt_cache_clear) - nothing runs at parse time after
+     * it, and their programs must not outlive the parse (the -vm teardown
+     * proves no AST node is left) */
+    int block_depth = 0;
+    static const int MAX_NEST = 256;
+
+    /*
+     * #47: FUNCTION LITERALS A CONST BAKE WOULD HAVE FREED. When the parser
+     * replaces a const subtree with ONE baked LiteralObj (cse_materialize),
+     * the replaced subtree dies - and with it any `pure func` LITERAL inside
+     * it, whose FuncDeclStmt owns the FuncDescriptor (desc_owner). A value
+     * like `[pure func(a, b) => a < b]` holds a FuncObject naming exactly
+     * that descriptor, so the bake left it dangling: a heap-use-after-free
+     * in the inferencer's baked-value walk, and a function with no body for
+     * codegen to compile. Such a decl is DETACHED instead and parked here;
+     * pBlock re-inserts it as a plain expression statement just before the
+     * statement that baked it, so every later pass (resolver, inferencer,
+     * codegen, descriptor ownership) sees a live, ordinary lambda. `pure`
+     * forbids captures, so evaluating it earlier is unobservable.
+     */
+    std::vector<unique_ptr<Construct>> baked_funcs;
 
     /* token operations */
     const Tok &operator*() const { return ts.get(); }
@@ -134,3 +291,59 @@ public:
  */
 unique_ptr<Construct>
 pBlock(ParseContext &c, unsigned fl = 0, bool push_const_scope = true);
+
+/*
+ * Question 5 (plans/open-language-questions.md, decision A): a user
+ * function run at PARSE time runs a copy of itself type-inferred for its
+ * argument types - do_func_call calls this for a function no inference has
+ * typed (FuncDescriptor::parse_typed) when the call happens under the
+ * parser's const scope (EvalContext::parse_typed). `vals` are the bound
+ * argument values. False: no typed copy can be built (an unsupported
+ * binding, a function value in the result) - the call runs untyped, as
+ * before. The copies are cached per (function, argument types) until the
+ * outermost pBlock ends or the ParseContext dies (pt_cache_clear): they are
+ * AST, and the -vm teardown proves none is left.
+ */
+class FuncObject;
+class EvalValue;
+class CallExpr;
+class Identifier;
+struct FuncDescriptor;
+/* a call the parser makes, as written (its callee and argument
+ * expressions, the consts they read) */
+bool pt_typed_written(EvalContext *ctx, const CallExpr *call, EvalValue &out);
+/* do the arguments of a builtin call the parser makes name a user function
+ * (a function literal, a name bound to a function)? Such a call runs as
+ * written, so the builtin calls it as the program's inference types it */
+bool pt_args_name_function(EvalContext *ctx, Construct *args);
+/* a call a running function makes, by value */
+bool pt_typed_value(FuncObject &obj, const std::vector<EvalValue> &vals,
+                    Loc call_site, EvalValue &out);
+/*
+ * Render the struct payload of `e`, and of every exception it was raised
+ * while handling, to the text the driver prints for it (eval.cpp). For an
+ * exception that leaves a constant evaluation: the nodes that own the
+ * definitions it names may die before the report is written (do_func_call
+ * freezes it where the call is left; pBlock again as it unwinds).
+ */
+struct RuntimeException;
+void freeze_exception_chain(RuntimeException &e);
+/* what a const scope noted about a const it declared holding a function
+ * (pt_note_const): its initializer, which a typed copy declares it by, so
+ * the function arrives as it does in the program; whether it is `dyn` */
+struct PtConstInit {
+    std::unique_ptr<Construct> expr;
+    bool dyn = false;
+    const FuncDescriptor *fn = nullptr;
+};
+struct PtConstInits {
+    std::unordered_map<const UniqueId *, PtConstInit> m;
+};
+void pt_note_const(EvalContext *scope, const Identifier *id,
+                   const Construct *init);
+void pt_cache_clear();
+#ifdef TESTS
+/* typed parse-time runs made, synthetic programs inferred for them, and
+ * calls that fell back to an untyped run - the proof a test reached them */
+extern unsigned long g_pt_runs, g_pt_builds, g_pt_untyped;
+#endif

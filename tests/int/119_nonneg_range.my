@@ -1,0 +1,9 @@
+# INT-SOURCE: ../functional/26_nonneg_range.my
+# INT-ENGINES: tw default
+#
+# INT unit (#107): tests/functional/26_nonneg_range.my, which no other
+# unit runs. Its line (1b) divides a proven non-negative loop counter by
+# a NEGATIVE power of two - the one shape for which emit_div_magic's
+# one-instruction arm negates its quotient (`sar` then `neg`). The
+# program prints and asserts nothing: the tree-walker's output is the
+# oracle (INT-SOURCE: no second copy).

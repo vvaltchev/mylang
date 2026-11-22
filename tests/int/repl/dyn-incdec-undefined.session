@@ -1,0 +1,7 @@
+zz[0]++
+zz.a++
+zz++
+var dyn q = runtime([1])
+q[zz]--
+q[0]++
+q

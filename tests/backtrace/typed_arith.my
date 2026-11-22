@@ -1,0 +1,10 @@
+# typed-scalar chains spliced from inlined bodies
+func ratio(int a, int b) => a * 3 / (b - a);
+func mix(float f, int a, int b) => f + float(ratio(a, b));
+func run(int n) {
+    var acc = 0.0;
+    for (var i = 1; i <= n; i++)
+        acc = acc + mix(0.5, i, runtime(n));
+    return acc;
+}
+print(run(runtime(5)));

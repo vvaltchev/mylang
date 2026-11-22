@@ -21,7 +21,7 @@ private:
      */
     struct StrObj final : RefCounted {
 
-        ML_POOL_NEW_DELETE
+        ML_POOL_NEW_DELETE_K(IOK_STR)
 
         inner_type s;
         /*
@@ -33,7 +33,7 @@ private:
          */
         mutable size_t hash_cache = 0;
         mutable bool hash_valid = false;
-        StrObj(inner_type &&str) : s(move(str)) { }
+        StrObj(inner_type &&str) : s(std::move(str)) { }
     };
 
     intrusive_ptr<StrObj> obj;
@@ -52,7 +52,7 @@ public:
     SharedStr(const inner_type &s) = delete;
 
     SharedStr(inner_type &&s)
-        : obj(make_intrusive<StrObj>(move(s)))
+        : obj(make_intrusive<StrObj>(std::move(s)))
         , off(0)
         , len(obj->s.size())
         , slice(false)
@@ -72,22 +72,122 @@ public:
     inner_type &get_ref() { return obj->s; }
     const inner_type &get_ref() const { return obj->s; }
 
+    /*
+     * THE WINDOW MODEL (2026-08-06). EVERY SharedStr is a window
+     * [offset(), offset()+size()) over a shared, APPEND-ONLY buffer - what
+     * a slice always was; a "full" string is just the window that happens
+     * to cover the whole buffer. Because the buffer only ever GROWS (the
+     * one in-place mutation is TypeStr::append, below), a window taken at
+     * any moment keeps denoting the same characters forever. That single
+     * fact is the whole soundness argument, and it is what gives strings
+     * their documented VALUE semantics with no copy-on-write clone at all:
+     * after `var b = a; a += "!"`, `a`'s window grew and `b`'s did not, so
+     * b still reads "hi" while sharing the same buffer.
+     *
+     * `len` is therefore AUTHORITATIVE for both forms - hence size() below
+     * is a plain field read rather than a dependent load through `obj`.
+     *
+     * owns_whole_buffer() is the precondition for appending IN PLACE: this
+     * window must end where the buffer ends, or growing the buffer would
+     * silently extend a window that is only a prefix of it.
+     */
+    bool owns_whole_buffer() const {
+        return !slice && obj && len == obj->s.size();
+    }
+
+    /*
+     * Fix up this window after the ONE in-place mutation there is: append
+     * growing a buffer this window wholly owns. Every other path builds a
+     * fresh SharedStr, whose ctor sets `len`.
+     *
+     * BOTH steps are load-bearing. Re-deriving `len` keeps the window on
+     * the new end. Dropping `hash_valid` is what the DICT depends on: the
+     * cache is the hash of the WHOLE buffer, and the buffer just changed,
+     * so every window that covers it - including this one - would
+     * otherwise keep answering with the PRE-append hash. Without this, a
+     * string used as a key, appended to, and inserted into a second dict
+     * lands under the old hash and is unfindable by its own value (it
+     * still prints and compares equal - the map is simply corrupt).
+     */
+    void after_inplace_append() {
+        ML_CHECK(!slice);
+        len = static_cast<size_type>(obj->s.size());
+        obj->hash_valid = false;
+    }
+
     std::string_view get_view() const {
         ML_CHECK(offset() <= obj->s.size() &&
                  size() <= obj->s.size() - offset());
         return std::string_view(obj->s.data() + offset(), size());
     }
 
+    /*
+     * The JIT's layout probe (the co-located-probe rule, as
+     * SharedArrayObj::jit_probe): hand out the ADDRESS of the window
+     * length so jit.cpp can bake its byte offset from a REAL object
+     * instead of growing a second copy of this class's layout that could
+     * drift. `len` is private, hence the accessor.
+     */
+    /*
+     * `slice`/`obj` join it for the INLINE `ord(s[i])` read: a non-slice
+     * must IGNORE `off` (see offset() below), so the emitted fast arm
+     * tests `slice` and declines one to the helper rather than carrying
+     * the extra load and branch.
+     *
+     * `strobj_data` is the offset FROM the StrObj to the pointer that
+     * holds its characters - i.e. to `std::string::_M_p`. It is derived
+     * from a REAL object here rather than assumed, and jit.cpp must
+     * additionally VERIFY it against a live short and long string before
+     * enabling the tier: libstdc++ keeps that pointer at offset 0 of the
+     * string and valid for both the SSO and the heap form, but libc++
+     * lays its short form out differently, and a wrong offset here is a
+     * silent wrong character or a wild read, not a build error.
+     */
+    struct JitProbe {
+        const void *len;
+        const void *slice;
+        const void *obj;
+        /* ⛔ ptrdiff_t, NOT long: this is initialised from a POINTER
+         * DIFFERENCE, and Windows is LLP64 - `long` is 32 bits there,
+         * so a braced init from __int64 is a NARROWING CONVERSION and
+         * MSVC rejects it outright (error C2397). Green on gcc/clang
+         * for a day before the Windows lane saw it. */
+        ptrdiff_t strobj_data;
+        /* the object the offset is INTO, so the emitter can bound it
+         * without needing StrObj (which is private) visible there */
+        size_t strobj_size;
+        /* #97: StrObj's RefCounted base offset (see sharedarray.h's
+         * refcnt probe) */
+        ptrdiff_t strobj_refcnt;
+    };
+    JitProbe jit_probe() const {
+        return { &len, &slice, &obj,
+                 obj ? reinterpret_cast<const char *>(&obj->s)
+                       - reinterpret_cast<const char *>(obj.get())
+                     : 0,
+                 sizeof(StrObj),
+                 obj ? reinterpret_cast<const char *>(&obj->intr_refcount)
+                       - reinterpret_cast<const char *>(obj.get())
+                     : 0 };
+    }
+
     bool is_slice() const { return slice; }
     size_type offset() const { return slice ? off : 0; }
-    size_type size() const { return slice ? len : obj->s.size(); }
+    /* `len` is authoritative for BOTH forms - see THE WINDOW MODEL above.
+     * (A default-constructed SharedStr has no `obj`; returning `len` == 0
+     * is also what makes that case safe rather than a null deref.) */
+    size_type size() const { return len; }
 
     /*
      * Hash of the string's value. A full (non-slice) string caches it on the
      * shared StrObj (computed once); a slice hashes its sub-view on demand.
      */
     size_t hash() const {
-        if (!slice) {
+        /* The StrObj's cache is the hash of the WHOLE buffer, so it may
+         * only be used by a window that covers it - a prefix window must
+         * hash its own view. (Before the window model a "non-slice" always
+         * covered the buffer, so `!slice` alone was the same test.) */
+        if (owns_whole_buffer()) {
             if (!obj->hash_valid) {
                 obj->hash_cache = std::hash<std::string_view>()(
                     std::string_view(obj->s.data(), obj->s.size()));

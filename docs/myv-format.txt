@@ -1,0 +1,1828 @@
+================================================================================
+THE .myv STORED-BYTECODE FORMAT
+================================================================================
+
+Format version 46.  This document describes the on-disk image exhaustively:
+every record, in order, with its exact byte encoding.
+
+(v46: a Field (7.1) carries an `annot` exactly when its kind is
+`array`, `dict` or `box` - a bare container field is a compile error
+since rule 5 (plans/strict-container-types.md) and a scalar, `dyn` or
+struct field has none, so no compile writes either, and the loader
+refuses an image that does.  The encoding is unchanged.)
+
+(v45: one opcode was APPENDED, CastV - `cast<T>(x)` - and a chunk gains
+the pool `cast_types` (9.11c) after ctypes, which a CastV names by its
+`target2`.  The builtin `dynarray` was removed, so the builtin-set
+fingerprint in the header changed too.)
+
+(v44: the GLOBALS section (10) ends with a bool `typed` - the program was
+compiled with type inference, so a container that carries no type of its
+own takes the type of the typed place it enters.)
+
+(v43: every array (11.1) and dict (11.2) value carries its OWN TYPE, a
+`ctype` (2.3), after its readonly flag; a chunk gains the pool `ctypes`
+(9.11b) after fit_specs, which MakeArrayV / MakeDictV / MapFilterV name
+from their `target2`; a BuiltinCall (9.15) and a CallSite (9.16) carry the
+type a container the call builds is made with, after `arr_hint`, and then
+a bool `ct_store`: the call stores a value into a container whose type the
+compiler did not know (an append, push or insert through `dyn`), and
+checks it against the container's own type; an EmplaceSite (9.12) ends
+with the same bool, for a construct-in-place append.  Opflags bit 7 on a
+container store op (StoreElemValue, DictStore, StoreElem2V,
+StoreElemChainV, StoreLValueChainV) means the same for that store.  One opcode was
+APPENDED, StampTypeV: an array sum `a + b` takes its static type, a REF
+into ctypes in its target2 (never 0).  And an `annot`'s struct may be one
+of the binary's reflection structs (the reserved srefs of section 2), so
+an `array<Type>` can be written.)
+
+(v42: each catch type name (9.9) is followed by the struct it names, an
+`sref`.  A catch clause catches a struct by IDENTITY - the struct its name
+resolves to where the clause is written - so two structs named `Err` are
+told apart, and a name stored with a null `sref` is a built-in exception's
+or one an open world (the REPL) could not resolve.)
+
+(v41: a LiteralObj (9.10) loses its `arr_hint` and `arr_hint_struct`.  The
+compiler now builds a baked literal's value in the storage its destination
+gives it, so nothing reads a hint when the literal is loaded.)
+
+(v40: an `sref` may name one of the BINARY's own reflection structs by a
+reserved number (section 2) - in a struct value's def (11.3) and a member
+key's bake_def (9.4) only.  A folded `type(x)` / `decltype(x)`
+bakes a `Type` instance into a pool, which no program declares, so `-c`
+refused every program that asked one; and a member read on a reflection
+value - `type(x).kind`, `layout(S).fields`, a StructField's `name` - is
+baked against its native struct, and an image dropped that bake_def
+silently.)
+
+(v39: the value codec gains tag 11, `bltn` - a builtin VALUE, written as its
+name (section 11).  A const container holding a builtin - `const OPS = [len,
+abs];` - compiled and ran, and `-c` refused to store it.)
+
+(v38: a HandlerSite (9.18) ends with `chain` in place of `has_rethrow` -
+question 12, implicit exception chaining.  A region may now be a CHAIN
+MARKER: no clause and no finally, only a chain.  The dispatch parks every
+caught exception, so the old flag had nothing left to say.  SetPend's
+`target2` gains a meaning: 1 frees the exception parked in its region (a
+catch body's exit emits it), anything else must be -1 - the verifier
+refuses another value.)
+
+(v37: a Field (7.1) and a Param (8) each END with an `annot` (2.2), a
+TypeAnnot record - the field's declared type, the parameter's run-time FIT
+check (#49: the type a `dyn` argument must fit at that parameter, absent
+when the bind already checks it).  The loader derives a descriptor's
+`fit_any` from the params' records (section 12).  A BoxedCtor (9.11) ends
+with a bool `fit`, and a chunk gains a pool after boxed_ctors, fit_specs
+(9.11a), which one APPENDED opcode reads - CheckFitV, the check of a value
+a store or an in-place builtin is about to put into a typed place: its `a`
+must be a slot and its `target2` must index fit_specs, at an entry whose
+annot is present - the verifier refuses anything else.)
+
+(v36: a Param (8) ENDS with a uid, `sig_type` - the parameter's annotation
+as signature() renders it (`P p`, `array<int> a`, `dict<str,P>? d`, `box<int>
+b`), null when its DeclType keyword says it all.  It is display text only:
+nothing binds, checks or dispatches on it.)
+
+(v35: FieldKind (section 13) gains `8 f_box` and DeclType `9 box` - a
+`box<T>` field and parameter (plans/class-and-box.md, step 3) - and two
+opcodes are APPENDED, LoadBoxV and StoreBoxV (`*b` read and written), so a
+v34 binary would meet an opcode it does not know; see the note on version
+10 below.  LoadBoxV's `b` must be an int literal from 0 to 5 (the box the
+compile proved: 0 any, 1 int, 2 float, 3 bool, 4 str, 5 a struct), and for
+5 `target2` must index the chunk's struct_defs, else be -1; its `a` and
+StoreBoxV's `a` and `b` must be slots - the verifier refuses anything
+else.  No value record changes: box() is a run-time builtin, so no
+constant holds a box, and the writer refuses one.)
+
+(v34: an array's storage kind (11.1, section 13) gains `6 objs` - the flat
+CLASS storage, one class reference per element - and ArrHint gains
+`6 flat_c`.)
+
+(v33: a StructDef (7.1) gains `is_class` after its name, and the value codec
+a tenth tag, `cls` (11.4) - a class instance, written once and then referred
+to by its identity number.)
+
+(v32: a BuiltinCall (9.15) and a CallSite (9.16) each END with a StepList
+(9.7) - the chain forms of an in-place builtin's first argument, empty
+when the record has none - and CallSite::A0 gains `5 chain`.)
+
+(v31 changes no encoding: a ThrowSite's `kind` loses rebind_builtin (2)
+and rebind_const (3), and bad_args moves from 4 to 2.  Assigning to a
+builtin or a const name is a compile error now, so no image carries such
+a throw; a v30 binary would read a v31 bad_args as rebind_builtin.)
+
+(v30 changes no encoding: IncDecChainV's root kind (`a`) loses the value
+3, "an rvalue root held in a frame slot, read as a value".  A root that
+is not a variable - `f()[0]++` - is now held in a temp and named as a
+local, kind 0, so the inc-dec goes into the value it evaluated to; like
+every kind but 1 (global) and 2 (capture), a 3 now names a local frame
+slot, `target2`, and the verifier bounds it as one.  A v29 binary would
+read such a root as a value and raise NotLValueEx.)
+
+(v29 changes no encoding: one opcode was APPENDED - CheckNoneArgsV, which
+stands before a call whose argument may hold `none` and refuses a `none`
+bound to a parameter not declared `opt` - so a v28 binary would meet an
+opcode it does not know; see the note on version 10 below.  Its `target`
+is the callee's KIND, not an index: 0 = `target2` is a frame slot, 1 =
+`target2` is a global-table slot (as CallV's); the verifier refuses any
+other kind.  `a` and `b` are literals, the argument run's base slot and
+its count, bounded like a call's run.  Its carets are the call's: a loc
+table entry, a base_locs entry (the argument list) and an arg_locs entry
+(one span per argument).)
+
+(v28 adds two locs to every IncDecSite record (section 9.6): `bstart` and
+`bend`, the caret of the inc-dec's base.  The member form's "Expected dict
+object" type error marks the base, as the tree-walker's member read does; it
+marked the member until then.)
+
+(v27 drops two bools from every IncDecChain record (section 9.7):
+`allow_flat` and `allow_pod` said whether the final step's base was free of
+side effects, which gated the flat-array and POD-field stores to mirror the
+tree-walker; both engines now evaluate an access chain's base and keys once
+and always take those stores, so the bits meant nothing.)
+
+(v26 changes no encoding: one opcode was APPENDED - UnpackLenCheck, the
+strict length test of a destructure `a, b = arr` whose rvalue is a proven
+array - so a v25 binary would meet an opcode it does not know; see the
+note on version 10 below.  Its `target2` is a frame SLOT (the array);
+its `target` is a COUNT, not an index into anything, and the verifier
+refuses only a negative one.)
+
+(v25 changes no encoding: MakeClosureV's `a` gains a meaning.  At its
+default (-1, i.e. absent) the op is as before.  Set, it is a DUAL - lo =
+the lowest captured slot in this chunk's frame, hi = the span of captured
+slots - written by the bytecode splice when it pastes a closure FACTORY's
+body into a caller (#97 increment 3): every capture is then a frame local,
+read at the descriptor's slot + (lo - the descriptor's lowest captured
+slot).  The verifier refuses a set dual whose span is not the
+descriptor's own, whose shift is negative, whose run leaves the frame, or
+whose descriptor has a capture that is not a frame local, and any other
+value than the default.  A v24 binary would ignore the dual and read the
+captures from the unshifted slots.)
+
+(v24 changes no encoding: three opcodes were APPENDED - GuardCalleeV,
+LoadCaptureOfV and StoreCaptureOfV, the inline cache the bytecode splice
+builds at a value-call site (#97 closure inlining) - so a v23 binary would
+meet an opcode it does not know; see the note on version 10 below.  Their
+frame-slot operands are ALWAYS slots (the verifier refuses the literal
+flag on GuardCalleeV's `a`, LoadCaptureOfV's `a` and StoreCaptureOfV's `a`
+and `b`); GuardCalleeV's `target2` indexes `closure_defs` and its `target`
+is a pc.  The capture INDEX (LoadCaptureOfV's `target2`, StoreCaptureOfV's
+`target`) names a capture of the closure held in a slot, whose descriptor
+no static pass can name, so the loader bounds only its sign and the
+runtime refuses an index past that closure's captures.)
+
+(v23 changes no encoding: MapFilterV's `target2` gains two meaning bits.
+Bit 0 is still is_filter; bits 1-2 are the flat RESULT kind (0 none /
+general, 1 int, 2 float, 3 bool - #97 CB3).  A v22 binary read any
+nonzero `target2` as "filter", so it would run a hinted `map` as a
+filter; the version bump is what makes it refuse the image instead.)
+
+(v22 adds one per-chunk record, `op_locs` - section 9.2 - a third loc
+table in the identical encoding, written right after `base_locs`: the
+COMPOUND-OPERATION carets of the store ops.  No existing encoding
+changes.)
+
+(v21 changes no encoding: two opcodes were APPENDED - ArrEpochMark and
+ArrEpochCheck, the foreach shift guard (#53 option 1) - so a v20 binary
+would meet an opcode it does not know; see the note on version 10 below.
+ArrEpochCheck's `a` operand must be a SLOT: the verifier refuses the
+literal flag on it.)
+
+(v20 adds the TABLE OF CONTENTS (section 7.0): the struct and descriptor
+COUNTS, both written before the struct table, which therefore no longer
+carries a leading count - nor does the descriptor table.  The reader builds
+an empty shell for every struct and every descriptor before it reads a
+record, so a struct's const member may hold a FUNCTION (value tag 9), which
+v19 and earlier had to refuse at write time.
+
+v19 changes no encoding: the loader now REFUSES an image whose
+`root_slot_count` (section 10) disagrees with the root chunk's own
+`slot_count` (section 9) - a cross-record check, see section 3 layer 3.
+v18 REMOVED one per-chunk record: `ref_slots`, which used to follow
+`handler_sites` - it is DERIVED at load now, see section 12.  v17 added
+one descriptor field, `noescape_params` - section 8 - written right
+after `fast_bind`; v16 added one per-chunk record, `arg_locs` - section
+9.21 - written right after `base_locs`; v15 added `value_callees`,
+section 9.20.  None changed an existing encoding.)
+
+(v14 changed no encoding: it widened the VALUE DOMAIN of an instruction's
+`aop` byte - the compound shift/bitwise assignment operators `<<=` `>>=`
+`>>>=` `&=` `|=` `^=` are Op values 44-49, which a v13 reader has no
+dispatch for, so the version was bumped rather than let an old binary map
+an unknown compound to a plain store.)
+
+It is the specification of what `mylang -c FILE` writes and what `mylang
+FILE.myv` reads.  The implementation is src/serialize.{h,cpp}; the design
+history and the per-version measurements are in
+plans/archived/myv-serializer.md, and
+the implementation-shape summary is in CLAUDE.md (".myv STORED-BYTECODE
+FORMAT").
+
+--------------------------------------------------------------------------------
+1.  WHAT AN IMAGE IS
+--------------------------------------------------------------------------------
+
+An image is the bytecode VM's runtime state, serialized: instructions, their
+data pools, function descriptors, struct type definitions, and the global
+table's names.  Loading one skips the lexer, the parser, and every optimizer
+pass - the program runs straight from the file.
+
+    mylang -c script.my                 # writes script.myv
+    mylang -c script.my -o out.myv      # explicit output path
+    mylang -c script.my --strip-source  # store no source reference
+    mylang script.myv                   # run (detected by CONTENT, not name)
+    mylang --source ~/proj script.myv   # find the source under another root
+    mylang -f script.myv                # accept a CRC32-mismatched source
+    mylang -vd script.myv               # disassemble a loaded image
+
+WHAT IS NOT IN AN IMAGE
+
+  * NATIVE MACHINE CODE.  The AOT tier rewrites bytecode in place (inserting
+    EnterNative, deleting originals) against fragments that cannot be
+    relocated, so `-c` compiles with the JIT off and the LOADER re-runs the
+    whole tier (vm_jit_loaded_image).  An image is therefore portable across
+    machines and keeps working as the native tier evolves.  Storing fragments
+    would need a relocating linker - a deliberate later increment.
+
+  * THE AST.  Nothing in the runtime image references a Construct; that is the
+    zero-AST invariant the whole VM was built to satisfy (CLAUDE.md).  A
+    descriptor's compile-only `decl` back-pointer is written as nothing and set
+    to null at load.
+
+  * THE SOURCE TEXT.  Only a verified REFERENCE to the source file (section 5).
+
+  * DERIVED DATA.  Anything recomputable is recomputed at load, never stored:
+    see section 12.
+
+TRUST MODEL.  An image is TRUSTED input, like a .pyc.  A MALICIOUSLY CRAFTED
+file is out of scope: an attacker who can write your .myv can equally write
+your .my.  What IS in scope is that a corrupt or truncated file produces a
+clean "MyvError" - never a crash, a hang, or an unbounded allocation.  The
+loader validates in FOUR layers, and the layering matters because each one
+sees a kind of field the others structurally cannot (#137):
+
+  1. THE BYTES.  Magic, version, endianness, builtin-set fingerprint; every
+     read length-checked (Reader::need); every ELEMENT COUNT bounded by the
+     bytes remaining (Reader::countv); every table REFERENCE required to name
+     a real entry (Reader::idx - the permissive idx_opt is opt-in, for a field
+     with a genuine null form); every ENUM stored as a byte bounded by its
+     last valid enumerator (Reader::enumv), since each is cast straight into
+     a type the VM switches on or indexes a table with; every NAME a record
+     cannot do without (a uid, below) refused in its null form
+     (Reader::uid_req) - myv_fuzz fat-259 / fat-309 (2026-10-04): a struct
+     whose name was nulled loaded cleanly and crashed the `throw` that
+     named it.
+
+  2. THE STANDALONE COUNTS.  A count that no record array follows, so layer 1
+     has nothing to bound it against: a chunk's slot_count / n_temps, its
+     dict-iterator, dyn-iterator and try-region slices, a descriptor's
+     frame_size.  Each sizes something the VM allocates per activation, and
+     each is bounded by the WHOLE FILE (Reader::sizev) - each counts a thing
+     that must also appear somewhere in the image, and those bytes may lie
+     before the field as easily as after it.
+
+  3. THE INSTRUCTION OPERANDS (vm_verify_program -> verify_chunk, codegen.h).
+     Instructions are stored FIELD-WISE, so the reader cannot know which field
+     is a pool index, a frame slot, or a pc - the byte layers are blind here
+     by construction.  One switch over every opcode bounds each operand
+     against the table it indexes, plus the pc-keyed side tables (locs,
+     base_locs, inline_ctxs - which are REMAPPED by indexing, not merely
+     searched) and each closure descriptor's capture slots.  It runs BEFORE
+     the load-time JIT, which bakes pool ENTRY ADDRESSES into machine code.
+
+     It also checks the STATIC CROSS-FIELD facts a runtime path would
+     otherwise discover the hard way: a boxed arith/compare op's `aop` must
+     be one vm_num_binop can dispatch (a value in neither table gives a NULL
+     pointer-to-member, and calling through it was a SIGSEGV in a release
+     build), and a def reached by a BYTE-LEVEL path - a baked ctor plan, an
+     emplace site, a flat struct array - must be POD and must have exactly
+     the field count the site was compiled for.
+
+     Two JIT-ONLY facts (2026-09-20, myv_fuzz): a stored chunk contains NO
+     EnterNative and NO ExitBlock - both are inserted by the load-time JIT
+     and never written (`-c` compiles with jit=false), so either op in
+     read code was invented by corruption and is refused (an ExitBlock in
+     a body the frameless gate otherwise admits sends the chunk down the
+     container path with no frameless entry, and its return arm then runs
+     on a frame that was never frameless).  And a FUNCTION chunk's
+     `slot_count` must equal its descriptor's `frame_size` (section 8,
+     `frame_size`): the push sizes a frame from the descriptor and the
+     JIT's return arms from the chunk, and a mutated count makes the two
+     disagree on how many slots a frame has.  Checked in
+     vm_verify_program, across the two records.
+
+     THE HANDLER-STACK BALANCE (2026-09-21, myv_fuzz; handler_balance_fault,
+     codegen.h) - the one PopHandler property no per-operand bound can
+     express, because it is a property of the PATH.  The activation's
+     handler stack is shared by every frame and a PopHandler is a bare
+     pop, so a chunk whose control flow reaches one with nothing of its
+     own pushed pops the CALLER's handler, or an EMPTY vector (one mutated
+     opcode byte: a SEGV in the assert-free build).  The verifier walks the
+     chunk's control flow from pc 0 carrying the handler depth: +1 through a
+     PushHandler, -1 through a PopHandler, which must find one; every join
+     must agree; and a region's clause body pcs and fin_pc are entered at
+     the depth its PushHandler was met at (the dispatch has popped that
+     handler, and every inner one, before resuming there), so a region
+     pushed at two depths is refused too.  Successors are the pc-field
+     table's targets plus the fall-through of every op but Jump / Halt /
+     ReturnV.  Applied to a chunk with no native fragment - which is every
+     chunk of a stored image.  The same walk asserts codegen's own output
+     in an ASSERTS build, so the rule cannot drift from what the compiler
+     emits.
+
+     TWO STORE-OPERAND RULES (2026-09-21, found auditing the store family's
+     operand layouts): a `chain_locs` entry a TWO-LEVEL op dereferences is
+     required to hold at least TWO pairs - `StoreElem2V` (whose entry index,
+     `a_dual_hi`, was not bounded at all) and the fused `LoadElem2Int` /
+     `LoadElem2Float` read `locs[0]` and `locs[1]`, and the load-time JIT
+     bakes the entry's address, so a one-pair entry (which a
+     `StoreElemChainV` may legitimately own) is a read past its end.  And an
+     operand the VM reads as a SLOT unconditionally - the key and value of
+     `DictStore` and `StoreElemValue`, the value of `StoreMemberV` and the
+     k2 of `StoreElem2V` (the compiler materialises every literal into a
+     temp for these; only `StoreElemInt`/`StoreElemFloat` take a literal) -
+     is refused when its lit flag is set, instead of the bound being
+     skipped: one mutated `opflags` bit had let the handler index the frame
+     with the raw payload.
+
+     MAIN'S SLOT COUNT, ACROSS TWO RECORDS (2026-09-22, myv_fuzz fat-316
+     and fat-311): the root chunk's `slot_count` (section 9) must equal
+     `root_slot_count` (section 10), exactly as a function chunk's must
+     equal its descriptor's `frame_size`.  Every load-time analysis and
+     the JIT's pin gate classify a frame slot as a local or a temp by it,
+     so a mutated copy is not a wrong size but a wrong CLASSIFICATION -
+     the register cache pinned a temp it took for a local and the
+     reference that temp also held leaked - and the fact has no
+     derivation, so the redundancy is what makes the mutation visible.
+
+     AN OPERAND NO HANDLER READS (2026-09-22, myv_fuzz small-938): a
+     planned `StructCtorV`'s `a` dual is its computed-argument MINI-RUN
+     (lo = base or -1, hi = count), consumed by no handler and by exactly
+     one load-time analysis, whose `run(base, cnt)` ITERATES the count -
+     so a mutated count of 0x73A07676 was a HANG at load, not a crash.
+     The run is bounded like every other (`base + count` inside the frame),
+     and a `-1` base must carry a zero count, the only shape the compiler
+     emits.
+
+  4. THE VALUE-DEPENDENT RESIDUE (ML_UNTRUSTED_CHECK, defs.h).  A few facts
+     no load-time pass can decide, because they are properties of the VALUE a
+     slot holds rather than of the image: a flat array's storage-kind union
+     tag, a struct field index against the def the instance actually has.
+     Those sites check at RUN time, gated on `g_untrusted_bytecode` - set by
+     myv_read and false for bytecode this process compiled - so the cost
+     falls only on a run that loaded an image.  Deliberately NOT tied to
+     ASSERTS: the build that most needs the check is an optimized,
+     assert-free release running a shipped `.myv`.
+
+WHAT VALIDATION DOES NOT PROMISE.  A structurally valid image whose VALUES are
+nonsense is ACCEPTED, and may then fail at run time - as a located
+InternalErrorEx from layer 4 where one covers it, else a named ML_CHECK
+abort - or simply never terminate.  Proving that a slot holds the type an op
+expects at every pc would be a bytecode type-checker, and halting is
+undecidable.
+
+--------------------------------------------------------------------------------
+2.  CONVENTIONS AND PRIMITIVES
+--------------------------------------------------------------------------------
+
+All integers are LITTLE-ENDIAN.  Big-endian hosts are refused at load via the
+endianness marker (section 4).
+
+Every field is a whole number of bytes on a byte boundary.  NOTHING in this
+format is a 5-byte - or any non-multiple-of-8-bit - integer, and there are no
+LEB128/varint fields (byte-granular but bit-tagged) anywhere.  The ONLY
+sub-byte fields in the entire format are the width CODES inside the
+instruction flags word (section 9.1); every value they describe is itself
+byte-aligned.
+
+Notation used throughout this document:
+
+    u8            one byte
+    u16           two bytes
+    u32           four bytes
+    i64           eight bytes, two's complement
+    f64           eight bytes: the IEEE-754 double's bit pattern as i64
+    bool          u8, 0 or 1 (any nonzero reads as true)
+    str           u32 length, then that many raw bytes, INLINE (not a table
+                  reference).  May contain NUL and newlines.
+    sid           u32 index into the string table (section 6)
+    uid           u32 index into the string table, or 0xFFFFFFFF for null.
+                  The loader re-interns the string into a UniqueId.  Null is
+                  legal ONLY where a record says so: a descriptor's name (a
+                  lambda has none), a field's struct_ty (a non-struct
+                  field), a ThrowSite's name (except an undefined_var one),
+                  a BuiltinCall's member (except one a CallBuiltinLVMember
+                  op uses), an IncDecSite's memUid (except one an
+                  IncDecMemberCheckedV op uses), a CallSite's a0_name
+                  (except in the `undef` form) and a Param's sig_type.
+                  Every other uid - a
+                  struct's, field's, const's, parameter's or capture's name,
+                  a member key, an emplace callee, a builtin's name, a
+                  global slot's name - is refused when null.
+    sref          u32 index into the struct table, or 0xFFFFFFFF for null.
+                  v40: 0xFFFFFFF0, 0xFFFFFFF1 and 0xFFFFFFF2 name the
+                  binary's own reflection structs StructField,
+                  StructLayout and Type (eval.cpp, native_struct_*_def),
+                  which no struct table holds - every binary has them.
+                  Legal ONLY as a strct value's def (11.3) and a
+                  MemberKey's bake_def; anywhere else it is out of
+                  range like any index past the table.
+    dref          u32 index into the descriptor table
+    loc           a source location, 3 bytes in the common case (section 2.1)
+    value         a runtime value, recursive (section 11)
+    arglocs       u32 count, then that many { loc start; loc end } pairs
+    N x REC       a u32 count immediately followed by N records
+    signed u32    a u32 whose bit pattern is read back as an int32; used for
+                  fields that are `int` in memory and may be -1
+
+Counts are u32 and always immediately precede the records they count.  There
+is no section table and no padding: the file is read strictly sequentially.
+
+2.1  loc - a source location
+
+A Loc is a (line, column) pair; both are 1-based in practice, and a
+default/absent Loc is (0, 0).  On disk:
+
+    u16 line          0..65534 direct;  65535 (0xFFFF) = ESCAPE
+    [u32]             present only when line escaped: the line as an int32
+    u8  col           0..254 direct;    255 (0xFF)     = ESCAPE
+    [u32]             present only when col escaped: the column as an int32
+
+So a loc is 3 bytes normally, 7 or 9 if one or both fields escape.  The byte
+forms are an OPTIMIZATION FOR THE COMMON CASE, never a cap: a 70000-line file
+or a 300-column caret round-trips exactly.
+
+Rationale for u16 (not u8) on the line: these Locs are ABSOLUTE.  Unlike the
+loc TABLE's (section 9.2), a caret pool's Locs have no ordering relationship
+to delta against, and a one-byte line would escape in any file over 254
+lines - which is most of them.  Measured over bench/ + samples/: 1618 pool
+Locs, widest line 206, widest column 77, so nothing escapes in practice.
+
+Every pool in section 9 writes its Locs through this one encoding.
+
+2.2  annot - a TypeAnnot record (v37)
+
+A declared type, as the parser built it (`array<P?>`, `dict<str, int>`,
+`box<float>`), possibly absent:
+
+    u8    kind      DeclType, section 13; 255 (0xFF) = NO annotation, and
+                    then nothing else follows
+    bool  opt       the `?` / `opt` of this level
+    u32   struct    a struct table index (section 7), 0xFFFFFFFF = none;
+                    only a `strct` kind may name one (it may name ANY
+                    struct, a later one or its own - `array<Tree> kids`)
+    [annot elem]    present for an `arr` or a `box` kind: the element type
+    [annot key]     present for a `dict` kind: the key type,
+    [annot val]       then the value type
+
+A child may itself be absent (its kind byte 0xFF).  The reader REFUSES a kind
+above `box`, a struct index on another kind or past the table, and a nesting
+deeper than 256 levels ("corrupt .myv (annot ...)").  (v43: the struct index
+may also be one of the reserved native srefs of section 2 - a reflection
+struct, as an `array<Type>`'s element.)
+
+2.3  ctype - a container's own type (v43)
+
+An `annot` (2.2) naming the type an array or a dict carries (plans/
+typed-containers.md): `array<T>` or `dict<K, V>`, possibly absent (its kind
+byte 0xFF: an UNTYPED container).  Where present its kind must be `arr` (an
+array's, a MakeArrayV's, a MapFilterV's) or `dict` (a dict's, a MakeDictV's)
+- either for a builtin call's, which may build one or the other - and its
+top-level `opt` must be false; the reader refuses anything else ("corrupt
+.myv (container type)" / "(ctype)").  The loader interns it, so two equal
+types are one object.
+
+--------------------------------------------------------------------------------
+3.  TOP-LEVEL LAYOUT
+--------------------------------------------------------------------------------
+
+    +----------------------------------------------------------+
+    |  HEADER            (section 4)                           |
+    |  SOURCE REFERENCE  (section 5)                           |
+    |  STRING TABLE      (section 6)                           |
+    +----------------------------------------------------------+
+    |  TABLE OF CONTENTS (section 7.0)                         |
+    |  STRUCT TABLE      (section 7)                           |
+    |  DESCRIPTOR TABLE  (section 8)                           |
+    |  CHUNKS            (section 9)  root first, then one per |
+    |                                 descriptor that has one  |
+    |  GLOBALS           (section 10)                          |
+    +----------------------------------------------------------+
+
+The writer emits the second group FIRST into a separate buffer, because
+writing it is what POPULATES the string table; the header group is then built
+and the two are concatenated with the header in front.  A reader therefore
+sees the string table before any index that refers to it.
+
+--------------------------------------------------------------------------------
+4.  HEADER
+--------------------------------------------------------------------------------
+
+    char[4]   magic                 "MYLV"
+    u32       format_version        must EXACTLY equal the reader's
+    u32       endian_mark           0x01020304
+    i64       builtin_fingerprint   builtin_set_fingerprint()
+
+magic - `myv_is_image()` reads these 4 bytes alone, which is how a file
+argument is recognized as an image BY CONTENT rather than by extension.
+
+format_version - no cross-version compatibility: a mismatch is refused with
+"incompatible .myv version - recompile from source".  Any change to any record
+in this document bumps it.
+
+endian_mark - a byte-order canary.  A big-endian host reads 0x04030201 and is
+refused.
+
+builtin_fingerprint - a hash of the builtin SET: FNV-1a over every builtin
+name in table order (which is sorted by name), xor'd with the count.  It
+exists because instruction operands can name a
+builtin by SLOT: `SymKind::builtin` references are baked indices into the
+program-wide builtin table.  That table is now sorted BY NAME, so its order is
+deterministic given the set - but a binary built with a different set of
+builtins would resolve a baked slot to the WRONG builtin, so such an image is
+refused rather than silently misinterpreted.
+
+(This was a real bug: the builtin table used to be keyed by interned POINTER
+order, which differs per process, making baked slots unstable across runs of
+the same binary.  Sorting by name fixed it; the fingerprint guards the rest.)
+
+--------------------------------------------------------------------------------
+5.  SOURCE REFERENCE
+--------------------------------------------------------------------------------
+
+    str   root      the project root, absolute
+    str   rel       the source path relative to `root`
+    str   abs       the source's absolute path at compile time
+    u32   crc       CRC-32 of the source bytes
+    i64   size      the source's size in bytes
+
+An image does NOT embed the program text.  It records where the text WAS plus
+enough to prove a file found there is still the one that was compiled.  ~100
+bytes, versus the whole program.
+
+`--strip-source` writes all three strings empty and crc/size zero, which means
+"no reference": errors then print no source line, and the image carries no
+local paths at all.
+
+HOW THE WRITER PICKS root/rel (myv_source_ref):  `root` is the compile-time
+working directory when the source lives under it - the usual `mylang -c
+samples/phonebook` from the project root - otherwise the source's own
+directory.  Either way `rel` is non-empty, which is what makes an image
+RELOCATABLE: a `rel` full of ".." hops would not survive relocation, so one is
+never built.
+
+HOW THE LOADER RESOLVES IT (resolve_source):
+
+  * `--source ROOT` given: look ONLY under it, at ROOT/rel.  An explicit root
+    that lacks the file is a mistake worth reporting, not a reason to fall
+    back silently to a stale absolute path.
+  * otherwise: try `abs`, then `root`/`rel`.
+
+Then, for the first candidate that exists:
+
+  * size and CRC32 both match -> use it.  Errors are then byte-identical to
+    the same error from a source run.
+  * they differ -> print a warning and REFUSE the file (no quoted line, no
+    caret), because a caret drawn on the wrong text is worse than no caret.
+    `-f` / `--force` uses it anyway and warns that carets may be misplaced.
+  * no candidate exists -> silence.  Shipping an image without its source is
+    an ordinary thing to do; the error header still names the file and line
+    and the backtrace still names every function.
+
+CRC-32 is the standard reflected form (polynomial 0xEDB88320, initial and
+final inversion), computed a bit at a time - no table to carry.  It runs twice
+per file lifetime, so speed is irrelevant; detecting an edited source is the
+whole point.
+
+--------------------------------------------------------------------------------
+6.  STRING TABLE
+--------------------------------------------------------------------------------
+
+    N x str
+
+Deduplicated, in first-use (insertion) order, so it is deterministic for a
+given write order.  `sid` and `uid` fields elsewhere are indices into it; the
+loader re-interns every entry into a UniqueId, so identifier identity is
+restored by NAME rather than by a stored pointer.
+
+Note that `str` payloads INSIDE values (section 11) are written inline, not
+through this table: a string CONSTANT is data, not an identifier.
+
+--------------------------------------------------------------------------------
+7.  STRUCT TABLE
+--------------------------------------------------------------------------------
+
+7.0  TABLE OF CONTENTS (v20)
+
+    u32   n_structs         the number of StructDef records in section 7
+    u32   n_descriptors     the number of Descriptor records in section 8
+
+Both counts come BEFORE either table's content: the loader constructs an
+empty SHELL for every struct and every descriptor first (IDENTITY), then fills
+the records in file order (CONTENT), then derives what depends on filled
+records (WIRING - section 14).  Any cross-table index is therefore resolvable
+wherever it appears; in particular a struct's const member may name a
+descriptor (value tag 9) although the descriptor table follows it.  The design
+record is plans/myv-table-ordering.md.
+
+VALIDATION: the counts no longer precede their own records, so the
+"no more entries than bytes remaining" bound of a plain count does not apply.
+Instead a struct record is at least 12 bytes and a descriptor record at least
+40, and the loader REFUSES an image where
+12 * n_structs + 40 * n_descriptors exceeds the bytes remaining after the two
+counts ("corrupt .myv (table of contents exceeds the file)").
+
+7.1  THE RECORDS
+
+    n_structs x StructDef           (no leading count - it is in 7.0)
+
+    StructDef:
+        uid   name
+        bool  is_class      v33: a `class` (reference semantics); a class
+                            def is never POD (compute_layout)
+        M x Field
+        K x Const
+
+    Field:
+        uid   name
+        u8    kind          FieldKind, section 13
+        uid   struct_ty     the field's struct type NAME, if any
+        sref  struct_def    the resolved struct type, or null
+        bool  is_opt
+        u32   slot          (signed) the boxed-layout slot index
+        annot annot         v37 - the field's declared type (2.2):
+                            PRESENT for an `array`, `dict` or `box` kind,
+                            absent for any other (whose kind says it
+                            all) - v46: the loader refuses either the
+                            other way
+
+    Const:
+        uid   name
+        value value         the folded `const NAME = expr;` member
+
+                            A `func` value (tag 9) is legal here since
+                            v20: the descriptor it names is a SHELL when
+                            this record is read (section 7.0), so the
+                            loader stores only the pointer and DEFERS
+                            the capture-free check of section 11 to the
+                            wiring phase, when the descriptor is filled.
+
+Structs are written in definition order.  A field's `struct_def` can only
+reference an EARLIER struct (inline fields only go backwards - a parser
+invariant enforced by the recursive-struct rejection), so no forward reference
+is possible.
+
+THE LAYOUT IS NOT STORED.  size, align, the POD/boxed decision and every byte
+offset are RECOMPUTED at load by `compute_layout()`, deterministically from
+the field kinds.  Storing them would only add drift surface.
+
+The loader constructs all N definitions first, then fills them, so a field may
+reference any of them during the fill.
+
+--------------------------------------------------------------------------------
+8.  DESCRIPTOR TABLE
+--------------------------------------------------------------------------------
+
+A FuncDescriptor is the serializable runtime identity of a function - the
+whole call model reads it, never an AST node.
+
+    n_descriptors x Descriptor      (no leading count - it is in 7.0)
+
+    Descriptor:
+        uid   name
+        sid   display_name          the original name for a `$N` clone
+        P x Param
+        C x Capture
+        bool  resolved
+        u32   frame_size            (signed)
+        u32   min_args              (signed)
+        bool  explicit_pure
+        bool  effective_pure
+        bool  cache_results
+        bool  pure_ctx
+        bool  is_template_base
+        bool  fast_bind             see the note below
+        i64   noescape_params       v17 - bit i set: parameter i is
+                                    NON-ESCAPING (#93, the resolver's
+                                    parameter escape analysis): the
+                                    reference bound to it cannot be
+                                    reachable after the call returns, so
+                                    the bind BORROWS it (#94) - no retain,
+                                    no release. Stored because the
+                                    analysis runs on the AST, which an
+                                    image does not have; before v17 an
+                                    image never borrowed, and since the
+                                    frameless site binds a borrow INLINE
+                                    (#97 W5) the emitted code depends on
+                                    it, so a fresh compile and its image
+                                    must agree. A hostile value costs
+                                    nothing worse than the analysis being
+                                    wrong would (see #93's rules). Written
+                                    as the i64 of the 64-bit mask.
+        bool  has_chunk             false for a dead template base
+
+    NOTE on fast_bind: the reader RECOMPUTES it from the params it just
+    read (compute_bind_flags, eval.cpp) and compares the result with the
+    stored byte - so the field doubles as a cross-check of the param round
+    trip.  A mismatch REFUSES the image ("corrupt .myv (descriptor bind
+    flags)"); it is an input error, not an assertion, so a release build
+    reports it too. Its companion `bind_req` (the per-param bind-time coercion
+    target) is DERIVED from the same read and is deliberately NOT stored,
+    like every other derived pool in this format.
+
+    Param:
+        uid   name
+        bool  opt
+        bool  cnst
+        bool  dyn_mod
+        u8    decl_type             DeclType, section 13
+        u8    proven_type           v11 - DeclType, section 13.  The type
+                                    INFERENCE proved for this parameter, as
+                                    opposed to the one the source DECLARED
+                                    (decl_type): the JIT elides a bind-time
+                                    type store when the two agree (C3).
+        uid   sig_type              v36 - the annotation as the source
+                                    wrote it, `[opt] TYPE`, when decl_type
+                                    alone cannot say it: a struct, a
+                                    parameterized container, a box.  May be
+                                    null.  Read by signature() only.
+        annot fit                   v37 - #49: the type a `dyn` argument
+                                    must FIT at this parameter (2.2),
+                                    checked at run time; absent when the
+                                    bind's own coercion already decides
+                                    it (a plain int/float/none check).
+
+    Capture:
+        uid   name
+        u8    kind                  SymKind, section 13
+        u32   slot                  (signed)
+        loc   start                 v12 - the capture-list entry's own span
+        loc   end                   (see below)
+
+`has_chunk` is what pairs a descriptor with its chunk in section 9: the chunks
+follow in exactly this order, skipping descriptors whose flag is false.  A
+false flag makes the loader mark the descriptor `vm_chunk_tried`, so nothing
+tries to compile it later.
+
+    VALIDATION (v14 rule, #122) - `has_chunk == false` REQUIRES
+    `is_template_base == true`, and the loader REFUSES the image otherwise
+    ("corrupt .myv (a callable descriptor has no chunk)").
+
+    A dead base template is the ONLY reason a descriptor may lack a chunk:
+    every call to it was redirected to a monomorphized instance, so codegen
+    skips it deliberately (the only compiled-set exclusion).  Every other
+    function is compiled UPFRONT - the format stores no lazily-compiled
+    bodies - so a chunk-less non-template descriptor cannot be produced by
+    any writer.
+
+    The rule is not cosmetic: after the AST teardown a descriptor carries no
+    body either, so a call to one that also lacks a chunk has nothing to
+    execute.  Clearing this one bit on an ordinary function used to yield an
+    image that loaded happily and then dereferenced a null body pointer at
+    the first call - a named abort in an asserts build, a SIGSEGV in a
+    release.  Both bits together are self-consistent and pass this check; a
+    provenance-gated runtime check (ML_UNTRUSTED_CHECK in do_func_call)
+    covers that residue, since "is this descriptor ever CALLED" is not
+    decidable from the image.
+
+    NOTE this is a READER rule only.  It constrains no byte and adds no
+    field, so a v14 image written before the rule existed still loads
+    unchanged: every writer has always emitted the consistent pair.
+
+Like structs, descriptors are constructed first and filled second, because a
+chunk's `closure_defs` may reference any of them.
+
+--------------------------------------------------------------------------------
+9.  CHUNKS
+--------------------------------------------------------------------------------
+
+The root chunk comes first, then one chunk per descriptor with `has_chunk`.
+Each chunk is:
+
+    N x Instr                       9.1
+    u32   slot_count                (signed)
+    u32   n_temps                   (signed)
+    u32   n_dict_iters              (signed)
+    u32   n_dyn_iters               (signed)
+    u32   n_trys                    (signed) try-REGION count: sizes the
+                                    frame's per-region exception-state
+                                    slice, exactly as n_dict_iters sizes
+                                    the dict-iterator slice (v7)
+    N x HandlerSite handler_sites   the per-try-region catch table (v8),
+                                    section 9.18
+                                    (v18: `ref_slots`, once here, is NOT
+                                    stored - see DERIVED POOLS)
+    N x value consts
+    N x LocEntry locs               9.2
+    N x LocEntry base_locs          9.2 - the store-BASE carets (v13)
+    N x LocEntry op_locs            9.2 - the compound-OPERATION carets
+                                    (v22)
+    u32      n_arg_locs             the per-ARGUMENT carets (v16)
+    n x ArgLocs                     9.21
+    u32      n_value_callees        the named value-call callees (v15)
+    n x { u32 pc; u32 def }         9.20
+    N x InlineFrame inline_frames   9.3
+    N x InlineCtx inline_ctxs       9.3
+    N x MemberKey member_keys       9.4
+    N x CtorPlan ctor_plans         9.5
+    N x IncDecSite incdec_sites     9.6
+    N x StepList chain_steps        9.7
+    N x IncDecChain incdec_chains   9.7
+    N x ChainLocs chain_locs        9.8
+    N x CatchTypes catch_types      9.9
+    N x LiteralObj literal_objs     9.10
+    N x dref closure_defs
+    N x sref struct_defs
+    N x BoxedCtor boxed_ctors       9.11
+    N x FitSpec fit_specs           9.11a   (v37)
+    N x ctype ctypes                9.11b   (v43)
+    N x annot cast_types            9.11c   (v45)
+    N x EmplaceSite emplace_sites   9.12
+    N x ThrowSite throws            9.13
+    N x SlotList unpack_targets     9.14
+    N x ByteList unpack_coerce      9.14
+    N x BuiltinCall builtin_calls   9.15
+    N x CallSite call_sites         9.16
+    N x sid slot_names              9.17
+
+`boxed_ops` is ABSENT from this list on purpose - see section 12.
+
+9.1  Instr - the compact instruction encoding
+
+An in-memory Instr is 32 bytes with 27 meaningful ones (op, aop, opflags,
+target, target2, pa, pb).  It is never memcpy'd to disk (its padding is
+indeterminate); each field is written individually, and only when it is not at
+its default:
+
+    u8    op                        the opcode
+    u16   flags                     which optional fields follow, and how wide
+    [u8]  aop                       iff flags bit 10.  An Op value
+                                    (src/operators.h): the base arith/
+                                    compare op for BinOpV/CmpV/CompoundV/
+                                    the global+capture stores, the
+                                    COMPOUND Expr14 op (assign/addeq/../
+                                    bxoreq, values 15 + 25-29 + 44-49)
+                                    for the element/dict/member stores
+    [u8]  opflags                   iff flags bit 11
+    [..]  target                    iff its width code is nonzero
+    [..]  target2                   iff its width code is nonzero
+    [..]  pa                        iff its width code is nonzero
+    [..]  pb                        iff its width code is nonzero
+
+The flags word:
+
+    bits 0-2    pa       width code 0..4
+    bits 3-5    pb       width code 0..4
+    bits 6-7    target   width code 0..3
+    bits 8-9    target2  width code 0..3
+    bit  10     aop is stored     (else Op::invalid)
+    bit  11     opflags is stored (else 0)
+    bits 12-15  RESERVED, MUST BE ZERO
+
+A width code is:  0 = the field is at its DEFAULT and is not stored at all;
+1 = 1 byte; 2 = 2 bytes; 3 = 4 bytes; 4 = 8 bytes.  A stored field is a plain
+little-endian signed integer of that width, sign-extended on read.  The
+default is -1 for target, target2, pa and pb.
+
+The reader REFUSES a nonzero in bits 12-15, so a later version can spend them
+without a version-6 reader silently misreading such a file.  It also refuses
+a width code above 4, and an opcode at or above OpCount_.
+
+Field order on disk is exactly as listed above (aop, opflags, target,
+target2, pa, pb) - not the order of the flag bits.
+
+WHY.  Measured over bench/ + samples/ (3483 instructions): the fixed 27-byte
+record was 37% of an image, yet `target` is present in 95% of instructions and
+fits in ONE byte in 97% of those; `target2` and `pb` are at their default in
+roughly half; `pa` fits in one byte in two thirds.  The typical instruction is
+therefore 5-6 bytes rather than 27.
+
+THE DEFAULT-VS-VALUE SUBTLETY.  `pa == -1` means both "unset slot" and the
+integer literal -1.  That is not ambiguous on disk: the field is simply not
+stored and the reader's default restores exactly -1, while `opflags`
+independently records whether the operand is a literal.  Nothing is lost.
+
+OPFLAGS BIT 6 (C1c, 2026-08-03) is the ELEM-BOOL hint on StoreElemInt - an
+ADVISORY compile-time note (the JIT's hoist pick guards the bools kind
+instead of ints; a wrong hint merely fails a runtime guard).  It rides the
+stored opflags byte with no format change: the byte was always stored whole,
+and an older reader simply carries the bit through untouched.  Bit 7 is
+spoken for per opcode family: LoadStructFieldInt/Float's checked subscript
+form, CallV/CachedCallV's scalar result, and (v43) a container store op's
+CHECKED store - StoreElemValue, DictStore, StoreElem2V, StoreElemChainV and
+StoreLValueChainV check the stored value against the container's own type.
+
+This is NOT in-format compression: no dictionary, no entropy coding, no
+bit-level packing of values, no decoder state.  Each field is a plain integer
+at a byte boundary, decoded in O(1), and two compiles remain byte-identical.
+
+9.2  LocEntry - the delta-coded loc tables
+
+`locs` maps the pc of an op that can throw to the source span its caret
+covers.  `base_locs` (v13) has the IDENTICAL encoding and holds an op's
+SECOND caret - a container store's base identifier, and (since 2026-09-20,
+no encoding change) a user call op's argument list - see the version note in
+section 12.  `op_locs` (v22), again identical, holds a store op's
+COMPOUND-OPERATION caret: the whole `lv OP= rhs` (or inc-dec) span, which
+an error raised by the operation step - div0, a negative shift count, a
+type error - takes, while `locs` keeps the lvalue's span for an error
+reaching the element.  It is sparse: only a store op whose assignment is
+a compound records one.  A reader bounds its pcs like the other two (they
+are remapped by indexing).  All three are pc-ascending, and each entry is
+FOUR bytes in the common case:
+
+    u8    pcd       pc - previous pc            255  = escape
+    i8    lined     start.line - previous line  -128 = escape
+    u8    col       start.col                   255  = escape
+    u8    ecol      end.col, IMPLYING end.line == start.line
+                                                255  = escape
+
+An escape means: that byte is the reserved sentinel, and the value follows as
+a plain 4-byte little-endian int32.  The `ecol` escape is special - it carries
+the FULL end Loc, two int32s (line then column) - which is how a span that
+crosses lines is represented:
+
+    ecol == 255  ->  i32 end.line, i32 end.column
+
+"Previous" starts at 0 for both running values, per chunk.  Note this is the
+loc table's OWN delta encoding, unrelated to the pool `loc` of section 2.1.
+
+WHY FOUR AND NOT FIVE.  A dedicated end-line byte would serve only the 2.3%
+of entries whose span crosses a line, so it is folded into `ecol`'s escape
+instead.  Measured over 969 corpus entries: the pc delta never exceeded 19,
+the widest column was 99, 97.7% of spans end on the line they start, and only
+4 entries needed any escape at all.  The old record was 20 bytes.
+
+WORST CASE, honestly: an entry escaping all four fields is 24 bytes, four more
+than the old fixed record.  It requires a pc delta over 254 AND a line jump
+over 127 AND a column over 254 AND a multi-line span in ONE entry, which the
+measured maxima put out of reach.
+
+ON-DISK ONLY.  The loader rebuilds the same in-memory vector<LocEntry>, so
+`Chunk::loc_at`'s binary search on the throw path is completely unaffected.
+
+The reader rejects a negative reconstructed pc or line, and a pc past the end
+of the code.
+
+9.3  Inline frames - virtual backtrace frames
+
+    InlineFrame:
+        sid   callee_name
+        N x sid  params
+        loc   call_site
+        u32   parent            index into this same pool, or 0xFFFFFFFF
+
+    InlineCtx:
+        u32   pc
+        u32   frame             index into inline_frames
+
+Together these reproduce the "inlined-at" chains that make an inlined call
+appear in a backtrace even though no physical call happened.  A parent always
+has a LOWER index than its child, so the pool is topologically ordered and can
+be walked without recursion.
+
+9.4  MemberKey - a member access's key and carets
+
+        value memId             the name as a dict-key VALUE (so a dict
+                                member read `d.k` needs no conversion)
+        uid   memUid            the interned field/const name
+        bool  optional          `a?.b` short-circuits a none base
+        loc   mstart, mend      the member expression's caret
+        loc   bstart, bend      the base's caret
+        sref  bake_def          the compile-proven struct type, or null
+                                (v40: or a NATIVE struct - a member read
+                                on a folded type() is baked against Type)
+        u32   bake_slot         (signed) its resolved field slot
+
+`bake_def`/`bake_slot` are the compile-baked field resolution: a consumer uses
+the slot behind a def-identity check instead of a runtime name scan.
+
+9.5  CtorPlan - a planned POD struct construction
+
+    CtorPlan:
+        N x { u32 off; u32 src; u8 act }
+
+Per field: the byte offset in the instance, the source frame slot, and the
+action (0 = raw int, 1 = float via promotion, 2 = bool byte).
+
+9.6  IncDecSite
+
+    loc   lstart, lend      the lvalue's caret
+    loc   istart, iend      the inc-dec's own caret
+    loc   bstart, bend      the base's caret (v28)
+    value memId             the member name as a dict-key value
+    uid   memUid
+
+Three distinct carets because a subscript-internal throw (out of bounds, key
+not found), the member form's "Expected dict object" (a base that is neither
+a struct nor a dict - it marks the base) and the inc-dec's own throw (not an
+lvalue, const, type error) must report different spans - which a single
+loc-per-pc table cannot express.  The element form writes the subscript
+base's caret and never reads it.
+
+9.7  Chain steps and inc-dec chains
+
+    StepList:
+        N x { bool is_member; u32 operand (signed); loc lstart, lend }
+
+`operand` is a member_keys index when `is_member`, else the frame slot of the
+temp holding the subscript key.  Each step carries its own caret so a throw at
+that step reports the same span the tree-walker would.
+
+    IncDecChain:
+        StepList steps
+        bool  tier2             the operand is a proven int/float
+        bool  is_prefix
+        loc   id_start, id_end
+        loc   kstart, kend
+
+9.8  ChainLocs
+
+    N x { loc; loc }
+
+One caret pair per step of a subscript chain store, innermost first.
+
+9.9  CatchTypes
+
+    N x CatchType
+
+    CatchType:
+        sid   name          the clause's type name, as written
+        sref  struct_def    v42 - the struct the name resolved to (the
+                            clause catches that struct only), or null:
+                            a built-in exception's name (TypeErrorEx,
+                            ...), or a name an open world could not
+                            resolve, which matches by name
+
+One list per try region: the catch clause types, in order.  The name's
+interned twin and whether it is a built-in exception's are DERIVED
+(`catch_keys`) - rebuilt at load, not stored (section 12).
+
+9.10  LiteralObj - a baked const array/dict/struct literal
+
+    value value             already in the storage its destination's
+                            type gives it (a flat array<int> is stored
+                            flat), so it is loaded as it is
+    bool  immutable         a const decl, or an already-read-only value
+
+9.11  BoxedCtor
+
+    sref     def
+    arglocs  arg_locs       per-field carets for a boxed construction
+    bool     fit            v37 - #49: check the container and box fields'
+                            declared element types (an argument may be a
+                            `dyn` the static check let through)
+
+9.11a FitSpec - a CheckFitV's place (v37)
+
+    annot    annot          the place's type (2.2), the type the value must
+                            fit; must be present for an entry a CheckFitV
+                            names
+    u8       place          0 variable, 1 field, 2 element, 3 dict value,
+                            4 dict key (the error message's subject); the
+                            reader refuses a larger one
+    uid      name           the field's or variable's name; null (0xFFFFFFFF)
+                            for an element, a dict value or a key
+
+9.11b ctypes - the creation ops' container types (v43)
+
+Each a `ctype` (2.3), present (never 0xFF).  An op names one by a REF -
+0 for none, else the index + 1: MakeArrayV in target2's bits 8 and up
+(its low 8 bits are the ArrHint), MakeDictV in the whole of target2,
+MapFilterV in target2's bits 3 and up, StampTypeV in the whole of target2
+(never 0 there).  The verifier refuses a ref past the pool, and a
+StampTypeV with none ("corrupt .myv (ctype at pc N)").
+
+9.11c cast_types - the casts' types (v45)
+
+Each an `annot` (2.2), present (never 0xFF) and COMPLETE: an array or a
+box names its element, a dict its key and value, a struct annotation its
+struct, at every level, and no annotation is of kind none - the reader
+refuses any other ("corrupt .myv (cast type)").  Any kind, `?` included.
+A CastV names one by its index in `target2`; the verifier refuses an
+index past the pool.
+
+9.12  EmplaceSite - a construct-in-place append
+
+    sref     def
+    uid      bname          the callee name (append/push)
+    loc      a0_start, a0_end     the container argument's caret
+    arglocs  field_locs           per-field coerce carets
+    bool     ct_store             v43 - the append goes through `dyn`: the
+                                  built value is checked against the
+                                  array's own type
+
+9.13  ThrowSite - a compiled always-throwing construct
+
+    u8    kind              ThrowKind, section 13
+    loc   start, end
+    uid   name              used by undefined_var only
+
+9.14  Unpack targets and coercions
+
+    SlotList:   N x u32     (signed) per-position frame slot; -1 = `_`
+    ByteList:   N x u8      per-position numeric coercion
+
+9.15  BuiltinCall
+
+    uid      name           the builtin's NAME, re-resolved at load
+    loc      start, end     the whole-args caret
+    u8       arr_hint       ArrHint, section 13
+    ctype    ctype          v43 - (2.3) the type a container the call builds
+                            is made with; absent for every other call
+    bool     ct_store       v43 - the call stores a value into a container
+                            whose type was not known here (append / push /
+                            insert through `dyn`): checked against the
+                            container's own type
+    arglocs  args           per-argument carets
+    uid      member         arg0's field name for `append(s.f, x)`, else null
+    StepList steps          (9.7) CallBuiltinLVMember's chain form: arg0
+                            is the base walked through these steps
+                            (`append(o.i.a, x)`), `member` then null;
+                            empty for every other record
+
+A builtin is stored BY NAME, never as a function pointer.  The loader
+re-resolves it through `vm_lookup_builtin`; an unknown name is refused.
+
+9.16  CallSite - an indirect call's carets plus arg0's lvalue descriptor
+
+    loc      start, end
+    arglocs  args
+    u8       arr_hint       ArrHint, section 13
+    ctype    ctype          v43 - (2.3), as a BuiltinCall's
+    bool     ct_store       v43 - as a BuiltinCall's (the callee may be an
+                            in-place builtin)
+    u8       a0_form        CallSite::A0, section 13
+    u32      a0_kind        0 local / 1 global / 2 capture / 3 builtin
+    u32      a0_slot        (signed)
+    u32      a0_operand     (signed) elem: index temp; member: key index
+    uid      a0_name        undef form only
+    StepList a0_steps       (9.7) chain form only: the base -> arg0 steps
+
+9.18  HandlerSite - the per-region catch table
+
+    N x Clause                      one per catch clause, in source order
+        u32  types_idx              (signed) catch_types index, -1 = the
+                                    parenless catch-all
+        u32  bind_slot              (signed) `catch (T as e)` frame slot,
+                                    -1 when the clause binds nothing
+        u32  body_pc                the clause's catch body
+    u32   fin_pc                    (signed) the shared finally, or -1 when
+                                    the try has none (a no-match then
+                                    re-raises to the next handler out)
+    u32   chain                     (signed, v38) the region whose parked
+                                    exception an exception leaving this
+                                    region's body remembers as its context,
+                                    or -1
+
+Indexed by TRY REGION ID - the same id the exception ops carry - so entry
+i describes region i.  A try whose native lowering bailed leaves an EMPTY
+entry (zero clauses, fin_pc -1, chain -1): a hole in the id space,
+harmless.  No PushHandler names a hole: the loader refuses an image whose
+PushHandler names an empty entry (2026-10-21, myv_fuzz).
+
+A CHAIN MARKER (v38, question 12 - implicit exception chaining) is a
+region with a chain.  Codegen runs a try's catch bodies under one region
+chaining to the try's own (it gets a finally copy as its fin_pc when the
+try has a finally), and each RERAISE copy of a finally - the copy a
+fin_pc names, entered only by the dispatch - under a marker with no
+clause and no finally whose chain is the region that parked the
+propagating exception (a normal exit runs its own copy, under no marker).
+The dispatch reads a marker as it pops it, before its clauses: when the
+chain region's slot holds an exception, the in-flight exception remembers
+it.  The loader refuses a pushed marker whose chain is
+not below the chunk's try region count (the {exc, pend} slice it indexes).
+
+This is PRIMARY data, not derived: it IS what the raise path matches
+against.  The interpreted CatchTest/Reraise chain that used to mirror it
+was deleted in version 9 - those two opcodes no longer exist, and a
+PushHandler carries only its region id.  Every pc in this table is a
+RESUME the raise path jumps to, so the peephole treats them as roots and
+remaps them like any branch target.
+
+9.17  slot_names
+
+    N x sid
+
+DEBUG data: the `-vd` disassembly labels frame slots with these.  It is stored
+unconditionally so a loaded image dumps byte-identically to a fresh compile -
+the round-trip oracle - which is worth its ~2% of an image.  It is the one
+section that could be dropped without losing behaviour.
+
+--------------------------------------------------------------------------------
+10.  GLOBALS
+--------------------------------------------------------------------------------
+
+    N x u8   global_slot_reassigned    per global slot: written more than once?
+    u32      root_slot_count           (signed) the root chunk's `slot_count`
+                                       (section 9) written a SECOND time;
+                                       the loader refuses the image when
+                                       the two disagree (v19)
+    N x uid  global_func_names         the global table's slot -> name list
+    bool     typed                     compiled with type inference (v44)
+
+`root_slot_count` is deliberately redundant, as a function chunk's
+`slot_count` is with its descriptor's `frame_size`: `slot_count` partitions
+main's frame into locals and temps, every load-time analysis and the JIT's
+pin gate classify a slot by it, and it has NO derivation - so a second copy
+is the only way to DETECT a mutated one (myv_fuzz fat-316 and fat-311, both
+the chunk's copy: a leaked reference either way, and undetectable while the
+format kept one record).
+
+`typed` says whether the program was compiled with type inference (not
+under `-nti`): only then does a container that carries no type of its own
+TAKE the type of the typed place it enters (Q2 increment 3, README "A
+container enters a typed place by its type"), so an image runs as its
+compile would.
+
+`global_slot_reassigned` is what lets the load-time JIT rebuild its compile
+context: a write-once global slot may be baked, a reassigned one may not.
+`global_func_names` both sizes the global table and backs the `globals()`
+reflection builtin - and it is how the loader maps a global slot back to a
+descriptor BY NAME when rebuilding the JIT context.
+
+--------------------------------------------------------------------------------
+11.  THE VALUE CODEC
+--------------------------------------------------------------------------------
+
+Used by chunk `consts`, `literal_objs`, struct `consts`, member keys, dict
+keys and values, and recursively by itself.
+
+    u8 tag, then a payload:
+
+    0  none         (nothing)
+    1  boolean      bool
+    2  integer      i64
+    3  flt          f64
+    4  str          str
+    5  arr          see 11.1
+    6  dict         see 11.2
+    7  strct        see 11.3 - a STRUCT instance (never a class's)
+    8  structtype   sref
+    9  func         dref     (a FuncObject.  Legal in a struct's const
+                              members since v20 - the descriptor is a
+                              shell there (section 7.0), so the check
+                              below runs in the wiring phase.
+                              The descriptor MUST have
+                              NO captures - the writer refuses a
+                              capturing closure and the READER
+                              REJECTS one: "corrupt .myv (capturing
+                              closure in a pool)". A loaded closure
+                              gets no capture_root - it has no
+                              context to root at - and runs under
+                              its caller's root.)
+    10 cls          see 11.4 - a CLASS instance (v33)
+    11 bltn         uid      (a builtin VALUE, v39 - `const OPS = [len,
+                              abs];`.  The name is the least, by
+                              spelling, of the names registered with the
+                              builtin's implementation, so two compiles
+                              write the same bytes; the loader binds it
+                              as it binds a BuiltinCall's name (9.15).
+                              A name this binary has no builtin for is
+                              "corrupt or incompatible .myv (unknown
+                              builtin)".)
+
+The writer ABORTS on any other type - "unserializable value type in a chunk
+pool".  An image is never silently lossy.
+
+A VALUE IS A TREE.  The codec has no back-reference record: a container
+shared at two places is written twice and loads back as two copies (as
+the compiler's own bake already holds it: the deep copies that bake a
+constant keep no sharing that is not on a cycle), and a value that
+CONTAINS ITSELF cannot be written at all.  The writer refuses one
+with "<where> holds a reference cycle (a value that contains itself),
+which a .myv image cannot store" - <where> is "a constant at the top
+level", "a constant in function 'f'", "a constant in a lambda" or "the
+constant 'S.K'" - and writes no file.  A reader therefore never meets one.
+
+11.1  arr
+
+    u8    storage kind      Storage, section 13
+    bool  readonly          the deep-const flag
+    ctype ctype             v43 - (2.3) the array's own type, or absent
+    u32   n                 element count
+    then, per kind:
+        ints      n x i64
+        floats    n x f64
+        bools     n x bool
+        strs      n x str
+        structs   sref def; u32 stride; then n*stride RAW BYTES.  The
+                  def must be a POD struct (not a class) whose computed
+                  size is `stride` - an element is that struct's bytes -
+                  else "corrupt .myv (a struct value does not match its
+                  struct)"; checked once every layout is computed
+        objs      n x value (v34), each a `cls` record (11.4) or `none`,
+                  else "corrupt .myv (class array element)"
+        general   n x value
+
+The STORAGE KIND round-trips, because `array_storage()` is script-observable:
+a flat array must load back flat.
+
+SLICES ARE NOT STORED.  A stored array is materialized as its own storage -
+offset 0, no parent, no live-slice registration - exactly as the in-memory
+const pool holds a self-contained value.
+
+11.2  dict
+
+    bool  readonly
+    ctype ctype             v43 - (2.3) the dict's own type, or absent
+    bool  has_default
+    [value default]         iff has_default
+    u32   n
+    n x { value key; value value }
+
+The pairs are in the dict's ORDER, which MyLang specifies as insertion order
+(README, Dictionary): a reader inserts them in file order, and the loaded dict
+iterates exactly as the written one did.  (Until 2026-10-12 dicts were
+unordered and this was the writer's hash-map order, which a rebuilt map did
+not keep; the bytes did not change, only what their order means.)
+
+11.3  strct
+
+    sref  def
+    bool  readonly
+    bool  pod
+    if pod:      u32 nbytes;  then nbytes RAW BYTES
+    else:        u32 nfields; then nfields x value
+
+VALIDATION (v33): the def must be a STRUCT (not a class), `pod` must equal
+the def's computed layout, and the count must be the def's - nbytes its size,
+nfields its field count - else "corrupt .myv (a struct value does not match
+its struct)".  A value read inside the struct table (a const member) is
+checked in the wiring phase, once every layout is computed.  The def may be a
+NATIVE struct (v40, section 2's `sref`): a folded `type(x)` is a constant
+`Type` instance, whose elem / key / val fields hold more of them or none;
+the three native structs are boxed.
+
+PORTABILITY NOTE.  A POD instance's bytes are written as laid out by the
+writing host, and a flat struct array's element bytes likewise.  The layout
+rules (pod_field_size / pod_field_align, structtype.h) depend only on
+sizeof(int_type), and the endianness marker already refuses a differently-
+ordered host - so an image with POD struct constants is portable between hosts
+that agree on int_type's width, which is every 64-bit target MyLang builds
+for.  A 32-bit host would need its own image.
+
+11.4  cls (v33)
+
+    sref  def               a CLASS def
+    i64   ident             the instance's identity number
+    u8    form              1 = the instance, 0 = a reference to it
+    if form == 1:
+        bool  readonly
+        u32   nfields;  then nfields x value
+
+A class instance has IDENTITY: two references to one instance are one object,
+and its hash is its identity number (StructObject::ident, structtype.h), which
+a dict keyed by class instances iterates by.  So the FIRST occurrence of an
+instance in the file (in file order) is written whole, with its number, and
+every later one as a reference (form 0) - the loader keeps the instances it
+has read by number and hands the same object back.  The number is the one the
+compile gave the instance, so its hash is the source run's.
+
+VALIDATION: a reference to a number not read yet, or to an instance of another
+def, is "corrupt .myv (a class reference names no instance)"; two instances
+with one number, "corrupt .myv (two class instances share a number)".  The
+instance is registered BEFORE its fields are read, so a field may refer back
+to it.  As for strct (11.3), the def must be a class and nfields its field
+count, checked in the wiring phase for a value read inside the struct table.
+
+--------------------------------------------------------------------------------
+12.  DERIVED DATA - PRESENT IN MEMORY, ABSENT FROM THE FILE
+--------------------------------------------------------------------------------
+
+Anything a load can recompute is recomputed, for size and - more importantly -
+to keep ONE implementation of it.  Each is rebuilt by calling the SAME function
+that built it during compilation; a hand-written reader would be a second
+implementation free to drift.
+
+    Chunk::boxed_ops      The JIT-bakeable operand pool for the boxed
+                          arithmetic ops.  A pure function of the final code
+                          plus the loc table, so `read_chunk` calls
+                          `build_boxed_ops` (codegen.h) after reading a chunk -
+                          last, since it needs `locs`.  It also stamps each
+                          such op's `target2` with the pool index, overwriting
+                          the stored value with an identical one.
+                          49 bytes per entry saved.
+
+    Chunk::nonneg_slots   The frame slots this chunk can only ever observe
+                          holding a value >= 0 - what lets the JIT reduce
+                          `i % 2^k` on a counted loop's induction variable
+                          to a single `and`.  A pure function of the final
+                          code plus `consts` and `handler_sites`, so
+                          `myv_read` calls `compute_nonneg_slots`
+                          (codegen.h) - NOT in `read_chunk` beside the
+                          other derived pools but AFTER
+                          `vm_verify_program`, because it is the first
+                          loader-side pass to walk instruction OPERANDS,
+                          and one of them is an iteration COUNT taken
+                          straight from the file.  Being
+                          derived is not only a size argument here: the
+                          fact is BAKED into emitted machine code, so an
+                          image and a fresh compile must not be able to
+                          disagree about it.  It is also why the analysis
+                          may read only chunk data - the parameter seeds
+                          `compute_ref_slots` receives are a
+                          DESCRIPTOR's, rebuilt from it (below).
+
+    FuncDescriptor::fit_any
+                          (v37) Whether any parameter carries a `fit`
+                          annot (section 8) - what makes a callback's
+                          raw-scalar bind tier decline.  Recomputed with
+                          `fast_bind` by `compute_bind_flags` from the
+                          params just read, so it cannot disagree with
+                          them.
+
+    Chunk::ref_slots      (v18) The frame slots that can hold a
+                          REFERENCE: what a frame pop RELEASES, what the
+                          return arms scan, what the frameless gate
+                          counts.  Stored until v17, and that was the
+                          one derived pool whose stored copy could be
+                          DANGEROUSLY wrong rather than merely stale:
+                          one mutated entry (myv_fuzz small-1305, a
+                          single bit, `[1, 2]` -> `[0, 2]`) unlisted the
+                          temp two closures were built in, the release
+                          scan skipped it, and the image ran to the
+                          right answer while leaking both.  Now a pure
+                          function of the final code (its write-dsts
+                          through the audited `visit_use_def` /
+                          `op_writes_scalar` tables and their
+                          per-instruction refinements), `consts`,
+                          `handler_sites` (the catch binds) and the
+                          PARAMETER SEEDS - the descriptor's parameter
+                          slots whose bind can write a reference, i.e.
+                          those neither int/float-coerced nor
+                          inference-proven scalar (`ref_seeds_of`,
+                          codegen.h, the same function the compile
+                          calls).  `myv_read` calls `compute_ref_slots`
+                          right after `compute_nonneg_slots`, for the
+                          same two reasons: it walks operands, so it
+                          runs after `vm_verify_program`, and the JIT
+                          bakes the list into its release arms, so it
+                          runs before `vm_jit_loaded_image`.  Derived
+                          from the code beside it, the list cannot
+                          disagree with that code.
+                          ONE stored input feeds it: a call's
+                          SCALAR-RESULT bit (opflags 0x80 on CallV /
+                          CachedCallV), which keeps the call's dst off
+                          the list - and the JIT writes an unlisted
+                          slot raw, so a false bit copied a returned
+                          reference without a retain (myv_fuzz
+                          small-390, 2026-10-06: a double free).  The
+                          reader therefore HONORS the bit only when it
+                          can justify it: the callee is a write-once
+                          global (`global_func_names`, not
+                          `global_slot_reassigned`) whose every ReturnV
+                          returns a literal or a slot its own derived
+                          `ref_slots` does not list.  A GREATEST
+                          fixpoint: every bit on such a call is kept to
+                          start with, and one is cleared as soon as its
+                          callee's derived `ref_slots` list a slot the
+                          callee returns, until none is - so a cycle of
+                          calls returning each other's results (`ev`
+                          returning `od(n - 1)`, `od` returning
+                          `ev(n - 1)`) keeps its bits, which a least
+                          fixpoint from "no bit" - the loader's rule
+                          until 2026-11-07, no format change - never
+                          restores.  Any other bit is CLEARED
+                          (never refused: a bit the compile set is
+                          always justified this way, so a valid image
+                          keeps every one).
+
+    Chunk::catch_keys     Per catch type, the name's interned twin and
+                          whether it is a built-in exception's
+                          (is_catchable_ex_name); rebuilt inline as the
+                          names are read.  Its struct is stored (9.9).
+
+    Chunk::native, native_leaf, native_entry_off
+                          The native tier: recomputed by
+                          `vm_jit_loaded_image` at the end of the load.
+                          `native_leaf` is derived from the ops
+                          (`jit_chunk_is_native_leaf`).
+
+    StructTypeDef layout  size, align, the POD decision and every field
+                          offset: `compute_layout()`.
+
+    FuncDescriptor::decl  A compile-only AST back-pointer; always null at
+                          runtime.
+
+--------------------------------------------------------------------------------
+13.  BAKED ENUM ORDINALS
+--------------------------------------------------------------------------------
+
+These enumerations are stored as their NUMERIC values, so REORDERING OR
+INSERTING A MEMBER IS A FORMAT CHANGE and must bump the format version.  (The
+same is true of OpCode and Op, which appear in every instruction.)
+
+    Storage (sharedarray.h)
+        0 general   1 ints   2 floats   3 bools   4 structs   5 strs
+        6 objs (v34)
+
+    FieldKind (structtype.h)
+        0 f_bool  1 f_int  2 f_float  3 f_str  4 f_array  5 f_dict
+        6 f_dyn   7 f_struct  8 f_box (v35)
+
+    DeclType (funcdesc.h)
+        0 none  1 b  2 i  3 f  4 s  5 arr  6 dict  7 strct  8 dyn
+        9 box (v35)
+
+    SymKind (funcdesc.h)
+        0 unresolved  1 local  2 global  3 capture  4 builtin
+
+    ArrHint (syntax.h)
+        0 dflt  1 general  2 flat_i  3 flat_f  4 flat_b  5 flat_s
+        6 flat_c (v34)
+
+    ThrowKind (bytecode.h)
+        0 undefined_var  1 not_lvalue  2 bad_args
+
+    CallSite::A0 (bytecode.h)
+        0 none  1 slot  2 elem  3 member  4 undef  5 chain
+
+    VTag (serialize.cpp, section 11)
+        0 none  1 boolean  2 integer  3 flt  4 str  5 arr  6 dict
+        7 strct  8 structtype  9 func  10 cls  11 bltn
+
+Version 9 is exactly such a change: deleting the CatchTest and Reraise
+opcodes renumbered every OpCode after them.
+
+LOADER HARDENING (2026-08-09, no format change).  Every ELEMENT COUNT is
+read through `Reader::countv`, which refuses a count larger than the bytes
+remaining in the file.  A count precedes records that each consume at least
+one byte, so a larger one cannot describe a real image - and feeding it to
+`reserve()` is what a corrupt file exploits.  Measured over 400 random
+mutations of an 800-byte image: 19 hangs and 20 crashes before, 5 and 9 after,
+the dominant signature being an allocator failure or 5 GB of RSS in five
+seconds.  The bound is the weakest universally-true one ("no more entries than
+bytes") on purpose - it needs no knowledge of the record it guards, so it
+cannot drift when a record's encoding changes.  The RESIDUAL is a different
+class (a slot or pool INDEX that is in range for the file but not for the
+structure it indexes) and is tracked separately.
+
+9.20  value_callees - the NAMED CALLEE of a value-call site (v15)
+
+A `CallValueV` calls a function held in a TEMP - a closure a factory
+returned, a lambda in a variable - so the callee is not a slot the emitter
+can read a descriptor from.  The compiler's callee-set analysis often knows
+it anyway (a MUST answer: exactly one candidate, not unknown, not escaped),
+and this table carries that answer into the image so a loaded chunk compiles
+to the same machine code a fresh one does.
+
+    u32   count
+    count x:
+        u32  pc     the CallValueV's pc, non-decreasing, exact-match searched
+        u32  def    an index into THIS chunk's closure_defs
+
+SPARSE - only a call site whose callee the analysis could name records one -
+so a chunk with none pays the 4-byte count and nothing else.
+
+A pc may appear TWICE, in consecutive entries (since 2026-09-20, no
+encoding change): a TWO-WAY site - a callee set of exactly two functions,
+`ops[i % 2]` reaching add_op or sub_op - records both candidates, in the
+analysis's order.  A reader keeps both, in that order; a consumer that
+needs ONE named callee treats such a pc as unnamed.  Three or more
+candidates record nothing.
+
+A reader must bound BOTH fields: `pc` against the chunk's instruction count
+(it is remapped by INDEXING a per-pc vector, exactly like `locs` and
+`base_locs`), and `def` against `closure_defs`, whose entry the JIT bakes
+into machine code as a descriptor pointer.  Note that a WRONG-but-in-range
+entry is harmless by construction: the emitted code compares the live
+callee's descriptor against the baked one and takes a generic path on a
+mismatch, so a bad prediction costs a slow path and never a wrong answer.
+An OUT-OF-RANGE one is not harmless, which is what the bound is for.
+
+9.21  arg_locs - a user call op's PER-ARGUMENT carets (v16)
+
+A user call op (`CallV`, `CachedCallV`, `CallValueV`) has THREE error
+spans: the whole call (`locs`), its argument list (`base_locs`, for an
+arity error) and, for a BIND COERCION - a declared `int`/`float`
+parameter refusing a `dyn` value, or (v29) any parameter not declared
+`opt` refusing a `none`, which a `CheckNoneArgsV` standing before the
+call raises and so records the call's three spans as its own - the ONE
+ARGUMENT that was rejected
+(section 9.20's sibling in shape: pc-keyed, sparse, read only on a throw
+path).  The tree-walker carets that argument's own expression, so the VM
+and the JIT must be able to name it too; the bind records the parameter
+index on the exception, and the call site reads the span from here.
+
+    u32   count
+    count x:
+        u32  pc     the call op's pc, non-decreasing, exact-match searched
+        u32  n      the argument count of that call
+        n x:
+            loc  start      2.1 (the narrow pool loc)
+            loc  end
+
+One entry per user call op with at least one argument; a chunk with none
+pays the 4-byte count and nothing else.  An argument that has no span of
+its own in the source (a const-folded literal) is stored with the LIST's
+span, so an image renders exactly what the source run renders.
+
+The in-memory form is a flat pool of spans plus `{pc, first, n}` runs
+into it; the on-disk form is deliberately SELF-CONTAINED per entry - the
+reader rebuilds `first` as it appends - so there is no pool INDEX in the
+file for a hostile image to point past.  A reader must bound `pc` against
+the chunk's instruction count (it is remapped by INDEXING a per-pc vector,
+like `locs`); `n` is bounded like any element count.  The JIT bakes the
+run's ADDRESS into the call site's exception stamp and the emitted code
+indexes it at run time by the recorded parameter index, which is why the
+run is re-verified against the rebuilt pool before the load-time JIT.
+
+Version 22 adds `op_locs` (section 9.2), a third loc table per chunk in
+the identical encoding, written right after `base_locs`.  A compound
+store (`a[i] /= z`, `d[k] <<= n`, `p.x -= v`, `m[i][j] += v`) has TWO
+error spans: reaching the element carets the LVALUE (an out-of-bounds
+index, a missing key, not-an-lvalue - what `locs` records), while the
+OPERATION carets the whole compound expression (a division by zero, a
+negative shift count, a type error), because that is the first node the
+tree-walker's evaluator stamps such a loc-less throw with.  One table
+could hold only one of them: the VM reported the lvalue for both, and a
+nested store - whose `locs` records nothing - reported no location at
+all.  A chunk with no compound store pays the 4-byte count and nothing
+else.
+
+Version 16 adds `arg_locs` (section 9.21), the per-argument carets of a
+user call op, so a bind coercion's error names the argument it rejected
+from an image exactly as from source.  No existing encoding changes; the
+record is appended to the chunk right after `base_locs`.
+
+Version 15 adds `value_callees` (section 9.20), a per-chunk table naming the
+single function a value-call site can reach.  The emitter could previously
+name a callee only through a write-once GLOBAL FUNCTION SLOT, so every call
+through a closure held in a variable re-established the callee's properties
+from memory on every call, even where the compiler had proved which function
+it was.  The table is what lets that proof survive the AST teardown and the
+trip through an image.  It changes no instruction encoding - the record is
+appended to the chunk after `base_locs`.
+
+Version 13 adds `base_locs`, a second loc table per chunk, written straight
+after `locs` in the identical encoding.  A container store has TWO error
+spans and one table cannot hold both: an out-of-bounds / key / type error
+carets the WHOLE lvalue (`g[0]`, which is what `locs` records and what the
+tree-walker marks), while an UNBOUND-GLOBAL base carets only the base
+identifier (`g`).  Before it, every store form reported the whole subscript
+where the tree-walker reported the name, and the CHAIN stores - whose per-step
+carets live in `chain_locs`, so they record no `locs` entry at all - reported
+NO location, rendering a backtrace that read "line 0".  The table is SPARSE
+(only a store whose base can be a global records one), so a chunk with no such
+store pays the 4-byte count and nothing else.
+
+Version 12 adds the two Locs to the Capture record.  The capture SNAPSHOT
+runs in the FuncObject constructor, which is AST-free by design - it reads
+the descriptor, never the capture Identifiers - so when a captured GLOBAL is
+not bound yet (UnboundSymbolEx, #131) there was no span to caret with, and
+the three engines produced three different answers.  Carrying the span in
+the descriptor is what lets the caret land on the name INSIDE the brackets,
+identically everywhere.  They go through the narrow pool-Loc encoding
+(u16 line + u8 col, whole-byte escapes), so a capture costs 6 more bytes and
+almost always exactly 6.
+
+Version 10 is the milder kind: LoadElem2Int and LoadElem2Float (the fused
+nested read `a[i][j]`) were APPENDED, so no existing ordinal moved and a v9
+image would in fact still decode correctly.  The version still had to be
+bumped, because the guarantee runs the other way - a v9 BINARY reading a v10
+image would meet an opcode it does not know and mis-dispatch it.  An added
+member is a format change even when it renumbers nothing.
+
+--------------------------------------------------------------------------------
+14.  LOADING
+--------------------------------------------------------------------------------
+
+`myv_read` performs, in order:
+
+     1. read the whole file into memory
+     2. magic, format version, endianness, builtin fingerprint
+     3. the source reference; resolve and verify it (section 5)
+     4. the string table -> re-interned UniqueIds
+     5. the table of contents (section 7.0); construct an empty shell for
+        every struct AND every descriptor (IDENTITY)
+     6. fill every struct record, then every descriptor record, in file
+        order (CONTENT) - a function value read while the descriptors are
+        still shells is materialized as a pointer, its checks deferred
+     7. WIRING: compute_layout of each struct in table order; the deferred
+        capture-free check of every function value read in step 6; each
+        descriptor's bind flags recomputed and cross-checked
+     8. the root chunk, then each descriptor's chunk, installing it
+        (each chunk's derived pools rebuilt at the end of read_chunk)
+     9. the globals
+    10. vm_jit_loaded_image(prog) - the native tier, both passes, exactly as a
+        fresh compile runs them
+    11. return the VmProgram
+
+The caller OWNS the returned program and must keep it alive for the whole run:
+exception payloads and lazily-rendered backtrace frames reference its struct
+definitions and descriptors.
+
+VALIDATION.  Every read is length-checked (a short file is "corrupt or
+incompatible .myv (truncated)").  Every table index is bounds-checked against
+the table it names.  Opcodes are range-checked, instruction width codes are
+range-checked, reserved instruction flag bits must be zero, loc pcs must be
+within the code, and reconstructed loc deltas must not go negative.  Any
+failure throws a plain `MyvError` Exception; the driver prints it and exits
+non-zero.
+
+--------------------------------------------------------------------------------
+15.  DETERMINISM
+--------------------------------------------------------------------------------
+
+Compiling the same source twice produces a BYTE-IDENTICAL file - pinned by a
+test - provided both compiles run from the same working directory, since the
+source reference contains paths.  `--strip-source` makes an image
+path-independent and therefore reproducible from anywhere.
+
+There is no timestamp, no build id, and no address anywhere in the format.
+
+The `-vd` disassembly of a loaded image is byte-identical to that of a fresh
+in-memory compile.  This is the format's primary ORACLE, and it holds for 84
+of 86 files in bench/ + samples/; the 2 exceptions differ only in the printed
+ORDER of a const dict's entries (section 11.2).
+
+15.1  Is THIS DOCUMENT correct?
+
+`tests/myv_doc_check` is an independent reader written from this document
+and deliberately NOT from serialize.cpp.  If it consumes an image to exactly
+EOF, the document is complete: every byte is accounted for by some record
+described here.  A leftover byte means the doc and the format have drifted -
+precisely what a reader of the doc would hit.
+
+    for f in samples/* bench/my/*.my; do
+        ./mylang -c "$f" -o /tmp/i/$(basename "$f").myv
+    done
+    tests/myv_doc_check /tmp/i/*.myv
+
+As of version 10 it reads all 89 corpus images to exactly EOF, including a
+`--strip-source` image, a struct-bearing one, and one built to force all four
+Loc escapes.  Keep it in step with THIS FILE, never with the C++ - updating it
+by reading serialize.cpp would defeat its purpose.
+
+--------------------------------------------------------------------------------
+16.  CHANGING THE FORMAT
+--------------------------------------------------------------------------------
+
+Rules, in force:
+
+  1. BUMP `MYV_FORMAT_VERSION` (serialize.h) IN THE SAME COMMIT.  There is no
+     compatibility shim; an old image is refused with a clear message.
+
+  2. THE PAIRING RULE: a record's write and its read live ADJACENT in
+     serialize.cpp, in the same order, so the two cannot drift.  Where a
+     record is complex (instructions, the loc table), the write site carries
+     the documentation and the read site points at it.
+
+  3. NO ODD WIDTHS.  A field is one byte, two, four or eight - or a sentinel
+     byte followed by a plain 4-byte int32.  No 5-byte integers, no
+     bit-straddling values, no LEB128.
+
+  4. DERIVED DATA IS NOT STORED, and is rebuilt by calling the producer's own
+     function rather than a reimplementation (section 12).
+
+  5. NEVER memcpy a struct.  Padding content is indeterminate and would make
+     images non-deterministic; every field is written individually.
+
+  6. THE `-vd` DUMP IS A PARTIAL ORACLE.  It does not print every boxed_ops
+     field, nor a loc entry's `end`, nor most pool carets - so byte-identical
+     dumps alone do NOT prove a Loc or an operand round-tripped.  The tests
+     therefore compare those structures FIELD-FOR-FIELD (`myv_locs_equal`,
+     `myv_pool_locs_equal`, and the boxed_ops comparison in
+     `myv_round_trip`), and each such check ASSERTS it had something to
+     compare, so it cannot pass vacuously on two empty pools.
+
+  7. TEST A LIMIT ON BOTH SIDES.  Every escape path has a test that forces it
+     and asserts it fired (`myv_loc_escapes` covers all four Loc escapes).
+     An encoding whose escape is never exercised is an untested encoding.
+
+  8. TRAP TO REMEMBER: `myv_read` runs the load-time JIT, which inserts
+     EnterNative ops and REMAPS every pc - the loc table included.  A test
+     comparing a written image against an in-memory program must therefore
+     WRITE FIRST and then run `vm_jit_loaded_image` on the in-memory side, or
+     it will report an off-by-one pc that is not a format bug.
+
+--------------------------------------------------------------------------------
+17.  SIZE
+--------------------------------------------------------------------------------
+
+Measured on samples/, image bytes versus source bytes:
+
+    sample       source   image   ratio
+    strloop         126     356   2.83x
+    loop            166     543   3.27x
+    fib             240     543   2.26x
+    rand_sort       275     558   2.03x
+    primes          419    1037   2.47x
+    primes2         828    1677   2.03x
+    gcd            1809    1580   0.87x
+    shopping       2700    4327   1.60x
+    phonebook      2908    6506   2.24x
+
+Version 7 added the chunk's try-region count (one u32) for the
+per-region exception state.
+
+Version 1 of the format was 4-6x the source; the five encoding changes since
+(a source reference instead of the embedded text, compact instructions, the
+derived pool dropped, delta-coded locs, narrow pool Locs) took shopping from
+12847 to 4327 bytes and gcd from 4920 to 1580 - an image smaller than the
+program it came from.
+
+`MYLANG_MYVSTATS=1 mylang -c FILE` prints the per-section byte accounting used
+for these measurements.

@@ -1,0 +1,6 @@
+:undef len
+:undef print
+struct Q { float a; str b; }
+if ([]) {
+:show abs
+:quit

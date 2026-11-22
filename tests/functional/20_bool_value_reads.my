@@ -1,0 +1,59 @@
+# A BOOL READ IN A VALUE POSITION IS A BOOL, IN EVERY ENGINE.
+#
+# The corpus hole this closes: a bool node is stamped `th == i` on
+# purpose (bool promotes to 0/1, so typed arithmetic over bools is
+# unboxed exactly like int), and the VM's boxed lowering took that as
+# licence to materialize the value through the INT path. The result was
+# a real int, so `print(a[0])` said 1 where the tree-walker said true -
+# a RULE 2 divergence that had been shipping in four shapes: an array
+# element, a struct field, a dict value and a slice element. A bool
+# VARIABLE, a bool RETURN, foreach, unpack and a dyn read were always
+# right, which is exactly why nothing noticed.
+#
+# corpus_diff runs this against the tree-walker, so the check is
+# engine-vs-engine and needs no expected-output file.
+
+var t = runtime(1) > 0;
+var f = runtime(0) > 0;
+var arr = [true, false];
+var d = {"k": true, "n": false};
+struct P { bool b; int n; }
+var p = P(true, 0);
+var sl = arr[0:2];
+
+# the four that were WRONG
+print("elem  ", arr[0], arr[1]);
+print("field ", p.b);
+print("dict  ", d["k"], d["n"]);
+print("slice ", sl[0], sl[1]);
+
+# the ones that were always right - they must stay right
+print("var   ", t, f);
+print("ret   ", (func () => runtime(1) > 0)());
+foreach (var e in arr) { print("each  ", e); }
+var dyn dv = arr;
+print("dyn   ", dv[0]);
+print("clone ", clone(arr)[0]);
+
+# a bool read used as a VALUE in the shapes that box it
+var box = [arr[0], p.b, d["k"]];
+print("boxed ", box[0], box[1], box[2]);
+print("str   ", str(arr[0]), str(p.b));
+var dyn any = p.b;
+print("dyn=  ", any);
+
+# ...and the same reads used as CONDITIONS and as ARITHMETIC, where a
+# bool is 0/1 by design: these keep the typed path (`if (a[k])` fuses
+# into JumpUnlessElemInt, 57_bool_reduce's hot loop), so this file
+# pins BOTH halves of the rule.
+var c = 0;
+for (var i = 0; i < 2; i++) {
+    if (arr[i]) c += 1;
+    if (p.b) c += 10;
+}
+print("cond  ", c);
+var s = 0;
+for (var i = 0; i < 2; i++)
+    s += int(arr[i]) + int(p.b);
+print("arith ", s);
+print("promo ", arr[0] + 1, p.b + 1, d["k"] + 1);

@@ -1,0 +1,57 @@
+# Reassigning a named function takes effect - README: "Functions are
+# treated as regular symbols". `sq = ng;` used to be ignored in EVERY
+# engine (`-tw -ni -nc` included): template instantiation redirected
+# `sq(3)` to a clone of the original body, auto-purity folded it at
+# compile time, the inliner spliced it and the recursion unroll unrolled
+# it - each by the DECLARATION's name (task #38 D). corpus_diff compares
+# every engine and -nc/-nti against this output.
+
+func sq(x) { return x * x; }
+func ng(x) { return 0 - x; }
+func use(y) { return sq(y) + 1; }
+print("before  ", sq(3), sq(runtime(3)), use(runtime(2)));
+sq = ng;
+print("after   ", sq(3), sq(runtime(3)), use(runtime(2)));
+sq = func(x) { return x + 100; };
+print("lambda  ", sq(3), use(2));
+
+# a typed function rebound from inside another function
+func tw(int x) { return x * 2; }
+func th(int x) { return x * 3; }
+func flip() { tw = th; }
+print("typed   ", tw(5));
+flip();
+print("flipped ", tw(5), tw(runtime(5)));
+
+# rebound before its first call; the recursion's self calls follow it
+func fib(int n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); }
+func one(int n) { return 1; }
+var keep = fib;
+fib = one;
+print("fib     ", fib(10), keep(10), keep(runtime(10)));
+
+# a block-scoped function
+{
+    func loc(int x) { return x * 10; }
+    func alt(int x) { return x * 20; }
+    print("scoped  ", loc(2));
+    loc = alt;
+    print("scoped  ", loc(2));
+}
+
+# a var-bound lambda reassigned
+var f = func(x) { return x * 2; };
+print("var     ", f(3));
+f = func(x) { return x + 1; };
+print("var     ", f(3));
+
+# the BYTECODE INLINER must not paste the declared body behind a slot the
+# program reassigns: `a` is called (and inlinable) inside `drive`, then
+# rebound - the second call runs `b`. It printed `3 3` while the
+# tree-walker printed `3 103` (shipped; found by the #107 P3 enumerator)
+func ia(x) { var s = 0; for (var i = 0; i < 3; i++) s += i; return s + 0 * x; }
+func ib(x) { var s = 100; for (var i = 0; i < 3; i++) s += i; return s; }
+func drive(int n) { var r = ia(n); return r; }
+var d1 = drive(runtime(1));
+ia = ib;
+print("inlined ", d1, drive(runtime(1)));

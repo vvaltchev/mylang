@@ -9,7 +9,7 @@ class FuncDeclStmt;
 
 /*
  * Render the FINAL optimized AST of a function back into synthetic MyLang-like
- * code (see plans/repl-introspection.md) - the "decompiler" behind the `show()`
+ * code (see plans/archived/repl-introspection.md) - the "decompiler" behind the `show()`
  * builtin and the REPL `:show` command. It walks the tree AFTER parsing,
  * const-folding, inference, resolve_names (inlining/specialization) and
  * specialize_types, so what you see is what actually runs:
@@ -22,13 +22,18 @@ class FuncDeclStmt;
  *     valid script syntax); explicit annotations and proven typed-scalar hints
  *     surface as the variable's type.
  *
- * It is best-effort, not a round-trippable pretty-printer: an unhandled node
- * falls back to a comment placeholder rather than failing.
+ * It is best-effort, not a round-trippable pretty-printer, but every node
+ * kind renders as code: the expression renderer switches over ConstructType
+ * with no `default`, so a new kind does not compile until it is rendered.
+ * A function with no name (a lambda) renders as the expression
+ * `func [captures] (params) ...`.
  */
 std::string render_func_code(const FuncDeclStmt *fn,
                              const std::vector<std::string> &param_types = {},
                              const std::string &ret_type = "");
 
 /* Render an arbitrary construct (a statement or expression) - used by the
- * above and by the unit tests. */
+ * above and by the unit tests. The text has NO trailing newline, whether a
+ * statement (a declaration included: `int q = 5;`) or an expression
+ * (`14`); a caller breaks the line itself. */
 std::string render_construct_code(const Construct *c);

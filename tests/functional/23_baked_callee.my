@@ -1,0 +1,107 @@
+# THE BAKED CALLEE (#97 step 4). A call to a WRITE-ONCE global slot has a
+# callee the JIT can name at compile time, so the five descriptor gates -
+# arity, fast_bind, a compiled chunk, a native entry, plain_frame - are
+# decided when the code is emitted and what survives to run time is one
+# identity compare. The window SIZE, the record-less fork and the
+# per-argument reference test become constants.
+#
+# This file is about the DECLINES as much as the hits: every shape below
+# either must bake and still answer correctly, or must NOT bake and still
+# answer correctly. corpus_diff runs it against the tree-walker, which has
+# none of this, so any divergence is the bake being wrong.
+
+var trace_log = [];
+
+# ---- THE SHAPE THE BAKE IS FOR: a write-once global function, called
+# ---- from main and from another function, with scalar arguments
+func step(a, b) {
+    append(trace_log, a);
+    var t = a * 3 + b;
+    var u = t - a;
+    return u;
+}
+var s = 0;
+for (var i = 0; i < 60; i++) s = s + step(i, 2);
+print("main   ", s, len(trace_log));
+
+func driver(int n) {
+    var acc = 0;
+    for (var i = 0; i < n; i++) acc = acc + step(i, 1);
+    return acc;
+}
+print("nested ", driver(runtime(40)));
+
+# ---- SELF-RECURSION: the callee's own fragment does not exist yet when
+# ---- the call is emitted, so the two deferred properties (a native
+# ---- entry, norec_ok) stay RUNTIME tests here
+func down(int k) {
+    if (k <= 0)
+        return 0;
+    var t = down(k - 1);
+    return t + k;
+}
+print("recurse", down(runtime(30)));
+
+# ---- A REASSIGNED SLOT must NOT bake: the identity compare would pass
+# ---- for one callee and the baked constants belong to the other
+func alpha(x) { var t = x + 1; return t * 2; }
+func beta(x) { var t = x + 100; return t * 3; }
+var pick = alpha;
+pick = beta;
+var r = 0;
+for (var i = 0; i < 40; i++) r = r + pick(i);
+print("reassn ", r);
+
+# ---- A REFERENCE ARGUMENT keeps its per-argument test and its helper
+# ---- arm (the parameter is not proven scalar)
+func widen(arr, extra) {
+    append(arr, extra);
+    var t = len(arr);
+    return t;
+}
+var box = [1, 2, 3];
+var w = 0;
+for (var i = 0; i < 30; i++) w = w + widen(box, i);
+print("refarg ", w, len(box));
+
+# ---- A MIXED signature: one reference parameter and one proven scalar,
+# ---- so the two argument arms are emitted differently in ONE call
+func mixed(arr, int k) {
+    var t = len(arr) + k;
+    return t;
+}
+var m = 0;
+for (var i = 0; i < 30; i++) m = m + mixed(box, i);
+print("mixed  ", m);
+
+# ---- A NAMED FUNCTION DECLARED IN A LOOP BODY re-binds its global slot
+# ---- every iteration (#134), so the FuncObject changes while the
+# ---- descriptor does not - the identity compare is on the descriptor
+var q = 0;
+for (var i = 0; i < 20; i++) {
+    func inner(z) { var t = z * 7; return t + 1; }
+    q = q + inner(i);
+}
+print("loopdcl", q);
+
+# ---- A FLOAT argument and a FLOAT return through the same machinery
+func fmix(x) { var t = x * 1.5; return t + 0.25; }
+var f = 0.0;
+for (var i = 0; i < 30; i++) f = f + fmix(i * 1.0);
+print("float  ", f);
+
+# ---- THE CALLEE THROWS: the record-less arm must still unwind, and the
+# ---- backtrace is built from reconstructed frames
+func boom(k) {
+    if (k == 17)
+        throw Trouble(k);
+    var t = k + 1;
+    return t;
+}
+struct Trouble { int at; }
+var caught = 0;
+for (var i = 0; i < 30; i++) {
+    try { caught = caught + boom(i); }
+    catch (Trouble as e) { caught = caught + 1000 + e.at; }
+}
+print("throw  ", caught);

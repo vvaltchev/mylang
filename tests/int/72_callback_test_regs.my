@@ -1,0 +1,12 @@
+# INT-SOURCE: ../functional/57_callback_test_regs.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/57_callback_test_regs.my:
+# #84: a callback's truth value - sort's comparator, filter's predicate,
+# find's key - is read on an INLINE path, and for a body whose every return
+# is an int or a bool, straight from the payload register the boundary
+# return leaves (Chunk::ret_truth_regs).
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

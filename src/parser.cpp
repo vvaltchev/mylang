@@ -4,10 +4,19 @@
 #include "eval.h"
 #include "syntax.h"
 #include "analyzer.h"
+#include "resolver.h"
+#include "inferencer.h"   /* for_each_child_of */
+#include "numtext.h"
+#include "inttest.h"
+#include "cyclewalk.h"   /* a constant's value may contain itself */
 
+#include <algorithm>
+#include <functional>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using std::string;
@@ -28,39 +37,174 @@ using std::string;
  */
 struct CseCache {
 
-    std::vector<std::unordered_map<string, EvalValue>> stack;
+    /*
+     * A baked value, and whether ANY target may share it. A value that was
+     * read-only on its own (derived from a constant) is shared by a `var`
+     * too, as the uncached path shares it; one frozen only because its
+     * target was a CONST (`const X = f(A);`, f returning a fresh array) is
+     * that constant's alone - the same expression bound to a `var` is a
+     * fresh mutable value, as under -nc, where nothing is shared. A `var`
+     * hit on such an entry made the var read-only (RULE 2, 2026-10-08).
+     */
+    struct Entry {
+        EvalValue v;
+        bool any_target;
+    };
+    std::vector<std::unordered_map<string, Entry>> stack;
 
     void push() { stack.emplace_back(); }
     /* push/pop must stay in lockstep with pBlock's const-ctx scopes (CLAUDE.md
      * const-evaluation): an unbalanced pop here is a scope-management bug. */
     void pop() { ML_CHECK(!stack.empty()); stack.pop_back(); }
 
-    const EvalValue *lookup(const string &key) const {
+    /* the entry a target may share (`for_const`: a const target), or null */
+    const EvalValue *lookup(const string &key, bool for_const) const {
         for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
             auto f = it->find(key);
             if (f != it->end())
-                return &f->second;
+                return for_const || f->second.any_target ? &f->second.v
+                                                         : nullptr;
         }
         return nullptr;
     }
 
-    void insert(const string &key, const EvalValue &v) {
-        if (!stack.empty())
-            stack.back().emplace(key, v);
+    void insert(const string &key, const EvalValue &v, bool any_target) {
+        if (stack.empty())
+            return;
+        auto r = stack.back().emplace(key, Entry{v, any_target});
+        if (!r.second && any_target)
+            r.first->second.any_target = true;
     }
 };
 
-ParseContext::ParseContext(const TokenStream &ts, bool const_eval)
+ParseContext::ParseContext(const TokenStream &ts, bool fold)
     : const_ctx_owner(new EvalContext(nullptr, true))
     , ts(ts)
-    , const_eval(const_eval)
+    , fold(fold)
     , const_ctx(const_ctx_owner.get())
     , cse(new CseCache)
 {
+    /* a program's constants number their class instances from 1, in the
+     * order they are declared (g_class_ident) - the same in every engine */
+    class_ident_reset(0);
     pending_decl_type = DeclType::none;
+    /* a user function the parser runs is type-inferred first (question 5;
+     * the driver turns it off under -nti) */
+    const_ctx_owner->parse_typed = true;
+
+    /*
+     * #133: PRE-SCAN the token stream for every `func NAME` / `struct NAME`
+     * whose NAME is a const builtin, and shadow it for the whole parse.
+     *
+     * Why a whole-stream scan and not the declaration site: since #134 a named
+     * func/struct binds at SCOPE ENTRY, so a call ABOVE the declaration already
+     * means the user's function - and a single-pass parser folding that call
+     * has not seen the declaration yet. `print(abs(-1)); func abs(x) {...}`
+     * printed the BUILTIN's 1 where the un-folded run printed 42.
+     *
+     * DELIBERATELY over-broad: a `func abs` nested inside one body shadows the
+     * name everywhere, so a genuinely-builtin `abs(-1)` elsewhere is left for
+     * runtime instead of folding. That direction is free - the resolver binds
+     * it to the builtin and it computes the same answer, one fold later. The
+     * other direction (folding a call whose name is declared) is the bug.
+     *
+     * A `pure func` is skipped: it IS the const evaluator's own binding.
+     * PARAMS and foreach vars are NOT scanned here - they are genuinely
+     * scoped, and pAcceptFuncDecl / the foreach parse shadow them precisely.
+     */
+    TokenStream scan = ts;
+    bool prev_pure = false;
+
+    for (; !(scan.get() == TokType::invalid); scan.next()) {
+
+        const Tok &t = scan.get();
+
+        if ((t == Keyword::kw_func || t == Keyword::kw_struct
+             || t == Keyword::kw_class) && !prev_pure) {
+            const Tok &nm = scan.peek(1);
+            if (nm == TokType::id)
+                shadow_add(UniqueId::get(nm.value));
+        }
+
+        prev_pure = (t == Keyword::kw_pure);
+    }
 }
 
-ParseContext::~ParseContext() = default;
+ParseContext::~ParseContext()
+{
+    /* the typed parse-time runs bind into this parse's const scopes */
+    pt_cache_clear();
+}
+
+/*
+ * #137: one level of source nesting = one level of C recursion, so the depth
+ * is counted and capped (see ParseContext::MAX_NEST). Scoped, so SIBLINGS do
+ * not accumulate - only nesting does. Guards the recursion points that
+ * can nest without bound: the expression primary (parens, array/dict
+ * literals, call arguments), the statement (a block, or a brace-less
+ * if/loop body, which is why the guard is in pStmt and not pBlock) and a
+ * type annotation (`array<array<...>>`, pTypeAnnot).
+ *
+ * A level is a level of the TREE too, which every later pass walks
+ * recursively - so the operators that nest without parentheses count:
+ * a unary operator, the ternary's else arm, `??`, an assignment's value,
+ * a lambda's `=> body` (each a guard around its recursive call) and a
+ * postfix chain
+ * (`f()()()`, `a[0][0]`, `a.b.c`: NestSteps, one level per step). Until
+ * 2026-10-24 they did not, and 20000 of any of them overflowed the stack
+ * in the parser or in the inferencer's walk (#98).
+ */
+namespace {
+struct NestGuard {
+    ParseContext &c;
+    explicit NestGuard(ParseContext &pc) : c(pc)
+    {
+        if (++c.nest_depth > ParseContext::MAX_NEST)
+            throw SyntaxErrorEx(c.get_loc(),
+                                "nesting too deep (max 256 levels)");
+    }
+    ~NestGuard() { c.nest_depth--; }
+};
+
+/* The levels a postfix chain adds, given back when the chain ends (or a
+ * parse error leaves it: the REPL keeps its parser for the next input) */
+struct NestSteps {
+    ParseContext &c;
+    int n = 0;
+    explicit NestSteps(ParseContext &pc) : c(pc) { }
+    void step()
+    {
+        n++;
+        if (++c.nest_depth > ParseContext::MAX_NEST)
+            throw SyntaxErrorEx(c.get_loc(),
+                                "nesting too deep (max 256 levels)");
+    }
+    ~NestSteps() { c.nest_depth -= n; }
+};
+}
+
+/*
+ * #133: record a declared name IFF it also names a CONST BUILTIN, so
+ * pAcceptId stops resolving it to that builtin for the extent of the scope.
+ * Anything else is dropped on the floor - which is what keeps the set empty
+ * (and `is_shadowed` a single compare) in every program that does not shadow
+ * one. A NON-const builtin (`print`) needs nothing: the const evaluator
+ * cannot see it, so it never folded a call to it in the first place.
+ */
+void ParseContext::shadow_add(const UniqueId *uid)
+{
+    if (uid && const_binding(uid))
+        shadowed.push_back(uid);
+}
+
+LValue *ParseContext::const_binding(const UniqueId *uid) const
+{
+    for (EvalContext *x = const_ctx; x; x = x->parent)
+        if (LValue *lv = x->lookup(uid))
+            return lv;
+    return nullptr;
+}
+
 
 /*
  * ----------------- Recursive Descent Parser -------------------
@@ -99,6 +243,16 @@ bool pAcceptKeyword(ParseContext &c, Keyword exp);   /* defined below */
 bool pAcceptOp(ParseContext &c, Op exp);             /* defined below */
 void pExpectOp(ParseContext &c, Op exp);             /* defined below */
 
+/* The parameterized type keywords - `array<T>`, `dict<K, V>`, `box<T>` -
+ * read as a type only when a `<` follows (a bare `box` is no type) */
+static DeclType container_keyword(std::string_view s)
+{
+    if (s == "array") return DeclType::arr;
+    if (s == "dict")  return DeclType::dict;
+    if (s == "box")   return DeclType::box;
+    return DeclType::none;
+}
+
 static DeclType type_keyword(std::string_view s)
 {
     if (s == "int")   return DeclType::i;
@@ -114,20 +268,67 @@ static DeclType type_keyword(std::string_view s)
  * If `name` is bound to a struct TYPE descriptor in the const context (i.e. a
  * `struct` declared earlier in scope), return its StructTypeDef, else nullptr.
  * This is what lets `A obj;` recognize `A` as a type in declaration position.
- * Structs register their descriptor in the const ctx at parse time, so it is
- * only meaningful with const-eval on (no struct types are visible otherwise).
+ * Structs register their descriptor in the const ctx at parse time - with or
+ * without `-nc`, which turns off folding, not the registration (#54).
  */
+/*
+ * A parameter, a foreach or catch variable or a capture named like the
+ * struct is the name in its scope (#133's shadowed set): there `P p;` is
+ * not a declaration of a `P`, as in C++ - the struct was found while the
+ * name denoted the binding (`*hidden`), an error for the caller. (The
+ * ctor pre-scan's entries never hide a struct here: they are added only
+ * for a builtin's name, which a struct cannot take.)
+ */
+/* The struct the innermost constant named `uid` is bound to - its own
+ * name, or a TYPE ALIAS (`const T = S;`) - whatever binding hides it. */
 static const StructTypeDef *
-lookup_struct_type(ParseContext &c, std::string_view name)
+const_struct_binding(ParseContext &c, const UniqueId *uid)
 {
-    if (!c.const_eval || !c.const_ctx)
+    for (EvalContext *x = c.const_ctx; x; x = x->parent) {
+        LValue *lv = x->lookup(uid);
+        if (!lv)
+            continue;
+        const EvalValue &v = lv->get();
+        return v.is<StructTypeDef *>() ? v.get<StructTypeDef *>() : nullptr;
+    }
+    return nullptr;
+}
+
+static const StructTypeDef *
+lookup_struct_type(ParseContext &c, std::string_view name,
+                   bool *hidden = nullptr)
+{
+    const UniqueId *uid = UniqueId::get(name);
+    /* the struct being declared, named in its own field's annotation */
+    if (c.decl_self && c.decl_self->name == uid)
+        return c.decl_self;
+    /* the whole scope chain: EvalContext::lookup is LOCAL, and a struct
+     * declared around a block is in an OUTER scope - looking in the
+     * innermost one alone, `P p;` in any function body or `if` block was
+     * "not a type" (until 2026-10-07) */
+    const StructTypeDef *def = const_struct_binding(c, uid);
+    if (def && c.is_shadowed(uid)) {
+        if (hidden)
+            *hidden = true;
         return nullptr;
-    Identifier id(name);
-    LValue *lv = c.const_ctx->lookup(&id);
-    if (!lv)
-        return nullptr;
-    const EvalValue &v = lv->get();
-    return v.is<StructTypeDef *>() ? v.get<StructTypeDef *>() : nullptr;
+    }
+    return def;
+}
+
+/* the error for a name in type position that is not a struct type */
+[[noreturn]] static void
+not_a_type(ParseContext &c, std::string_view name, Loc loc)
+{
+    bool hidden = false;
+    lookup_struct_type(c, name, &hidden);
+    const std::string n(name);
+    SyntaxErrorEx e(loc, intern_msg(hidden
+        ? "'" + n + "' is not a type here: a parameter, a loop or catch "
+          "variable or a capture named '" + n + "' hides the struct"
+        : "'" + n + "' is not a type"));
+    /* the name's own span (an end is its last column + 2) */
+    e.loc_end = loc + static_cast<int>(n.size() + 1);
+    throw e;
 }
 
 /*
@@ -183,6 +384,7 @@ static int skip_angle_balanced(ParseContext &c, int start)
  */
 static std::shared_ptr<TypeAnnot> pTypeAnnot(ParseContext &c)
 {
+    NestGuard ng(c);           /* `array<array<...>>` recurses here (#137) */
     auto ta = std::make_shared<TypeAnnot>();
     const Loc loc = c.get_loc();
 
@@ -192,7 +394,30 @@ static std::shared_ptr<TypeAnnot> pTypeAnnot(ParseContext &c)
         const std::string_view name = c.get_str();
         const DeclType k = type_keyword(name);
 
-        if (k == DeclType::arr) {
+        if (container_keyword(name) == DeclType::box
+                && c.peek_tok(1) == Op::lt) {
+            c.next();                                  /* 'box' */
+            c.next();                                  /* '<' */
+            ta->kind = DeclType::box;
+            const Loc eloc = c.get_loc();
+            ta->elem = pTypeAnnot(c);
+            if (!pAcceptCloseAngle(c))
+                throw SyntaxErrorEx(c.get_loc(),
+                    "expected '>' to close 'box<...>'", &c.get_tok());
+            /* box() passes a reference through and boxes no `none`, so
+             * a box holds a non-opt scalar, string or struct value */
+            const TypeAnnot *e = ta->elem.get();
+            if (e->opt || e->kind == DeclType::arr
+                    || e->kind == DeclType::dict || e->kind == DeclType::box
+                    || e->kind == DeclType::dyn
+                    || (e->kind == DeclType::strct && e->strct
+                        && e->strct->is_class))
+                throw SyntaxErrorEx(eloc, intern_msg(
+                    "not a box type: a box holds a bool, int, float, str "
+                    "or struct value (an array, a dict, a class instance "
+                    "or a box is a reference already, which box() "
+                    "returns as it is)"));
+        } else if (k == DeclType::arr) {
             c.next();                                  /* 'array' */
             ta->kind = DeclType::arr;
             if (pAcceptOp(c, Op::lt)) {                /* array<ELEM> */
@@ -218,8 +443,7 @@ static std::shared_ptr<TypeAnnot> pTypeAnnot(ParseContext &c)
         } else {                                       /* a user struct name */
             const StructTypeDef *sdef = lookup_struct_type(c, name);
             if (!sdef)
-                throw SyntaxErrorEx(loc,
-                    intern_msg("'" + std::string(name) + "' is not a type"));
+                not_a_type(c, name, loc);
             c.next();
             ta->kind = DeclType::strct;
             ta->strct = sdef;
@@ -326,8 +550,7 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
         } else if (t == Keyword::kw_opt || t == Op::questionmark) {
             f |= pFlags::pInDecl | pFlags::pInOptDecl; k++;
         } else if (dt == DeclType::none && t == TokType::id &&
-                   (type_keyword(t.value) == DeclType::arr ||
-                    type_keyword(t.value) == DeclType::dict) &&
+                   container_keyword(t.value) != DeclType::none &&
                    c.peek_tok(k + 1) == Op::lt) {
             /* A parameterized container `array<...>` / `dict<...>`: a container
              * keyword + `<`, a balanced `<...>`, then the name (after optional
@@ -344,7 +567,7 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
                 break;
             if (saw_q && !is_decl_terminator(c.peek_tok(n + 1)))
                 break;   /* `array<...> ? a : b` ternary, not a decl */
-            dt = type_keyword(t.value);
+            dt = container_keyword(t.value);
             parameterized = true;
             f |= pFlags::pInDecl; starter = true;
             break;
@@ -386,9 +609,7 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
                 break;
             sdef = lookup_struct_type(c, t.value);
             if (!sdef)
-                throw SyntaxErrorEx(t.loc,
-                    intern_msg("'" + std::string(t.value) +
-                               "' is not a type"));
+                not_a_type(c, t.value, t.loc);
             dt = DeclType::strct;
             f |= pFlags::pInDecl; starter = true; k++;
         } else {
@@ -439,6 +660,77 @@ static unique_ptr<Construct> zero_value_literal(DeclType dt)
     }
 }
 
+static unique_ptr<Construct>
+build_zero_struct_init(ParseContext &c, const StructTypeDef *def, Loc loc,
+                       Loc end);
+
+/* The zero value of a `box<T>` (`box<int> n;` is `box(0)`): a FRESH box of
+ * T's zero value, built per evaluation like a struct's zero. Every node
+ * built spans the declared name [loc, end), where an error about it
+ * points. */
+static unique_ptr<Construct>
+zero_box_init(ParseContext &c, const TypeAnnot *a, Loc loc, Loc end)
+{
+    const TypeAnnot *e = a ? a->elem.get() : nullptr;
+    unique_ptr<Construct> z =
+        !e ? unique_ptr<Construct>(new LiteralNone())
+        : e->kind == DeclType::strct && e->strct
+            ? build_zero_struct_init(c, e->strct, loc, end)
+            : zero_value_literal(e->kind);
+    z->start = loc;
+    z->end = end;
+    auto args = make_unique<ExprList>();
+    args->elems.push_back(std::move(z));
+    auto callee = make_unique<Identifier>("box");
+    callee->builtin_only = true;        /* a program's own `box` is not it */
+    callee->start = loc;
+    callee->end = end;
+    auto call = make_unique<CallExpr>();
+    call->what = std::move(callee);
+    call->args = std::move(args);
+    call->start = loc;
+    call->end = end;
+    return call;
+}
+
+/*
+ * The name a zero-value constructor call uses for `def` at this point of
+ * the parse: the struct's own name where it names `def` here, else a TYPE
+ * ALIAS that does. The call is resolved by NAME like a written one, and
+ * the struct's own name may be hidden or out of scope where an alias
+ * declares the variable: `const T = S; func f(S) { T t; }` called the
+ * PARAMETER ("'S' is not callable"), and an alias of a struct declared
+ * inside a pure function named nothing at all (until 2026-11-15). The
+ * innermost scope's aliases first, and the smallest name of several, so
+ * the choice does not depend on a map's order. With none - a nested
+ * field's struct whose name is hidden - the struct's own name, as before.
+ */
+static const UniqueId *
+struct_name_here(ParseContext &c, const StructTypeDef *def)
+{
+    if (lookup_struct_type(c, def->name->val) == def)
+        return def->name;
+    for (EvalContext *x = c.const_ctx; x; x = x->parent) {
+        std::vector<std::pair<const UniqueId *, const LValue *>> syms;
+        x->collect_symbols(syms);
+        const UniqueId *best = nullptr;
+        for (const auto &s : syms) {
+            const EvalValue &v = s.second->get();
+            if (!v.is<StructTypeDef *>() || v.get<StructTypeDef *>() != def)
+                continue;
+            /* ...that names it HERE: not hidden by a binding, nor by an
+             * inner constant of the same name */
+            if (lookup_struct_type(c, s.first->val) != def)
+                continue;
+            if (!best || s.first->val < best->val)
+                best = s.first;
+        }
+        if (best)
+            return best;
+    }
+    return def->name;
+}
+
 /*
  * Zero-initialize a struct (for `A obj;`): build the constructor call
  * `A(<zero per field>)`, applying the same zero-value rules as every other type
@@ -448,7 +740,8 @@ static unique_ptr<Construct> zero_value_literal(DeclType dt)
  * shared mutable state) and is type-checked like a hand-written construction.
  */
 static unique_ptr<Construct>
-build_zero_struct_init(const StructTypeDef *def, Loc loc)
+build_zero_struct_init(ParseContext &c, const StructTypeDef *def, Loc loc,
+                       Loc end)
 {
     auto args = make_unique<ExprList>();
 
@@ -470,29 +763,42 @@ build_zero_struct_init(const StructTypeDef *def, Loc loc)
                                          break;
                 case FieldKind::f_dict:  a = zero_value_literal(DeclType::dict);
                                          break;
-                case FieldKind::f_struct:
-                    a = fd.struct_def
-                        ? build_zero_struct_init(fd.struct_def, loc)
-                        : make_unique<LiteralNone>();
+                case FieldKind::f_struct: {
+                    /* a field typed by a struct declared AFTER this one
+                     * (a forward reference) has no def from the struct's
+                     * own parse; the struct is found by name now, when it
+                     * is declared above the variable. One declared below
+                     * it leaves `none` here, which the inferencer refuses
+                     * for the non-opt field - a struct type is declared
+                     * before a declaration that needs it. */
+                    const StructTypeDef *sd = fd.struct_def
+                        ? fd.struct_def
+                        : lookup_struct_type(c, fd.struct_ty->val);
+                    a = sd ? build_zero_struct_init(c, sd, loc, end)
+                           : make_unique<LiteralNone>();
+                    break;
+                }
+                case FieldKind::f_box:
+                    a = zero_box_init(c, fd.annot.get(), loc, end);
                     break;
                 default:                 a = make_unique<LiteralNone>();
                                          break;
             }
         }
         a->start = loc;
-        a->end = loc;
-        args->elems.push_back(move(a));
+        a->end = end;
+        args->elems.push_back(std::move(a));
     }
 
-    auto callee = make_unique<Identifier>(def->name->val);
+    auto callee = make_unique<Identifier>(struct_name_here(c, def)->val);
     callee->start = loc;
-    callee->end = loc;
+    callee->end = end;
 
     auto call = make_unique<CallExpr>();
-    call->what = move(callee);
-    call->args = move(args);
+    call->what = std::move(callee);
+    call->args = std::move(args);
     call->start = loc;
-    call->end = loc;
+    call->end = end;
     return call;
 }
 
@@ -545,11 +851,326 @@ pAcceptForStmt(ParseContext &c,
                unique_ptr<Construct> &ret,
                unsigned fl);
 
+static bool is_container_literal(const Construct *n);
+
+/* An element of a written container literal that is written too: a
+ * scalar literal, a container literal (recursively), or one baked from
+ * such a literal already */
+static bool is_written_elem(const Construct *n)
+{
+    switch (ctag(n)) {
+    case ConstructType::lit_int:
+    case ConstructType::lit_bool:
+    case ConstructType::lit_float:
+    case ConstructType::lit_none:
+    case ConstructType::lit_str:
+        return true;
+    case ConstructType::lit_arr:
+    case ConstructType::lit_dict:
+        return is_container_literal(n);
+    case ConstructType::lit_obj:
+        return static_cast<const LiteralObj *>(n)->from_literal;
+    default:
+        return false;
+    }
+}
+
+/*
+ * A container literal written in the source (LiteralObj::from_literal):
+ * `[...]` / `{...}` whose every element - key and value - is written too.
+ * One holding a call's result or a named constant (`[f()]`, `[K]`,
+ * `[dict(1)]`) is not: that element is checked as the value it is, which
+ * takes no declared type (README) - as the unfolded literal's element is
+ * under -nc.
+ */
+static bool is_container_literal(const Construct *n)
+{
+    if (!n)
+        return false;
+    if (ctag(n) == ConstructType::lit_arr) {
+        for (const auto &el : static_cast<const LiteralArray *>(n)->elems)
+            if (!is_written_elem(el.get()))
+                return false;
+        return true;
+    }
+    if (ctag(n) == ConstructType::lit_dict) {
+        for (const auto &kv : static_cast<const LiteralDict *>(n)->elems)
+            if (!is_written_elem(kv->key.get())
+                || !is_written_elem(kv->value.get()))
+                return false;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Whether `n`, run unfolded, builds its array to the storage of the place
+ * it is bound to (LiteralObj::takes_hint): a container literal, or a call
+ * whose callee is one of builtin_takes_arr_hint's builtins - the BUILTIN,
+ * not a `pure func` of the same name, which the parser folds too (#97).
+ */
+static bool node_takes_hint(ParseContext &c, const Construct *n)
+{
+    switch (ctag(n)) {
+    case ConstructType::lit_arr:
+    case ConstructType::lit_dict:
+        return true;
+    case ConstructType::lit_obj:
+        return static_cast<const LiteralObj *>(n)->takes_hint;
+    case ConstructType::call: {
+        const auto *call = static_cast<const CallExpr *>(n);
+        const auto *id = node_cast<const Identifier>(call->what.get());
+        if (!id || !builtin_takes_arr_hint(id->uid->val))
+            return false;
+        const EvalValue v = RValue(id->eval(c.const_ctx));
+        return v.get_type()->t == Type::t_builtin;
+    }
+    default:
+        return false;
+    }
+}
+
+/*
+ * Q2: whether `n`, run unfolded, makes its container with the TYPE of the
+ * place it is bound to (LiteralObj::typed_by_place): a container literal,
+ * an array sum, or a call to one of builtin_builds_container's builtins -
+ * the builtin itself, as node_takes_hint asks. A user function's result
+ * keeps the type it was made with.
+ */
+static bool node_typed_by_place(ParseContext &c, const Construct *n)
+{
+    switch (ctag(n)) {
+    case ConstructType::lit_arr:
+    case ConstructType::lit_dict:
+    case ConstructType::expr04:
+        return true;
+    case ConstructType::lit_obj:
+        return static_cast<const LiteralObj *>(n)->typed_by_place;
+    case ConstructType::call: {
+        const auto *call = static_cast<const CallExpr *>(n);
+        const auto *id = node_cast<const Identifier>(call->what.get());
+        if (!id || !builtin_builds_container(id->uid->val))
+            return false;
+        const EvalValue v = RValue(id->eval(c.const_ctx));
+        return v.get_type()->t == Type::t_builtin;
+    }
+    default:
+        return false;
+    }
+}
+
+/*
+ * Q2: a mutable container a bake could not give the type the unfolded
+ * run gives it. Built while parsing, before any type exists, it carries
+ * none - unless a user function made it (its typed parse-time run typed
+ * it). A node typed by its place gets the place's type later; any other
+ * (an element or a field of a literal, `get!` of one) is typed where its
+ * literal was made, which the value no longer says. Such a node is not
+ * baked: it runs, as it does unfolded.
+ */
+static bool bake_untypable(ParseContext &c, const Construct *node,
+                           const EvalValue &v)
+{
+    if (node_typed_by_place(c, node))
+        return false;
+    if (v.is<SharedArrayObj>()) {
+        const SharedArrayObj &a = v.get_ref<SharedArrayObj>();
+        return !a.is_readonly() && !a.ctype();
+    }
+    if (v.is<intrusive_ptr<DictObject>>()) {
+        const DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
+        return !d.is_readonly() && !d.ctype();
+    }
+    return false;
+}
+
+/* The numeric widening an element of annotated type `e` gets
+ * (LiteralArray::elem_coerce, the inferencer's stamp_literal_coerce) */
+static DeclType annot_num(const TypeAnnot *e)
+{
+    return !e ? DeclType::none
+         : e->kind == DeclType::f ? DeclType::f
+         : e->kind == DeclType::i ? DeclType::i
+         : DeclType::none;
+}
+
+/* A parsed container annotation's shape (widen_baked_value): its numbers
+ * and the storage of each array in it */
+static void widen_shape_of_annot(const TypeAnnot *a, WidenShape &w)
+{
+    w.k = 0;
+    if (!a)
+        return;
+    switch (a->kind) {
+    case DeclType::f: w.k = 'f'; return;
+    case DeclType::i: w.k = 'i'; return;
+    case DeclType::arr:
+        w.k = 'a';
+        w.hint = annot_arr_hint(a, w.hint_struct);
+        w.sub = make_unique<WidenShape>();
+        widen_shape_of_annot(a->elem.get(), *w.sub);
+        return;
+    case DeclType::dict:
+        w.k = 'd';
+        w.sub = make_unique<WidenShape>();
+        widen_shape_of_annot(a->val.get(), *w.sub);
+        w.key = make_unique<WidenShape>();
+        widen_shape_of_annot(a->key.get(), *w.key);
+        return;
+    default:
+        return;
+    }
+}
+
+/*
+ * A literal a DECLARATION annotates (`array<dyn> a = [n];`, `var dyn d =
+ * [1, 2];`, `const array<float> F = [1, 2];`) is built in the annotated
+ * type's storage, its numbers widened to it, from the parse on - the
+ * inferencer stamps the same later (literal_into, set_array_repr_hint),
+ * but a pure function evaluated at parse time, and a typed const bound
+ * then, run before it: `[n]` was built flat and refused the `a[0] = "s"`
+ * the same function's run-time call accepts (RULE 2).
+ */
+static void stamp_literal_annot(Construct *lit, const TypeAnnot *a, bool dyn)
+{
+    if (!lit)
+        return;
+    const ConstructType t = ctag(lit);
+    if (!a) {
+        /* `var dyn d = [...]`: a polymorphic array - and a folded value
+         * only where its unfolded node builds to it (#97: a folded
+         * `clone(K)` keeps K's storage, as at run time) */
+        if (dyn && (t == ConstructType::lit_arr
+                    || (t == ConstructType::lit_obj
+                        && static_cast<LiteralObj *>(lit)->takes_hint)))
+            lit->arr_hint = ArrHint::general;
+        if (dyn && t == ConstructType::lit_obj
+                && static_cast<LiteralObj *>(lit)->takes_hint) {
+            /* and a folded value is rebuilt general now: it is loaded as
+             * it is (eval_literal_obj converts nothing) */
+            auto *lo = static_cast<LiteralObj *>(lit);
+            WidenShape w;
+            w.k = 'a';
+            w.hint = ArrHint::general;
+            lo->set_literal_value(widen_baked_value(lo->literal_value(), w));
+        }
+        return;
+    }
+    if (t == ConstructType::lit_arr && a->kind == DeclType::arr) {
+        auto *la = static_cast<LiteralArray *>(lit);
+        la->arr_hint = annot_arr_hint(a, la->arr_hint_struct);
+        la->elem_coerce = annot_num(a->elem.get());
+        la->annotated = a->elem != nullptr;
+        for (auto &el : la->elems)
+            stamp_literal_annot(el.get(), a->elem.get(), false);
+    } else if (t == ConstructType::lit_dict && a->kind == DeclType::dict) {
+        auto *ld = static_cast<LiteralDict *>(lit);
+        ld->key_coerce = annot_num(a->key.get());
+        ld->val_coerce = annot_num(a->val.get());
+        /* (a dict annotation names both its key and its value, or
+         * neither) */
+        ld->annotated = a->key != nullptr;
+        for (auto &kv : ld->elems)
+            stamp_literal_annot(kv->value.get(), a->val.get(), false);
+    } else if (t == ConstructType::lit_obj
+               && (a->kind == DeclType::arr || a->kind == DeclType::dict)) {
+        auto *lo = static_cast<LiteralObj *>(lit);
+        if (!lo->from_literal)
+            return;
+        WidenShape w;
+        widen_shape_of_annot(a, w);
+        /* (in its storage too: see stamp_literal_repr) */
+        lo->set_literal_value(widen_baked_value(lo->literal_value(), w));
+    }
+}
+
 bool
 MakeConstructFromConstVal(const EvalValue &v,
                           unique_ptr<Construct> &out,
                           bool process_arrays = false,
                           bool immutable = false);
+
+/*
+ * A capture list entry naming a const SCALAR (it has no run-time symbol, so
+ * the closure's snapshot would read nothing - "Undefined variable"): declare
+ * `var K = <value>` just before the statement, in the enclosing block, once
+ * per block. The capture is its own binding in the body (shadowed there), so
+ * a write to it changes the closure's copy, as for any captured variable.
+ * A name a parameter or loop variable in scope shadows is a run-time
+ * binding already, and a const builtin has its own run-time slot.
+ */
+static inline bool ShouldConstSymbolExistAtRuntime(const EvalValue &rvalue);
+namespace { const UniqueId *pt_builtin_name(const Builtin &bi); }
+
+/*
+ * #94: a const bound to a BUILTIN (`const L = len;`) has no run-time
+ * symbol - a builtin is a trivial value, so its declaration is dropped
+ * like a scalar's - and a read of it becomes a reference to that builtin,
+ * as a scalar's becomes its value: `L(a)` is `len(a)`, typed, folded and
+ * called like it. The reference is builtin_only, so a program's own name
+ * `len` cannot take it. Null: not a builtin value, or the builtin's own
+ * name already.
+ */
+static unique_ptr<Identifier>
+builtin_ref(const EvalValue &v, const UniqueId *name)
+{
+    if (!v.is<Builtin>())
+        return nullptr;
+    const UniqueId *bn = pt_builtin_name(v.get_ref<Builtin>());
+    if (!bn || bn == name) /* INT-COV-EXEMPT: a const builtin always has one */
+        return nullptr;
+    auto r = make_unique<Identifier>(bn->val);
+    r->builtin_only = true;
+    r->is_const = true;
+    return r;
+}
+
+static void
+declare_captured_const_scalars(ParseContext &c, IdList *caps)
+{
+    if (!caps)
+        return;
+    for (const auto &cap : caps->elems) {
+        if (c.is_shadowed(cap->uid)
+                || EvalContext::const_builtins.count(cap->uid))
+            continue;
+        LValue *lv = c.const_binding(cap->uid);
+        if (!lv || ShouldConstSymbolExistAtRuntime(lv->get()))
+            continue;
+        /* only a value that becomes a literal: a struct NAME is bound to
+         * its descriptor here and has a run-time symbol already (its
+         * hoisted global slot) - a capture of it reads that */
+        unique_ptr<Construct> lit = builtin_ref(lv->get(), cap->uid);
+        const bool is_fn = lit != nullptr;   /* a builtin: a `dyn` value */
+        if (!lit)
+            MakeConstructFromConstVal(lv->get(), lit);
+        /* every value a const keeps no run-time symbol for has a
+         * literal: a scalar, a string, none (a builtin was handled
+         * above, and a struct's descriptor - a TYPE ALIAS's value - is
+         * kept since 2026-11-15) */
+        ML_CHECK(lit);
+        ML_CHECK(!c.cap_const_decls.empty());
+        auto &done = c.cap_const_decls.back();
+        if (std::find(done.begin(), done.end(), cap->uid) != done.end())
+            continue;
+        done.push_back(cap->uid);
+
+        auto d = make_unique<Expr14>();
+        d->op = Op::assign;
+        d->fl = pFlags::pInDecl;
+        d->start = cap->start;
+        d->end = cap->end;
+        auto lhs = make_unique<Identifier>(cap->uid->val);
+        lhs->start = cap->start;
+        lhs->end = cap->end;
+        lhs->dyn_mod = is_fn;
+        d->lvalue = std::move(lhs);
+        lit->start = cap->start;
+        lit->end = cap->end;
+        d->rvalue = std::move(lit);
+        c.baked_funcs.push_back(std::move(d));
+    }
+}
 
 static bool
 cse_materialize(ParseContext &c,
@@ -557,6 +1178,132 @@ cse_materialize(ParseContext &c,
                 unique_ptr<Construct> &out,
                 bool process_arrays,
                 bool immutable);
+
+static bool
+cse_materialize_core(ParseContext &c,
+                     Construct *node,
+                     unique_ptr<Construct> &out,
+                     bool process_arrays,
+                     bool immutable,
+                     EvalValue *deferred = nullptr);
+
+static void
+collect_value_descs(const EvalValue &v,
+                    std::unordered_set<const FuncDescriptor *> &out);
+
+static void
+collect_def_owner_funcs(Construct *n, const EvalValue &v,
+                        std::unordered_set<const FuncDescriptor *> &descs);
+
+static void
+detach_baked_funcs(ParseContext &c, unique_ptr<Construct> &slot,
+                   const std::unordered_set<const FuncDescriptor *> &descs);
+
+/*
+ * #54: a folding site under `-nc` (!c.folding()). EVALUATE the constant node -
+ * so an error it raises is the same compile-time error the folding run
+ * raises - and record on it whether that run would have REPLACED it by a
+ * literal (Construct::nc_folds, read by pExpr14's assignable-shape rule:
+ * a folded `K[0]` is a value, not a location), but leave the node alone.
+ *
+ * The value is thrown away, so the class instances it made take back the
+ * identity numbers they used (g_class_ident): under -nc a constant's
+ * initializer is evaluated here and again where the constant is bound,
+ * so `const A = C(1);` got number 2 where the folding run gives it 1, and
+ * `hash(A)` differed between the two (RULE 2, found 2026-11-15).
+ */
+static void
+nc_eval_const(ParseContext &c, Construct *node,
+              bool process_arrays, bool immutable)
+{
+    const uint64_t ident = g_class_ident;
+    unique_ptr<Construct> scratch;
+    node->nc_folds = MakeConstructFromConstVal(
+        RValue(node->eval(c.const_ctx)), scratch, process_arrays, immutable);
+    class_ident_reset(ident);
+}
+
+/*
+ * #96: a FOLDING parse leaves a constant expression holding a call to a
+ * user function in place until type inference has seen it - as `-nc`
+ * leaves it - outside a const declaration and a pure function's body,
+ * where both runs fold (or bake) it. Folded while parsing, the call was
+ * gone from the program inference typed: a parameter the program joins
+ * over its call sites missed it (`f(2.5); f(int(runtime(2)))` printed
+ * `2!` where -nc printed `2.000000!`), and a type error or a warning
+ * about it landed on another call.
+ */
+static bool
+pDefersFolds(const ParseContext &c, unsigned fl)
+{
+    return c.fold && c.pure_depth == 0 && !(fl & pFlags::pInConstDecl);
+}
+
+/* `n` or a node below it is such a call (or holds one) */
+static bool
+pHoldsDeferred(Construct *n)
+{
+    if (!n)
+        return false;
+    if (n->defer_fold)
+        return true;
+    bool found = false;
+    for_each_child_of(n, [&](Construct *ch) {
+        if (!found && pHoldsDeferred(ch))
+            found = true;
+    });
+    return found;
+}
+
+/*
+ * Evaluate the node, as the fold would - its errors are the same compile
+ * errors - and keep the literal it folds to for apply_late_folds. A
+ * value naming a function keeps none: inference may name that function
+ * from elsewhere (a callee set), so the node stays and runs. A value the
+ * fold would not bake (an array outside a declaration: `sort(K)` inside
+ * `sum(sort(K))`) is kept as a WITNESS of its type, so the enclosing
+ * call may still fold (late_fold_fits checks every deferred node inside
+ * it) while this one stays a call, as the fold left it.
+ */
+static void
+pDeferFold(ParseContext &c, Construct *node,
+           bool process_arrays, bool immutable)
+{
+    node->defer_fold = true;
+    /* through the CSE cache, as the fold it stands for went: a read-only
+     * value two identical expressions compute is ONE object (`var a =
+     * get!(E, "k"); var b = get!(E, "k");` name the same array, as they
+     * do unfolded) */
+    EvalValue v;
+    unique_ptr<Construct> lit;
+    node->nc_folds = cse_materialize_core(c, node, lit, process_arrays,
+                                          immutable, &v);
+    std::unordered_set<const FuncDescriptor *> descs;
+    collect_value_descs(v, descs);
+    /* ...and one holding an instance of a struct declared in a function
+     * literal written here: the literal owns the definition, and a late
+     * fold would retire it */
+    collect_def_owner_funcs(node, v, descs);
+    /* a node can be deferred twice - the call, then the declaration
+     * whose value it is (which bakes arrays) - and the second decides */
+    node->late_fold.reset();
+    node->late_fold_witness = false;
+    if (!descs.empty())
+        return;
+    if (node->nc_folds && !bake_untypable(c, node, v)) {
+        /* as cse_materialize marks a bake: whether the unfolded node
+         * builds to its place's storage */
+        if (ctag(lit.get()) == ConstructType::lit_obj) {
+            auto *lo = static_cast<LiteralObj *>(lit.get());
+            lo->takes_hint = node_takes_hint(c, node);
+            lo->typed_by_place = node_typed_by_place(c, node);
+        }
+        node->late_fold = std::move(lit);
+    } else {
+        node->late_fold = make_unique<LiteralObj>(std::move(v), true);
+        node->late_fold_witness = true;
+    }
+}
 
 bool
 pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
@@ -566,13 +1313,21 @@ pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
     if (*c == TokType::integer) {
 
         const string s(c.get_str());
-        int_type ival;
+        int_type ival = 0;
 
-        try {
-            ival = stol(s);
-        } catch (const std::out_of_range &) {
+        /*
+         * numtext_int, the reader int() uses, against int_type itself - so a
+         * 32-bit target refuses a 64-bit literal instead of truncating it,
+         * and no C `long` is involved (32 bits on Windows: `stol` once
+         * refused every literal above 2^31-1 there alone). -2^63 is written
+         * `-9223372036854775808`: pExpr02 reads that pair as one literal.
+         */
+        if (numtext_int(s, ival) != NumText::ok) {
+            ML_INT_ONLY(int_vc(IntVc::lit_int_range);)
             throw SyntaxErrorEx(start, "Integer literal out of range");
         }
+        ML_INT_ONLY(if (ival == std::numeric_limits<int_type>::max())
+                        int_vc(IntVc::lit_int_max);)
 
         v.reset(new LiteralInt(ival));
         v->start = start;
@@ -582,16 +1337,18 @@ pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 
     } else if (pAcceptKeyword(c, Keyword::kw_true)) {
 
+        /* the keyword's own span: from `start`, not from the next token
+         * (pAcceptKeyword has already moved past it) */
         v.reset(new LiteralBool(true));
         v->start = start;
-        v->end = c.get_loc() + 5;
+        v->end = start + 5;
         return true;
 
     } else if (pAcceptKeyword(c, Keyword::kw_false)) {
 
         v.reset(new LiteralBool(false));
         v->start = start;
-        v->end = c.get_loc() + 6;
+        v->end = start + 6;
         return true;
     }
 
@@ -606,13 +1363,26 @@ pAcceptLiteralFloat(ParseContext &c, unique_ptr<Construct> &v)
     if (*c == TokType::floatnum) {
 
         const string s(c.get_str());
-        float_type fval;
+        float_type fval = 0;
 
-        try {
-            fval = stod(s);
-        } catch (const std::out_of_range &) {
+        /* A literal outside the double range (beyond it, or so small it
+         * would read as 0) is refused - no literal silently becomes inf or
+         * 0. A subnormal is a double and is kept: stod's range error on one
+         * (glibc) made the smallest double, 4.9e-324, unwritable. */
+        const NumText o = numtext_float(s, fval);
+        if (o == NumText::overflow || o == NumText::underflow) {
+            ML_INT_ONLY(int_vc(IntVc::lit_flt_range);)
             throw SyntaxErrorEx(start, "Float literal out of range");
         }
+        /* INT-COV-EXEMPT: the lexer admits only numtext's spellings */
+        if (o != NumText::ok)               /* INT-COV-EXEMPT: see above */
+            throw SyntaxErrorEx(start, "Invalid float literal");
+        ML_INT_ONLY(
+            if (s.find('E') != string::npos)
+                int_vc(IntVc::lit_flt_exp_upper);
+            if (std::fpclassify(fval) == FP_SUBNORMAL)
+                int_vc(IntVc::lit_flt_subnormal);
+        )
 
         v.reset(new LiteralFloat(fval));
         v->start = start;
@@ -624,13 +1394,31 @@ pAcceptLiteralFloat(ParseContext &c, unique_ptr<Construct> &v)
     return false;
 }
 
+/*
+ * A string literal's span, from its opening quote (the token's loc) through
+ * its closing one - `raw` is the source text between them - so the end is
+ * the closing quote's column + 2; a literal spanning lines ends on its last
+ * line. It used to be start + the text's length + 1: two columns short (no
+ * quotes), and on the wrong line for a multi-line literal.
+ */
+static Loc
+str_literal_end(Loc start, std::string_view raw)
+{
+    const size_t nl = raw.rfind('\n');
+    if (nl == std::string_view::npos)
+        return start + (raw.size() + 3);
+    const int lines = static_cast<int>(std::count(raw.begin(), raw.end(),
+                                                  '\n'));
+    return Loc(start.line + lines, static_cast<int>(raw.size() - nl - 1) + 3);
+}
+
 bool
 pAcceptLiteralStr(ParseContext &c, unique_ptr<Construct> &v)
 {
     if (*c == TokType::str) {
         v.reset(new LiteralStr(c.get_str()));
         v->start = c.get_loc();
-        v->end = c.get_loc() + (c.get_str().length() + 1);
+        v->end = str_literal_end(c.get_loc(), c.get_str());
         c++;
         return true;
     }
@@ -645,11 +1433,18 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
 
         v.reset(new Identifier(c.get_str()));
 
-        if (c.const_eval && resolve_const) {
+        /* #133: a DECLARATION in scope names this const builtin, so it is not
+         * the builtin here - leave the identifier alone and let the resolver
+         * bind it to the real declaration. */
+        if (c.is_shadowed(static_cast<Identifier *>(v.get())->uid))
+            resolve_const = false;
+
+        if (resolve_const) {
 
             /*
-             * The const evaluation is enabled and we've been asked to resolve
-             * identifier, if possible. Steps:
+             * We've been asked to resolve the identifier, if possible (with
+             * or without `-nc`: a const scalar NAME denotes its value - that
+             * is what a const scalar is - #54). Steps:
              *
              *      1) Eval it in the const EvalContext
              *
@@ -668,8 +1463,16 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
 
             if (const_value.get_type()->t == Type::t_lval) {
 
-                MakeConstructFromConstVal(RValue(const_value), v);
+                const EvalValue &cv = RValue(const_value);
+                const bool cls = cv.is<StructTypeDef *>()
+                    && cv.get<StructTypeDef *>()->is_class;
+                if (auto ref = builtin_ref(
+                        cv, static_cast<Identifier *>(v.get())->uid))
+                    v = std::move(ref);
+                MakeConstructFromConstVal(cv, v);
                 v->is_const = true;
+                if (cls)
+                    static_cast<Identifier *>(v.get())->names_class = true;
 
             } else if (const_value.is<intrusive_ptr<FuncObject>>()) {
 
@@ -744,7 +1547,14 @@ pIdentifier(ParseContext &c, unsigned fl)
 {
     unique_ptr<Construct> ret;
 
-    if (!pAcceptId(c, ret))
+    /* resolve_const=false: this parses a DECLARATION name (a func / struct
+     * name - see the two callers), a fresh binding, NEVER a const reference.
+     * With const-resolution on, a name that collides with a const GLOBAL
+     * (e.g. `func inf()` / `struct nan` - `inf`/`nan` are const float builtins)
+     * would fold to a LiteralFloat, and the static_cast<Identifier*> below
+     * would be UB (a real bug, not just a UBSan finding: `id` would point at a
+     * LiteralFloat). A decl name must stay a plain Identifier. */
+    if (!pAcceptId(c, ret, false /* resolve_const */))
         return nullptr;
 
     return unique_ptr<Identifier>(static_cast<Identifier *>(ret.release()));
@@ -794,19 +1604,18 @@ pFuncParam(ParseContext &c, unsigned fl)
     const StructTypeDef *sdef = nullptr;
     std::shared_ptr<TypeAnnot> annot;
     if (!is_dyn && *c == TokType::id) {
-        const DeclType ck = type_keyword(c.get_str());
         const bool q1 = c.peek_tok(1) == Op::questionmark;
         const bool name_follows =
             c.peek_tok(1) == TokType::id ||
             (q1 && c.peek_tok(2) == TokType::id);
 
-        if ((ck == DeclType::arr || ck == DeclType::dict) &&
+        if (container_keyword(c.get_str()) != DeclType::none &&
             c.peek_tok(1) == Op::lt) {
             /* a parameterized container param: `array<int> xs`, `dict<str,P> m`
              * (a param is never an expression, so the `<` is unambiguous here -
              * no balanced-skip needed). pTypeAnnot eats the `<...>` + `?`. */
             annot = pTypeAnnot(c);
-            dt = ck;
+            dt = annot->kind;
             if (annot->opt)
                 is_opt = true;
         } else if (name_follows) {
@@ -820,9 +1629,7 @@ pFuncParam(ParseContext &c, unsigned fl)
             } else {
                 sdef = lookup_struct_type(c, c.get_str());
                 if (!sdef)
-                    throw SyntaxErrorEx(c.get_loc(),
-                        intern_msg("'" + std::string(c.get_str()) +
-                                   "' is not a type"));
+                    not_a_type(c, c.get_str(), c.get_loc());
                 dt = DeclType::strct;
             }
             c.next();                          /* consume the type name */
@@ -873,7 +1680,7 @@ pList(ParseContext &c,
     if (subexpr) {
 
         is_const = is_const && subexpr->is_const;
-        ret->elems.emplace_back(move(subexpr));
+        ret->elems.emplace_back(std::move(subexpr));
 
         while (*c == Op::comma) {
 
@@ -884,7 +1691,7 @@ pList(ParseContext &c,
                 noExprError(c);
 
             is_const = is_const && subexpr->is_const;
-            ret->elems.emplace_back(move(subexpr));
+            ret->elems.emplace_back(std::move(subexpr));
         }
     }
 
@@ -951,7 +1758,7 @@ pArgList(ParseContext &c, unsigned fl)
 
             is_const = is_const && e->is_const;
             ret->arg_names.push_back(name);
-            ret->elems.emplace_back(move(e));
+            ret->elems.emplace_back(std::move(e));
 
             if (!pAcceptOp(c, Op::comma))
                 break;
@@ -983,7 +1790,7 @@ pArgList(ParseContext &c, unsigned fl)
 static void
 pTryDesugarNamedCall(ParseContext &c, CallExpr *call)
 {
-    if (!c.const_eval || !call->what->is_const) {
+    if (!call->what->is_const) {
         call->args->is_const = false;
         return;
     }
@@ -1014,8 +1821,23 @@ pAcceptCallExpr(ParseContext &c,
 
         ret.reset();
         expr->start = what->start;
-        expr->what = move(what);
+        expr->what = std::move(what);
         expr->args = pArgList(c, fl);
+
+        /* A pure function makes no class instance: each construction is
+         * a new object, so a fold or a de-duplicated call would merge
+         * objects the program can tell apart (a class named before the
+         * function; one declared after it is refused when the call is
+         * evaluated at compile time - construct_struct's caller) */
+        if (c.pure_depth > 0
+            && ctag(expr->what.get()) == ConstructType::id
+            && static_cast<Identifier *>(expr->what.get())->names_class)
+            throw SyntaxErrorEx(expr->what->start,
+                "a pure function cannot construct a class instance (each "
+                "construction is a new object)");
+
+        /* the one place a class instance may be made at compile time */
+        expr->in_const_decl = (fl & pFlags::pInConstDecl) != 0;
 
         /* A named call can't bind/fold until its labels are mapped to
          * positions; do it now if the callee is a parse-time pure func. */
@@ -1027,19 +1849,39 @@ pAcceptCallExpr(ParseContext &c,
          * coercion/validation makes it type-safe). Everywhere else it is
          * deferred to the inferencer (which gives the precise field type/arity
          * errors) + runtime. */
-        else if (c.const_eval && !(fl & pFlags::pInConstDecl) &&
+        else if (!(fl & pFlags::pInConstDecl) &&
                  expr->what->is_const && expr->args->is_const &&
                  RValue(expr->what->eval(c.const_ctx)).is<StructTypeDef *>())
             expr->args->is_const = false;
 
-        if (c.const_eval && expr->what->is_const && expr->args->is_const) {
-
+        if (expr->what->is_const && expr->args->is_const)
             expr->is_const = true;
+
+        if (expr->is_const && !c.folding())
+            nc_eval_const(c, expr.get(), (fl & pFlags::pInConstDecl) != 0,
+                          (fl & pFlags::pInConstDecl) != 0);
+
+        /* #96: a call - to a user function or to a builtin - waits for
+         * inference. A builtin's value has an exact type its call does
+         * not: `get(D, "a")` is `int?` and its value 1 an `int`, so
+         * folded here `g + 1` compiled where -nc refused it (RULE 2), and
+         * `dict(pairs)` typed `dict<str,int>` against `dict<dyn,dyn>` */
+        if (expr->is_const && pDefersFolds(c, fl)) {
+            pDeferFold(c, expr.get(), false, false);
+            /* -a: marked as the fold below marks it; a late fold the
+             * types refuse is folded by AutoConst, which marks it too */
+            if (c.analysis && expr->late_fold)
+                if (auto *cid = node_cast<Identifier>(expr->what.get()))
+                    c.analysis->mark(cid->start,
+                        static_cast<int>(cid->get_str().length()),
+                        AnnoKind::folded);
+
+        } else if (c.folding() && expr->is_const) {
 
             /* -a: this call is about to fold to a literal at compile time -
              * color the callee identifier magenta before it is gone. */
             if (c.analysis)
-                if (auto *cid = dynamic_cast<Identifier *>(expr->what.get()))
+                if (auto *cid = node_cast<Identifier>(expr->what.get()))
                     c.analysis->mark(cid->start,
                         static_cast<int>(cid->get_str().length()),
                         AnnoKind::folded);
@@ -1057,7 +1899,7 @@ pAcceptCallExpr(ParseContext &c,
             /* end spans through the closing ')': the caret convention is
              * loc_end = last-char-column + 2, and get_loc() is the ')' here. */
             expr->end = c.get_loc() + 2;
-            ret = move(expr);
+            ret = std::move(expr);
         }
 
         pExpectOp(c, Op::parenR);
@@ -1065,6 +1907,70 @@ pAcceptCallExpr(ParseContext &c,
     }
 
     return false;
+}
+
+/* the parse-time fold of a const subscript / slice (with -nc: its
+ * evaluation, for the errors and `nc_folds`) */
+static void
+pFoldSubscript(ParseContext &c, unique_ptr<Construct> &ret, bool in_slice,
+               unsigned fl)
+{
+    if (!c.folding() && ret->is_const) {
+
+        if (!in_slice || fl & pFlags::pInConstDecl)
+            nc_eval_const(c, ret.get(), true,
+                          (fl & pFlags::pInConstDecl) != 0);
+
+    } else if (ret->is_const) {
+
+        if ((!in_slice || fl & pFlags::pInConstDecl)
+                && pDefersFolds(c, fl) && pHoldsDeferred(ret.get())) {
+
+            pDeferFold(c, ret.get(), true, false);       /* #96 */
+
+        } else if (!in_slice || fl & pFlags::pInConstDecl) {
+
+            unique_ptr<Construct> const_construct;
+
+            if (cse_materialize(
+                    c,
+                    ret.get(),
+                    const_construct,
+                    true,
+                    (fl & pFlags::pInConstDecl) != 0))
+            {
+                /* #54: keep the subscript's span, so `K[0] = v` is
+                 * refused WITH a caret - the -nc run refuses the
+                 * un-folded Subscript at the same place. */
+                const_construct->start = ret->start;
+                const_construct->end = ret->end;
+                ret = std::move(const_construct);
+            }
+        }
+    }
+}
+
+/* ParseContext::pending_fold: a const subscript naming no element */
+static void
+pDeferFoldError(ParseContext &c, Construct *node, const RuntimeException &e)
+{
+    node->nc_folds = true;
+    c.pending_fold.emplace_back(node,
+                                unique_ptr<RuntimeException>(e.clone()));
+}
+
+void ParseContext::pending_fold_drop(size_t mark)
+{
+    pending_fold.resize(mark);
+}
+
+void ParseContext::pending_fold_check(size_t mark)
+{
+    if (pending_fold.size() <= mark)
+        return;
+    unique_ptr<RuntimeException> e = std::move(pending_fold[mark].second);
+    pending_fold.resize(mark);
+    e->rethrow();
 }
 
 bool
@@ -1083,8 +1989,8 @@ pAcceptSubscript(ParseContext &c,
 
             unique_ptr<Slice> s(new Slice);
 
-            s->what = move(what);
-            s->start_idx = move(start);
+            s->what = std::move(what);
+            s->start_idx = std::move(start);
             s->end_idx = pExprTop(c, fl);
 
             if (s->what->is_const) {
@@ -1093,7 +1999,7 @@ pAcceptSubscript(ParseContext &c,
                         s->is_const = true;
             }
 
-            ret = move(s);
+            ret = std::move(s);
             in_slice = true;
 
         } else {
@@ -1103,13 +2009,13 @@ pAcceptSubscript(ParseContext &c,
             if (!start)
                 noExprError(c);
 
-            s->what = move(what);
-            s->index = move(start);
+            s->what = std::move(what);
+            s->index = std::move(start);
 
             if (s->what->is_const && s->index->is_const)
                 s->is_const = true;
 
-            ret = move(s);
+            ret = std::move(s);
         }
 
         /* Set the node's own span (start of the subscripted expr, through ']'),
@@ -1117,22 +2023,12 @@ pAcceptSubscript(ParseContext &c,
         ret->start = wstart;
         ret->end = c.get_loc() + 2;   /* get_loc() is the ']' */
 
-        if (c.const_eval && ret->is_const) {
-
-            if (!in_slice || fl & pFlags::pInConstDecl) {
-
-                unique_ptr<Construct> const_construct;
-
-                if (cse_materialize(
-                        c,
-                        ret.get(),
-                        const_construct,
-                        true,
-                        (fl & pFlags::pInConstDecl) != 0))
-                {
-                    ret = move(const_construct);
-                }
-            }
+        try {
+            pFoldSubscript(c, ret, in_slice, fl);
+        } catch (const KeyNotFoundEx &e) {
+            pDeferFoldError(c, ret.get(), e);
+        } catch (const OutOfBoundsEx &e) {
+            pDeferFoldError(c, ret.get(), e);
         }
 
         pExpectOp(c, Op::bracketR);
@@ -1201,7 +2097,7 @@ pAcceptMember(ParseContext &c,
     mem->is_const = what->is_const && !opt;
     mem->optional = opt;
     mem->start = what->start;
-    mem->what = move(what);
+    mem->what = std::move(what);
 
     unique_ptr<Construct> tmpId;
 
@@ -1209,21 +2105,206 @@ pAcceptMember(ParseContext &c,
         throw SyntaxErrorEx(c.get_loc(), "Expected identifier, got", &c.get_tok());
     }
 
-    mem->end = c.get_loc();
-    unique_ptr<Identifier> id(dynamic_cast<Identifier *>(tmpId.release()));
+    /* the member name's own end - not the next token's start, which put
+     * the spaces after `d.zz` under its caret (and one column too few
+     * when nothing separated them: `d.zz+1` underlined `d.z`) */
+    mem->end = tmpId->end;
+    unique_ptr<Identifier> id(node_cast<Identifier>(tmpId.release()));
 
     if (!id)
         throw InternalErrorEx(mem->start, mem->end);
 
     mem->memId = SharedStr(string(id->get_str()));
     mem->memUid = UniqueId::get(id->get_str());
-    ret = move(mem);
+    ret = std::move(mem);
     return true;
+}
+
+/*
+ * An OPTIONAL member `a?.f` is a value - `none` when `a` is none - and not
+ * one of the four forms that denote a location (pExpr14's assignable-shape
+ * rule), so it is refused as the target of `=`, of a compound assignment
+ * and of `++` / `--` alike, by its shape (2026-10-05). Before, typed code
+ * got a NullabilityEx for `++` / `+=` and a plain store for `=` in the
+ * tree-walker, where the VM refused to compile it (NotLoweredEx); with
+ * -nti the tree-walker raised NotLValueEx even for a base that was not
+ * none. A plain field AFTER an optional link (`a?.b.c`) is unaffected.
+ */
+static void
+pRefuseOptionalTarget(const Construct *lv)
+{
+    if (ctag(lv) != ConstructType::member
+            || !static_cast<const MemberExpr *>(lv)->optional)
+        return;
+
+    SyntaxErrorEx e(lv->start,
+                    "Cannot assign to an optional member: `a?.f` is a value "
+                    "(none when `a` is none), not an assignable location");
+    e.loc_end = lv->end;
+    throw e;
+}
+
+/*
+ * THE ASSIGNABLE-SHAPE RULE (pExpr14's comment has the history): only four
+ * forms can denote a location - a variable, a destructuring list, an
+ * element `a[i]` and a field `a.f` (an optional one excepted, above). Any
+ * other target - a literal, a call result, an arithmetic chain, a ternary,
+ * a slice - is a value by construction, refused here whatever the types,
+ * so no flag that disables a pass can change the answer. Shared by `=` /
+ * `OP=` and by `++` / `--`, whose operand used to skip it: under -nti
+ * `f()++`, `(a + 1)++` and `s[0:1]++` failed at run time in the
+ * tree-walker while the VM refused to compile them (until 2026-10-05).
+ * A CONST element lands here too - the parser already folded `K[0]` to
+ * its value (#54: under -nc, nc_folds says it would have) - which is
+ * right: writing it IS decidable at compile time; the same const reached
+ * through a PARAMETER keeps its Subscript shape and stays the runtime
+ * NotLValueEx. `what` is the message's verb ("Cannot assign to").
+ */
+/* the assignable-shape error for a target that is a folded constant */
+[[noreturn]] static void
+pRefuseFoldedTarget(Loc start, Loc end)
+{
+    SyntaxErrorEx e(start, intern_msg(
+        "Cannot assign to this expression: it is not an assignable "
+        "location"));
+    e.loc_end = end;
+    throw e;
+}
+
+/*
+ * A multi-assignment `a, b = v` has NO VALUE (question 11, maintainer,
+ * 2026-10-26): it is a statement, and where its value would be used - the
+ * value of an assignment or a declaration, a `return`, a `throw` - it is
+ * refused here, since it would always be `none` (`w = a, b = [5, 6]` made
+ * `w` none, `a, b = c, d = [1, 2]` made `a` and `b` none). A statement of
+ * its own (a block's, a `for`'s init or step) is unaffected.
+ * plans/multi-assign-value.md has what giving it a value would take.
+ */
+static void
+pRefuseMultiAssignValue(const Construct *e)
+{
+    if (!e || ctag(e) != ConstructType::expr14)
+        return;
+    const Construct *lv = static_cast<const Expr14 *>(e)->lvalue.get();
+    if (!lv || ctag(lv) != ConstructType::idlist)
+        return;
+    SyntaxErrorEx ex(e->start, intern_msg(
+        "A multi-assignment has no value: write it as a statement of its "
+        "own"));
+    ex.loc_end = e->end;
+    throw ex;
+}
+
+static void
+pRefuseUnassignable(const Construct *lv, const char *what)
+{
+    pRefuseOptionalTarget(lv);
+
+    /* #94: a const bound to a builtin reads as a reference to it
+     * (builtin_ref) - a store there is a store into the const */
+    if (lv->is_id() && static_cast<const Identifier *>(lv)->builtin_only)
+        throw CannotRebindConstEx(lv->start, lv->end);
+    if (lv->is_idlist())
+        for (const auto &t : static_cast<const IdList *>(lv)->elems)
+            if (t->builtin_only)
+                throw CannotRebindConstEx(t->start, t->end);
+
+    /* a FIELD of a constant (`K.k`, `P.CONST`) is a location no store can
+     * write, decidable here like the element `K["k"]` (folded to its value,
+     * or - naming no element - marked nc_folds): a member is not folded at
+     * parse time, so `K.k = v` used to reach run time as NotLValueEx while
+     * `K["k"] = v` was refused here (2026-10-07) */
+    if (!lv->nc_folds
+        && (lv->is_id() || lv->is_idlist()
+            || ctag(lv) == ConstructType::subscript
+            || ctag(lv) == ConstructType::deref
+            || (ctag(lv) == ConstructType::member && !lv->is_const)))
+        return;
+
+    const std::string m = std::string(what) +
+        " this expression: it is not an assignable location";
+    SyntaxErrorEx e(lv->start, intern_msg(m));
+    e.loc_end = lv->end;
+    throw e;
+}
+
+/* Is `t` incomplete anywhere - a bare `array` / `dict` (a HOLE a
+ * declaration fills, which a cast cannot: its type is what it makes)? */
+static bool annot_has_hole(const TypeAnnot *t)
+{
+    if (!t)
+        return false;
+    if (t->kind == DeclType::arr && !t->elem)
+        return true;
+    if (t->kind == DeclType::dict && !t->key)
+        return true;
+    return annot_has_hole(t->elem.get()) || annot_has_hole(t->key.get())
+           || annot_has_hole(t->val.get());
+}
+
+/*
+ * `cast<T>(x)` (plans/cast.md), `cast` consumed. A constant `x` is cast
+ * at compile time, so a refusal is a compile error; the cast then folds
+ * where a call with constant arguments folds - after inference (#96),
+ * which keeps the node when its literal's type is not T's (`cast<dyn>(5)`
+ * is a dyn, its value an int).
+ */
+static unique_ptr<Construct>
+pCastExpr(ParseContext &c, unsigned fl, Loc start)
+{
+    if (!pAcceptOp(c, Op::lt))
+        throw SyntaxErrorEx(c.get_loc(), "expected '<' after 'cast': "
+                            "cast<TYPE>(value)", &c.get_tok());
+    const Loc tloc = c.get_loc();
+    std::shared_ptr<TypeAnnot> t = pTypeAnnot(c);
+    if (!pAcceptCloseAngle(c))
+        throw SyntaxErrorEx(c.get_loc(),
+            "expected '>' to close 'cast<...>'", &c.get_tok());
+    if (c.pending_gt) {
+        c.pending_gt = 0;
+        throw SyntaxErrorEx(c.get_loc(), "unexpected '>' after "
+                            "'cast<...>'", &c.get_tok());
+    }
+    if (annot_has_hole(t.get()))
+        throw SyntaxErrorEx(tloc, intern_msg(
+            "a cast needs a complete type: write array<T> / dict<K, V>, "
+            "not a bare array / dict"));
+    if (!pAcceptOp(c, Op::parenL))
+        throw SyntaxErrorEx(c.get_loc(), "expected '(' after 'cast<...>'",
+                            &c.get_tok());
+
+    auto node = make_unique<CastExpr>();
+    node->start = start;
+    node->to = annot_intern(*t);
+    {
+        NestGuard ng(c);                    /* #98: the operand nests */
+        node->elem = pExpr14(c, fl & ~pFlags::pInDecl);
+    }
+    if (!node->elem)
+        noExprError(c);
+    node->end = c.get_loc() + 2;            /* through the ')' */
+    pExpectOp(c, Op::parenR);
+
+    /* as a call with constant arguments (pAcceptCallExpr) */
+    const bool in_const = (fl & pFlags::pInConstDecl) != 0;
+    node->is_const = node->elem->is_const;
+    if (node->is_const && !c.folding())
+        nc_eval_const(c, node.get(), in_const, in_const);
+    if (node->is_const && pDefersFolds(c, fl)) {
+        pDeferFold(c, node.get(), false, false);
+    } else if (c.folding() && node->is_const) {
+        unique_ptr<Construct> lit;
+        cse_materialize(c, node.get(), lit, in_const, in_const);
+        if (lit)
+            return lit;
+    }
+    return node;
 }
 
 unique_ptr<Construct>
 pExpr01(ParseContext &c, unsigned fl)
 {
+    NestGuard ng(c);                   /* #137: bound the C recursion */
     unique_ptr<Construct> main;
     unique_ptr<Construct> otherExpr;
     const Loc start = c.get_loc();
@@ -1239,10 +2320,12 @@ pExpr01(ParseContext &c, unsigned fl)
     } else if (pAcceptKeyword(c, Keyword::kw_none) ||
                pAcceptKeyword(c, Keyword::kw_null)) {
 
-        /* `null` is an alias for `none`. */
+        /* `null` is an alias for `none` - both four letters. The span is the
+         * keyword's own (end = last column + 2), not up to the next token,
+         * which made a caret on it depend on the spacing after it. */
         main.reset(new LiteralNone());
         main->start = start;
-        main->end = c.get_loc();
+        main->end = start + 5;
         return main;     /* Not subscriptable, nor callable */
     }
 
@@ -1273,6 +2356,10 @@ pExpr01(ParseContext &c, unsigned fl)
         main->end = c.get_loc() + 2;    /* span through the '}' */
         pExpectOp(c, Op::braceR);
 
+    } else if (pAcceptKeyword(c, Keyword::kw_cast)) {
+
+        main = pCastExpr(c, fl, start);
+
     } else if (pAcceptId(c, main)) {
 
         /* do nothing */
@@ -1282,11 +2369,13 @@ pExpr01(ParseContext &c, unsigned fl)
         return nullptr;
     }
 
+    NestSteps steps(c);          /* #98: each step nests the tree */
     while (pAcceptCallExpr(c, main, otherExpr, fl)  ||
            pAcceptSubscript(c, main, otherExpr, fl) ||
            pAcceptMember(c, main, otherExpr, fl))
     {
-        main = move(otherExpr);
+        main = std::move(otherExpr);
+        steps.step();
     }
 
     /* postfix ++ / -- : binds tighter than any unary/binary operator (it sits
@@ -1296,13 +2385,16 @@ pExpr01(ParseContext &c, unsigned fl)
     if (main && (*c == Op::inc || *c == Op::dec)) {
         const bool is_inc = (*c == Op::inc);
         const Loc opLoc = c.get_loc();
+        pRefuseUnassignable(main.get(), "Cannot increment or decrement");
         c++;
         auto id = make_unique<IncDecExpr>();
         id->start = main->start;
-        id->end = opLoc + 2;       /* span through the ++ / -- */
+        /* span through the ++ / --: its last column is opLoc + 1, and an
+         * end is the last column + 2 (it was + 2, one column short) */
+        id->end = opLoc + 3;
         id->is_prefix = false;
         id->is_inc = is_inc;
-        id->lvalue = move(main);
+        id->lvalue = std::move(main);
         return id;
     }
 
@@ -1331,7 +2423,7 @@ pExprGeneric(ParseContext &c,
 
         if (!ret) {
             ret.reset(new ExprT);
-            ret->elems.emplace_back(Op::invalid, move(lowerE));
+            ret->elems.emplace_back(Op::invalid, std::move(lowerE));
         }
 
         lowerE = lowerExpr(c, fl);
@@ -1340,14 +2432,14 @@ pExprGeneric(ParseContext &c,
             noExprError(c);
 
         is_const = is_const && lowerE->is_const;
-        ret->elems.emplace_back(op, move(lowerE));
+        ret->elems.emplace_back(op, std::move(lowerE));
     }
 
     if (!ret)
         return lowerE;
 
     ret->start = start;
-    ret->end = c.get_loc();
+    ret->end = ret->elems.back().second->end;   /* the last operand's */
     ret->is_const = is_const;
     return ret;
 }
@@ -1366,22 +2458,67 @@ pExpr02(ParseContext &c, unsigned fl)
     if (*c == Op::inc || *c == Op::dec) {
         const bool is_inc = (*c == Op::inc);
         c++;
-        elem = pExpr02(c, fl);
+        {
+            NestGuard ng(c);            /* #98: a unary operator nests */
+            elem = pExpr02(c, fl);
+        }
         if (!elem)
             noExprError(c);
+        pRefuseUnassignable(elem.get(), "Cannot increment or decrement");
         auto id = make_unique<IncDecExpr>();
         id->start = start;
-        id->end = c.get_loc();
+        id->end = elem->end;                    /* the operand's */
         id->is_prefix = true;
         id->is_inc = is_inc;
-        id->lvalue = move(elem);
+        id->lvalue = std::move(elem);
         return id;
+    }
+
+    /* unary `*` - the value a box holds (DerefExpr), a location. A prefix
+     * operator like the others, so `*b++` is `*(b++)`. A slash directly
+     * followed by `*b` opens a block comment, as in C: write `a / *b`. */
+    if (*c == Op::times) {
+        c++;
+        {
+            NestGuard ng(c);            /* #98: a unary operator nests */
+            elem = pExpr02(c, fl);
+        }
+        if (!elem)
+            noExprError(c);
+        auto d = make_unique<DerefExpr>();
+        d->start = start;
+        d->end = elem->end;
+        d->elem = std::move(elem);
+        return d;
     }
 
     /* `~` (Op::bnot) is bitwise NOT here; in a PARAM position it is the `dyn`
      * alias, but that is handled in pFuncParam before any expression is parsed,
      * so the two uses never collide. */
     Op op = AcceptOneOf(c, {Op::plus, Op::minus, Op::lnot, Op::bnot});
+
+    /* -2^63 as a literal (Java's rule): `-` directly before the literal
+     * 9223372036854775808 - which fits no int on its own, as `-` is an
+     * operator - is the lowest int. Only as the minus's whole operand: a
+     * postfix after the digits (`-9223372036854775808[0]`) makes them the
+     * operand of that instead, and they stay out of range. */
+    if (op == Op::minus && *c == TokType::integer) {
+        const Tok &nx = c.peek_tok(1);
+        const bool postfix = nx == Op::parenL || nx == Op::bracketL ||
+            nx == Op::dot || nx == Op::qmdot || nx == Op::inc ||
+            nx == Op::dec;
+        int_type v = 0;
+        const string digits = "-" + string(c.get_str());
+        if (!postfix && numtext_int(digits, v) == NumText::ok &&
+            v == std::numeric_limits<int_type>::min()) {
+            ML_INT_ONLY(int_vc(IntVc::lit_int_min);)
+            auto lit = make_unique<LiteralInt>(v);
+            lit->start = start;
+            lit->end = c.get_loc() + (c.get_str().length() + 1);
+            c++;
+            return lit;
+        }
+    }
 
     if (op != Op::invalid) {
 
@@ -1392,7 +2529,10 @@ pExpr02(ParseContext &c, unsigned fl)
          *      --1, !+1, !-1, !!1
          */
 
-        elem = pExpr02(c, fl);
+        {
+            NestGuard ng(c);            /* #98: a unary operator nests */
+            elem = pExpr02(c, fl);
+        }
 
         if (!elem)
             noExprError(c);
@@ -1407,9 +2547,9 @@ pExpr02(ParseContext &c, unsigned fl)
 
     ret.reset(new Expr02);
     ret->start = start;
-    ret->end = c.get_loc();
+    ret->end = elem->end;                       /* the operand's */
     ret->is_const = elem->is_const;
-    ret->elems.emplace_back(op, move(elem));
+    ret->elems.emplace_back(op, std::move(elem));
     return ret;
 }
 
@@ -1496,6 +2636,34 @@ pExpr12(ParseContext &c, unsigned fl)
 }
 
 /*
+ * Does the constant expression `n` compute its value from constants and
+ * builtins alone - no user function called, named or written in it? Then
+ * the value the parser computed is the value it has when the program
+ * runs, however the program is typed. A pure function's body is typed
+ * by the PROGRAM (#96: a parameter joined over its call sites), so a
+ * call to one may give another value at run time than it gave here.
+ */
+static bool
+pValueIsTypingFree(ParseContext &c, Construct *n)
+{
+    if (!n)
+        return true;
+    if (ctag(n) == ConstructType::func_decl)
+        return false;
+    if (ctag(n) == ConstructType::id) {
+        std::unordered_set<const FuncDescriptor *> descs;
+        collect_value_descs(RValue(n->eval(c.const_ctx)), descs);
+        return descs.empty();
+    }
+    bool ok = true;
+    for_each_child_of(n, [&](Construct *ch) {
+        if (ok && !pValueIsTypingFree(c, ch))
+            ok = false;
+    });
+    return ok;
+}
+
+/*
  * Null-coalescing `a ?? b` (right-assoc): `a` unless it is none, otherwise `b`.
  * Precedence sits between `||` and the ternary (matching C#: || > ?? > ?: > =).
  * A const lhs folds: a none lhs -> rhs, a non-none lhs -> lhs.
@@ -1510,15 +2678,29 @@ pExprCoalesce(ParseContext &c, unsigned fl)
 
     unique_ptr<CoalesceExpr> co(new CoalesceExpr);
     co->start = lhs->start;
-    co->lhs = move(lhs);
-    co->rhs = pExprCoalesce(c, fl);          /* right-associative */
+    co->lhs = std::move(lhs);
+    /* the right side may be a lambda, as the ternary's arms may (a lambda
+     * literal is a whole expression: pExpr14 takes it before any operator
+     * level, and its `=> body` extends as far as an expression can) */
+    if (!pAcceptFuncDecl(c, co->rhs, fl & ~pFlags::pInStmt)) {
+        NestGuard ng(c);                    /* #98: `a ?? b ?? ...` nests */
+        co->rhs = pExprCoalesce(c, fl);      /* right-associative */
+    }
     if (!co->rhs)
         noExprError(c);
     co->end = co->rhs->end;
 
-    if (c.const_eval && co->lhs->is_const) {
+    if (co->lhs->is_const) {
         const EvalValue &v = co->lhs->eval(c.const_ctx);
-        return v.is<NoneVal>() ? move(co->rhs) : move(co->lhs);
+        if (v.is<NoneVal>())
+            return std::move(co->rhs);
+        /* the left side stands for the whole `??`, whose result is never
+         * none. A node kept for inference (a deferred call, any constant
+         * expression under -nc) may be typed `opt`: `var n = get(D, "a")
+         * ?? 0; n + 1` was refused, an int? where README says int */
+        if (pValueIsTypingFree(c, co->lhs.get()))
+            co->lhs->never_none = true;
+        return std::move(co->lhs);
     }
 
     return co;
@@ -1540,20 +2722,26 @@ pExpr13(ParseContext &c, unsigned fl)
     const unsigned bfl = fl & ~(pFlags::pInStmt | pFlags::pInDecl);
     unique_ptr<TernaryExpr> t(new TernaryExpr);
     t->start = cond->start;
-    t->condExpr = move(cond);
+    t->condExpr = std::move(cond);
     t->thenExpr = pExpr14(c, bfl);           /* middle: full expr, up to ':' */
     if (!t->thenExpr)
         noExprError(c);
     pExpectOp(c, Op::colon);
-    t->elseExpr = pExpr13(c, bfl);           /* right-associative */
+    /* a lambda in the else arm too, as in the middle one (pExpr14 accepts
+     * it there): `c ? func(x) => x + 1 : func(x) => x * 2` was "Expected
+     * expression" at the second `func` */
+    if (!pAcceptFuncDecl(c, t->elseExpr, bfl)) {
+        NestGuard ng(c);                    /* #98: an else-arm chain nests */
+        t->elseExpr = pExpr13(c, bfl);       /* right-associative */
+    }
     if (!t->elseExpr)
         noExprError(c);
     t->end = t->elseExpr->end;
 
-    if (c.const_eval && t->condExpr->is_const) {
+    if (t->condExpr->is_const) {
         const EvalValue &v = t->condExpr->eval(c.const_ctx);
-        return v.get_type()->is_true(v) ? move(t->thenExpr)
-                                        : move(t->elseExpr);
+        return v.get_type()->is_true(v) ? std::move(t->thenExpr)
+                                        : std::move(t->elseExpr);
     }
 
     return t;
@@ -1564,14 +2752,16 @@ declExprCheckId(ParseContext &c, Construct *id)
 {
     const EvalValue &val = id->eval(c.const_ctx);
 
+    /* the caret is the declared NAME (it was the next token's position,
+     * so `var log = "";` marked `= "";`) */
     if (!val.is<UndefinedId>()) {
 
         if (val.is<LValue *>()) {
             if (val.get<LValue *>()->is<Builtin>())
-                throw CannotRebindBuiltinEx(c.get_loc());
+                throw CannotRebindBuiltinEx(id->start, id->end);
         }
 
-        throw CannotRebindConstEx(c.get_loc());
+        throw CannotRebindConstEx(id->start, id->end);
     }
 }
 
@@ -1616,25 +2806,493 @@ declExprCheckId(ParseContext &c, Construct *id)
 static inline bool
 ShouldConstSymbolExistAtRuntime(const EvalValue& rvalue)
 {
+    /* a struct's descriptor: `const T = S;` is a TYPE ALIAS (README, *Type
+     * aliases*), and a construction `T(5)` that runs at run time reads T.
+     * Dropped like a scalar's, the declaration left nothing named T, and
+     * every such call was "Undefined variable 'T'" (until 2026-11-15) */
     return
         rvalue.is<SharedArrayObj>()              ||
         rvalue.is<intrusive_ptr<DictObject>>()   ||
         rvalue.is<intrusive_ptr<StructObject>>() ||
-        rvalue.is<intrusive_ptr<FuncObject>>();
+        rvalue.is<intrusive_ptr<FuncObject>>()   ||
+        rvalue.is<StructTypeDef *>();
 }
 
-unique_ptr<Construct>
-pExpr14(ParseContext &c, unsigned fl)
+/*
+ * The initializer of a type alias, or a constant multi-declaration's
+ * element bound to one, becomes a literal of the struct's descriptor: the
+ * inferencer reads the alias's struct off it (walk_struct), whatever
+ * expression named the struct (`S`, a ternary, a pure call), and the run
+ * reads it like any constant's value. Nothing for another value.
+ */
+static void
+alias_literal(ParseContext &c, unique_ptr<Construct> &node,
+              const EvalValue *value = nullptr)
+{
+    ML_CHECK(node);
+    if (node_cast<LiteralObj>(node.get()))
+        return;
+    /* the value the declaration already bound, when the caller has it: a
+     * second evaluation of a constant call is work and nothing else */
+    const EvalValue v = RValue(value ? *value : node->eval(c.const_ctx));
+    if (!v.is<StructTypeDef *>())
+        return;
+    auto lit = make_unique<LiteralObj>(v, true);
+    lit->start = node->start;
+    lit->end = node->end;
+    lit->is_const = true;
+    node = std::move(lit);
+}
+
+/*
+ * The rest of an assignment-level expression, once its left side is
+ * parsed - a frame of its own on purpose. The left side is where the
+ * parser RECURSES for nested brackets and parentheses (pExpr13 -> ... ->
+ * pExpr01 -> pExpr14), once per level up to MAX_NEST, so what this part
+ * keeps on the stack would be kept per level too: under ASan, which gives
+ * every local its own slot, that was ~6 KB a level, and 256 levels of
+ * `[[[...]]]` overflowed macOS's 8 MB stack.
+ */
+ML_NOINLINE static unique_ptr<Construct>
+pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
+             unique_ptr<Construct> lside)
 {
     static const std::initializer_list<Op> valid_ops = {
-        Op::assign, Op::addeq, Op::subeq, Op::muleq, Op::diveq, Op::modeq
+        Op::assign, Op::addeq, Op::subeq, Op::muleq, Op::diveq, Op::modeq,
+        Op::shleq, Op::shreq, Op::ushreq, Op::bandeq, Op::boreq, Op::bxoreq
     };
 
-    const Loc start = c.get_loc();
-    unique_ptr<Construct> lside;
     unique_ptr<Expr14> ret;
     bool in_idlist = false;
     Op op;
+
+    if (fl & pFlags::pInStmt) {
+
+        Identifier *first_id = node_cast<Identifier>(lside.get());
+
+        /* `K, a = ..` with a const scalar K: the name folded to its value,
+         * so no IdList forms - refuse it as the single target `K = 6` is
+         * (it was a syntax error at the comma) */
+        if (!first_id && *c == Op::comma
+                && dynamic_cast<const Literal *>(lside.get()))
+            pRefuseFoldedTarget(lside->start, lside->end);
+
+        if (first_id && pAcceptOp(c, Op::comma)) {
+
+            unique_ptr<IdList> idlist(new IdList);
+            lside.release();
+            idlist->elems.emplace_back(first_id);
+
+            unique_ptr<IdList> tmp = pList<IdList>(c, fl, pIdentifier);
+
+            idlist->elems.insert(
+                idlist->elems.end(),
+                make_move_iterator(tmp->elems.begin()),
+                make_move_iterator(tmp->elems.end())
+            );
+
+            if (fl & pFlags::pInDecl) {
+                for (const auto &e : idlist->elems)
+                    declExprCheckId(c, e.get());
+            } else {
+                /* A target after the first is parsed as a name only, so it
+                 * gets the const marking pAcceptId gives the first one (and
+                 * a single target) here: a const kept at run time stays an
+                 * identifier, marked const, so codegen refuses the store as
+                 * the tree-walker does - it stored into `K` in `a, K = ..`. */
+                for (size_t i = 1; i < idlist->elems.size(); i++) {
+                    Identifier *id = idlist->elems[i].get();
+                    if (c.is_shadowed(id->uid))
+                        continue;
+                    const EvalValue cv = id->eval(c.const_ctx);
+                    if (cv.get_type()->t != Type::t_lval)
+                        continue;
+                    /* a const SCALAR has no run-time symbol: as a single
+                     * target it folds to its value, which is not a location
+                     * (pRefuseUnassignable) - the same error here, where it
+                     * read as an undefined name */
+                    const Type::TypeE k = RValue(cv).get_type()->t;
+                    if (k == Type::t_int || k == Type::t_float
+                            || k == Type::t_bool || k == Type::t_none
+                            || k == Type::t_str)
+                        pRefuseFoldedTarget(id->start, id->end);
+                    /* a const bound to a builtin (#94): a store into the
+                     * const, as for the first target */
+                    if (builtin_ref(RValue(cv), id->uid))
+                        throw CannotRebindConstEx(id->start, id->end);
+                    id->is_const = true;
+                }
+            }
+
+            lside = std::move(idlist);
+            in_idlist = true;
+        }
+    }
+
+    if ((op = AcceptOneOf(c, valid_ops)) != Op::invalid) {
+
+        if (fl & pInDecl && op != Op::assign) {
+            throw SyntaxErrorEx(
+                c.get_loc(),
+                "Operator '=' is required when declaring a variable or a constant"
+            );
+        }
+
+    } else {
+
+        /* No valid operator: this is not an assignment expr */
+
+        if (fl & pFlags::pInDecl) {
+
+            /*
+             * A decl with no initializer. A plain `var x;` assumes `none`; an
+             * explicitly-typed `int x;` / `str s;` assumes the type's zero value
+             * (0 / 0.0 / false / "" / [] / {}), so a non-null typed var is never
+             * left `none`. A struct zero-initializes recursively, by the same
+             * rules: `A x;` becomes `x = A(<zero per field>)`. A `dyn` has
+             * no zero value and is never none (rule 3, plans/strict-
+             * container-types.md): `dyn x;` is refused, `dyn? x;` is none.
+             */
+            if ((fl & pFlags::pInDynDecl) && !(fl & pFlags::pInOptDecl))
+                throw SyntaxErrorEx(
+                    lside->start,
+                    "A 'dyn' variable has no zero value: give it an "
+                    "initial value, or declare it 'dyn?' to start as none"
+                );
+            ret.reset(new Expr14);
+            ret->op = Op::assign;
+            ret->lvalue = std::move(lside);
+            /* An `opt` typed decl (nullable) defaults to none; a non-opt typed
+             * decl to its type's zero value; a plain `var` to none. */
+            ret->rvalue =
+                (fl & pFlags::pInOptDecl)
+                    ? unique_ptr<Construct>(new LiteralNone())
+                    : (c.pending_decl_type == DeclType::strct
+                         ? build_zero_struct_init(c, c.pending_decl_struct,
+                                                  start, ret->lvalue->end)
+                         : c.pending_decl_type == DeclType::box
+                         ? zero_box_init(c, c.pending_decl_annot.get(), start,
+                                         ret->lvalue->end)
+                         : zero_value_literal(c.pending_decl_type));
+
+        } else if (in_idlist) {
+
+            throw SyntaxErrorEx(
+                c.get_loc(),
+                "Operator '=' is required when the left side is an ID list"
+            );
+
+        } else {
+
+            /* Just return lside (doing const eval if possible) */
+
+            if (lside->is_const && !c.folding())
+                nc_eval_const(c, lside.get(), false, false);
+            else if (lside->is_const && pDefersFolds(c, fl)
+                     && pHoldsDeferred(lside.get()))
+                pDeferFold(c, lside.get(), false, false);     /* #96 */
+            else if (lside->is_const)
+                MakeConstructFromConstVal(lside->eval(c.const_ctx), lside);
+
+            return lside;
+        }
+    }
+
+    if (!ret) {
+        ret.reset(new Expr14);
+        ret->op = op;
+        ret->lvalue = std::move(lside);
+        NestGuard ng(c);                    /* #98: `a = b = ...` nests */
+        ret->rvalue = pExpr14(c, fl & ~pFlags::pInDecl);
+        pRefuseMultiAssignValue(ret->rvalue.get());
+    }
+
+    ret->fl = fl & pFlags::pInDecl;
+    ret->start = start;
+    /* the last part's end, not the next token's start (see MemberExpr);
+     * every path to here has set the lvalue */
+    ret->end = (ret->rvalue ? ret->rvalue : ret->lvalue)->end;
+
+    /*
+     * A target whose SHAPE can never denote a location is refused HERE, at
+     * compile time (maintainer's call, 2026-08-06): "when NotLValueEx is
+     * determined at compile time, make it a compile failure - but the
+     * exception must keep existing at runtime, because a dynamic value
+     * cannot always be proven".
+     *
+     * Only four forms can ever be assignable: a variable, a destructuring
+     * list, an element `a[i]` and a field `a.f`. Everything else - a
+     * literal, a call result, an arithmetic/comparison/logical chain, a
+     * ternary, a SLICE - is an rvalue by construction whatever its operands
+     * turn out to be, so no type information is needed and this needs no
+     * pass that a flag can disable. The VALUE-dependent failures (writing
+     * through a `const` container, a read-only element, a `dyn` that holds
+     * one) are NOT decidable here and stay the runtime NotLValueEx they
+     * have always been.
+     *
+     * This also closes two divergences: the tree-walker used to report a
+     * SLICE target as TypeErrorEx "does NOT support slice operator []"
+     * (misleading - the type slices fine; the result just is not a
+     * location), and the NO-FAIL codegen could not lower either a slice or
+     * an arithmetic target at all, so the VM raised a NON-catchable
+     * InternalErrorEx where the tree-walker raised a catchable NotLValueEx.
+     */
+    if (!(fl & pFlags::pInDecl))
+        pRefuseUnassignable(ret->lvalue.get(), "Cannot assign to");
+
+    /* Propagate a `var opt`/`var dyn` modifier onto the declared identifier(s),
+     * so the type inferencer (which reads Identifier::opt_mod/dyn_mod) sees it. */
+    if ((fl & pFlags::pInDecl) &&
+        (fl & (pFlags::pInOptDecl | pFlags::pInDynDecl))) {
+
+        const bool opt_f = (fl & pFlags::pInOptDecl) != 0;
+        const bool dyn_f = (fl & pFlags::pInDynDecl) != 0;
+
+        if (auto *id = node_cast<Identifier>(ret->lvalue.get())) {
+            id->opt_mod = opt_f;
+            id->dyn_mod = dyn_f;
+        } else if (auto *idl = node_cast<IdList>(ret->lvalue.get())) {
+            for (auto &e : idl->elems) {
+                e->opt_mod = opt_f;
+                e->dyn_mod = dyn_f;
+            }
+        }
+    }
+
+    /* Propagate an explicit-type annotation (`int x = ...`) onto the declared
+     * identifier(s) for the inferencer/resolver. Consume the pending type. */
+    if ((fl & pFlags::pInDecl) && c.pending_decl_type != DeclType::none) {
+
+        const DeclType dt = c.pending_decl_type;
+        const StructTypeDef *ds = c.pending_decl_struct;
+        const std::shared_ptr<TypeAnnot> da = c.pending_decl_annot;
+        c.pending_decl_type = DeclType::none;
+        c.pending_decl_struct = nullptr;
+        c.pending_decl_annot = nullptr;
+
+        if (auto *id = node_cast<Identifier>(ret->lvalue.get())) {
+            id->decl_type = dt;
+            id->decl_struct = ds;
+            id->decl_annot = da;
+        } else if (auto *idl = node_cast<IdList>(ret->lvalue.get())) {
+            for (auto &e : idl->elems) {
+                e->decl_type = dt;
+                e->decl_struct = ds;
+                e->decl_annot = da;
+            }
+        }
+    }
+
+    if (!ret->rvalue)
+        noExprError(c);
+
+    /* a multi-assignment's literal is unpacked AS WRITTEN: even a const
+     * evaluation of it must not widen it (LiteralArray::unpacked) */
+    if (in_idlist && ctag(ret->rvalue.get()) == ConstructType::lit_arr)
+        static_cast<LiteralArray *>(ret->rvalue.get())->unpacked = true;
+
+    /* a literal the declaration annotates is built as the annotation
+     * says by the bake below too, not by the join of its own values
+     * (LiteralArray::annotated) - stamped again after it, for a value
+     * another site baked */
+    if ((fl & pFlags::pInDecl) && !in_idlist
+            && (ctag(ret->rvalue.get()) == ConstructType::lit_arr
+                || ctag(ret->rvalue.get()) == ConstructType::lit_dict)) {
+        /* (a declaration's single target is a name) */
+        ML_CHECK(ctag(ret->lvalue.get()) == ConstructType::id);
+        auto *did = static_cast<Identifier *>(ret->lvalue.get());
+        stamp_literal_annot(ret->rvalue.get(), did->decl_annot.get(),
+                            did->dyn_mod);
+    }
+
+    /*
+     * Materialize a const rvalue - unless it is ALREADY a LiteralObj, i.e. a
+     * subscript/slice/call result that pAcceptSubscript/pAcceptCallExpr already
+     * baked (and de-duplicated). Re-baking it here would just deep-clone the
+     * value a second time and break that sharing; skip it.
+     */
+    /* #54: a CONST declaration's rvalue is materialized with or without
+     * `-nc` - its value, baked deep read-only, is what the const IS. Only a
+     * `var` initializer's bake is folding. */
+    if (!c.folding() && ret->rvalue->is_const
+        && !(fl & pFlags::pInConstDecl)
+        && !node_cast<LiteralObj>(ret->rvalue.get()))
+    {
+        nc_eval_const(c, ret->rvalue.get(), true, false);
+    }
+    /* A multi-assignment unpacks its literal element by element, each AS
+     * WRITTEN (`x, y = [12, 2.5]` gives x the int 12 - README): baking the
+     * literal would widen it to its joined type first, so it stays a
+     * literal (its elements are folded already). */
+    /* Nor is a container literal holding a call's result or a named
+     * constant baked for a `var`: a declared type checks each element of
+     * a literal (the inferencer's literal_fits), the written ones widening
+     * and those as the values they are; baked whole, the value would be
+     * checked as if all of it were written (`array<array<float>> m =
+     * [f()];` compiled, and was refused under -nc). A const's bake is
+     * what the const IS, so it stays, checked as a whole. */
+    else if (ret->rvalue->is_const
+        && !node_cast<LiteralObj>(ret->rvalue.get())
+        && !(in_idlist
+             && ctag(ret->rvalue.get()) == ConstructType::lit_arr)
+        && ((fl & pFlags::pInConstDecl)
+            || !(ctag(ret->rvalue.get()) == ConstructType::lit_arr
+                 || ctag(ret->rvalue.get()) == ConstructType::lit_dict)
+            || is_container_literal(ret->rvalue.get())))
+    {
+        unique_ptr<Construct> cc;
+
+        if (pDefersFolds(c, fl) && pHoldsDeferred(ret->rvalue.get())) {
+            pDeferFold(c, ret->rvalue.get(), true, false);    /* #96 */
+        } else if (cse_materialize(
+                c,
+                ret->rvalue.get(),
+                cc,
+                true,
+                (fl & pFlags::pInConstDecl) != 0))
+        {
+            ret->rvalue = std::move(cc);
+        }
+    }
+    /* ...and a CONST multi-declaration's literal stays one too, but each
+     * ELEMENT is what `const a = <element>` would bind: baked deep
+     * read-only. Left as written, a container element was a fresh MUTABLE
+     * array at run time - `const a, b = [[1], [2]]; append(a, 3);` was
+     * refused by the tree-walker (a const binding) and appended in the VM. */
+    else if (in_idlist && (fl & pFlags::pInConstDecl)
+             && ret->rvalue->is_const
+             && ctag(ret->rvalue.get()) == ConstructType::lit_arr)
+    {
+        for (auto &el :
+                static_cast<LiteralArray *>(ret->rvalue.get())->elems) {
+            if (node_cast<LiteralObj>(el.get()))
+                continue;
+            unique_ptr<Construct> cc;
+            if (cse_materialize(c, el.get(), cc, true, true))
+                el = std::move(cc);
+            else
+                alias_literal(c, el);
+        }
+    }
+
+    if ((fl & pFlags::pInDecl) && !in_idlist)
+        if (auto *did = node_cast<Identifier>(ret->lvalue.get())) {
+            stamp_literal_annot(ret->rvalue.get(), did->decl_annot.get(),
+                                did->dyn_mod);
+            /* `var dyn d = range(3)`: a constant call that builds to its
+             * place's storage is not baked here any more (#96), so the
+             * `dyn` goes on its arguments, where the builtin and the late
+             * fold's rebuild read it. Inference stamps the same from the
+             * type; with -nti nothing else does, and `d[0] = "s"` was
+             * refused there */
+            Construct *rv = ret->rvalue.get();
+            if (did->dyn_mod && !did->decl_annot && rv->is_const
+                    && ctag(rv) == ConstructType::call
+                    && node_takes_hint(c, rv))
+                static_cast<CallExpr *>(rv)->args->arr_hint =
+                    ArrHint::general;
+        }
+
+    if (fl & pFlags::pInConstDecl) {
+
+        if (!ret->rvalue->is_const)
+            throw ExpressionIsNotConstEx(ret->rvalue->start, ret->rvalue->end);
+
+        /*
+         * A typed const SCALAR is inlined before the inferencer runs, so check
+         * its declared type (and coerce a widening value) here; the rvalue is
+         * replaced with the coerced literal so the inlined value has the right
+         * type. array/dict consts stay runtime symbols (checked by inference).
+         */
+        if (auto *cid = node_cast<Identifier>(ret->lvalue.get())) {
+            const DeclType dt = cid->decl_type;
+            if (dt == DeclType::b || dt == DeclType::i ||
+                dt == DeclType::f || dt == DeclType::s) {
+                EvalValue cv = check_coerce_const_scalar(
+                    RValue(ret->rvalue->eval(c.const_ctx)), dt,
+                    ret->rvalue->start, ret->rvalue->end);
+                MakeConstructFromConstVal(cv, ret->rvalue);
+            }
+        }
+
+        /*
+         * Save the const declaration by evaluating the assignment
+         * in our special `const_ctx` EvalContext.
+         */
+
+        const EvalValue &rvalue = ret->eval(c.const_ctx);
+        bool keep = ShouldConstSymbolExistAtRuntime(rvalue);
+
+        /* question 5: what a typed copy declares this const by */
+        if (ctag(ret->lvalue.get()) == ConstructType::id)
+            pt_note_const(c.const_ctx,
+                          static_cast<Identifier *>(ret->lvalue.get()),
+                          ret->rvalue.get());
+
+        /* `const a, b = [[1], [2]]`: the assignment's value is none, so ask
+         * each target - one bound to a container needs its run-time symbol
+         * (it was dropped, and reading `a` was an undefined name) */
+        if (auto *il = node_cast<IdList>(ret->lvalue.get())) {
+            keep = false;
+            for (const auto &id : il->elems) {
+                if (id->is_underscore())
+                    continue;
+                if (LValue *lv = c.const_binding(id->uid))
+                    keep = keep || ShouldConstSymbolExistAtRuntime(lv->get());
+            }
+            /* ...and a SCALAR target of a kept declaration becomes a `_`
+             * placeholder: a const scalar has no run-time symbol, like
+             * `const a = 3` (every read of it is folded, and a closure
+             * capturing it declares its own `var a`, which a run-time `a`
+             * here would collide with - AlreadyDefinedEx) */
+            for (auto &id : il->elems) {
+                if (!keep || id->is_underscore())
+                    continue;
+                LValue *lv = c.const_binding(id->uid);
+                if (lv && !ShouldConstSymbolExistAtRuntime(lv->get())) {
+                    auto ph = make_unique<Identifier>("_");
+                    ph->start = id->start;
+                    ph->end = id->end;
+                    id = std::move(ph);
+                } else {
+                    id->is_const = true;
+                }
+            }
+        }
+
+        if (!keep) {
+
+            /*
+             * In this case, the const symbol is supposed to not exist at all
+             * in the runtime AST so, we just return a NopConstruct.
+             *
+             * NOTE: we cannot return nullptr, otherwise the caller would believe
+             * that we matched nothing.
+             */
+            return make_unique<NopConstruct>();
+        }
+
+        /* a type alias (`const T = S;`) holds its struct's descriptor at
+         * run time, whatever expression named it - and so does each
+         * target a multi-declaration spreads one to (`const A, B = S;`;
+         * a literal's elements were done above) */
+        if (ctag(ret->lvalue.get()) == ConstructType::id)
+            alias_literal(c, ret->rvalue, &rvalue);
+        else if (ctag(ret->rvalue.get()) != ConstructType::lit_arr)
+            alias_literal(c, ret->rvalue);
+
+        ret->fl |= pInConstDecl;
+        ret->lvalue->is_const = true;
+    }
+
+    return ret;
+}
+
+static unique_ptr<Construct>
+pExpr14_body(ParseContext &c, unsigned fl)
+{
+    const Loc start = c.get_loc();
+    unique_ptr<Construct> lside;
 
     if (fl & pFlags::pInDecl) {
 
@@ -1672,211 +3330,28 @@ pExpr14(ParseContext &c, unsigned fl)
     if (!lside)
         return nullptr;
 
-    if (fl & pFlags::pInStmt) {
+    return pExpr14_tail(c, fl, start, std::move(lside));
+}
 
-        Identifier *first_id = dynamic_cast<Identifier *>(lside.get());
-
-        if (first_id && pAcceptOp(c, Op::comma)) {
-
-            unique_ptr<IdList> idlist(new IdList);
-            lside.release();
-            idlist->elems.emplace_back(first_id);
-
-            unique_ptr<IdList> tmp = pList<IdList>(c, fl, pIdentifier);
-
-            idlist->elems.insert(
-                idlist->elems.end(),
-                make_move_iterator(tmp->elems.begin()),
-                make_move_iterator(tmp->elems.end())
-            );
-
-            if (fl & pFlags::pInDecl) {
-                for (const auto &e : idlist->elems)
-                    declExprCheckId(c, e.get());
-            }
-
-            lside = move(idlist);
-            in_idlist = true;
-        }
+/*
+ * An expression ends here: a const subscript that named no element (a
+ * missing key, an index out of range - ParseContext::pending_fold) and
+ * was not refused as a TARGET was a read, and its error is the compile
+ * error it always was.
+ */
+unique_ptr<Construct>
+pExpr14(ParseContext &c, unsigned fl)
+{
+    const size_t mark = c.pending_fold.size();
+    unique_ptr<Construct> e;
+    try {
+        e = pExpr14_body(c, fl);
+    } catch (...) {
+        c.pending_fold_drop(mark);
+        throw;
     }
-
-    if ((op = AcceptOneOf(c, valid_ops)) != Op::invalid) {
-
-        if (fl & pInDecl && op != Op::assign) {
-            throw SyntaxErrorEx(
-                c.get_loc(),
-                "Operator '=' is required when declaring a variable or a constant"
-            );
-        }
-
-    } else {
-
-        /* No valid operator: this is not an assignment expr */
-
-        if (fl & pFlags::pInDecl) {
-
-            /*
-             * A decl with no initializer. A plain `var x;` assumes `none`; an
-             * explicitly-typed `int x;` / `str s;` assumes the type's zero value
-             * (0 / 0.0 / false / "" / [] / {}), so a non-null typed var is never
-             * left `none`. A struct zero-initializes recursively, by the same
-             * rules: `A x;` becomes `x = A(<zero per field>)`.
-             */
-            ret.reset(new Expr14);
-            ret->op = Op::assign;
-            ret->lvalue = move(lside);
-            /* An `opt` typed decl (nullable) defaults to none; a non-opt typed
-             * decl to its type's zero value; a plain `var` to none. */
-            ret->rvalue =
-                (fl & pFlags::pInOptDecl)
-                    ? unique_ptr<Construct>(new LiteralNone())
-                    : (c.pending_decl_type == DeclType::strct
-                         ? build_zero_struct_init(c.pending_decl_struct, start)
-                         : zero_value_literal(c.pending_decl_type));
-
-        } else if (in_idlist) {
-
-            throw SyntaxErrorEx(
-                c.get_loc(),
-                "Operator '=' is required when the left side is an ID list"
-            );
-
-        } else {
-
-            /* Just return lside (doing const eval if possible) */
-
-            if (c.const_eval && lside->is_const)
-                MakeConstructFromConstVal(lside->eval(c.const_ctx), lside);
-
-            return lside;
-        }
-    }
-
-    if (!ret) {
-        ret.reset(new Expr14);
-        ret->op = op;
-        ret->lvalue = move(lside);
-        ret->rvalue = pExpr14(c, fl & ~pFlags::pInDecl);
-    }
-
-    ret->fl = fl & pFlags::pInDecl;
-    ret->start = start;
-    ret->end = c.get_loc();
-
-    /* Propagate a `var opt`/`var dyn` modifier onto the declared identifier(s),
-     * so the type inferencer (which reads Identifier::opt_mod/dyn_mod) sees it. */
-    if ((fl & pFlags::pInDecl) &&
-        (fl & (pFlags::pInOptDecl | pFlags::pInDynDecl))) {
-
-        const bool opt_f = (fl & pFlags::pInOptDecl) != 0;
-        const bool dyn_f = (fl & pFlags::pInDynDecl) != 0;
-
-        if (auto *id = dynamic_cast<Identifier *>(ret->lvalue.get())) {
-            id->opt_mod = opt_f;
-            id->dyn_mod = dyn_f;
-        } else if (auto *idl = dynamic_cast<IdList *>(ret->lvalue.get())) {
-            for (auto &e : idl->elems) {
-                e->opt_mod = opt_f;
-                e->dyn_mod = dyn_f;
-            }
-        }
-    }
-
-    /* Propagate an explicit-type annotation (`int x = ...`) onto the declared
-     * identifier(s) for the inferencer/resolver. Consume the pending type. */
-    if ((fl & pFlags::pInDecl) && c.pending_decl_type != DeclType::none) {
-
-        const DeclType dt = c.pending_decl_type;
-        const StructTypeDef *ds = c.pending_decl_struct;
-        const std::shared_ptr<TypeAnnot> da = c.pending_decl_annot;
-        c.pending_decl_type = DeclType::none;
-        c.pending_decl_struct = nullptr;
-        c.pending_decl_annot = nullptr;
-
-        if (auto *id = dynamic_cast<Identifier *>(ret->lvalue.get())) {
-            id->decl_type = dt;
-            id->decl_struct = ds;
-            id->decl_annot = da;
-        } else if (auto *idl = dynamic_cast<IdList *>(ret->lvalue.get())) {
-            for (auto &e : idl->elems) {
-                e->decl_type = dt;
-                e->decl_struct = ds;
-                e->decl_annot = da;
-            }
-        }
-    }
-
-    if (!ret->rvalue)
-        noExprError(c);
-
-    /*
-     * Materialize a const rvalue - unless it is ALREADY a LiteralObj, i.e. a
-     * subscript/slice/call result that pAcceptSubscript/pAcceptCallExpr already
-     * baked (and de-duplicated). Re-baking it here would just deep-clone the
-     * value a second time and break that sharing; skip it.
-     */
-    if (c.const_eval && ret->rvalue->is_const
-        && !dynamic_cast<LiteralObj *>(ret->rvalue.get()))
-    {
-        unique_ptr<Construct> cc;
-
-        if (cse_materialize(
-                c,
-                ret->rvalue.get(),
-                cc,
-                true,
-                (fl & pFlags::pInConstDecl) != 0))
-        {
-            ret->rvalue = move(cc);
-        }
-    }
-
-    if (c.const_eval && fl & pFlags::pInConstDecl) {
-
-        if (!ret->rvalue->is_const)
-            throw ExpressionIsNotConstEx(ret->rvalue->start, ret->rvalue->end);
-
-        /*
-         * A typed const SCALAR is inlined before the inferencer runs, so check
-         * its declared type (and coerce a widening value) here; the rvalue is
-         * replaced with the coerced literal so the inlined value has the right
-         * type. array/dict consts stay runtime symbols (checked by inference).
-         */
-        if (auto *cid = dynamic_cast<Identifier *>(ret->lvalue.get())) {
-            const DeclType dt = cid->decl_type;
-            if (dt == DeclType::b || dt == DeclType::i ||
-                dt == DeclType::f || dt == DeclType::s) {
-                EvalValue cv = check_coerce_const_scalar(
-                    RValue(ret->rvalue->eval(c.const_ctx)), dt,
-                    ret->rvalue->start, ret->rvalue->end);
-                MakeConstructFromConstVal(cv, ret->rvalue);
-            }
-        }
-
-        /*
-         * Save the const declaration by evaluating the assignment
-         * in our special `const_ctx` EvalContext.
-         */
-
-        const EvalValue &rvalue = ret->eval(c.const_ctx);
-
-        if (!ShouldConstSymbolExistAtRuntime(rvalue)) {
-
-            /*
-             * In this case, the const symbol is supposed to not exist at all
-             * in the runtime AST so, we just return a NopConstruct.
-             *
-             * NOTE: we cannot return nullptr, otherwise the caller would believe
-             * that we matched nothing.
-             */
-            return make_unique<NopConstruct>();
-        }
-
-        ret->fl |= pInConstDecl;
-        ret->lvalue->is_const = true;
-    }
-
-    return ret;
+    c.pending_fold_check(mark);
+    return e;
 }
 
 unique_ptr<Construct>
@@ -1884,8 +3359,14 @@ pExprTop(ParseContext &c, unsigned fl)
 {
     unique_ptr<Construct> e = pExpr14(c, fl);
 
-    if (c.const_eval && e && e->is_const && !e->is_nop())
-        MakeConstructFromConstVal(e->eval(c.const_ctx), e);
+    if (e && e->is_const && !e->is_nop()) {
+        if (pDefersFolds(c, fl) && pHoldsDeferred(e.get()))
+            pDeferFold(c, e.get(), false, false);          /* #96 */
+        else if (c.folding())
+            MakeConstructFromConstVal(e->eval(c.const_ctx), e);
+        else
+            nc_eval_const(c, e.get(), false, false);
+    }
 
     return e;
 }
@@ -1902,10 +3383,11 @@ pAcceptReturnStmt(ParseContext &c,
         unique_ptr<ReturnStmt> stmt(new ReturnStmt);
 
         stmt->elem = pExpr14(c, fl);
+        pRefuseMultiAssignValue(stmt->elem.get());
         pExpectOp(c, Op::semicolon);
         stmt->start = start;
         stmt->end = c.get_loc();
-        ret = move(stmt);
+        ret = std::move(stmt);
         return true;
     }
 
@@ -1923,13 +3405,14 @@ pAcceptThrowStmt(ParseContext &c,
 
         unique_ptr<ThrowStmt> t(new ThrowStmt);
         t->elem = pExprTop(c, fl);
+        pRefuseMultiAssignValue(t->elem.get());
 
         if (!t->elem)
             noExprError(c);
 
         t->start = start;
         t->end = c.get_loc();
-        ret = move(t);
+        ret = std::move(t);
         return true;
     }
 
@@ -1939,22 +3422,33 @@ pAcceptThrowStmt(ParseContext &c,
 unique_ptr<Construct>
 pStmt(ParseContext &c, unsigned fl)
 {
+    NestGuard ng(c);                   /* #137: bound the C recursion */
     unique_ptr<Construct> subStmt;
     const Loc start = c.get_loc();
     fl |= pFlags::pInStmt;
 
+    /* Each of these takes its `;`, as `return` and `throw` do. Left for
+     * the enclosing block to skip, the `;` ended a brace-less `if`
+     * branch before its `else`: `if (c) break; else ...` was a syntax
+     * error ("unexpected token 'else'"). */
     if (fl & pFlags::pInLoop) {
 
-        if (pAcceptKeyword(c, Keyword::kw_break))
+        if (pAcceptKeyword(c, Keyword::kw_break)) {
+            pExpectOp(c, Op::semicolon);
             return make_unique<BreakStmt>();
-        else if (pAcceptKeyword(c, Keyword::kw_continue))
+        } else if (pAcceptKeyword(c, Keyword::kw_continue)) {
+            pExpectOp(c, Op::semicolon);
             return make_unique<ContinueStmt>();
+        }
     }
 
     if (fl & pFlags::pInCatchBody) {
 
-        if (pAcceptKeyword(c, Keyword::kw_rethrow))
-            return make_unique<RethrowStmt>(start, c.get_loc());
+        if (pAcceptKeyword(c, Keyword::kw_rethrow)) {
+            const Loc end = c.get_loc();
+            pExpectOp(c, Op::semicolon);
+            return make_unique<RethrowStmt>(start, end);
+        }
     }
 
     /*
@@ -2028,9 +3522,29 @@ pStmt(ParseContext &c, unsigned fl)
     }
 }
 
+/* question 5: the typed copies of parse-time calls are AST - dropped when
+ * the outermost block ends, so the -vm teardown finds none */
+struct PtBlockScope {
+    ParseContext &c;
+    explicit PtBlockScope(ParseContext &pc) : c(pc) { c.block_depth++; }
+    ~PtBlockScope()
+    {
+        c.block_depth--;
+        if (c.block_depth == 0)
+            pt_cache_clear();
+    }
+};
+
 unique_ptr<Construct>
 pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
 {
+    /* #137: a bare `{ ... }` is parsed by pAcceptBracedBlock straight from
+     * pBlock's own loop, never through pStmt - so the statement guard does
+     * NOT see it and `{{{...}}}` recursed unbounded (an ASan DEADLYSIGNAL at
+     * 5000). Guard here too; the two nest through each other, and each is
+     * scoped, so a block's SIBLINGS still cost nothing. */
+    NestGuard ng(c);
+    PtBlockScope pts(c);
     unique_ptr<Block> ret(new Block);
     unique_ptr<Construct> stmt, tmp;
     bool added_elem;
@@ -2041,39 +3555,129 @@ pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
      * A block normally gets its own nested const scope (popped on exit). The
      * REPL's top-level input passes push_const_scope=false so its consts land
      * in the persistent const context on c.const_ctx and survive to the next
-     * input (see plans/repl.md). The CSE cache scope is still per-block.
+     * input (see plans/archived/repl.md). The CSE cache scope is still per-block.
      */
     EvalContext block_const_ctx(c.const_ctx, true);
     if (push_const_scope)
         c.const_ctx = &block_const_ctx; // push a new const eval context
     c.cse->push();                  // matching CSE cache scope
+    c.shadow_push();                // #133: matching shadowed-builtin scope
+    c.cap_const_decls.emplace_back();
 
-    if (!c.eoi()) {
+    /*
+     * #47: a statement of THIS block whose const bake detached a function
+     * literal (ParseContext::baked_funcs) gets it back here, as an ordinary
+     * expression statement placed just BEFORE it - same scope, so the
+     * lambda's body resolves exactly as it would have in place. Only the
+     * entries past `baked_base` are ours: an enclosing block's pending ones
+     * (a bake in an `if` condition, before its body block) stay for it.
+     */
+    const size_t baked_base = c.baked_funcs.size();
+    const auto take_baked = [&]() {
+        for (size_t i = baked_base; i < c.baked_funcs.size(); i++)
+            ret->elems.emplace_back(std::move(c.baked_funcs[i]));
+        c.baked_funcs.resize(baked_base);
+    };
 
-        do {
+    /*
+     * A user exception a constant evaluation raised while this block was
+     * parsed (a folded `pure` call that throws a struct) leaves the parse,
+     * and the statements parsed so far die as it unwinds - the struct's
+     * definition among them. The driver renders the payload after that
+     * (`Uncaught exception 'E', data: ...`), so it is rendered HERE, while
+     * every enclosing block is still alive: a freed def was a heap
+     * use-after-free in every build (a SIGSEGV in a release).
+     * The call that raised it froze it already, where it left the
+     * constant evaluation (do_func_call, eval.cpp) - before any node a
+     * parse function holds in a local died; this is the second net.
+     */
+    try {
+        if (!c.eoi()) {
 
-            added_elem = false;
+            do {
 
-            if (pAcceptBracedBlock(c, tmp, fl)) {
-                ret->elems.emplace_back(move(tmp));
-                added_elem = true;
-            }
+                added_elem = false;
 
-            while ((stmt = pStmt(c, fl))) {
+                /*
+                 * An extra `;` is an EMPTY statement wherever a statement may
+                 * start - first in a block, or right after a braced block -
+                 * as it is after any other statement (the skip below). This
+                 * leading pAcceptBracedBlock left a `;` behind it unparsed, so
+                 * `{ { a(); }; b(); }` and a block's leading `;` were syntax
+                 * errors while the same `;` later in the block was not; the
+                 * REPL's terminator appends one after every `}`, so a
+                 * top-level `{ ... }` typed at the prompt always failed.
+                 */
+                while (*c == Op::semicolon) {
+                    c++;
+                    added_elem = true;
+                }
 
-                if (!stmt->is_nop())
-                    ret->elems.emplace_back(move(stmt));
+                if (pAcceptBracedBlock(c, tmp, fl)) {
+                    take_baked();
+                    ret->elems.emplace_back(std::move(tmp));
+                    added_elem = true;
+                }
 
-                added_elem = true;
+                while ((stmt = pStmt(c, fl))) {
 
-                while (*c == Op::semicolon)
-                    c++;    /* skip multiple ';' */
-            }
+                    take_baked();
 
-        } while (added_elem);
+                    if (!stmt->is_nop())
+                        ret->elems.emplace_back(std::move(stmt));
+
+                    added_elem = true;
+
+                    while (*c == Op::semicolon)
+                        c++;    /* skip multiple ';' */
+                }
+
+            } while (added_elem);
+        }
+
+    } catch (RuntimeException &e) {
+        freeze_exception_chain(e);
+        throw;
     }
 
     ret->end = c.get_loc();
+
+    /*
+     * What binds at SCOPE ENTRY comes first (question 21, maintainer's
+     * decision A, 2026-11-16): the block's named function and struct
+     * declarations (#134), then its run-time `const` declarations - a
+     * const container, function or type alias - in source order. A const's
+     * value is computed while parsing and can name only what is declared
+     * above it, so binding it first changes no value; it makes a read made
+     * before its declaration ran see it, as every optimizer assumed when it
+     * folded such a read. Ordering the TREE, rather than each engine's
+     * statement loop, is what keeps every pass and every lowering in step:
+     * the loop-body compiler (compile_scalar_body) emitted a function
+     * declaration where it was written, so a call above it in a loop body
+     * raised UnboundSymbolEx in the VM alone. The REPL's input keeps its
+     * order (push_const_scope false): it runs statement by statement in an
+     * open world, and its echo reads the last statement.
+     */
+    if (push_const_scope) {
+        const auto rank = [](const unique_ptr<Construct> &e) {
+            const Construct *n = e.get();
+            if (const auto *fd = node_cast<const FuncDeclStmt>(n))
+                return fd->id ? 0 : 2;
+            if (const auto *sd = node_cast<const StructDeclStmt>(n))
+                return sd->id ? 0 : 2;
+            if (const auto *ex = node_cast<const Expr14>(n))
+                return (ex->fl & pFlags::pInConstDecl) ? 1 : 2;
+            return 2;
+        };
+        std::stable_sort(ret->elems.begin(), ret->elems.end(),
+                         [&](const unique_ptr<Construct> &a,
+                             const unique_ptr<Construct> &b) {
+                             return rank(a) < rank(b);
+                         });
+    }
+
+    c.cap_const_decls.pop_back();
+    c.shadow_pop();                    // #133
     c.cse->pop();                      // pop the CSE cache scope
     if (push_const_scope)
         c.const_ctx = c.const_ctx->parent; // restore the previous const ctx
@@ -2095,32 +3699,93 @@ pAcceptBracedBlock(ParseContext &c,
 }
 
 /*
- * A func/struct decl as a BRACE-LESS `if`/loop body must behave exactly like
- * its braced form (block-scoped, hoisted by the resolver's Block pre-scan):
- * without a Block wrapper the decl bypasses `hoist_scoped_decls` (which only
- * scans Block statement lists), falls to `declare_masking`, and the decl's
- * do_eval map-emplace ABORTS a script (the asserted-empty runtime map) -
- * `if (c) func g() => 1;` crashed. Wrap it in a synthetic single-statement
- * Block. ONLY these two decl kinds are wrapped: a brace-less VAR/CONST body
- * (`if (c) var x = 5;`) deliberately keeps its historical enclosing-scope
- * binding (`x` stays visible after the `if` - verified, pre-existing), and
- * every other statement is scope-neutral anyway. The `if` applies this only
- * to the RUNTIME statement (after const-folding): a const-true
- * `if (true) func g() => 1;` keeps folding to the bare decl in the enclosing
- * scope, preserving the working feature-flag pattern.
+ * Does this single statement introduce a NAME into the scope that contains it?
+ *
+ * A brace-less body is exactly one statement, and only three statement kinds
+ * can declare into the enclosing scope: a func decl, a struct decl, and a
+ * var/const decl (an `Expr14` carrying pInDecl - `pInConstDecl` implies it).
+ * Every other statement is scope-neutral: a nested `if`/loop/`try` declares
+ * only inside its OWN body, which is wrapped by its own call to
+ * pWrapDeclBody. ADD TO THIS TEST if a new declaring statement form appears -
+ * a missing kind here silently restores the leak documented below.
+ */
+static bool pStmtDeclaresName(const Construct *stmt)
+{
+    if (node_cast<const FuncDeclStmt>(stmt))
+        return true;
+
+    if (node_cast<const StructDeclStmt>(stmt))
+        return true;
+
+    if (const auto *e = node_cast<const Expr14>(stmt))
+        return (e->fl & pFlags::pInDecl) != 0;
+
+    return false;
+}
+
+/*
+ * A DECLARATION as a BRACE-LESS `if`/`else`/loop body must behave exactly like
+ * its braced form - block-scoped, so the name is NOT visible after the
+ * statement. Without a Block wrapper it lands in the ENCLOSING scope, which is
+ * wrong three ways (each found separately, each fixed here):
+ *
+ *  - a func/struct decl bypasses `hoist_scoped_decls` (which only scans Block
+ *    statement lists), falls to `declare_masking`, and its do_eval map-emplace
+ *    ABORTS a script (the asserted-empty runtime map): `if (c) func g() => 1;`
+ *    CRASHED (2026-07-14);
+ *  - a var/const decl stays visible after the statement even when the branch
+ *    NEVER RAN, so its slot holds `none` while inference still proves the
+ *    declared type - and the engines then disagree about a typed read of it:
+ *    `if (runtime(false)) var x = 5; return x + 1;` PRINTED 1 under the JIT
+ *    (reading `none` as int 0), aborted `ML_VM_CHECK` under `-nj`, and threw
+ *    TypeErrorEx in the tree-walker (2026-08-08). The JIT is not at fault -
+ *    it elides the tag check BECAUSE inference proved the type, and that proof
+ *    is sound only once a declaration cannot be skipped;
+ *  - the CONST-FOLDED taken branch was hoisted UNWRAPPED, so const-eval
+ *    CHANGED SCOPING: `if (1) func g() {...} g();` worked by default and threw
+ *    "Undefined variable 'g'" under `-nc`.
+ *
+ * So: wrap whenever the body DECLARES, on the const-folded path too. A
+ * non-declaring body is left ALONE rather than blanket-wrapped - an extra
+ * Block around `for (...) sum += a[i];` would perturb the shapes the for-range
+ * and LICM passes match on, for no scoping benefit.
  */
 static unique_ptr<Construct> pWrapDeclBody(unique_ptr<Construct> stmt)
 {
-    if (!stmt)
+    if (!stmt || stmt->is_block() || !pStmtDeclaresName(stmt.get()))
         return stmt;
-    if (!dynamic_cast<FuncDeclStmt *>(stmt.get())
-        && !dynamic_cast<StructDeclStmt *>(stmt.get()))
-        return stmt;
+
     auto blk = make_unique<Block>();
     blk->start = stmt->start;
     blk->end = stmt->end;
-    blk->elems.push_back(move(stmt));
+    blk->elems.push_back(std::move(stmt));
     return blk;
+}
+
+/*
+ * Parse a BRACE-LESS body and give it its own scope. The Block wrapper above
+ * is not enough on its own for `const`: a const decl registers its VALUE in
+ * the parser's const context AS IT IS PARSED, so by the time the finished
+ * statement is wrapped, `if (c) const K = 7;` has already put K where a later
+ * `print(K)` folds it. So the const + CSE scopes are pushed AROUND the parse,
+ * exactly as pBlock does for a braced body (and, like pBlock, not restored on
+ * a parse throw - that aborts the whole parse, and the REPL builds a fresh
+ * ParseContext per input).
+ */
+static unique_ptr<Construct> pBraceLessBody(ParseContext &c, unsigned fl)
+{
+    EvalContext body_const_ctx(c.const_ctx, true);
+    EvalContext *const saved = c.const_ctx;
+
+    c.const_ctx = &body_const_ctx;
+    c.cse->push();
+
+    unique_ptr<Construct> stmt = pStmt(c, fl);
+
+    c.cse->pop();
+    c.const_ctx = saved;
+
+    return pWrapDeclBody(std::move(stmt));
 }
 
 bool
@@ -2143,27 +3808,27 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
     if (!pAcceptBracedBlock(c, ifstmt->thenBlock, fl)) {
 
-        unique_ptr<Construct> stmt = pStmt(c, fl);
+        unique_ptr<Construct> stmt = pBraceLessBody(c, fl);
 
         if (stmt && !stmt->is_nop())
-            ifstmt->thenBlock = move(stmt);
+            ifstmt->thenBlock = std::move(stmt);
     }
 
     if (pAcceptKeyword(c, Keyword::kw_else)) {
 
         if (!pAcceptBracedBlock(c, ifstmt->elseBlock, fl)) {
 
-            unique_ptr<Construct> stmt = pStmt(c, fl);
+            unique_ptr<Construct> stmt = pBraceLessBody(c, fl);
 
             if (stmt && !stmt->is_nop())
-                ifstmt->elseBlock = move(stmt);
+                ifstmt->elseBlock = std::move(stmt);
         }
     }
 
     ifstmt->start = start;
     ifstmt->end = c.get_loc();
 
-    if (c.const_eval && ifstmt->condExpr->is_const) {
+    if (ifstmt->condExpr->is_const) {
 
         const EvalValue &v = ifstmt->condExpr->eval(c.const_ctx);
         const bool t = v.get_type()->is_true(v);
@@ -2176,14 +3841,12 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
                 c.analysis->mark_dead(dead->start, dead->end);
         }
 
+        /* The taken branch was already scoped at parse time (see
+         * pBraceLessBody): hoisting it BARE made const-eval change scoping. */
         if (t)
-            ret = move(ifstmt->thenBlock);   /* NOT wrapped: keeps the
-                                              * `if (true) func g()...`
-                                              * feature-flag decl leaking to
-                                              * the enclosing scope, as it
-                                              * always did */
+            ret = std::move(ifstmt->thenBlock);
         else
-            ret = move(ifstmt->elseBlock);
+            ret = std::move(ifstmt->elseBlock);
 
         /* The taken branch is empty (a const-false `if` with no `else`, or a
          * const-true `if` with an empty body): the whole statement folds away.
@@ -2194,11 +3857,7 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
             ret = make_unique<NopConstruct>();
 
     } else {
-        /* A RUNTIME if: a brace-less func/struct decl branch gets its Block
-         * wrapper (the crash fix - see pWrapDeclBody). */
-        ifstmt->thenBlock = pWrapDeclBody(move(ifstmt->thenBlock));
-        ifstmt->elseBlock = pWrapDeclBody(move(ifstmt->elseBlock));
-        ret = move(ifstmt);
+        ret = std::move(ifstmt);
     }
 
     return true;
@@ -2223,16 +3882,17 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     pExpectOp(c, Op::parenR);
 
     if (!pAcceptBracedBlock(c, whileStmt->body, fl | pFlags::pInLoop))
-        whileStmt->body = pWrapDeclBody(pStmt(c, fl | pFlags::pInLoop));
+        whileStmt->body = pBraceLessBody(c, fl | pFlags::pInLoop);
 
     whileStmt->start = start;
     whileStmt->end = c.get_loc();
 
-    if (c.const_eval && whileStmt->condExpr->is_const) {
+    if (whileStmt->condExpr->is_const) {
 
         const EvalValue &v = whileStmt->condExpr->eval(c.const_ctx);
 
-        if (!v.get_type()->is_true(v)) {
+        whileStmt->cond_true = v.get_type()->is_true(v);
+        if (!whileStmt->cond_true) {
             /* -a: while (false) is dead - dim the loop (the body's end, not
              * whileStmt->end, which points at the next token). */
             if (c.analysis)
@@ -2245,8 +3905,199 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         }
     }
 
-    ret = move(whileStmt);
+    ret = std::move(whileStmt);
     return true;
+}
+
+/*
+ * An explicit `pure` function RUNS at parse time when its arguments are
+ * constant (a fold, a const's initializer) - before inference stamps how a
+ * store converts its value. So a store into an element or a field of a
+ * place the body DECLARED (`array<float?> a = [none]; a[0] = n;`) kept the
+ * int `mk(1)` was folded to, while the run-time call `mk(int(runtime(1)))`
+ * stored 1.0 (RULE 2). Stamp such a store from the declarations here, as
+ * the inferencer later does from the static types (which it overwrites
+ * these with): Expr14::rv_coerce for an array element or a dict value, the
+ * assignment's value (val_widen), and the type a container literal stored
+ * there has (stamp_literal_annot). Each place's type is read off its own
+ * declaration - a parameter's or a declared local's annotation, a struct
+ * field's - so only what the body states is used.
+ */
+typedef std::unordered_map<const UniqueId *, const TypeAnnot *> PureAnnots;
+
+/* the annotated type of the place `lv` names (`cont`: the container its
+ * last step is in), or null when no declaration states it */
+static const TypeAnnot *
+pure_place_annot(const Construct *lv, const PureAnnots &m,
+                 std::vector<unique_ptr<TypeAnnot>> &tmp,
+                 const TypeAnnot **cont)
+{
+    *cont = nullptr;
+    if (!lv)
+        return nullptr;
+    if (ctag(lv) == ConstructType::id) {
+        auto it = m.find(static_cast<const Identifier *>(lv)->uid);
+        return it != m.end() ? it->second : nullptr;
+    }
+    const TypeAnnot *dummy;
+    if (ctag(lv) == ConstructType::subscript) {
+        const TypeAnnot *b = pure_place_annot(
+            static_cast<const Subscript *>(lv)->what.get(), m, tmp, &dummy);
+        *cont = b;
+        if (b && b->kind == DeclType::arr)
+            return b->elem.get();
+        if (b && b->kind == DeclType::dict)
+            return b->val.get();
+        return nullptr;
+    }
+    if (ctag(lv) != ConstructType::member)
+        return nullptr;
+    auto *me = static_cast<const MemberExpr *>(lv);
+    const TypeAnnot *b = pure_place_annot(me->what.get(), m, tmp, &dummy);
+    *cont = b;
+    if (!b || me->optional)
+        return nullptr;
+    if (b->kind == DeclType::dict)
+        return b->val.get();
+    if (b->kind != DeclType::strct || !b->strct)
+        return nullptr;
+    const FieldDef *fd = b->strct->field_of(me->memUid);
+    if (!fd)
+        return nullptr;
+    if (fd->annot)
+        return fd->annot.get();
+    auto t = make_unique<TypeAnnot>();
+    if (fd->kind == FieldKind::f_float)
+        t->kind = DeclType::f;
+    else if (fd->kind == FieldKind::f_int)
+        t->kind = DeclType::i;
+    else if (fd->kind == FieldKind::f_struct && fd->struct_def) {
+        t->kind = DeclType::strct;
+        t->strct = fd->struct_def;
+    } else
+        return nullptr;
+    tmp.push_back(std::move(t));
+    return tmp.back().get();
+}
+
+/* a declared identifier's annotated type (a struct-typed or a numeric
+ * one has only decl_type / decl_struct) */
+static const TypeAnnot *
+pure_decl_annot(const Identifier *id, std::vector<unique_ptr<TypeAnnot>> &tmp)
+{
+    if (id->decl_annot)
+        return id->decl_annot.get();
+    const bool num =
+        id->decl_type == DeclType::i || id->decl_type == DeclType::f;
+    if (!num && (id->decl_type != DeclType::strct || !id->decl_struct))
+        return nullptr;
+    auto t = make_unique<TypeAnnot>();
+    t->kind = id->decl_type;
+    t->strct = num ? nullptr : id->decl_struct;
+    tmp.push_back(std::move(t));
+    return tmp.back().get();
+}
+
+static void
+pure_stamp_stores(Construct *n, PureAnnots &m,
+                  std::vector<unique_ptr<TypeAnnot>> &tmp)
+{
+    if (!n || ctag(n) == ConstructType::func_decl)
+        return;     /* a nested pure function is stamped by its own parse */
+    if (ctag(n) == ConstructType::block) {
+        PureAnnots inner = m;          /* its declarations end with it */
+        for (auto &st : static_cast<Block *>(n)->elems)
+            pure_stamp_stores(st.get(), inner, tmp);
+        return;
+    }
+    /* the constructs that declare a name for a sibling part: the name
+     * shadows the outer one there, and nowhere else */
+    if (ctag(n) == ConstructType::for_stmt) {
+        auto *f = static_cast<ForStmt *>(n);
+        PureAnnots inner = m;          /* the init's declaration */
+        pure_stamp_stores(f->init.get(), inner, tmp);
+        for (Construct *ch : {f->cond.get(), f->inc.get(), f->body.get()}) {
+            PureAnnots part = inner;
+            pure_stamp_stores(ch, part, tmp);
+        }
+        return;
+    }
+    if (ctag(n) == ConstructType::foreach_stmt) {
+        auto *f = static_cast<ForeachStmt *>(n);
+        PureAnnots outer = m;
+        pure_stamp_stores(f->container.get(), outer, tmp);
+        PureAnnots inner = m;
+        if (f->ids)
+            for (auto &el : f->ids->elems)
+                inner[el->uid] = pure_decl_annot(el.get(), tmp);
+        pure_stamp_stores(f->body.get(), inner, tmp);
+        return;
+    }
+    if (ctag(n) == ConstructType::try_catch) {
+        auto *t = static_cast<TryCatchStmt *>(n);
+        PureAnnots part = m;
+        pure_stamp_stores(t->tryBody.get(), part, tmp);
+        for (auto &cs : t->catchStmts) {
+            part = m;
+            if (cs.first.asId)
+                part[cs.first.asId->uid] = nullptr;
+            pure_stamp_stores(cs.second.get(), part, tmp);
+        }
+        part = m;
+        pure_stamp_stores(t->finallyBody.get(), part, tmp);
+        return;
+    }
+    if (ctag(n) != ConstructType::expr14) {
+        for_each_child_of(n, [&](Construct *ch) {
+            PureAnnots inner = m;
+            pure_stamp_stores(ch, inner, tmp);
+        });
+        return;
+    }
+    auto *e = static_cast<Expr14 *>(n);
+    {
+        PureAnnots inner = m;
+        pure_stamp_stores(e->rvalue.get(), inner, tmp);
+        inner = m;
+        pure_stamp_stores(e->lvalue.get(), inner, tmp);
+    }
+    if (e->fl & pFlags::pInDecl) {
+        const Construct *lv = e->lvalue.get();
+        if (lv && ctag(lv) == ConstructType::id) {
+            auto *id = static_cast<const Identifier *>(lv);
+            m[id->uid] = pure_decl_annot(id, tmp);
+        } else if (lv && ctag(lv) == ConstructType::idlist) {
+            for (auto &el : static_cast<const IdList *>(lv)->elems)
+                m[el->uid] = pure_decl_annot(el.get(), tmp);
+        }
+        return;
+    }
+    const Construct *lv = e->lvalue.get();
+    /* a declared numeric variable: the store coerces by the use's
+     * decl_type, which resolve_names carries from the declaration - later,
+     * so a folded call stored an int into a `float x` */
+    if (e->op == Op::assign && lv && ctag(lv) == ConstructType::id) {
+        auto *id = static_cast<Identifier *>(e->lvalue.get());
+        auto it = m.find(id->uid);
+        const DeclType k =
+            it != m.end() ? annot_num(it->second) : DeclType::none;
+        if (k != DeclType::none && id->decl_type == DeclType::none)
+            id->decl_type = k;
+        return;
+    }
+    if (e->op != Op::assign || !lv
+        || (ctag(lv) != ConstructType::subscript
+            && ctag(lv) != ConstructType::member))
+        return;
+    const TypeAnnot *cont = nullptr;
+    const TypeAnnot *t = pure_place_annot(lv, m, tmp, &cont);
+    if (!t || !cont)
+        return;
+    if (cont->kind == DeclType::arr || cont->kind == DeclType::dict)
+        e->rv_coerce = annot_num(t);
+    if (cont->kind != DeclType::dict)
+        e->val_widen = annot_num(t);
+    stamp_literal_annot(e->rvalue.get(), t, false);
 }
 
 bool
@@ -2300,6 +4151,7 @@ pAcceptFuncDecl(ParseContext &c,
 
             func->captures = pList<IdList>(c, fl, pIdentifier);
             pExpectOp(c, Op::bracketR);
+            declare_captured_const_scalars(c, func->captures.get());
         }
     }
 
@@ -2307,6 +4159,40 @@ pAcceptFuncDecl(ParseContext &c,
         func->params = pList<IdList>(c, fl, pFuncParam);
         pExpectOp(c, Op::parenR);
     }
+
+    /*
+     * #133: a PARAM named after a const builtin shadows it inside the body.
+     * The scope is pushed HERE, not in pBlock, because the `=> expr` sugar
+     * parses its body with pExpr14 and never reaches pBlock - and that is the
+     * form that showed the bug worst: `func g(abs) => abs + 1` const-folded
+     * `abs` to the BUILTIN and then refused `builtin + 1` as a COMPILE error.
+     */
+    c.shadow_push();
+    if (func->params)
+        for (const auto &pm : func->params->elems)
+            if (const auto *pid = node_cast<const Identifier>(pm.get()))
+                c.shadow_add(pid->uid);
+    /* ...and so does a capture: a closure's own copy, which the body may
+     * rebind (a const scalar's is declared by the capture list above) */
+    if (func->captures)
+        for (const auto &cap : func->captures->elems)
+            c.shadow_add(cap->uid);
+    if (is_pure)
+        c.pure_depth++;                /* #54: see ParseContext::folding */
+
+    /*
+     * The body is a new context: nothing of the statement the function
+     * literal stands in carries into it. Inherited, a `break` in a lambda
+     * inside a loop and a `rethrow` in one inside a catch body parsed, and
+     * the codegen then refused them (NotLoweredEx); and a lambda in a
+     * `const` declaration's rvalue parsed its own `var t = a;` as a const
+     * declaration (ExpressionIsNotConstEx) and `t = a` as a store into
+     * the folded constant.
+     */
+    const unsigned body_fl = fl & ~(pFlags::pInDecl | pFlags::pInConstDecl
+                                    | pFlags::pInLoop | pFlags::pInCatchBody
+                                    | pFlags::pInOptDecl
+                                    | pFlags::pInDynDecl);
 
     if (pAcceptOp(c, Op::arrow)) {
 
@@ -2318,24 +4204,71 @@ pAcceptFuncDecl(ParseContext &c,
          * via func_expr_body (syntax.h); the synthetic nodes carry the
          * expression's locs so carets/backtraces are unchanged.
          */
-        unique_ptr<Construct> ex = pExpr14(c, fl);
+        /*
+         * #98: `func() => func() => ...` nests, and each level is the
+         * Block and the ReturnStmt below: two levels, as the `{ return
+         * e; }` it stands for takes (pBlock and pStmt), so the sugar
+         * cannot nest twice as deep as what every later pass walks.
+         */
+        /*
+         * ...and the body is its own BLOCK for the statements a parse
+         * puts beside an expression (ParseContext::baked_funcs: H2's
+         * `var K = <value>` for a const scalar a closure captures, #47's
+         * detached function literal), as a braced body is through its
+         * pBlock. They used to land in the ENCLOSING block, before the
+         * statement holding this function - outside the body that reads
+         * them: `func() => func [K] () => K` inside a function body was
+         * "Undefined variable 'K'" (the middle function cannot see the
+         * enclosing function's local), and a NAMED arrow function - or,
+         * since question 21, a `const` bound to a pure one - called above
+         * its line read the synthesized global before its statement ran
+         * (UnboundSymbolEx). The braced spelling of each worked.
+         */
+        unique_ptr<Construct> ex;
+        const size_t baked_base = c.baked_funcs.size();
+        c.cap_const_decls.emplace_back();
+        {
+            NestGuard ng_block(c);
+            NestGuard ng_ret(c);
+            ex = pExpr14(c, body_fl);
+        }
+        c.cap_const_decls.pop_back();
+        if (!ex)                    /* `func() => ;` read a null body */
+            noExprError(c);
         auto rs = make_unique<ReturnStmt>();
         rs->start = ex->start;
         rs->end = ex->end;
-        rs->elem = move(ex);
+        rs->elem = std::move(ex);
         auto blk = make_unique<Block>();
         blk->start = rs->start;
         blk->end = rs->end;
-        blk->elems.push_back(move(rs));
-        func->body = move(blk);
+        for (size_t i = baked_base; i < c.baked_funcs.size(); i++)
+            blk->elems.push_back(std::move(c.baked_funcs[i]));
+        c.baked_funcs.resize(baked_base);
+        blk->elems.push_back(std::move(rs));
+        func->body = std::move(blk);
 
-    } else if (!pAcceptBracedBlock(c, func->body, fl | pFlags::pInFuncBody)) {
+    } else if (!pAcceptBracedBlock(c, func->body,
+                                   body_fl | pFlags::pInFuncBody)) {
 
         throw SyntaxErrorEx(
             c.get_loc(),
             "Expected { } block or => expr, got",
             &c.get_tok()
         );
+    }
+    c.shadow_pop();                    /* #133: the params' scope */
+    if (is_pure) {
+        c.pure_depth--;
+        PureAnnots m;
+        std::vector<unique_ptr<TypeAnnot>> tmp;
+        if (func->params)
+            for (const auto &pm : func->params->elems)
+                if (ctag(pm.get()) == ConstructType::id) {
+                    auto *pid = static_cast<const Identifier *>(pm.get());
+                    m[pid->uid] = pure_decl_annot(pid, tmp);
+                }
+        pure_stamp_stores(func->body.get(), m, tmp);
     }
 
     func->end = c.get_loc() + 1;
@@ -2345,10 +4278,10 @@ pAcceptFuncDecl(ParseContext &c,
      * its params from the descriptor. */
     func->sync_params();
 
-    if (c.const_eval && is_pure && func->id)
+    if (is_pure && func->id)
         func->eval(c.const_ctx);
 
-    ret = move(func);
+    ret = std::move(func);
     return true;
 }
 
@@ -2359,20 +4292,43 @@ static FieldKind decltype_to_fieldkind(DeclType dt)
         case DeclType::i:    return FieldKind::f_int;
         case DeclType::f:    return FieldKind::f_float;
         case DeclType::s:    return FieldKind::f_str;
-        case DeclType::arr:  return FieldKind::f_array;
-        case DeclType::dict: return FieldKind::f_dict;
+        /* (a bare `array` / `dict` is refused before this: rule 5) */
         default:             return FieldKind::f_dyn;
     }
 }
 
 /* v1: `opt` is allowed only on the reference kinds that already carry `none`
  * (a null handle): dyn/array/dict. A scalar/str/struct field with `opt` would
- * need extra presence bits or break the C layout - deferred (plans/structs.md).
+ * need extra presence bits or break the C layout - deferred (plans/archived/structs.md).
  */
 static bool fieldkind_allows_opt(FieldKind k)
 {
     return k == FieldKind::f_dyn || k == FieldKind::f_array ||
-           k == FieldKind::f_dict;
+           k == FieldKind::f_dict || k == FieldKind::f_box;
+}
+
+/*
+ * `opt` on a struct-typed field is allowed when the type is a CLASS: the
+ * field holds a reference, and `none` is a null one - the linked-list
+ * spelling `opt Node next;` (plans/class-and-box.md). On a STRUCT it is
+ * not (a struct field is a value; an opt one is deferred with the opt
+ * scalar fields). The type is known here when it is the declaration
+ * being parsed or one declared above it; a forward reference is accepted
+ * and checked by the inferencer once every declaration is known
+ * (Inferencer::check_opt_struct_fields).
+ */
+static const char *const opt_field_msg =
+    "'opt' is only allowed on dyn/array/dict/box and class-typed fields";
+
+static bool opt_struct_field_ok(const FieldDef &fd, const StructTypeDef &def)
+{
+    if (fd.kind != FieldKind::f_struct)
+        return false;
+    if (fd.struct_def)
+        return fd.struct_def->is_class;
+    if (fd.struct_ty == def.name)
+        return def.is_class;
+    return true;              /* a forward reference: the inferencer checks */
 }
 
 /* Reject a field/const name already used by a field or const in this struct
@@ -2394,13 +4350,27 @@ struct_check_name_free(const StructTypeDef &def, const UniqueId *n, Loc loc)
  * declared (a self/forward reference to it), else a lookup of the field's type
  * name in `const_ctx` (a forward reference to a struct declared in between -
  * its `struct_def` was null when the field was parsed but it is in scope now).
+ * A non-opt `box<S>` field points at S too: a box always holds a value (it
+ * is never none unless `opt`), so constructing one needs an S - `struct T
+ * { box<T> me; }` can never be constructed either, and zero-initializing
+ * it (`T t;`, zero_box_init <-> build_zero_struct_init) recursed until the
+ * parser's stack overflowed. The element is resolved already (a box's
+ * annotation names a declared struct or, through decl_self, the one being
+ * declared) and is never opt (pTypeAnnot refuses `box<S?>`).
  * Returns null for an opt/non-struct field or a genuinely undeclared type.
  */
 static const StructTypeDef *
 struct_field_target(const FieldDef &f, const StructTypeDef *root,
                     EvalContext *const_ctx)
 {
-    if (f.kind != FieldKind::f_struct || f.is_opt)
+    if (f.is_opt)
+        return nullptr;
+    if (f.kind == FieldKind::f_box) {
+        const TypeAnnot *e = f.annot ? f.annot->elem.get() : nullptr;
+        return e && e->kind == DeclType::strct && !e->opt ? e->strct
+                                                          : nullptr;
+    }
+    if (f.kind != FieldKind::f_struct)
         return nullptr;
     if (f.struct_def)
         return f.struct_def;
@@ -2444,7 +4414,8 @@ struct_reaches_root(const StructTypeDef *cur, const StructTypeDef *root,
  * to box the back-edge by making it nullable; v1 boxes via `dyn`, so the
  * message points the user at `dyn? <field>`. A self/mutual cycle is detected at
  * the declaration that closes it. An `opt` field breaks the cycle (it can
- * terminate with `none`), so it is not followed.
+ * terminate with `none`), so it is not followed. A non-opt `box<S>` field
+ * is followed like an S field (struct_field_target): the box needs an S.
  */
 static void
 check_struct_no_recursion(const StructTypeDef *def,
@@ -2457,17 +4428,31 @@ check_struct_no_recursion(const StructTypeDef *def,
         if (!t)
             continue;
         std::set<const StructTypeDef *> seen{def};
-        if (t == def || struct_reaches_root(t, def, seen, cctx))
+        if (t == def || struct_reaches_root(t, def, seen, cctx)) {
+            if (def->fields[i].kind == FieldKind::f_box)
+                throw SyntaxErrorEx(field_locs[i],
+                    "recursive box field: a non-opt box always holds a "
+                    "value, and a value of this struct would need a box "
+                    "holding another - it can never be constructed. Make "
+                    "it nullable - e.g. 'opt box<...> <name>'");
+            if (def->is_class)
+                throw SyntaxErrorEx(field_locs[i],
+                    "recursive class field: a non-opt field whose type "
+                    "contains its own class can never be constructed (the "
+                    "first instance would need an existing one). Make it "
+                    "nullable - e.g. 'opt <type> <name>' or '<type>? "
+                    "<name>'");
             throw SyntaxErrorEx(field_locs[i],
                 "recursive struct field: a non-opt struct field whose type "
                 "contains its own struct can never be constructed (it would "
                 "nest forever). Box it by making it nullable - e.g. "
                 "'dyn? <name>' or 'opt dyn <name>'");
+        }
     }
 }
 
 /*
- * Parse `struct Name { field/const ... }` (plans/structs.md). A field is
+ * Parse `struct Name { field/const ... }` (plans/archived/structs.md). A field is
  * `[opt] TYPE name;` where TYPE is a primitive keyword, `dyn`, or a struct-type
  * name (an identifier - validated later by the inferencer). v1 rejects `var`
  * fields and `opt` on a non-reference field. A `const NAME = expr;` member is
@@ -2478,7 +4463,12 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 {
     const Loc start = c.get_loc();
 
-    if (!pAcceptKeyword(c, Keyword::kw_struct))
+    /* `class` is the same declaration with reference semantics
+     * (StructTypeDef::is_class, plans/class-and-box.md) */
+    bool is_class = false;
+    if (pAcceptKeyword(c, Keyword::kw_class))
+        is_class = true;
+    else if (!pAcceptKeyword(c, Keyword::kw_struct))
         return false;
 
     auto stmt = make_unique<StructDeclStmt>();
@@ -2486,16 +4476,28 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     stmt->id = pIdentifier(c, fl & ~pFlags::pInStmt);
 
     if (!stmt->id)
-        throw SyntaxErrorEx(c.get_loc(), "Expected struct name, got",
+        throw SyntaxErrorEx(c.get_loc(), is_class
+                                ? "Expected class name, got"
+                                : "Expected struct name, got",
                             &c.get_tok());
 
     stmt->set_def(make_unique<StructTypeDef>());
     stmt->def->name = stmt->id->uid;
+    stmt->def->is_class = is_class;
 
     pExpectOp(c, Op::braceL);
 
     int next_slot = 0;
     std::vector<Loc> field_locs;     /* parallel to def->fields, for errors */
+
+    /* its own name is a type in its fields' annotations (lookup_struct_type) */
+    struct SelfScope {
+        ParseContext &c;
+        const StructTypeDef *saved;
+        SelfScope(ParseContext &c, const StructTypeDef *d)
+            : c(c), saved(c.decl_self) { c.decl_self = d; }
+        ~SelfScope() { c.decl_self = saved; }
+    } self_scope(c, stmt->def);
 
     while (!pAcceptOp(c, Op::braceR)) {
 
@@ -2515,16 +4517,32 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
             pExpectOp(c, Op::assign);
 
             /* The rvalue is a plain (const) expression, not a declaration: no
-             * pInDecl. make_const_clone below makes the stored value deep
-             * read-only regardless. */
-            unique_ptr<Construct> rv = pExpr14(c, fl & ~pFlags::pInStmt);
+             * pInDecl - but it IS a constant's initializer, parsed as a
+             * `const` declaration parses its own (pInConstDecl): a struct or
+             * class construction there is a constant expression. Without
+             * it `const Z = P(1);` was "not const" in a struct while the
+             * same line at the top level worked. make_const_clone below
+             * makes the stored value deep read-only regardless. */
+            unique_ptr<Construct> rv = pExpr14(c,
+                (fl & ~(pFlags::pInStmt | pFlags::pInDecl))
+                | pFlags::pInConstDecl);
             if (!rv)
                 noExprError(c);
             if (!rv->is_const)
                 throw ExpressionIsNotConstEx(rv->start, rv->end);
 
             EvalValue cv = make_const_clone(RValue(rv->eval(c.const_ctx)));
-            stmt->def->consts.emplace_back(cn, move(cv));
+            /* #47: `rv` dies below - keep the function literals the
+             * member's value names (`const F = pure func(a) => a;` is
+             * itself one) */
+            {
+                std::unordered_set<const FuncDescriptor *> descs;
+                collect_value_descs(cv, descs);
+                collect_def_owner_funcs(rv.get(), cv, descs);
+                if (!descs.empty())
+                    detach_baked_funcs(c, rv, descs);
+            }
+            stmt->def->consts.emplace_back(cn, std::move(cv));
             pExpectOp(c, Op::semicolon);
             continue;
         }
@@ -2544,8 +4562,7 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         if (pAcceptKeyword(c, Keyword::kw_dyn)) {
             fd.kind = FieldKind::f_dyn;
         } else if (*c == TokType::id &&
-                   (type_keyword(c.get_str()) == DeclType::arr ||
-                    type_keyword(c.get_str()) == DeclType::dict) &&
+                   container_keyword(c.get_str()) != DeclType::none &&
                    c.peek_tok(1) == Op::lt) {
             /* a parameterized container field: `array<int> xs;`,
              * `dict<str, Point> m;` - pTypeAnnot consumes `<...>` + `?`. The
@@ -2553,23 +4570,33 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
              * the element type for the inferencer. */
             std::shared_ptr<TypeAnnot> annot = pTypeAnnot(c);
             fd.kind = annot->kind == DeclType::arr ? FieldKind::f_array
-                                                   : FieldKind::f_dict;
+                    : annot->kind == DeclType::dict ? FieldKind::f_dict
+                                                    : FieldKind::f_box;
             fd.annot = annot;
             if (annot->opt)
                 fd.is_opt = true;
         } else if (*c == TokType::id &&
                    type_keyword(c.get_str()) != DeclType::none) {
+            /* rule 5 (plans/strict-container-types.md): a bare `array` /
+             * `dict` is a hole the compiler fills from what a variable or a
+             * parameter receives - a field has no single receiver, so it
+             * names its whole type */
+            if (container_keyword(c.get_str()) != DeclType::none)
+                throw SyntaxErrorEx(c.get_loc(), intern_msg(
+                    "a struct field needs a complete type: write "
+                    "array<T> / dict<K, V>, not a bare array / dict"));
             fd.kind = decltype_to_fieldkind(type_keyword(c.get_str()));
             c++;
         } else if (*c == TokType::id) {
             fd.kind = FieldKind::f_struct;
             fd.struct_ty = UniqueId::get(c.get_str());
+            fd.type_loc = c.get_loc();
             /* Resolve the nested type if it was declared before this struct
              * (its descriptor is in const_ctx): a POD nested struct is then
              * embedded inline (compute_layout); a forward-ref / boxed one stays
              * a boxed pointer field. A self/forward reference is simply not yet
              * in scope, so it boxes - no infinite layout. */
-            if (c.const_eval) {
+            {
                 Identifier nameRef(fd.struct_ty->val);
                 const EvalValue ev = nameRef.eval(c.const_ctx);
                 if (ev.is<LValue *>()) {
@@ -2578,6 +4605,14 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
                         fd.struct_def = dv.get<StructTypeDef *>();
                 }
             }
+            /* ...and the field's type is that struct, under its own
+             * name: written through a TYPE ALIAS (`const T = S;` then
+             * `T s;`) the field kept the name `T`, which names no struct
+             * - the inferencer, asking by name, typed it `dyn` (`var k =
+             * w.s.a + 1` was refused, DynRequiredEx) and layout() / -vd
+             * showed a type `T` (until 2026-11-15) */
+            if (fd.struct_def)
+                fd.struct_ty = fd.struct_def->name;
             c++;
         } else {
             throw SyntaxErrorEx(c.get_loc(),
@@ -2596,9 +4631,10 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         fd.name = static_cast<Identifier *>(nameId.get())->uid;
         struct_check_name_free(*stmt->def, fd.name, mloc);
 
-        if (fd.is_opt && !fieldkind_allows_opt(fd.kind))
-            throw SyntaxErrorEx(mloc,
-                "'opt' is only allowed on dyn/array/dict fields (v1)");
+        fd.loc = mloc;
+        if (fd.is_opt && !fieldkind_allows_opt(fd.kind)
+            && !opt_struct_field_ok(fd, *stmt->def))
+            throw SyntaxErrorEx(mloc, opt_field_msg);
 
         pExpectOp(c, Op::semicolon);
 
@@ -2613,15 +4649,14 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
      * field) with a clear "box it as 'dyn?'" message - before compute_layout,
      * which would otherwise just silently box the back-edge */
     check_struct_no_recursion(stmt->def, field_locs,
-                              c.const_eval ? c.const_ctx : nullptr);
+                              c.const_ctx);
 
     /* decide POD vs boxed storage and assign POD field byte offsets */
     stmt->def->compute_layout();
 
-    if (c.const_eval)
-        stmt->eval(c.const_ctx);
+    stmt->eval(c.const_ctx);
 
-    ret = move(stmt);
+    ret = std::move(stmt);
     return true;
 }
 
@@ -2647,30 +4682,36 @@ MakeConstructFromConstVal(const EvalValue &v,
                           bool process_arrays,
                           bool immutable)
 {
-    if (v.is<int_type>()) {
-        out = make_unique<LiteralInt>(v.get<int_type>());
+    /*
+     * The literal REPLACES the node in `out` (when there is one), so it
+     * keeps that node's span: a folded `65` or `K` passed to a builtin is
+     * still where its caret goes. A span-less literal made every error
+     * about it loc-less, and the call then stamped the whole ARGUMENT
+     * LIST on it - `str(f, 65)` underlined `f, 65` (until 2026-10-05).
+     */
+    const Loc span_start = out ? out->start : Loc();
+    const Loc span_end = out ? out->end : Loc();
+    auto place = [&](unique_ptr<Construct> n) {
+        n->start = span_start;
+        n->end = span_end;
+        out = std::move(n);
         return true;
-    }
+    };
 
-    if (v.is<bool>()) {
-        out = make_unique<LiteralBool>(v.get<bool>());
-        return true;
-    }
+    if (v.is<int_type>())
+        return place(make_unique<LiteralInt>(v.get<int_type>()));
 
-    if (v.is<float_type>()) {
-        out = make_unique<LiteralFloat>(v.get<float_type>());
-        return true;
-    }
+    if (v.is<bool>())
+        return place(make_unique<LiteralBool>(v.get<bool>()));
 
-    if (v.is<NoneVal>()) {
-        out = make_unique<LiteralNone>();
-        return true;
-    }
+    if (v.is<float_type>())
+        return place(make_unique<LiteralFloat>(v.get<float_type>()));
 
-    if (v.is<SharedStr>()) {
-        out = make_unique<LiteralStr>(v);
-        return true;
-    }
+    if (v.is<NoneVal>())
+        return place(make_unique<LiteralNone>());
+
+    if (v.is<SharedStr>())
+        return place(make_unique<LiteralStr>(v));
 
     if (process_arrays) {
 
@@ -2694,17 +4735,33 @@ MakeConstructFromConstVal(const EvalValue &v,
              * For a read-only result we bake a deep read-only value: do_eval
              * then *shares* it (it can't be mutated), so the symbol and this
              * node hold one buffer, not two. For a mutable result we bake a
-             * standalone clone (do_eval copies it per eval). Either way the
-             * baked value is self-contained, so a small slice of a huge const
-             * array doesn't pin the huge buffer.
+             * standalone deep copy (do_eval copies it per eval). Either way
+             * the baked value is self-contained, so a small slice of a huge
+             * const array doesn't pin the huge buffer.
+             *
+             * The mutable bake is clone(): a fresh top over v's own
+             * sub-objects, which nothing else holds - EXCEPT for a value that
+             * contains itself (cyclewalk.h). clone() of a ring is its
+             * one-step unrolling, a fresh top in front of the original ring,
+             * so a folded `var r = mk();` and the same call left to run time
+             * compared and printed differently (RULE 2). That value is
+             * copied with its cycle (make_mutable_clone; every dict keeps
+             * its insertion order through a copy), and kept until the
+             * program ends (cyc_keep_until_exit): the compiler holds it,
+             * so no program can break it. A frozen one is kept already.
              */
             const bool ro = immutable || is_readonly_value(v);
+            EvalValue baked;
+            if (ro) {
+                baked = make_const_clone(v);
+            } else if (cyc_value_reaches_cycle(v)) {
+                baked = make_mutable_clone(v);
+                cyc_keep_until_exit(baked);
+            } else {
+                baked = v.clone();
+            }
 
-            out = make_unique<LiteralObj>(
-                ro ? make_const_clone(v) : v.clone(),
-                ro
-            );
-            return true;
+            return place(make_unique<LiteralObj>(std::move(baked), ro));
         }
     }
 
@@ -2736,7 +4793,7 @@ cse_key_rec(ParseContext &c, const Construct *node, string &out)
     if (out.size() > CSE_KEY_CAP)
         return false;
 
-    if (const Subscript *s = dynamic_cast<const Subscript *>(node)) {
+    if (const Subscript *s = node_cast<const Subscript>(node)) {
         out += "S(";
         if (!cse_key_rec(c, s->what.get(), out))
             return false;
@@ -2747,7 +4804,7 @@ cse_key_rec(ParseContext &c, const Construct *node, string &out)
         return out.size() <= CSE_KEY_CAP;
     }
 
-    if (const Slice *s = dynamic_cast<const Slice *>(node)) {
+    if (const Slice *s = node_cast<const Slice>(node)) {
         out += "L(";
         if (!cse_key_rec(c, s->what.get(), out))
             return false;
@@ -2761,7 +4818,19 @@ cse_key_rec(ParseContext &c, const Construct *node, string &out)
         return out.size() <= CSE_KEY_CAP;
     }
 
-    if (const CallExpr *ce = dynamic_cast<const CallExpr *>(node)) {
+    if (const CallExpr *ce = node_cast<const CallExpr>(node)) {
+        /* a CLASS construction makes a new object each time it is
+         * evaluated: two `const a = C(1); const b = C(1);` are two
+         * instances, and sharing one baked value would make a == b */
+        if (node_cast<const Identifier>(ce->what.get())) {
+            const EvalValue cv = ce->what->eval(c.const_ctx);
+            if (cv.is<LValue *>()) {
+                const EvalValue &d = cv.get<LValue *>()->get();
+                if (d.is<StructTypeDef *>()
+                    && d.get<StructTypeDef *>()->is_class)
+                    return false;
+            }
+        }
         out += "C(";
         if (!cse_key_rec(c, ce->what.get(), out))
             return false;
@@ -2776,7 +4845,7 @@ cse_key_rec(ParseContext &c, const Construct *node, string &out)
     }
 
     if (const MultiOpConstruct *mo =
-            dynamic_cast<const MultiOpConstruct *>(node))
+            node_cast<const MultiOpConstruct>(node))
     {
         out += "M(";
         for (const auto &pr : mo->elems) {
@@ -2790,7 +4859,7 @@ cse_key_rec(ParseContext &c, const Construct *node, string &out)
         return out.size() <= CSE_KEY_CAP;
     }
 
-    if (dynamic_cast<const Identifier *>(node)) {
+    if (node_cast<const Identifier>(node)) {
         const EvalValue ev = node->eval(c.const_ctx);
         if (!ev.is<LValue *>())
             return false;
@@ -2837,6 +4906,815 @@ cse_key(ParseContext &c, const Construct *node)
 }
 
 /*
+ * #47: the FuncDescriptors a baked const value NAMES - every FuncObject in
+ * it, through general arrays, dicts (keys too), boxed struct fields and a
+ * struct type's const members. A flat array (ints/floats/bools/strs/POD
+ * structs) cannot hold a function, and get_view() on one would PROMOTE it,
+ * so those kinds are skipped rather than viewed. The value may contain
+ * itself: a container (or a struct type's consts) already on this walk's
+ * path is not entered again (cyclewalk.h).
+ */
+static void
+collect_value_descs(const EvalValue &v,
+                    std::unordered_set<const FuncDescriptor *> &out,
+                    CycStack &st)
+{
+    CycKey k;
+    bool keyed = cyc_key(v, k);
+    if (!keyed && v.get_type()->t == Type::t_structtype) {
+        k = cyc_key_consts(v.get<StructTypeDef *>());
+        keyed = true;
+    }
+    if (keyed && st.contains(k))
+        return;
+    CycGuard g(st, k, keyed);
+
+    switch (v.get_type()->t) {
+
+    case Type::t_func:
+        out.insert(v.get_ref<intrusive_ptr<FuncObject>>()->func);
+        break;
+
+    case Type::t_arr: {
+        const SharedArrayObj &arr = v.get_ref<SharedArrayObj>();
+        if (arr.skind() == SharedArrayObj::Storage::objs) {
+            /* class instances: their fields may name one */
+            for (size_type i = 0; i < arr.size(); i++)
+                collect_value_descs(obj_elem_value(
+                    arr.flat_objs()[arr.offset() + i]), out);
+            break;
+        }
+        if (arr.skind() != SharedArrayObj::Storage::general)
+            break;
+        ArrayConstView view = arr.get_view();
+        for (size_type i = 0; i < view.size(); i++)
+            collect_value_descs(view[i].get(), out, st);
+        break;
+    }
+
+    case Type::t_dict:
+        for (const auto &kv :
+                 v.get_ref<intrusive_ptr<DictObject>>()->get_ref()) {
+            collect_value_descs(kv.first, out, st);
+            collect_value_descs(kv.second.get(), out, st);
+        }
+        break;
+
+    case Type::t_struct:
+        for (const LValue &f :
+                 v.get_ref<intrusive_ptr<StructObject>>()->fields)
+            collect_value_descs(f.get(), out, st);   /* POD holds no func */
+        break;
+
+    case Type::t_structtype:
+        for (const auto &cm : v.get<StructTypeDef *>()->consts)
+            collect_value_descs(cm.second, out, st);
+        break;
+
+    default:
+        break;
+    }
+}
+
+static void
+collect_value_descs(const EvalValue &v,
+                    std::unordered_set<const FuncDescriptor *> &out)
+{
+    CycStack st;
+    collect_value_descs(v, out, st);
+}
+
+/* The struct definitions a value names: an instance's (a class's, a
+ * box's), a flat struct array's element def, a struct type itself, and
+ * those inside containers, fields and a type's const members. A flat
+ * scalar or string array names none (and get_view() would promote it).
+ * The value may contain itself (cyclewalk.h). */
+static void
+collect_value_defs(const EvalValue &v,
+                   std::unordered_set<const StructTypeDef *> &out,
+                   CycStack &st)
+{
+    CycKey k;
+    bool keyed = cyc_key(v, k);
+    if (!keyed && v.get_type()->t == Type::t_structtype) {
+        k = cyc_key_consts(v.get<StructTypeDef *>());
+        keyed = true;
+    }
+    if (keyed && st.contains(k))
+        return;
+    CycGuard g(st, k, keyed);
+
+    switch (v.get_type()->t) {
+
+    case Type::t_arr: {
+        const SharedArrayObj &arr = v.get_ref<SharedArrayObj>();
+        switch (arr.skind()) {
+        case SharedArrayObj::Storage::structs:
+            out.insert(arr.flat_structs().def);
+            break;
+        case SharedArrayObj::Storage::objs:
+            for (size_type i = 0; i < arr.size(); i++)
+                collect_value_defs(obj_elem_value(
+                    arr.flat_objs()[arr.offset() + i]), out, st);
+            break;
+        case SharedArrayObj::Storage::general: {
+            ArrayConstView view = arr.get_view();
+            for (size_type i = 0; i < view.size(); i++)
+                collect_value_defs(view[i].get(), out, st);
+            break;
+        }
+        default:
+            break;
+        }
+        break;
+    }
+
+    case Type::t_dict:
+        for (const auto &kv :
+                 v.get_ref<intrusive_ptr<DictObject>>()->get_ref()) {
+            collect_value_defs(kv.first, out, st);
+            collect_value_defs(kv.second.get(), out, st);
+        }
+        break;
+
+    case Type::t_struct: {
+        const StructObject &so = *v.get_ref<intrusive_ptr<StructObject>>();
+        out.insert(so.def);
+        /* a POD instance's fields are bytes: a nested POD struct's def
+         * is a field's, named by the def itself */
+        for (const LValue &f : so.fields)
+            collect_value_defs(f.get(), out, st);
+        break;
+    }
+
+    case Type::t_structtype: {
+        const StructTypeDef *d = v.get<StructTypeDef *>();
+        out.insert(d);
+        for (const auto &cm : d->consts)
+            collect_value_defs(cm.second, out, st);
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
+/*
+ * A bake is about to free `n` (or a late fold to retire it) while the
+ * value it computed lives on. A struct declared inside a function literal
+ * written in `n` is OWNED by that declaration, so an instance of it in
+ * the value would read a freed definition - `const c = map(pure func(x)
+ * { struct Q { int a; } return Q(x); }, K);` was a heap-use-after-free.
+ * The descriptor of each such literal (the outermost one around the
+ * declaration) joins `descs`: the callers keep those literals alive as
+ * they keep one the value NAMES (#47), or leave the node in place.
+ */
+static void
+collect_def_owner_funcs(Construct *n, const EvalValue &v,
+                        std::unordered_set<const FuncDescriptor *> &descs)
+{
+    std::unordered_set<const StructTypeDef *> defs;
+    CycStack st;
+    collect_value_defs(v, defs, st);
+    if (defs.empty())
+        return;
+    std::function<void(Construct *, const FuncDeclStmt *)> walk =
+        [&](Construct *x, const FuncDeclStmt *lit) {
+        if (!x)
+            return;
+        if (!lit && ctag(x) == ConstructType::func_decl)
+            lit = static_cast<const FuncDeclStmt *>(x);
+        if (auto *sd = node_cast<StructDeclStmt>(x))
+            if (defs.count(sd->def)) {
+                /* a declaration is a statement: in an expression, one
+                 * stands in a function literal's body */
+                ML_CHECK(lit);
+                descs.insert(lit->desc);
+            }
+        for_each_child_of(x, [&](Construct *ch) { walk(ch, lit); });
+    };
+    walk(n, nullptr);
+}
+
+/*
+ * QUESTION 5 (plans/open-language-questions.md, decision A) - A USER
+ * FUNCTION THE PARSER RUNS, RUNS TYPED.
+ *
+ * A constant call (`f(3)`, a `const` initializer, a struct const member,
+ * a callback a const builtin calls) is evaluated while parsing, before
+ * inference exists. Inference decides types that change what a run
+ * computes - `var x = n; x = 2.5;` makes `x` a float, so `str(x)` after
+ * `var x = n` is "3.000000"; a return type joined with a float returns
+ * 1.0; an array literal written into a float array is flat floats - so an
+ * untyped run gave a constant call another answer than the same call at
+ * run time, and `-nc` (no folding) disagreed with the default (RULE 2).
+ *
+ * So the call runs in a synthetic program that inference types as a
+ * compile does - a template instance per argument signature, every stamp a
+ * store or a bind reads - holding clones of the functions the call reaches
+ * by name, its consts and struct names as declarations, and the call:
+ *
+ *  - A call the PARSER makes runs AS WRITTEN: its callee and argument
+ *    expressions are cloned, and a const holding a FUNCTION is declared by
+ *    its own initializer (EvalContext::pt_inits). So a function value
+ *    arrives the way it does in the program - by its name, out of a call,
+ *    out of a const container - and inference decides what the program's
+ *    does: a template called by name, or through a name bound to it, gets
+ *    an instance; one read out of a const container runs untyped.
+ *  - A call a running function makes (a call through a value inside a
+ *    body, a callback a builtin calls) knows only VALUES: the function's
+ *    copy is called by its name with the arguments as literals (a function
+ *    argument by its name), and a TEMPLATE reached that way runs untyped,
+ *    as the program runs one it reaches through a value.
+ *
+ * Any other const is declared with its value. A builtin goes by its own
+ * name, as the program passes it. The declarations are bound under a const root of their own (the
+ * builtins only), never the parser's: the REPL keeps its consts there.
+ *
+ * A parameter whose type inference JOINS over every call site (an
+ * un-annotated `opt` parameter, a lambda's) is typed by this call alone,
+ * and so is a template's instance through a value, which the program
+ * makes only when every call through the value agrees: the parser cannot
+ * see the call sites below it.
+ *
+ * Not typed (the call runs as before, untyped): a running function's call
+ * given a struct TYPE (the template it is passed to is not instantiated
+ * for one at run time either), and a result holding a function value - a
+ * copy's descriptor dies with the cache, so it may not escape into the
+ * program. (A struct declared inside a copied function does not die with
+ * it: a clone shares the definition its original owns.)
+ */
+EvalValue pt_invoke(EvalContext *ctx, FuncObject &obj,
+                    const std::vector<EvalValue> &args, Loc call_site);
+
+namespace {
+
+/* One typed copy: the synthetic program it was inferred in, the scope its
+ * declarations are bound in, and what to run - the call as written, or the
+ * typed function. Members die in reverse order: the function and the
+ * bindings before the program that owns their descriptors. */
+struct PtEntry {
+    unique_ptr<Construct> root;
+    /* a const root of its own (the builtins only, as a script's): the
+     * REPL keeps its consts in the parser's root, where a declaration of
+     * one here would be a store into it */
+    unique_ptr<EvalContext> croot;
+    unique_ptr<EvalContext> ctx;
+    /* a call the parser makes: the call, in `root` */
+    Construct *call = nullptr;
+    /* a call a running function makes: the typed function, and each
+     * function argument as inference gave it in the program (a template's
+     * instance, where the program would make one) */
+    EvalValue fn;
+    std::vector<std::pair<size_t, EvalValue>> fn_args;
+};
+
+/* key: the call's node id (as written), or the function's node id and its
+ * argument signature (by value); null: no typed copy can be built */
+std::map<std::string, unique_ptr<PtEntry>> g_pt_cache;
+
+struct PtBuild {
+    std::vector<unique_ptr<Construct>> decls;
+    /* a name -> the one thing it names here (a descriptor, a struct def,
+     * a const's slot) */
+    std::unordered_map<const UniqueId *, const void *> bound;
+    Loc at;
+    bool failed = false;
+};
+
+EvalContext *pt_scope_of(const FuncObject &fo)
+{
+    /* one a running function made has no const scope: its root */
+    if (!fo.const_scope)
+        return fo.capture_root;
+    /* a call at parse time cannot outlive the scope that made the
+     * function: a guard */
+    if (fo.const_scope_alive && *fo.const_scope_alive) /* INT-COV-EXEMPT */
+        return fo.const_scope;
+    return fo.capture_root;
+}
+
+/* the scope that binds `uid`, from `scope` out, and its binding */
+EvalContext *pt_lookup(EvalContext *scope, const UniqueId *uid, LValue *&lv)
+{
+    for (EvalContext *c = scope; c; c = c->parent)
+        if ((lv = c->lookup(uid)) != nullptr)
+            return c;
+    return nullptr;
+}
+
+/* what `scope` noted about its const `uid` (pt_note_const), or null */
+const PtConstInit *pt_init_of(const EvalContext *scope, const UniqueId *uid)
+{
+    if (!scope->pt_inits)
+        return nullptr;
+    const auto it = scope->pt_inits->m.find(uid);
+    return it != scope->pt_inits->m.end() ? &it->second : nullptr;
+}
+
+unique_ptr<Identifier> pt_id(const UniqueId *uid, Loc at)
+{
+    auto id = make_unique<Identifier>(uid->val);
+    id->start = at;
+    id->end = at;
+    return id;
+}
+
+/* `var NAME = rv` / `const NAME = rv`, `dyn` as the program declared it */
+unique_ptr<Construct> pt_decl(const UniqueId *uid, unique_ptr<Construct> rv,
+                              bool is_const, Loc at, bool dyn)
+{
+    auto d = make_unique<Expr14>();
+    d->op = Op::assign;
+    d->fl = is_const ? (pFlags::pInDecl | pFlags::pInConstDecl)
+                     : pFlags::pInDecl;
+    d->start = at;
+    d->end = at;
+    auto id = pt_id(uid, at);
+    id->dyn_mod = dyn;
+    d->lvalue = std::move(id);
+    d->rvalue = std::move(rv);
+    return d;
+}
+
+void pt_collect(PtBuild &b, Construct *c, EvalContext *scope);
+
+/* the name a builtin value is registered under: inference knows a builtin
+ * by its name. A builtin the parser can reach is a const one, and no two
+ * of those share an implementation. */
+const UniqueId *pt_builtin_name(const Builtin &bi)
+{
+    using Names = std::map<decltype(Builtin::func), const UniqueId *>;
+    static const Names names = [] {
+        Names m;
+        for (const auto &kv : EvalContext::const_builtins)
+            if (kv.second.get().is<Builtin>())
+                m.emplace(kv.second.get().get_ref<Builtin>().func, kv.first);
+        return m;
+    }();
+    const auto it = names.find(bi.func);
+    return it != names.end() ? it->second : nullptr; /* INT-COV-EXEMPT */
+}
+
+/* `uid` names `ident` from now on; false: it did already (naming another
+ * thing fails the build) */
+bool pt_bind_new(PtBuild &b, const UniqueId *uid, const void *ident)
+{
+    const auto it = b.bound.find(uid);
+    if (it == b.bound.end()) {
+        b.bound.emplace(uid, ident);
+        return true;
+    }
+    /* a const scope chain binds a name once (CannotRebindConstEx,
+     * AlreadyDefinedEx), and a function cannot leave the block that
+     * names it at parse time: a guard */
+    if (it->second != ident)            /* INT-COV-EXEMPT: see above */
+        b.failed = true;
+    return false;
+}
+
+/* declare the function `fo` as `uid` */
+void pt_bind_func(PtBuild &b, const UniqueId *uid, const FuncObject &fo,
+                  bool scoped)
+{
+    const FuncDeclStmt *fd = fo.func->decl;
+    /* a function the parser reaches is this program's (or an earlier
+     * REPL input's, whose tree the REPL keeps) */
+    if (!fd) {                          /* INT-COV-EXEMPT: see above */
+        b.failed = true;
+        return;
+    }
+    if (fo.func->name && fo.func->name != uid) {
+        /* another name for a named function (`const FA, FB = [f, g];`
+         * notes no initializer): the function first - the declarations
+         * are evaluated in order */
+        if (pt_bind_new(b, fo.func->name, fo.func))
+            pt_bind_func(b, fo.func->name, fo, false);
+        b.decls.push_back(pt_decl(uid, pt_id(fo.func->name, b.at),
+                                  true, b.at, false));
+        return;
+    }
+    unique_ptr<Construct> cl = fd->clone();
+    Construct *body = static_cast<FuncDeclStmt *>(cl.get())->body.get();
+    if (fo.func->name)
+        b.decls.push_back(std::move(cl));
+    else            /* a lambda: a const's, or the call's own ($pt) */
+        b.decls.push_back(pt_decl(uid, std::move(cl), scoped, b.at, false));
+    pt_collect(b, body, pt_scope_of(fo));
+}
+
+/* declare what `uid` is bound to, found in `in` (null: the call's own
+ * callee or argument) */
+void pt_bind(PtBuild &b, const UniqueId *uid, const EvalValue &v,
+             const void *ident, EvalContext *in)
+{
+    const UniqueId *bname = nullptr;
+    if (v.is<Builtin>()) {
+        bname = pt_builtin_name(v.get_ref<Builtin>());
+        if (!bname) {   /* INT-COV-EXEMPT: every reachable one has a name */
+            b.failed = true;
+            return;
+        }
+        ident = bname;
+    } else if (v.is<intrusive_ptr<FuncObject>>()) {
+        ident = v.get_ref<intrusive_ptr<FuncObject>>()->func;
+    } else if (v.is<StructTypeDef *>()) {
+        ident = v.get<StructTypeDef *>();
+    }
+    if (!pt_bind_new(b, uid, ident))
+        return;
+
+    /* a builtin is bound under its own name only - a read of a const
+     * bound to one is the builtin's name (#94) - and the copy's root
+     * holds the builtins */
+    if (bname)
+        return;
+
+    if (v.is<StructTypeDef *>()) {
+        /* the struct's own descriptor, not a copy: the decl does not own
+         * it (def_owner stays null) */
+        auto sd = make_unique<StructDeclStmt>();
+        sd->start = b.at;
+        sd->end = b.at;
+        sd->id = pt_id(uid, b.at);
+        sd->def = v.get<StructTypeDef *>();
+        b.decls.push_back(std::move(sd));
+        return;
+    }
+    if (v.is<intrusive_ptr<FuncObject>>()) {
+        const FuncObject &fo = *v.get_ref<intrusive_ptr<FuncObject>>();
+        const PtConstInit *ci = in ? pt_init_of(in, uid) : nullptr;
+        if (ci && ci->fn == fo.func) {
+            /* a const holding a function, declared by its initializer -
+             * after what that reads, which it runs */
+            unique_ptr<Construct> rv = ci->expr->clone();
+            pt_collect(b, rv.get(), in);
+            b.decls.push_back(pt_decl(uid, std::move(rv), true, b.at,
+                                      ci->dyn));
+            return;
+        }
+        pt_bind_func(b, uid, fo, in != nullptr);
+        return;
+    }
+    /* every other kind a const holds is a literal (a box, an exception
+     * object are run-time values) */
+    unique_ptr<Construct> lit;
+    if (!MakeConstructFromConstVal(v, lit, true, true)) { /* INT-COV-EXEMPT */
+        b.failed = true;
+        return;
+    }
+    lit->start = b.at;
+    lit->end = b.at;
+    b.decls.push_back(pt_decl(uid, std::move(lit), true, b.at, false));
+}
+
+/* every name `c` reads that `scope` binds, declared */
+void pt_collect(PtBuild &b, Construct *c, EvalContext *scope)
+{
+    if (!c)
+        return;
+    if (ctag(c) == ConstructType::id) {
+        const UniqueId *uid = static_cast<Identifier *>(c)->uid;
+        LValue *lv = nullptr;
+        if (EvalContext *in = pt_lookup(scope, uid, lv))
+            pt_bind(b, uid, lv->get(), lv, in);
+    }
+    if (ctag(c) == ConstructType::try_catch) {
+        /* a catch clause names a struct (or an alias of one) the walk
+         * below does not visit: declared in the copy, the copy's own
+         * inference resolves the clause to it (question 25) - a clause
+         * catches by identity, at compile time too */
+        for (auto &cs : static_cast<TryCatchStmt *>(c)->catchStmts) {
+            if (!cs.first.exList)
+                continue;
+            for (auto &id : cs.first.exList->elems) {
+                LValue *lv = nullptr;
+                EvalContext *in = pt_lookup(scope, id->uid, lv);
+                if (in && lv->get().is<StructTypeDef *>())
+                    pt_bind(b, id->uid, lv->get(), lv, in);
+            }
+        }
+    }
+    for_each_child_of(c, [&](Construct *ch) { pt_collect(b, ch, scope); });
+}
+
+/* the synthetic program around `call`: inferred, every function in it
+ * marked typed, its declarations bound */
+unique_ptr<PtEntry> pt_finish(PtBuild &b, unique_ptr<Construct> call,
+                              Loc at)
+{
+    auto root = make_unique<Block>();
+    root->start = at;
+    root->end = at;
+    for (auto &d : b.decls)
+        root->elems.push_back(std::move(d));
+    Construct *callp = call.get();
+    root->elems.push_back(std::move(call));
+
+    infer_parse_time(root.get());
+
+    /* every function of the program is typed now: a call to one runs it */
+    std::function<void (Construct *)> mark = [&](Construct *c) {
+        if (!c)
+            return;
+        if (ctag(c) == ConstructType::func_decl)
+            static_cast<FuncDeclStmt *>(c)->desc->parse_typed = true;
+        for_each_child_of(c, mark);
+    };
+    mark(root.get());
+
+    auto e = make_unique<PtEntry>();
+    e->croot = make_unique<EvalContext>(nullptr, true);
+    e->croot->parse_typed = true;
+    e->croot->pt_copy = true;
+    e->ctx = make_unique<EvalContext>(e->croot.get(), true);
+    auto *rb = static_cast<Block *>(root.get());
+    for (size_t i = 0; i + 1 < rb->elems.size(); i++)
+        rb->elems[i]->eval(e->ctx.get());
+    e->call = callp;
+    e->root = std::move(root);
+    return e;
+}
+
+/* the typed copy of a call the parser makes, as written */
+unique_ptr<PtEntry> pt_build_written(EvalContext *ctx, const CallExpr *call)
+{
+    PtBuild b;
+    b.at = call->start;
+    unique_ptr<Construct> cl = call->clone();
+    pt_collect(b, cl.get(), ctx);
+    if (b.failed)                       /* INT-COV-EXEMPT: the guards */
+        return nullptr;
+    return pt_finish(b, std::move(cl), call->start);
+}
+
+/* the typed copy of `obj` for these argument values, or null */
+unique_ptr<PtEntry> pt_build_value(FuncObject &obj,
+                                   const std::vector<EvalValue> &vals,
+                                   Loc call_site)
+{
+    PtBuild b;
+    b.at = call_site;
+    const UniqueId *callee = obj.func->name;
+    if (!callee)
+        callee = UniqueId::get("$ptc");
+    b.bound.emplace(callee, obj.func);
+    pt_bind_func(b, callee, obj, false);
+
+    auto args = make_unique<ExprList>();
+    for (size_t i = 0; i < vals.size(); i++) {
+        const EvalValue &v = vals[i];
+        unique_ptr<Construct> arg;
+        if (v.is<intrusive_ptr<FuncObject>>()) {
+            const FuncObject &fo = *v.get_ref<intrusive_ptr<FuncObject>>();
+            const UniqueId *n = fo.func->name
+                ? fo.func->name
+                : UniqueId::get("$pta" + std::to_string(i));
+            pt_bind(b, n, v, nullptr, nullptr);
+            arg = pt_id(n, call_site);
+        } else if (v.is<Builtin>()) {
+            /* a builtin by its name, as the program passes it */
+            const UniqueId *n = pt_builtin_name(v.get_ref<Builtin>());
+            if (!n) {   /* INT-COV-EXEMPT: every reachable one has a name */
+                b.failed = true;
+                break;
+            }
+            arg = pt_id(n, call_site);
+        } else if (v.is<StructTypeDef *>()) {
+            /* a struct TYPE by its name, declared in the copy (a `dyn`
+             * value there, as in the program - #95) */
+            const UniqueId *n = v.get<StructTypeDef *>()->name;
+            pt_bind(b, n, v, nullptr, nullptr);
+            arg = pt_id(n, call_site);
+        } else {
+            if (!MakeConstructFromConstVal(v, arg, true,
+                                           is_readonly_value(v))) {
+                b.failed = true;
+                break;
+            }
+            arg->start = call_site;
+            arg->end = call_site;
+        }
+        args->elems.push_back(std::move(arg));
+    }
+    if (b.failed)
+        return nullptr;
+
+    auto call = make_unique<CallExpr>();
+    call->start = call_site;
+    call->end = call_site;
+    call->what = pt_id(callee, call_site);
+    call->args = std::move(args);
+    unique_ptr<PtEntry> e = pt_finish(b, std::move(call), call_site);
+
+    CallExpr *callp = static_cast<CallExpr *>(e->call);
+    /* the callee's name was declared above as a function */
+    const EvalValue fv = RValue(callp->what->eval(e->ctx.get()));
+    if (!fv.is<intrusive_ptr<FuncObject>>())    /* INT-COV-EXEMPT: above */
+        return nullptr;
+    e->fn = fv;
+    for (size_t i = 0; i < vals.size(); i++)
+        if (vals[i].is<intrusive_ptr<FuncObject>>())
+            e->fn_args.emplace_back(
+                i, RValue(callp->args->elems[i]->eval(e->ctx.get())));
+    return e;
+}
+
+/* the cache's entry for `key`, built by `build` the first time */
+template <class Build>
+PtEntry *pt_entry(const std::string &key, Build build)
+{
+    auto it = g_pt_cache.find(key);
+    if (it == g_pt_cache.end()) {
+#ifdef TESTS
+        g_pt_builds++;
+#endif
+        it = g_pt_cache.emplace(key, build()).first;
+    }
+    return it->second.get();
+}
+
+/* a run's result, unless a function value in it is a copy's - whose
+ * descriptor dies with the cache, so it may not escape into the program:
+ * the call then runs untyped instead. (A struct declared inside a copied
+ * function is the program's own: a copy shares its definition -
+ * StructDeclStmt::clone.) */
+bool pt_result(EvalValue &r, EvalValue &out)
+{
+    std::unordered_set<const FuncDescriptor *> ds;
+    collect_value_descs(r, ds);
+    for (const FuncDescriptor *d : ds)
+        if (d->parse_typed) {
+#ifdef TESTS
+            g_pt_untyped++;
+#endif
+            return false;
+        }
+#ifdef TESTS
+    g_pt_runs++;
+#endif
+    out = std::move(r);
+    return true;
+}
+
+}  /* anonymous namespace */
+
+/* question 5: note the initializer of the const just declared as `id` in
+ * `scope` when it holds a function - a typed copy declares it by that, so
+ * the function arrives as it does in the program (and `dyn` where the
+ * program declared it so: such a value has no other type there) */
+void pt_note_const(EvalContext *scope, const Identifier *id,
+                   const Construct *init)
+{
+    const EvalValue &v = scope->lookup(id->uid)->get();
+    if (!v.is<intrusive_ptr<FuncObject>>()) {
+        if (scope->pt_inits)        /* a REPL redeclaration, say */
+            scope->pt_inits->m.erase(id->uid);
+        return;
+    }
+    if (!scope->pt_inits)
+        scope->pt_inits.reset(new PtConstInits());
+    PtConstInit &ci = scope->pt_inits->m[id->uid];
+    ci.dyn = id->dyn_mod;
+    ci.fn = v.get_ref<intrusive_ptr<FuncObject>>()->func;
+    ci.expr = init->clone();
+}
+
+#ifdef TESTS
+unsigned long g_pt_runs = 0, g_pt_builds = 0, g_pt_untyped = 0;
+#endif
+
+bool pt_typed_written(EvalContext *ctx, const CallExpr *call, EvalValue &out)
+{
+    PtEntry *e = pt_entry("w" + std::to_string(call->node_id),
+                          [&] { return pt_build_written(ctx, call); });
+    if (!e) {                           /* INT-COV-EXEMPT: the guards */
+#ifdef TESTS
+        g_pt_untyped++;
+#endif
+        return false;
+    }
+    EvalValue r = RValue(e->call->eval(e->ctx.get()));
+    return pt_result(r, out);
+}
+
+bool pt_args_name_function(EvalContext *ctx, Construct *args)
+{
+    bool found = false;
+    std::function<void (Construct *)> walk = [&](Construct *c) {
+        if (!c || found)
+            return;
+        if (ctag(c) == ConstructType::func_decl) {
+            found = true;
+            return;
+        }
+        LValue *lv = nullptr;
+        if (ctag(c) == ConstructType::id
+            && pt_lookup(ctx, static_cast<Identifier *>(c)->uid, lv)
+            && lv->get().is<intrusive_ptr<FuncObject>>()) {
+            found = true;
+            return;
+        }
+        for_each_child_of(c, walk);
+    };
+    walk(args);
+    return found;
+}
+
+bool pt_typed_value(FuncObject &obj, const std::vector<EvalValue> &vals,
+                    Loc call_site, EvalValue &out)
+{
+    /* the function by its node (never its address: a freed node's is
+     * reused), each argument by the static type it gives inference, and
+     * a function in one by its node too - the copy was inferred with it */
+    std::string key = "v" + std::to_string(obj.func->decl->node_id);
+    for (const EvalValue &v : vals) {
+        key += '|';
+        key += static_type_key(v);
+        std::unordered_set<const FuncDescriptor *> ds;
+        collect_value_descs(v, ds);
+        std::vector<uint64_t> ids;
+        for (const FuncDescriptor *d : ds)
+            ids.push_back(d->decl ? d->decl->node_id : 0); /* INT-COV-EXEMPT */
+        std::sort(ids.begin(), ids.end());
+        for (uint64_t id : ids)
+            key += ':' + std::to_string(id);
+    }
+
+    PtEntry *e = pt_entry(key, [&] {
+        return pt_build_value(obj, vals, call_site);
+    });
+    if (!e) {
+#ifdef TESTS
+        g_pt_untyped++;
+#endif
+        return false;
+    }
+
+    EvalValue r;
+    FuncObject &fn = *e->fn.get_ref<intrusive_ptr<FuncObject>>();
+    if (e->fn_args.empty()) {
+        r = pt_invoke(e->ctx.get(), fn, vals, call_site);
+    } else {
+        std::vector<EvalValue> args = vals;
+        for (const auto &fa : e->fn_args)
+            args[fa.first] = fa.second;
+        r = pt_invoke(e->ctx.get(), fn, args, call_site);
+    }
+    return pt_result(r, out);
+}
+
+void pt_cache_clear()
+{
+    g_pt_cache.clear();
+}
+
+/*
+ * #47: before a const bake FREES `slot`'s subtree, move out every function
+ * LITERAL in it whose descriptor the baked value still names, parking it in
+ * ParseContext::baked_funcs for the enclosing pBlock to re-insert (see that
+ * field). A decl the value does not name dies with the subtree as before -
+ * `sort([3, 1], pure func(a, b) => a < b)` bakes ints, and its comparator
+ * has nothing left to call it. The body of a detached decl goes with it; a
+ * literal nested in an UNNAMED decl's body is still searched, since a
+ * parse-time call of the outer one may have returned the inner one.
+ */
+static void
+detach_baked_funcs(ParseContext &c, unique_ptr<Construct> &slot,
+                   const std::unordered_set<const FuncDescriptor *> &descs)
+{
+    if (!slot)
+        return;
+    if (ctag(slot.get()) == ConstructType::func_decl
+        && descs.count(static_cast<FuncDeclStmt *>(slot.get())->desc))
+    {
+        c.baked_funcs.push_back(std::move(slot));
+        return;
+    }
+    for_each_child_slot(slot.get(), [&](unique_ptr<Construct> &ch) {
+        detach_baked_funcs(c, ch, descs);
+    });
+}
+
+/* The same, for a subtree the caller still owns through a raw pointer: its
+ * ROOT is never a function literal at the bake sites that use this (they
+ * bake array/dict/struct results), so only its children are searched. */
+static void
+detach_baked_funcs_below(ParseContext &c, Construct *node,
+                         const EvalValue &baked)
+{
+    std::unordered_set<const FuncDescriptor *> descs;
+    collect_value_descs(baked, descs);
+    collect_def_owner_funcs(node, baked, descs);
+    if (descs.empty())
+        return;
+    for_each_child_slot(node, [&](unique_ptr<Construct> &ch) {
+        detach_baked_funcs(c, ch, descs);
+    });
+}
+
+/*
  * Materialize a const expression's value into `out`, de-duplicating identical
  * const array/dict results across the parse. A drop-in for the
  * `MakeConstructFromConstVal(node->eval(...), out, ...)` pattern at the three
@@ -2846,12 +5724,21 @@ cse_key(ParseContext &c, const Construct *node)
  * result when it is a read-only (shareable) array/dict.
  */
 static bool
-cse_materialize(ParseContext &c,
-                Construct *node,
-                unique_ptr<Construct> &out,
-                bool process_arrays,
-                bool immutable)
+cse_materialize_core(ParseContext &c,
+                     Construct *node,
+                     unique_ptr<Construct> &out,
+                     bool process_arrays,
+                     bool immutable,
+                     EvalValue *deferred)
 {
+    /*
+     * `deferred` (pDeferFold): the node stays in the tree until inference
+     * has typed it, and the caller wants its value. Such a value is
+     * cached only when it names no function: the node may still be
+     * dropped (a dead branch) with the literal the value names, and no
+     * detach keeps that literal for a later hit, as cse_materialize's
+     * does for a node it replaces.
+     */
     /*
      * Only read-only array/dict results are cacheable, and those arise only
      * when process_arrays is set. An empty key means "don't touch the cache"
@@ -2864,18 +5751,31 @@ cse_materialize(ParseContext &c,
 
     if (!key.empty()) {
 
-        if (const EvalValue *hit = c.cse->lookup(key)) {
+        if (const EvalValue *hit = c.cse->lookup(key, immutable)) {
             /*
              * An identical const expression already produced this deep
              * read-only value: share it. It is immutable, so aliasing it
              * across const symbols is safe (and is the whole point).
              */
             out = make_unique<LiteralObj>(*hit, true);
+            static_cast<LiteralObj *>(out.get())->from_literal =
+                is_container_literal(node);
+            if (deferred)
+                *deferred = *hit;
             return true;
         }
     }
 
     const EvalValue &v = RValue(node->eval(c.const_ctx));
+
+    if (deferred) {
+        *deferred = v;
+        std::unordered_set<const FuncDescriptor *> descs;
+        collect_value_descs(v, descs);
+        collect_def_owner_funcs(node, v, descs);
+        if (!descs.empty())
+            key.clear();
+    }
 
     /*
      * Read-only array/dict: bake the deep read-only clone once, cache it, and
@@ -2888,12 +5788,15 @@ cse_materialize(ParseContext &c,
             v.is<intrusive_ptr<StructObject>>())
         && (immutable || is_readonly_value(v)))
     {
+        const bool ro = is_readonly_value(v);
         EvalValue baked = make_const_clone(v);
 
         if (!key.empty())
-            c.cse->insert(key, baked);
+            c.cse->insert(key, baked, ro);
 
-        out = make_unique<LiteralObj>(move(baked), true);
+        out = make_unique<LiteralObj>(std::move(baked), true);
+        static_cast<LiteralObj *>(out.get())->from_literal =
+            is_container_literal(node);
         return true;
     }
 
@@ -2901,7 +5804,43 @@ cse_materialize(ParseContext &c,
      * Everything else (scalars, strings, mutable arrays, non-materializable):
      * identical to the non-cached path.
      */
-    return MakeConstructFromConstVal(v, out, process_arrays, immutable);
+    if (!MakeConstructFromConstVal(v, out, process_arrays, immutable))
+        return false;
+    if (out && ctag(out.get()) == ConstructType::lit_obj
+            && is_container_literal(node))
+        static_cast<LiteralObj *>(out.get())->from_literal = true;
+    return true;
+}
+
+static bool
+cse_materialize(ParseContext &c,
+                Construct *node,
+                unique_ptr<Construct> &out,
+                bool process_arrays,
+                bool immutable)
+{
+    if (!cse_materialize_core(c, node, out, process_arrays, immutable))
+        return false;
+    ML_CHECK(out);              /* a bake always places a literal */
+    auto *lo = ctag(out.get()) == ConstructType::lit_obj
+        ? static_cast<LiteralObj *>(out.get()) : nullptr;
+    if (lo && bake_untypable(c, node, lo->literal_value())) {
+        out.reset();
+        return false;
+    }
+    /* the baked literal stands where `node` stood: its span */
+    if (!out->start) {
+        out->start = node->start;
+        out->end = node->end;
+    }
+    /* #47: `node` is about to be freed by the caller - keep alive every
+     * function literal in it that the baked value still names. */
+    if (lo) {
+        detach_baked_funcs_below(c, node, lo->literal_value());
+        lo->takes_hint = node_takes_hint(c, node);
+        lo->typed_by_place = node_typed_by_place(c, node);
+    }
+    return true;
 }
 
 bool
@@ -2929,7 +5868,9 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
             );
         }
 
-        if (pAcceptOp(c, Op::parenL)) {
+        bool dyn_catch = false;
+        if (pAcceptOp(c, Op::parenL)
+                && !(dyn_catch = pAcceptKeyword(c, Keyword::kw_dyn))) {
 
             exList = pList<IdList>(c, fl, pIdentifier);
 
@@ -2940,6 +5881,39 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
                     "Expected non-empty exception list, got",
                     &c.get_tok()
                 );
+            }
+
+            /* The COMPILE-TIME half of UncatchableRuntimeException: an
+             * interpreter-bug tripwire (InternalErrorEx) or a name error
+             * (UndefinedVariable) is reported properly but may never be
+             * HANDLED, so naming one here is refused rather than silently
+             * never matching. The run-time half is the is_catchable() test
+             * in both catch matchers, which also defeats the catch-all. */
+            for (auto &ex_id : exList->elems) {
+                if (is_uncatchable_ex_name(ex_id->get_str())) {
+                    throw SyntaxErrorEx(
+                        ex_id->start,
+                        "This exception cannot be caught: "
+                        "it reports an error the script must not handle"
+                    );
+                }
+                /* A name is resolved where the clause is written, by the
+                 * inferencer (resolve_catch_types, question 25) - a TYPE
+                 * ALIAS (`const T = S;`) included, so the name stays as
+                 * written: rewritten to the struct's own name here, a
+                 * clause through an alias was refused wherever that name
+                 * is not the struct (`func f(S) { .. catch (T) .. }`, an
+                 * alias of a struct some function declared). An alias a
+                 * binding of its name hides is refused here, as in any
+                 * type position. */
+                bool hidden = false;
+                lookup_struct_type(c, ex_id->get_str(), &hidden);
+                if (hidden) {
+                    const StructTypeDef *h =
+                        const_struct_binding(c, ex_id->uid);
+                    if (h->name != ex_id->uid)
+                        not_a_type(c, ex_id->get_str(), ex_id->start);
+                }
             }
 
             if (pAcceptKeyword(c, Keyword::kw_as)) {
@@ -2959,18 +5933,47 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
             pExpectOp(c, Op::parenR);
 
+        } else if (dyn_catch) {
+
+            /* question 25: `catch (dyn as e)` - the catch-all that binds
+             * what it caught, whatever its type (a struct no clause here
+             * can name, a built-in exception), to print it, say. Like
+             * `catch { }` it has no type list. */
+            unique_ptr<Construct> id;
+            if (!pAcceptKeyword(c, Keyword::kw_as)
+                    || !pAcceptId(c, id, false)) {
+                throw SyntaxErrorEx(
+                    c.get_loc(),
+                    "Expected 'as' and a name after 'catch (dyn' "
+                    "(`catch { }` catches without binding), got",
+                    &c.get_tok()
+                );
+            }
+            asId.reset(static_cast<Identifier *>(id.release()));
+            pExpectOp(c, Op::parenR);
+            have_catch_anything = true;
+
         } else {
 
             have_catch_anything = true;
         }
 
+        /* the catch variable is its own binding in the body, whatever
+         * const an outer name of it denotes (#133's shadowing) */
+        c.shadow_push();
+        if (asId)
+            c.shadow_add(asId->uid);
         if (!pAcceptBracedBlock(c, body, fl | pFlags::pInCatchBody))
             throw SyntaxErrorEx(c.get_loc(), "Expected { } block, got", &c.get_tok());
+        c.shadow_pop();
 
-        stmt->catchStmts.emplace_back(
-            AllowedExList{move(exList), move(asId)},
-            move(body)
-        );
+        /* (filled in place: a temporary AllowedExList leaves a
+         * conditional cleanup per member, branches no run takes) */
+        stmt->catchStmts.emplace_back();
+        auto &clause = stmt->catchStmts.back();
+        clause.first.exList = std::move(exList);
+        clause.first.asId = std::move(asId);
+        clause.second = std::move(body);
     };
 
     if (pAcceptKeyword(c, Keyword::kw_finally)) {
@@ -2986,7 +5989,7 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         );
     }
 
-    ret = move(stmt);
+    ret = std::move(stmt);
     return true;
 }
 
@@ -3023,7 +6026,25 @@ pAcceptForeachStmt(ParseContext &c,
     if (pAcceptKeyword(c, Keyword::kw_indexed))
         stmt->indexed = true;
 
-    stmt->container = pExpr01(c, fl);
+    /* An EXPRESSION, so not with the statement's pInStmt: pExpr14 reads that
+     * flag as "a multi-assignment target list may start here", and every
+     * element of an array literal and every call argument in the container
+     * is parsed by pExpr14 - so `foreach (x in [j, -j])` and
+     * `foreach (x in range(j, -j, -1))` took `j ,` for an id list and
+     * refused the `-` (a SyntaxError until 2026-10-05). Every other header
+     * reaches its expressions through pExprTop, whose pExpr14 strips the
+     * flag before the operand; this one starts below it. */
+    {
+        /* the one expression not parsed through pExpr14: the same check */
+        const size_t mark = c.pending_fold.size();
+        try {
+            stmt->container = pExpr01(c, fl & ~pFlags::pInStmt);
+        } catch (...) {
+            c.pending_fold_drop(mark);
+            throw;
+        }
+        c.pending_fold_check(mark);
+    }
 
     if (!stmt->container)
         noExprError(c);
@@ -3032,10 +6053,20 @@ pAcceptForeachStmt(ParseContext &c,
     stmt->start = start;
     stmt->end = c.get_loc();
 
-    if (!pAcceptBracedBlock(c, stmt->body, fl | pFlags::pInLoop))
-        stmt->body = pWrapDeclBody(pStmt(c, fl | pFlags::pInLoop));
+    /* #133: a loop VAR named after a const builtin shadows it in the body
+     * (`foreach (var abs in a) { abs(-1); }` folded to the BUILTIN, where the
+     * un-folded run correctly refuses to call an int). Pushed here, not in
+     * pBlock, because the var is declared OUTSIDE the body's own scope. */
+    c.shadow_push();
+    for (const auto &lv : stmt->ids->elems)
+        if (const auto *lid = node_cast<const Identifier>(lv.get()))
+            c.shadow_add(lid->uid);
 
-    if (c.const_eval && stmt->container->is_const) {
+    if (!pAcceptBracedBlock(c, stmt->body, fl | pFlags::pInLoop))
+        stmt->body = pBraceLessBody(c, fl | pFlags::pInLoop);
+    c.shadow_pop();
+
+    if (stmt->container->is_const) {
 
         const EvalValue &v = RValue(stmt->container->eval(c.const_ctx));
 
@@ -3055,7 +6086,7 @@ pAcceptForeachStmt(ParseContext &c,
         }
     }
 
-    ret = move(stmt);
+    ret = std::move(stmt);
     return true;
 }
 
@@ -3090,10 +6121,19 @@ pAcceptForStmt(ParseContext &c,
     stmt->inc = pExprTop(c, fl);
     pExpectOp(c, Op::parenR);
 
+    /* a brace-less body is a loop body too (README: `for (...) if (c)
+     * break;` - it was refused, 'break' outside a loop) */
     if (!pAcceptBracedBlock(c, stmt->body, fl | pFlags::pInLoop))
-        stmt->body = pWrapDeclBody(pStmt(c, fl));
+        stmt->body = pBraceLessBody(c, fl | pFlags::pInLoop);
+
+    if (!stmt->cond) {
+        stmt->cond_true = true;
+    } else if (stmt->cond->is_const) {
+        const EvalValue &v = stmt->cond->eval(c.const_ctx);
+        stmt->cond_true = v.get_type()->is_true(v);
+    }
 
     stmt->end = c.get_loc();
-    ret = move(stmt);
+    ret = std::move(stmt);
     return true;
 }

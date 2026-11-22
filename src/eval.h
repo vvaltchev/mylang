@@ -17,6 +17,8 @@
 #include <unordered_map>
 
 class Identifier;
+struct PtConstInits;  /* parser.h */
+class CaptureSlots;   /* a closure's captured values - defined below */
 
 /*
  * Non-local control flow (return/break/continue) is signaled through this
@@ -29,6 +31,8 @@ class Identifier;
  * use C++ exceptions, where the zero-cost-when-not-thrown model is the right
  * fit.
  */
+struct RuntimeException;
+
 struct FlowState {
 
     enum Type : unsigned char {
@@ -40,6 +44,15 @@ struct FlowState {
 
     Type type = none;
     EvalValue value;    /* the return value, meaningful when type == ret */
+
+    /*
+     * The exception the innermost RUNNING catch body of this invocation
+     * handles, or null: `rethrow` raises it again where it stands, so a
+     * `try` around the `rethrow` inside that body catches it (Python's
+     * `raise`, C#'s `throw;`, the VM). Per invocation, like `rethrow`
+     * itself, which a function literal cannot carry out of its catch.
+     */
+    RuntimeException *handling = nullptr;
 };
 
 /*
@@ -90,8 +103,82 @@ struct PureCacheKeyHash {
     }
 };
 
+/*
+ * A GENERAL array's element read as an INT, by the typed reads of every
+ * engine (Subscript::eval_int, the VM's element-int cores). A bool reads
+ * as 0/1, exactly as a FLAT bool element does: an array<bool> is not
+ * always flat - an inline keys() of a dict<bool, ...> builds a general
+ * one, and the bind accepts it - so `if (b[i])` on one raised
+ * TypeErrorEx in every engine, each with another caret. Anything else is
+ * the type error it always was.
+ */
+inline int_type general_elem_int(const LValue &e)
+{
+    if (e.is<bool>())
+        return e.getval<bool>() ? 1 : 0;
+    return e.getval<int_type>();
+}
+
+/* Its FLOAT twin: a typed float expression reads an int or bool operand
+ * as a float, so an element of a general array<int> or array<bool> is
+ * widened here (a bool to 0.0/1.0). The tree-walker's float chain asked a
+ * general bool element for a float and raised TypeErrorEx until
+ * 2026-11-07, where the VM read it as an int and widened the result. */
+inline float_type general_elem_float(const LValue &e)
+{
+    if (e.is<int_type>())
+        return static_cast<float_type>(e.getval<int_type>());
+    if (e.is<bool>())
+        return e.getval<bool>() ? 1.0 : 0.0;
+    return e.getval<float_type>();
+}
+
+/*
+ * A dict value or a general array element that a TYPED read takes as an
+ * int (or a float) holds a number of that kind: inference proved the
+ * container's element type, and the one way to store anything else is a
+ * `dyn` alias of it (#49 leaves a container reached through a dyn NAME
+ * unchecked). A read meeting anything else - a string - raises
+ * TypeErrorEx at the READ's caret, the span its OutOfBoundsEx or
+ * KeyNotFoundEx takes, in every engine (RULE 2: the tree-walker marked
+ * the enclosing statement, the VM nothing, the JIT the read).
+ */
+inline bool reads_as_int(const EvalValue &v)
+{
+    return v.is<int_type>() || v.is<bool>();
+}
+
+inline bool reads_as_float(const EvalValue &v)
+{
+    return v.is<float_type>() || v.is<int_type>() || v.is<bool>();
+}
+
+/* the tree-walker's form, whose caret is in hand */
+inline int_type typed_read_int(const EvalValue &v, Loc s, Loc e)
+{
+    if (!reads_as_int(v))
+        throw TypeErrorEx(s, e);
+    return v.is<bool>() ? (v.get<bool>() ? 1 : 0) : v.get<int_type>();
+}
+
+inline float_type typed_read_float(const EvalValue &v, Loc s, Loc e)
+{
+    if (!reads_as_float(v))
+        throw TypeErrorEx(s, e);
+    if (v.is<int_type>())
+        return static_cast<float_type>(v.get<int_type>());
+    if (v.is<bool>())
+        return v.get<bool>() ? 1.0 : 0.0;
+    return v.get<float_type>();
+}
+
 /* Node-POOLED (poolalloc.h) like the dict map: a recursion's per-frame
  * cache inserts a node per novel call - the pool serves + reuses them. */
+/* -npc: the per-frame pure-call cache is OFF.  Declared HERE, above
+ * Frame, because ensure_pure_cache()'s ML_CHECK reads it - and the
+ * JIT's -npc norec exemption rests on that check. */
+extern bool g_pure_cache_enabled;
+
 typedef std::unordered_map<PureCacheKey, EvalValue, PureCacheKeyHash,
                            std::equal_to<PureCacheKey>,
                            PoolAlloc<std::pair<const PureCacheKey,
@@ -115,15 +202,36 @@ struct Frame {
     Frame(const Frame &) = delete;  /* never copied; slots would dangle */
     Frame(Frame &&) = delete;
 
+    /*
+     * ⛔ THE ONE ALLOCATION SITE, AND THE JIT NOW DEPENDS ON ITS GUARD.
+     *
+     * `jit_chunk_norec_ok` refuses a body containing CachedCallV,
+     * because "a cached-call body could acquire a live vframe pure
+     * cache, which a record-less return cannot stash".  Under `-npc`
+     * that hazard CANNOT occur - no cache is ever built - so the tier
+     * is allowed there, which is worth -20.7% Ir on 09_fib.
+     *
+     * That makes "no PureCache exists when the flag is off" a
+     * SOUNDNESS PRECONDITION of emitted code, not a tidy fact.  It
+     * held by audit when written (every path here - pure_cache_call's
+     * two callers, vm_cache_probe_vals' four, and
+     * vm_frame_leave_cached, which is reachable only via a parked
+     * probe key - tests the flag first).  An audit is a snapshot; this
+     * is the invariant, stated where it cannot be walked past.
+     */
     PureCache &ensure_pure_cache()
     {
+        ML_CHECK_MSG(g_pure_cache_enabled,
+                     "a pure cache is being built with the cache "
+                     "DISABLED - jit_chunk_norec_ok's -npc exemption "
+                     "rests on this being impossible");
         if (!pure_cache)
             pure_cache = std::unique_ptr<PureCache>(new PureCache());
         return *pure_cache;
     }
 
     /*
-     * VIEW mode (the VM activation, plans/vm-native-call-stack.md): point
+     * VIEW mode (the VM activation, plans/archived/vm-native-call-stack.md): point
      * this frame at EXTERNALLY-OWNED slot storage (a window of the
      * activation's slot stack). The frame owns nothing in this mode - the
      * dtor destroys only placement-built inline slots (none here; the
@@ -211,6 +319,30 @@ struct GlobalFuncTable {
         slots.resize(nm.size());
         defined.assign(nm.size(), 0);
     }
+
+    /*
+     * THE ONLY TWO WAYS TO WRITE A GLOBAL SLOT. Marking `defined` in the same
+     * statement as the store is not a convenience - it is the invariant the
+     * EMITTED call site depends on:
+     *
+     *     an UNDEFINED slot holds the default-constructed LValue, i.e.
+     *     `none`, whose type can never pass a FuncObject check.
+     *
+     * So the inline call push tests only the TYPE and lets an undefined
+     * callee decline to the C++ tier, which raises UndefinedVariableEx with
+     * its caret exactly as before - the separate `defined` probe it used to
+     * emit (a load from a DIFFERENT vector, hence a second cache line) is
+     * redundant. Route every new write through these, or that stops being
+     * true silently.
+     */
+    void define(size_t slot, LValue &&v) {
+        slots[slot] = std::move(v);
+        defined[slot] = 1;
+    }
+    void put_defined(size_t slot, EvalValue &&v) {
+        slots[slot].put(std::move(v));
+        defined[slot] = 1;
+    }
 };
 
 class EvalContext {
@@ -261,6 +393,29 @@ public:
     bool allow_redeclare = false;
 
     /*
+     * Set on the PARSER's root const context (ParseContext, and the REPL's
+     * persistent const scope) unless type inference is off (-nti), and
+     * read through `root`: a user function run at PARSE time is first
+     * type-inferred for its argument types (pt_typed_call, parser.cpp -
+     * question 5, plans/open-language-questions.md), so a constant call
+     * computes with the types the same call has at run time. AutoConst's
+     * own const context (after inference) never has it.
+     */
+    bool parse_typed = false;
+
+    /*
+     * Question 5: a typed copy's own const root (pt_typed_written): a call
+     * made at its top level is one a running function makes, by value.
+     */
+    bool pt_copy = false;
+
+    /*
+     * Question 5: the initializers of the consts this CONST scope declared
+     * holding a function (pt_note_const, parser.h). Allocated on the first.
+     */
+    std::unique_ptr<PtConstInits> pt_inits;
+
+    /*
      * The current call's slot Frame, or nullptr outside any resolved call.
      * Inherited from the parent on construction; do_func_call points a resolved
      * call's args context at a fresh Frame.
@@ -285,7 +440,7 @@ public:
      * at the called closure's vector. A `SymKind::capture` reference
      * reads/writes `(*captures)[slot]` - an O(1) slot, no map walk.
      */
-    std::vector<LValue> *captures;
+    CaptureSlots *captures;
 
     /*
      * Points at the FlowState shared by every context within the current
@@ -300,6 +455,34 @@ public:
      */
     FlowState *flow;
 
+    /*
+     * #114: THE ROOT of this context chain - `this` for a root, the
+     * parent's otherwise, so it is inherited exactly like `frame`,
+     * `gfuncs` and `captures` above.
+     *
+     * Every closure creation needs it (`FuncObject::capture_root`), and
+     * `get_root_ctx` re-derived it by WALKING the parent chain - 5 Ir
+     * per closure to recompute a value that never changes. The trade is
+     * one store per EvalContext construction against one walk per
+     * closure, and it is lopsided the right way: under the VM+JIT an
+     * EvalContext is built a few dozen times in a whole program (the
+     * call protocol uses the native window instead), while 63_closures
+     * creates 400,000 closures. MEASURED before assuming: the ctor
+     * appears in that bench's profile at ~30k Ir total.
+     */
+    EvalContext *root;
+
+    /*
+     * A CONST scope's liveness (#38 B): set only on a const context, and
+     * cleared by its destructor. A `pure func` created during const
+     * evaluation remembers its DEFINING const scope (FuncObject::
+     * const_scope) - its body reads the consts in scope there, which a
+     * nested block's const context holds, not the root - and the parse
+     * pops block scopes long before a baked function value can be called
+     * again, so the token says whether the pointer may still be followed.
+     */
+    std::shared_ptr<bool> scope_alive;
+
     EvalContext(const EvalContext &rhs) = delete;
     EvalContext(EvalContext &&rhs) = delete;
 
@@ -307,6 +490,7 @@ public:
                 bool const_ctx = false,
                 bool func_ctx = false,
                 bool repl = false);
+    ~EvalContext();
 
     LValue *lookup(const Identifier *id);
     LValue *lookup(const UniqueId *uid);
@@ -344,6 +528,19 @@ public:
  */
 int builtin_slot_index(const UniqueId *uid);
 LValue &builtin_slot(int index);
+/* The number of entries - the bound a stored `SymKind::builtin` index must
+ * satisfy (#137's verifier). Builds the table if it is not built yet. */
+size_t builtin_slot_count();
+
+/* The registered NAME of a builtin-table slot by index - works for ANY
+ * entry (a Builtin function OR a value like `argv`). For the
+ * disassembler's `load.builtin` annotation. */
+std::string_view builtin_slot_name(int index);
+bool builtin_slot_is_int(int index);
+/* .myv: a fingerprint of the builtin SET - a stored image's baked builtin
+ * SLOT indices are only valid for the same set (see types.cpp). */
+uint64_t builtin_set_fingerprint();
+
 /* did the builtin come from const_builtins (visible during const-eval)? */
 bool builtin_is_const(int index);
 
@@ -368,7 +565,7 @@ extern bool g_dev_builtins_allowed;
  * but the callee of a direct call) is a COMPILE-TIME error (the inferencer's
  * reject_dev_builtins walk, same g_dev_builtins_allowed gate: the REPL keeps
  * the AST and allows the indirect form, like `show`). Maintainer-decided rule
- * (2026-07-14) - see plans/vm-fallback-elimination.md, fork F1.
+ * (2026-07-14) - see plans/archived/vm-fallback-elimination.md, fork F1.
  */
 bool is_lazy_builtin(const UniqueId *uid);
 
@@ -393,7 +590,7 @@ class CallExpr;
 EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
                             Loc a0s, Loc a0e, const StructTypeDef *cdef,
                             const ArgLoc *flocs, const EvalValue *vals,
-                            size_t n);
+                            size_t n, bool checked = false);
 
 /* F1 step 2: the VALUES dispatch of an INDIRECT builtin call, keyed on
  * Builtin::Kind - value (func_v), lvalue (func_lv; arg0 may be an
@@ -404,6 +601,27 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
 EvalValue dispatch_builtin_values(EvalContext *ctx, const Builtin &b,
                                   const ArgLocs *al, const EvalValue *args,
                                   size_t n);
+
+/* The arg0 TARGET an INDIRECT call hands an `lvalue` builtin's func_lv:
+ * `lv` when arg0 is an lvalue; else `tmp` loaded with arg0's VALUE - README
+ * *Storing through a value*: an in-place builtin works on a value, held
+ * for the call's length, as the direct call's adapter (lv_builtin_target,
+ * types.cpp) holds it. An UNDEFINED arg0 is null (the builtin's own
+ * error, as the direct call's) - except for a builtin that also takes a
+ * value (Builtin::arg0_value_ok - sort/rev_sort/reverse), where it throws
+ * UndefinedVariableEx, as reading it would: the compile-time folder
+ * relies on that to leave a call it cannot evaluate (#54: `sort(K)` with
+ * a const array K under -nc reached it that way). */
+inline LValue *builtin_lv_target(const Builtin &b, LValue *lv,
+                                 const EvalValue &arg0, LValue &tmp)
+{
+    if (lv)
+        return lv;
+    if (!b.arg0_value_ok && arg0.is<UndefinedId>())
+        return nullptr;
+    tmp.put(RValue(arg0));
+    return &tmp;
+}
 
 /* The VALUES twin of construct_struct for an INDIRECT construction (args
  * pre-evaluated + unvalidated: the full runtime arity/coerce checks run, with
@@ -427,11 +645,8 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
 /* Coerce + runtime-validate one struct field value (eval.cpp; shared with the
  * VM's pre-coercing vm_struct_ctor - H1). */
 struct FieldDef;
-EvalValue coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e);
-
-intrusive_ptr<StructObject>
-construct_struct_from_values(StructTypeDef *def,
-                             const EvalValue *vals, size_t n);
+EvalValue coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e,
+                              bool check_fit = false);
 
 /* VM StructCtorBoxedV: construct a BOXED (non-POD) struct from its field VALUES
  * (`vals[0..nargs)`), mirroring construct_struct's boxed loop. A field coerce
@@ -440,7 +655,8 @@ construct_struct_from_values(StructTypeDef *def,
  * none. See eval.cpp. */
 intrusive_ptr<StructObject>
 construct_struct_boxed_from_values(StructTypeDef *def, const EvalValue *vals,
-                                  size_t nargs, const ArgLoc *locs);
+                                  size_t nargs, const ArgLoc *locs,
+                                  bool check_fit);
 
 /* VM MakeStructArrayV: build a FLAT array<PodStruct> literal from N structs'
  * field VALUES (interleaved: struct i's field j at vals[i*M + j], M =
@@ -454,9 +670,11 @@ EvalValue vm_make_struct_array(StructTypeDef *def, size_t n,
  * or a general array (any base - type-dispatched Type::subscript(for_write)
  * + slot_rmw). AST-free: the not-an-lvalue caret is a Loc pair (from the loc
  * side table), not a node. See eval.cpp. */
+/* `checked` (Q2, Instr::ct_checked): a store through `dyn` - the value
+ * is checked against the container's own type (ct_fit) */
 EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
                              const EvalValue &value, Op op,
-                             Loc lstart, Loc lend);
+                             Loc lstart, Loc lend, bool checked = false);
 
 /* VM (IncDecElemCheckedV): `c[k]++` / `c[k]--` on a dyn/unproven base - forms
  * the element LValue, enforces int/float, applies ±1 (statement). Two carets:
@@ -467,36 +685,300 @@ void vm_incdec_elem(LValue *base_lv, const EvalValue &key, bool is_inc,
 
 /* VM (IncDecMemberCheckedV): `d.f++` / `d.f--` on a dyn/unproven base - forms
  * the member LValue (struct field / dict value), enforces int/float, applies
- * ±1 (statement). Two carets: member loc (KeyNotFound) vs inc-dec loc
- * (NotLValue/TypeError). See eval.cpp. */
+ * ±1 (statement). Three carets: member loc (KeyNotFound), base loc
+ * ("Expected dict object") and inc-dec loc (NotLValue/TypeError). See
+ * eval.cpp. */
 void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
                       const UniqueId *memUid, bool is_inc,
-                      Loc mstart, Loc mend, Loc id_start, Loc id_end);
+                      Loc mstart, Loc mend, Loc bstart, Loc bend,
+                      Loc id_start, Loc id_end);
 
 /* VM (CoerceNumV): the typed-store numeric coerce - the same
  * coerce_to_decl_type the tree-walker's op==assign path runs (widen float <-
  * int/bool and int <- bool, pass none, THROW on a non-fitting dyn value).
- * See eval.cpp. */
-EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float);
+ * `site_arg`: the call-site argument index when this coerces a PARAMETER
+ * for a call site (the throw carries it - Exception::bind_arg - so the
+ * site carets that argument); -1 for an assignment. See eval.cpp. */
+EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float,
+                             int site_arg = -1);
+
+/* The ONE derivation of a function's bind plan: `fast_bind` + `bind_req`
+ * (funcdesc.h). Every site that needs either calls this. */
+void compute_bind_flags(const FuncDescriptor *d);
+
+/*
+ * #49: does a run-time value fit a place's declared type (types/fit.cpp.h)?
+ * The check a `dyn` value - or a container holding one - meets where it
+ * enters a parameter, a declared variable, an element, a field or a dict,
+ * shared by every engine so they refuse the same values with the same
+ * message. On a misfit `why` names WHERE inside the value the misfit
+ * is ("" for the value itself, "[1]", "[\"k\"]", "key 3", "default")
+ * and what is there ("int", "none", "P").
+ */
+struct FitSpec;
+struct FitMisfit {
+    std::string where;
+    std::string got;
+};
+bool value_fits(const EvalValue &v, const TypeAnnot &a, FitMisfit &why);
+/* Q2 increment 3: value_fits, and an untyped container that fits takes
+ * the place's type (fit_adopt) - what a value ENTERING a place calls */
+bool value_enters(const EvalValue &v, const TypeAnnot &a, FitMisfit &why);
+/* do containers take types in this run? Only in one compiled with type
+ * inference (README: under -nti no container has a type). Set by
+ * infer_types and the script driver, carried by a VmProgram
+ * (VmProgram::typed) and a .myv image, and set from the program by
+ * vm_run. */
+extern bool g_ctype_adopt;
+
+/* question 25: the struct a thrown exception carries (what a catch clause
+ * naming a struct compares by identity), or null - a built-in exception,
+ * or a box (a box<P> is not a P). `is_struct`: it carries a struct object
+ * at all, a box included; a built-in exception's name catches none */
+const StructTypeDef *exc_struct_def(const RuntimeException *ex,
+                                    bool &is_struct);
+
+/* the misfit errors, loc-less: a parameter's (`site_arg`: the call-site
+ * argument index, as none_bind_error's) and a store's */
+TypeErrorEx param_fit_error(const UniqueId *param, const TypeAnnot &a,
+                            const FitMisfit &m, int site_arg);
+TypeErrorEx fit_error(const FitSpec &spec, const FitMisfit &m);
+
+/*
+ * THE CAST (plans/cast.md, types/cast.cpp.h): `v` converted to exactly
+ * the type `t` - a scalar by the table, a container rebuilt in `t`'s
+ * storage, a struct / class / box copied - or an InvalidValueEx (a value
+ * the conversion cannot take) / a TypeErrorEx (a value of the wrong kind)
+ * naming the position inside `v`. `at_compile`: a constant evaluation
+ * (float(s)'s range rule). Every engine's cast is this function; the _loc
+ * form gives the refusal the cast's argument's caret [s, e).
+ */
+EvalValue cast_value(const EvalValue &v, const TypeAnnot &t,
+                     bool at_compile);
+EvalValue cast_value_loc(const EvalValue &v, const TypeAnnot &t,
+                         bool at_compile, Loc s, Loc e);
+
+/* throw fit_error unless `v` fits `spec` */
+void check_fit(const EvalValue &v, const FitSpec &spec);
+/* the same, the error carrying the value's caret [s, e) - the
+ * tree-walker's stores (Expr14::rv_fit, Subscript::key_fit,
+ * ExprList::arg_fit) */
+void check_fit_loc(const EvalValue &v, const FitSpec &spec, Loc s, Loc e);
+
+/*
+ * Q2 (plans/typed-containers.md): a store the compiler could not check
+ * against the container's own type - a store through `dyn` - checks the
+ * value at the write (types/fit.cpp.h).
+ *  - ct_elem_annot: what a store into container `c` checks against (an
+ *    array's element type, a dict's value type; null = nothing: untyped,
+ *    or not a container);
+ *  - ct_fit (an annotation; `dict` names a dict's value in the message)
+ *    and ct_fit_value (container `c`): the value to store - an int or a
+ *    bool into a float element converted, a bool into an int one - or a
+ *    TypeErrorEx carrying [s, e) (no caret for Loc());
+ *  - ct_fit_key: the same for a NEW key of a dict, checked wherever one
+ *    is inserted, however the dict was reached.
+ */
+const TypeAnnot *ct_elem_annot(const EvalValue &c);
+/* `a + b` on arrays builds a NEW array from a copy of `a` (BinOpV, the
+ * tree-walker's Expr04): the copy starts UNTYPED, so what `b` appends is
+ * not checked against `a`'s type - the sum's static type may be wider
+ * (`[1, none] + ["s"]` is an array<dyn>) - and the sum takes that static
+ * type once built (StampTypeV, Expr04's own stamp). */
+inline void ctype_sum_copy(const EvalValue &v)
+{
+    if (v.is<SharedArrayObj>())
+        const_cast<SharedArrayObj &>(v.get_ref<SharedArrayObj>())
+            .set_ctype(nullptr);
+}
+/* ...and nothing else holds that copy, so the sum may give it the storage
+ * its elements need (TypeArr::add, arr_sum_join): `[1] + [1.5]` is an
+ * array<float>, `[1] + ["x"]` an array<dyn>. `g_arr_sum_copy` names the
+ * copy for the duration of one `+` (ArrSumScope, at the three places that
+ * make the copy); an array any name holds keeps its storage. */
+extern const EvalValue *g_arr_sum_copy;
+struct ArrSumScope {
+    explicit ArrSumScope(const EvalValue &v) { g_arr_sum_copy = &v; }
+    ~ArrSumScope() { g_arr_sum_copy = nullptr; }
+    ArrSumScope(const ArrSumScope &) = delete;
+    ArrSumScope &operator=(const ArrSumScope &) = delete;
+};
+EvalValue ct_fit(const TypeAnnot *a, EvalValue v, bool dict,
+                 Loc s = Loc(), Loc e = Loc());
+EvalValue ct_fit_value(const EvalValue &c, EvalValue v,
+                       Loc s = Loc(), Loc e = Loc());
+EvalValue ct_fit_key(const DictObject &d, EvalValue key);
+/* the storage a parsed `array<...>` annotation gives an array (`sd`: the
+ * POD struct a flat_s array needs) - types/fit.cpp.h */
+ArrHint annot_arr_hint(const TypeAnnot *a, const StructTypeDef *&sd);
+/* choice 6 (plans/strict-container-types.md): a FRESH zero value of the
+ * type `a`, what `T x;` gives, into `out` (null: only the answer); false
+ * when the type has none - a non-opt `dyn`, a struct reaching one, a
+ * struct field whose struct is a forward reference - types/fit.cpp.h */
+bool annot_zero_value(const TypeAnnot *a, EvalValue *out, int depth = 0);
+
+/*
+ * RULE 1 (2026-10-05): a parameter not declared `opt` never holds `none`
+ * (README, "A none the compiler cannot see is refused at the call"), so a
+ * bind REFUSES it - a TypeErrorEx, like a bind coercion's, naming the
+ * argument (`site_arg`: the call-site argument index, carried as
+ * Exception::bind_arg; -1 for a builtin CALLBACK, whose parameter names no
+ * argument of the builtin call). none_bind_error builds it, loc-less.
+ * Static checking covers an `opt` argument; a `dyn` one is non-opt by
+ * type and may still hold none, so the binds a dyn value can reach check
+ * at run time: the tree-walker's bind_param (every bind), CheckNoneArgsV
+ * before the VM's three call ops where codegen could not prove the
+ * arguments (CallExpr::may_bind_none), the generic dyn-callee call and
+ * the callback binds (always - slow paths already).
+ */
+TypeErrorEx none_bind_error(const UniqueId *param, int site_arg);
+[[noreturn]] void throw_none_bind(const UniqueId *param, int site_arg);
+
+/* would bind_param's numeric coercion throw for `v`? (`none` aside) */
+inline bool bind_coerce_throws(DeclType dt, const EvalValue &v)
+{
+    if (dt == DeclType::f)
+        return !v.is<float_type>() && !v.is<int_type>() && !v.is<bool>();
+    if (dt == DeclType::i)
+        return !v.is<int_type>() && !v.is<bool>();
+    return false;
+}
+
+/*
+ * The VM's pre-bind check: argument i is `arg_at(i)`. The first argument
+ * the bind would REFUSE - a none bound to a parameter not declared `opt`,
+ * or (#49) a value that misfits a parameter's ParamDesc::fit - or idx -1
+ * when the bind accepts. Walked in PARAMETER order, stopping (-1) exactly
+ * where the bind itself would raise first, at a numeric coercion that
+ * throws, so a site raises the error the tree-walker's bind_param raises
+ * at the same argument whatever mix of faults the call has. The caller
+ * builds the refusal (bind_fault_error) and gives it its own caret. This
+ * form needs the argument count in range - a caller whose bind checks the
+ * arity AFTER this runs uses bind_fault below.
+ */
+struct BindFault {
+    int idx = -1;               /* the refused argument; -1: accepted */
+    bool fit = false;           /* a misfit (#49), else a none */
+    FitMisfit m;                /* the misfit's place and kind */
+};
+
+template <class ArgAt>
+inline BindFault bind_fault_in_range(const FuncDescriptor *d, size_t n,
+                                     ArgAt arg_at)
+{
+    BindFault f;
+    for (size_t i = 0; i < n; i++) {
+        const FuncDescriptor::ParamDesc &p = d->params[i];
+        const EvalValue &v = arg_at(i);
+        if (v.is<NoneVal>()) {
+            if (p.opt)
+                continue;
+            f.idx = static_cast<int>(i);
+            return f;
+        }
+        if (bind_coerce_throws(p.decl_type, v))
+            return f;                   /* the bind's coercion error first */
+        if (p.fit && !value_enters(v, *p.fit, f.m)) {
+            f.idx = static_cast<int>(i);
+            f.fit = true;
+            return f;
+        }
+    }
+    return f;
+}
+
+/* the same, for a count not yet checked: the bind's arity error first */
+template <class ArgAt>
+inline BindFault bind_fault(const FuncDescriptor *d, size_t n, ArgAt arg_at)
+{
+    if (n > d->params.size() || n < static_cast<size_t>(d->min_args))
+        return BindFault();
+    return bind_fault_in_range(d, n, arg_at);
+}
+
+/* the refusal a fault names, loc-less (`site_arg` as none_bind_error's) */
+inline TypeErrorEx bind_fault_error(const FuncDescriptor *d,
+                                    const BindFault &f, int site_arg)
+{
+    const FuncDescriptor::ParamDesc &p =
+        d->params[static_cast<size_t>(f.idx)];
+    return f.fit ? param_fit_error(p.name, *p.fit, f.m, site_arg)
+                 : none_bind_error(p.name, site_arg);
+}
 
 /* The never-throwing append core (arr.cpp.h) shared by builtin_append and
  * the VM's AppendV: true = appended (flat or general, hash maintained);
  * false = take the full builtin path (errors/odd shapes, proper carets). */
 bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const);
 
-/* Form the member LValue* of `dval.member` for a ROOTED base (a mutable boxed
- * struct field / a dict value); nullptr for a POD field / readonly / non-
- * struct-non-dict (a value read). Shared by vm_incdec_member and the VM's
- * StoreLValueChainV walk. See eval.cpp. */
-LValue *vm_member_lvalue_ref(const EvalValue &dval, const EvalValue &memId,
+/*
+ * STRUCT VALUE SEMANTICS (plans/struct-value-semantics.md). A struct is a
+ * VALUE: every copy is independent. The copy is made at the WRITE, not at
+ * the move: a struct object may be shared by any number of holders (frame
+ * slots, elements, fields, captures), and a write INTO it first makes it
+ * its holder's own. struct_own returns the object `holder` may write in
+ * place - the one it holds, when no other holder can see it, else a
+ * shallow mutable clone put into the holder first. Another holder can see
+ * it when its count is above one, when `holder` is BORROWED (#94: the
+ * caller's slot holds the counted reference), or when it is read-only (a
+ * constant's, which a copy may change and the constant may not). An array
+ * element is detached from its array first (LValue::write_target), so
+ * `holder` is updated to the live slot. `holder` must hold a struct.
+ * ⛔ OWN BEFORE DERIVING ANY POINTER INTO THE OBJECT: a pointer taken
+ * earlier points into the object the holder no longer holds.
+ * A CLASS instance (def->is_class) is a reference: struct_own returns the
+ * object itself, shared or borrowed, and leaves `holder` alone - or
+ * throws CannotChangeConstEx when it is read-only (a constant's).
+ */
+StructObject &struct_own(LValue *&holder);
+/* struct_own when `holder` holds a struct; `holder` is updated as
+ * struct_own updates it. */
+void struct_own_if(LValue *&holder);
+
+/*
+ * BOXES (plans/class-and-box.md, step 3), shared by every engine.
+ * box_make is the box() builtin's work: an int / float / bool / str
+ * becomes a BoxObj, a struct VALUE a boxed copy, and every reference (an
+ * array, a dict, a function, a class instance, a box) is returned as it
+ * is; `none` is a TypeErrorEx. box_load is `*b` - a box's value (a COPY
+ * for a box<P>); box_store is `*b = v`, checked against the box's element
+ * kind (an int into a box<float> widens) and storing a box<P>'s fields in
+ * place, keeping its identity. Both raise a loc-less TypeErrorEx for a
+ * value that is not a box, and box_store a CannotChangeConstEx for a
+ * read-only box. The caller stamps the caret.
+ */
+EvalValue box_make(const EvalValue &v);
+/* the run-time type name of a value: `int`, `array`, ... (types.cpp) */
+std::string runtime_type_name(const EvalValue &v);
+EvalValue box_load(const EvalValue &b);
+/* box_load checking the box against the one the inferencer proved
+ * (DerefExpr::want: 0 any, 1 int, 2 float, 3 bool, 4 str, 5 the struct
+ * `def`): a box of another element is a loc-less TypeErrorEx */
+EvalValue box_load_want(const EvalValue &b, int want,
+                        const StructTypeDef *def);
+void box_store(const EvalValue &b, const EvalValue &v);
+
+/* The base of a store `<e>[k] = v` / the target of a mutating builtin
+ * `append(<e>, v)`, evaluated once, for writing: a member step into a
+ * struct OWNS it (struct_own); a value is held in `hold`, the caller's,
+ * as a store through a value holds its root. See eval.cpp. */
+EvalValue store_base_value(EvalContext *ctx, const Construct *e,
+                           LValue &hold);
+
+/* Form the member LValue* of `cur.member` for a store: a boxed field of the
+ * struct a writable slot holds (OWNED first - struct_own - so `cur` is
+ * updated to the live slot), or a dict value; nullptr for a POD field, a
+ * value base or a non-struct-non-dict (a value read).
+ * Shared by the VM's member stores and inc-decs, its chain walk and the
+ * mutating builtins' member argument. See eval.cpp. */
+LValue *vm_member_lvalue_ref(EvalValue &cur, const EvalValue &memId,
                              const UniqueId *memUid, bool for_write,
                              Loc mstart, Loc mend);
 
 /* AST-shape purity check (id / scalar-literal / subscript / member / arith
- * chains only) - the gate try_flat_subscript_store / try_pod_struct_store key
- * on. Exported for the codegen's IncDecChainV allow_flat/allow_pod flags,
- * which must encode the tree-walker's OWN compile-shape-dependent semantics.
- * See eval.cpp (no_side_effects). */
+ * chains only): evaluating the node twice is unobservable. Exported for the
+ * codegen (a planned struct ctor's argument reads). See eval.cpp
+ * (no_side_effects). */
 bool construct_no_side_effects(const Construct *c);
 
 /* VM IncDecChainV's FINAL-step semantics: given the walked-to container ref
@@ -504,31 +986,78 @@ bool construct_no_side_effects(const Construct *c);
  * convention) and the final member/subscript step, run IncDecExpr::do_eval's
  * exact tier logic and return the expression's value (old for postfix, new
  * for prefix). Tier 2 (`tier2`, a proven int/float lvalue) mirrors
- * handle_single_expr14's compound `±= 1` - the flat/POD fast stores only when
- * the codegen-proven allow_flat/allow_pod gate holds (try_flat/try_pod's
- * no_side_effects AST gate) - then derives old = new ∓ 1 with NO re-read;
+ * handle_single_expr14's compound `±= 1` (the flat / POD / general store of
+ * subscript_store / member_store), old being the value the store replaced;
  * tier 3 (dyn) mirrors the checked read-modify-write (NotLValue / const /
  * TypeError at the INC-DEC caret `id_*`). See eval.cpp. */
 EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
                           const EvalValue &memId, const UniqueId *memUid,
                           const EvalValue &key,
                           bool tier2, bool is_inc, bool is_prefix,
-                          bool allow_flat, bool allow_pod,
                           Loc lstart, Loc lend, Loc kstart, Loc kend,
-                          Loc id_start, Loc id_end);
+                          Loc bstart, Loc bend, Loc id_start, Loc id_end);
 
 /* VM (StoreMemberV): native `s.member = v` / `OP= v` for a STRUCT base (a dict
  * member store goes through DictStore). See eval.cpp. */
 EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,
                           const EvalValue &value,
                           const Loc &mstart, const Loc &mend,
-                          const Loc &bstart, const Loc &bend);
+                          const Loc &bstart, const Loc &bend,
+                          const StructTypeDef *bake_def = nullptr,
+                          int bake_slot = -1);
 
-/* The boxed field LValue* of `base.member` for a mutating builtin arg0
- * (`append(s.f, x)` — CallBuiltinLVMember). See eval.cpp. */
+/*
+ * POD PLACES (2026-10-05): the bytes of a struct that live INSIDE something
+ * - a flat struct array's element, or a POD struct embedded inline in
+ * another. A field there has no LValue to store through, so a store walks
+ * its base into the bytes instead. `ps[i].x = v` and `p.inner.a = v` raised
+ * NotLValueEx in every engine until then, though README says a struct's
+ * layout changes only memory and speed. Shared by the tree-walker's
+ * member_store / dyn inc-dec and the VM's chain walk (StoreLValueChainV,
+ * IncDecChainV - the JIT calls the same cores). See eval.cpp.
+ */
+struct PodPlace {
+    char *bytes = nullptr;              /* the struct's first byte */
+    const StructTypeDef *def = nullptr;
+};
+/* `blv` holds a writable flat struct array: the element `key` names becomes
+ * the place, the array detached first as an element store detaches it. A
+ * bad key or index throws what TypeArr::subscript throws, loc-less. False
+ * when `blv` holds no writable flat struct array. */
+bool pod_place_elem(LValue *blv, const EvalValue &key, PodPlace &out);
+/* `blv` holds a writable POD struct whose `memUid` is an inline POD struct:
+ * that field becomes the place. */
+bool pod_place_rooted_field(LValue *blv, const UniqueId *memUid,
+                            PodPlace &out);
+/* `v` is a REFERENCE instance of a POD struct (a box<P>) read as a VALUE -
+ * an element of a flat reference array, a field: it is still a location,
+ * its bytes the place; CannotChangeConstEx when it is read-only. False for
+ * anything else. */
+bool pod_place_ref(const EvalValue &v, PodPlace &out);
+/* Step into the place's inline POD struct member; false, the place
+ * unchanged, when the member is not one. */
+bool pod_place_step(PodPlace &p, const UniqueId *memUid);
+/* The struct in the place, as a value (a fresh copy). */
+EvalValue pod_place_value(const PodPlace &p);
+/* Store `rval` (`OP= rval`) into the place's field `slot`, coerced to its
+ * type; returns the stored value, and a compound's `*old_out` the one it
+ * replaced (a plain `=` leaves it: inc-dec, its one user, is compound). */
+EvalValue pod_place_store(const PodPlace &p, int slot, Op op,
+                          const EvalValue &rval, Loc ms, Loc me,
+                          EvalValue *old_out = nullptr);
+/* `++` / `--` on the place's field `slot` - an int or float, else the
+ * inc-dec TypeErrorEx at `id_*`; returns old for postfix, new for prefix. */
+EvalValue pod_place_incdec(const PodPlace &p, int slot, bool is_inc,
+                           bool is_prefix, Loc ms, Loc me,
+                           Loc id_start, Loc id_end);
+
+/* The target of a mutating builtin whose arg0 is `base.member`
+ * (`append(s.f, x)` — CallBuiltinLVMember): the boxed field's LValue, or
+ * `hold` holding the field's value when it is not a location. See
+ * eval.cpp. */
 LValue *vm_member_lvalue(LValue *base_lv, const UniqueId *memUid,
                          const Loc &mstart, const Loc &mend,
-                         const Loc &bstart, const Loc &bend);
+                         const Loc &bstart, const Loc &bend, LValue &hold);
 
 /* VM (StoreElem2V): native NESTED store `a[i][j] = v` / `OP= v`. `locs[0]`/
  * `locs[1]` are the inner/outer subscript carets (deref only on a throw). See
@@ -536,24 +1065,29 @@ LValue *vm_member_lvalue(LValue *base_lv, const UniqueId *memUid,
 EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
                                     const EvalValue &key2,
                                     const EvalValue &value, Op op,
-                                    const std::pair<Loc, Loc> *locs);
+                                    const std::pair<Loc, Loc> *locs,
+                                    bool checked = false);
 
 /* VM (StoreElemChainV): GENERIC N-level nested store `a[k0][k1]...[kn] = v` /
  * `OP= v`; `keys` + `steplocs` are base-to-innermost (steplocs[k] is that
  * subscript's caret). See eval.cpp. */
 EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
                                    size_t nkeys, const EvalValue &value, Op op,
-                                   const std::pair<Loc, Loc> *steplocs);
+                                   const std::pair<Loc, Loc> *steplocs,
+                                   bool checked = false);
 
 /* VM (MapFilterV) + tree-walker shared map/filter core: apply a (pre-validated)
  * function to each element of a container. See eval.cpp. */
 EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
                         const EvalValue &container, bool is_filter,
-                        Loc cstart, Loc cend);
+                        Loc cstart, Loc cend, Loc site, int flat_hint);
 
 /* VM (ForeachDynNext): read element `i` of the array VALUE box-free (boxing a
  * flat scalar), reaching arr_elem_at in its own TU. See generic.cpp.h. */
 EvalValue vm_arr_elem(const EvalValue &arr_val, size_type i);
+/* Overload for a caller that already extracted the array (every unpack site,
+ * which had to check the element count first) - skips re-deriving it. */
+EvalValue vm_arr_elem(const SharedArrayObj &arr, size_type i);
 
 /* VM LoadStructFieldInt/Float: read scalar field #fidx of element `idx` of a
  * flat array<PodStruct> directly from the bytes (the struct-foreach direct
@@ -563,9 +1097,18 @@ int_type vm_struct_field_int(const EvalValue &arrv, int_type idx,
 float_type vm_struct_field_float(const EvalValue &arrv, int_type idx,
                                  int_type fidx);
 
+/* G4: the CHECKED subscript form - `a[i].f`. Does the negative-index wrap +
+ * bounds check itself (throwing OutOfBoundsEx LOC-LESS) and serves BOTH flat
+ * struct storage and a PROMOTED general array. See eval.cpp. */
+int_type vm_struct_elem_field_int(const EvalValue &arrv, int_type idx,
+                                  int_type fidx);
+float_type vm_struct_elem_field_float(const EvalValue &arrv, int_type idx,
+                                      int_type fidx);
+
 /* Materialize element `idx` of a flat array<PodStruct> as a fresh StructObject
  * (the VM's LoadStructElemV - the whole-`p` foreach bind). See eval.cpp. */
 EvalValue vm_struct_elem(const EvalValue &arrv, int_type idx);
+void vm_struct_elem_into(LValue &dst, const EvalValue &arrv, int_type idx);
 
 /* The stored value of a PRESENT dict key, else nullptr (a plain map find - the
  * tree-walker's typed dict fast path). Shared by Subscript/MemberExpr eval_int/
@@ -584,13 +1127,48 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
                                   const StructTypeDef *hint_struct,
                                   bool is_const);
 
-/* The value a baked const array/dict/struct LiteralObj materializes (immutable
- * share vs mutable clone, plus the general/flat_s arr_hint cases). Shared by
- * tree-walker (LiteralObj::do_eval) and the VM's LoadLiteralObjV op, so both
+/* An element built for a destination PROVEN array<int> / <float> / <bool>
+ * (`hint` flat_i / flat_f / flat_b): `v` widened to that element type
+ * (bool -> int, int / bool -> float), a value that does not fit - only a
+ * `dyn` source can produce one - a TypeErrorEx; any other hint returns
+ * `v`. The builders a callback or a fill value feeds (map, filter,
+ * make_array, array, keys, values) pass each element through it, so a
+ * typed destination never holds a misfit. See eval.cpp. */
+EvalValue flat_hint_value(const EvalValue &v, ArrHint hint);
+
+/* Q2: does the type name a container's own type - an array<T>, a
+ * dict<K, V>? A generic `array` / `dict` (a component of `array<array>`)
+ * checks no store, so it types nothing: a container under one stays
+ * untyped, free to take a type where it enters one, as fit_adopt leaves
+ * a container entering a generic place */
+bool ctype_names(const TypeAnnot *t) noexcept;
+
+/*
+ * Q2 (plans/typed-containers.md): give a container MADE HERE the type the
+ * compiler stamped where it is made (`t`: an interned array<T> / dict<K,
+ * V>; null - nothing stamped - does nothing), and the fresh containers
+ * inside it the types `t` gives them (a builtin's result). Only an
+ * UNTYPED, MUTABLE, non-slice container takes a type: a copy kept its
+ * source's type already, and a read-only one needs none (no store can
+ * change it). A `dyn` element stops the walk: what a `dyn` holds keeps
+ * the type it was made with.
+ */
+void stamp_ctype(const EvalValue &v, const TypeAnnot *t) noexcept;
+/* ...the top container only: a LITERAL's (what it holds was typed where
+ * that was made, or is not this literal's to type) */
+void stamp_ctype_top(const EvalValue &v, const TypeAnnot *t) noexcept;
+
+/* Q2: a BAKED mutable value (a LiteralObj's) with its fresh containers
+ * typed `t`: stamped in place when untyped, COPIED when another node's
+ * stamp already gave it a different type (two nodes may share one baked
+ * value - a template's instances clone its body). */
+EvalValue ctype_restamp(const EvalValue &v, const TypeAnnot *t);
+
+/* The value a baked const array/dict/struct LiteralObj materializes (an
+ * immutable share vs a fresh mutable clone). Shared by the tree-walker
+ * (LiteralObj::do_eval) and the VM's LoadLiteralObjV op, so both
  * materialize byte-identically. */
-EvalValue eval_literal_obj(const EvalValue &value, bool immutable,
-                           ArrHint arr_hint,
-                           const StructTypeDef *arr_hint_struct);
+EvalValue eval_literal_obj(const EvalValue &value, bool immutable);
 
 /* Build a dict VALUE from `npairs` INTERLEAVED key/value values ([k0,v0,..]).
  * Keys are frozen. Shared by LiteralDict::do_eval and the VM's MakeDictV. */
@@ -599,20 +1177,17 @@ EvalValue build_dict_from_pairs(const EvalValue *pairs, size_t npairs,
 
 /* Inlining cost-model calibration: measure per-node-type eval cost from
  * hand-built AST nodes and print the weights. Driven by `--weights`. */
-void run_weight_bench();
+/* --weights [N]: N iterations per measured node (20M by default) */
+void run_weight_bench(long iters);
 
 /* The per-frame pure-call cache (PureCache) is on by default; `-npc` clears
  * this to measure the recursion unroll without it. */
-extern bool g_pure_cache_enabled;
 
 
 inline EvalContext *
 get_root_ctx(EvalContext *ctx)
 {
-    while (ctx->parent)
-        ctx = ctx->parent;
-
-    return ctx;
+    return ctx->root;      /* #114: inherited, not walked */
 }
 
 /*
@@ -623,12 +1198,171 @@ get_root_ctx(EvalContext *ctx)
  */
 EvalValue read_sym(EvalContext *ctx, SymKind kind, int slot,
                    const UniqueId *uid);
+/*
+ * #114: read_sym's LVALUE half. Every answer it can give except an
+ * `UndefinedId` is `EvalValue(&some_lvalue)` - a value BOXED purely so
+ * the caller can immediately unbox it with RValue(). A caller that
+ * wants the VALUE and not the reference (the closure capture snapshot)
+ * takes the slot directly and skips a whole EvalValue round trip.
+ *
+ * Returns null EXACTLY where read_sym returns an `UndefinedId`, i.e.
+ * where the RValue() that followed it would have THROWN - so the
+ * caller's fallback is the error path, not a second normal path.
+ */
+LValue *read_sym_lv(EvalContext *ctx, SymKind kind, int slot,
+                    const UniqueId *uid);
+
+/*
+ * A closure's captured values. A hand-rolled tiny vector, NOT a std::vector,
+ * for two reasons (G2, 2026-08-06):
+ *
+ *  - THE HEAP ALLOCATION. A capture list is almost always ONE name (every
+ *    site in bench/, samples/ and tests/functional/ is exactly one), and a
+ *    std::vector paid a malloc AND a free per closure - with its reserve,
+ *    141 Ir of the ~890 a closure creation cost. `inline_cap` slots live
+ *    inside the FuncObject, so the common closure allocates nothing.
+ *
+ *  - LAYOUT. The JIT walks `ctx->captures->data()` as a plain
+ *    `mov r9, [rax+0]` (emit_ctx_chain_r9, jit.cpp) - it hard-codes "the
+ *    first 8 bytes are the data pointer", which is where libstdc++ puts
+ *    vector's _M_start. `ptr` MUST therefore stay the FIRST member; the
+ *    static_assert below is what stops a future edit from moving it. (The
+ *    other two JIT sites only save/restore the container pointer itself,
+ *    into rec.caller_captures, and never index it.)
+ *
+ * Only what the call sites need: index, size/empty, and a one-shot build of
+ * reserve + emplace_back. No iterators, no erase, and no growth after the
+ * reserve - a capture list is fixed at closure creation.
+ *
+ * `ptr` may point INTO this object (the inline buffer), so a CaptureSlots is
+ * neither movable nor assignable; copying re-points the copy at its own
+ * buffer. FuncObject is only ever created in place and copied by
+ * TypeFunc::clone, never relocated.
+ */
+class CaptureSlots final {
+
+public:
+
+    static const uint32_t inline_cap = 2;
+
+private:
+
+    LValue *ptr;                 /* the data pointer - MUST be first */
+    uint32_t n;
+    uint32_t cap;
+    alignas(LValue) char inl[inline_cap * sizeof(LValue)];
+
+    LValue *inline_slots() { return reinterpret_cast<LValue *>(inl); }
+
+public:
+
+    CaptureSlots() : ptr(nullptr), n(0), cap(0) { }
+
+    CaptureSlots(const CaptureSlots &rhs) : ptr(nullptr), n(0), cap(0) {
+        reserve(rhs.n);
+        for (uint32_t i = 0; i < rhs.n; i++)
+            emplace_back(rhs.ptr[i]);
+    }
+
+    CaptureSlots &operator=(const CaptureSlots &rhs) = delete;
+    CaptureSlots(CaptureSlots &&rhs) = delete;
+    CaptureSlots &operator=(CaptureSlots &&rhs) = delete;
+
+    ~CaptureSlots() {
+        for (uint32_t i = n; i > 0; i--)
+            ptr[i - 1].~LValue();
+        if (cap > inline_cap)
+            ::operator delete(static_cast<void *>(ptr));
+    }
+
+    /* Fix the capacity ONCE, before any emplace_back. */
+    void reserve(size_t want) {
+        ML_CHECK(n == 0 && cap == 0);
+        if (!want)
+            return;
+        if (want <= inline_cap) {
+            ptr = inline_slots();
+            cap = inline_cap;
+            return;
+        }
+        ptr = static_cast<LValue *>(::operator new(want * sizeof(LValue)));
+        cap = static_cast<uint32_t>(want);
+    }
+
+    void emplace_back(EvalValue &&v, bool is_const) {
+        ML_CHECK(n < cap);
+        new (ptr + n) LValue(std::move(v), is_const);
+        n++;
+    }
+
+    void emplace_back(const LValue &lv) {
+        ML_CHECK(n < cap);
+        new (ptr + n) LValue(lv);
+        n++;
+    }
+
+    /* #97 R2b: an int/float/bool capture, copied by its payload word
+     * (EvalValue::ScalarWord says why) - no temporary */
+    void emplace_scalar(const EvalValue &v) {
+        ML_CHECK(n < cap);
+        new (ptr + n) LValue(EvalValue::ScalarWord(), v);
+        n++;
+    }
+
+    /*
+     * #97 R2c: the ONE-capture closure - every capture list in the
+     * corpus names one variable. Straight into the inline buffer: no
+     * reserve, no loop, the count written once instead of bumped
+     * through memory. `is_scalar` picks the word copy.
+     */
+    void set_single(const EvalValue &v, bool is_scalar) {
+        ML_CHECK(n == 0 && cap == 0);
+        ptr = inline_slots();
+        if (is_scalar)
+            new (ptr) LValue(EvalValue::ScalarWord(), v);
+        else
+            new (ptr) LValue(v, false);
+        n = 1;
+        cap = inline_cap;
+    }
+
+    /*
+     * #114: build the slot straight from a source VALUE. The
+     * rvalue-ref overload above exists for a caller holding a
+     * temporary; the capture snapshot holds a `const EvalValue &` from
+     * the source slot, and routing it through the temporary cost a
+     * copy, a move and a destroy where ONE copy does.
+     */
+    void emplace_back(const EvalValue &v, bool is_const) {
+        ML_CHECK(n < cap);
+        new (ptr + n) LValue(v, is_const);
+        n++;
+    }
+
+    size_t size() const { return n; }
+    bool empty() const { return n == 0; }
+    LValue &operator[](size_t i) { return ptr[i]; }
+    const LValue &operator[](size_t i) const { return ptr[i]; }
+
+    /*
+     * Never called - it exists for its body. A static_assert at namespace
+     * scope cannot name a private member, and one inside the class body
+     * would need the class to be complete; a member function's body is
+     * compiled after both are true, so this is where the JIT's offset-0
+     * contract can actually be enforced at COMPILE time.
+     */
+    static void layout_contract() {
+        static_assert(offsetof(CaptureSlots, ptr) == 0,
+                      "the JIT reads the capture data pointer at offset 0 "
+                      "(emit_ctx_chain_r9, jit.cpp)");
+    }
+};
 
 class FuncObject : public RefCounted {
 
 public:
 
-    ML_POOL_NEW_DELETE
+    ML_POOL_NEW_DELETE_K(IOK_FUNC)
 
     /*
      * The function's RUNTIME identity (funcdesc.h) - NOT an AST node. Binding,
@@ -646,24 +1380,114 @@ public:
      * must persist across calls to the same closure (e.g. a counter); each
      * closure instance / clone owns its own vector.
      */
-    std::vector<LValue> capture_slots;
+    CaptureSlots capture_slots;
     /*
-     * An empty context parented to the program root - the body's args context
-     * parents to this, so the body reaches the global table (gfuncs) and the
-     * builtins map. Holds no captured values (those are in capture_slots).
+     * The program ROOT context (get_root_ctx at creation). The tree-walker's
+     * do_func_call parents the body's args context DIRECTLY to it, so the body
+     * reaches the global table (gfuncs) and the builtins map.
+     *
+     * G2 (2026-08-06): this used to be an `EvalContext capture_ctx` BY VALUE -
+     * an empty context whose entire content was `(root, false, true)` and whose
+     * only use was to be that parent. Constructing one cost ~39 Ir per closure
+     * and embedded a std::map nobody ever wrote. Parenting args_ctx to the root
+     * instead is byte-identical: the ctor inherits repl_mode/frame/gfuncs/
+     * captures from the parent, and the empty node passed all four through
+     * unchanged (its own `captures` was the root's null, and args_ctx
+     * overwrites that field anyway); `in_const_eval()` walks to the same root
+     * because the node's const_ctx was false; and a name lookup simply skips
+     * one guaranteed-empty map. The raw root pointer is NOT a new lifetime
+     * hazard - `capture_ctx.parent` already held exactly this pointer.
+     *
+     * The VM never used it at all (it reads only capture_slots).
      */
-    EvalContext capture_ctx;
+    EvalContext *capture_root;
+
+    /*
+     * #38 B: the CONST scope a function was created in, when it was created
+     * during const evaluation (a `pure func` registered by the parser, or
+     * by AutoConst's fold context), with that scope's liveness token.
+     * do_func_call parents a const-eval call's body to it while it is
+     * alive, so the body sees the consts LEXICALLY in scope at the
+     * definition - a const CONTAINER or another pure func, which live in
+     * the defining block's const context. Parented to the root, `pure func
+     * f(i) => A[i]; const Z = f(1);` failed "Undefined variable 'A'".
+     */
+    EvalContext *const_scope = nullptr;
+    std::shared_ptr<bool> const_scope_alive;
 
     FuncObject(const FuncDescriptor *func, EvalContext *ctx);
+    /*
+     * #97 R2: the closure whose captures are ALL frame locals, which the
+     * JIT proves at emit time from the descriptor. `frame` is the
+     * creating frame's slot 0 and `root` the program root; each capture
+     * is a copy of frame[cap.slot]. No per-capture kind dispatch, no
+     * unbound-name path (a local cannot be unbound at run time - the
+     * TDZ is a compile error), no const-scope test (a JIT frame is never
+     * a const-eval context).
+     */
+    struct LocalCaptures { };
+    FuncObject(const FuncDescriptor *func, EvalContext *root,
+               const LValue *frame, LocalCaptures);
+    /* #97 R2c: exactly ONE local capture, `src` its source slot - a
+     * straight-line constructor for its own helper, so the many-capture
+     * loop's register pressure is not paid on every closure */
+    struct OneLocal { };
+    FuncObject(const FuncDescriptor *func, EvalContext *root,
+               const LValue &src, OneLocal);
     FuncObject(const FuncObject &rhs);
+#ifdef TESTS
+    /*
+     * ⛔ POOLING BLUNTS LeakSanitizer, which is why this exists (#97
+     * step 3, 2026-08-26). FuncObject carries ML_POOL_NEW_DELETE, so a
+     * leaked closure is memory the POOL already owns: a small leak
+     * fits inside a chunk LSan sees as reachable and is reported
+     * NOWHERE. Watched - deleting the inline store's release arm and
+     * running one 300-closure program is silent under ASan+LSan; only
+     * at SUITE volume does LSan report it, at exit, as a byte count
+     * with no hint which tier is at fault.
+     *
+     * The live count fails immediately, at any volume, and names the
+     * tier. The DANGEROUS direction (releasing one too many) needs no
+     * such help - it is an ASan use-after-free, watched.
+     *
+     * The same blunting applies to every ML_POOL_NEW_DELETE type.
+     */
+    ~FuncObject();
+#endif
 };
+#ifdef TESTS
+extern "C" unsigned long g_live_funcobjs;
+#endif
 
 /*
  * Deep, read-only copy of a const-evaluated array/dict value (see eval.cpp).
  * Used by the parser to bake a `const`-decl target into a LiteralObj that can
- * be shared (it can't be mutated) instead of deep-copied on every evaluation.
+ * be shared (it can't be mutated) instead of deep-copied on every evaluation,
+ * and by every dict insert to freeze a KEY (`key` true). A class instance
+ * keeps its identity either way: a key's is left alone, a constant's is
+ * frozen in place.
  */
-EvalValue make_const_clone(const EvalValue &v);
+EvalValue make_const_clone(const EvalValue &v, bool key = false);
+
+/* A baked constant value widened to a DESTINATION's static type, given as
+ * its numeric shape: `k` 'f' / 'i' a leaf an int or bool widens to, 'a' an
+ * array (its element in `sub`, the storage its type gives it in `hint` /
+ * `hint_struct` - dflt keeps the value's own) and 'd' a dict (its value in
+ * `sub`, its key in `key`), 0 anything else. The value is rebuilt where it
+ * changes, never edited (it may be shared). */
+struct WidenShape {
+    char k = 0;
+    ArrHint hint{};                 /* dflt (the enum is opaque here) */
+    const StructTypeDef *hint_struct = nullptr;
+    std::unique_ptr<WidenShape> sub;
+    std::unique_ptr<WidenShape> key;
+};
+EvalValue widen_baked_value(const EvalValue &v, const WidenShape &s);
+
+/* A value's numeric WIDENING to a stored type (a literal's elem_coerce,
+ * a store's rv_coerce, ExprList::arg_widen): int/bool -> float for `f`,
+ * bool -> int for `i`; every other value, none included, as it is. */
+EvalValue literal_widen(EvalValue v, DeclType dt);
 
 /*
  * Mutable copies of an array/dict value (scalars/strings returned as-is):
@@ -672,6 +1496,7 @@ EvalValue make_const_clone(const EvalValue &v);
  *    materialized value needs, and keeps clone() shallow w.r.t. consts.
  *  - make_deep_mutable_clone: every level copied and made mutable (read-only
  *    dropped) - a fully independent writable value. Backs deepclone().
+ * A dict copy keeps its source's order (insertion order, #50).
  */
 EvalValue make_mutable_clone(const EvalValue &v);
 EvalValue make_deep_mutable_clone(const EvalValue &v);

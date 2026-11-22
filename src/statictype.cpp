@@ -7,7 +7,7 @@
 
 /*
  * M0 of the type-inference feature: the static-type lattice and its operations.
- * See statictype.h for the data model and plans/type-inference.md sections 2 &
+ * See statictype.h for the data model and plans/archived/type-inference.md sections 2 &
  * 4 for the rules these implement.
  */
 
@@ -62,6 +62,15 @@ StaticTypeRef StaticTypeArena::array_of(StaticTypeRef elem, bool opt)
      * never null) - a null would null-deref in resolve/join/equal/to_string */
     ML_CHECK(elem != nullptr);
     StaticTypeRef t = alloc(StaticTypeKind::Array);
+    t->elem = elem;
+    t->opt = opt;
+    return t;
+}
+
+StaticTypeRef StaticTypeArena::box_of(StaticTypeRef elem, bool opt)
+{
+    ML_CHECK(elem != nullptr);
+    StaticTypeRef t = alloc(StaticTypeKind::Box);
     t->elem = elem;
     t->opt = opt;
     return t;
@@ -139,7 +148,6 @@ StaticTypeRef StaticTypeArena::with_opt(StaticTypeRef t, bool optflag)
     c->ret = t->ret;
     c->struct_def = t->struct_def;
     c->struct_name = t->struct_name;
-    c->finfos = t->finfos;             /* value-template tracking rides */
     return c;
 }
 
@@ -186,6 +194,7 @@ bool static_type_equal(StaticTypeRef a, StaticTypeRef b)
             return false;                 /* distinct unbound variables */
 
         case StaticTypeKind::Array:
+        case StaticTypeKind::Box:
             return static_type_equal(a->elem, b->elem);
 
         case StaticTypeKind::Dict:
@@ -221,6 +230,7 @@ static bool static_type_occurs(StaticTypeRef var, StaticTypeRef t)
 
     switch (t->kind) {
         case StaticTypeKind::Array:
+        case StaticTypeKind::Box:
             return static_type_occurs(var, t->elem);
         case StaticTypeKind::Dict:
             return static_type_occurs(var, t->key) || static_type_occurs(var,
@@ -265,6 +275,7 @@ bool static_type_unify(StaticTypeRef a, StaticTypeRef b)
     switch (a->kind) {
 
         case StaticTypeKind::Array:
+        case StaticTypeKind::Box:
             return static_type_unify(a->elem, b->elem);
 
         case StaticTypeKind::Dict:
@@ -292,14 +303,44 @@ bool static_type_unify(StaticTypeRef a, StaticTypeRef b)
 /* ---------------------------- assignable --------------------------------- */
 
 /* Two container component types are compatible for assignment when they are
- * equal, or when either is None (an empty container - the bottom element type)
- * or Dyn (a heterogeneous container). Keeps arrays/dicts practically usable
- * despite invariance: an empty [] fits any array<T>, a dyn array fits any. */
+ * equal, or when either is None (unfilled: an empty container - the bottom
+ * element type - fits any array<T>). Rule 1 (plans/strict-container-
+ * types.md): container types are EXACT - a `dyn` component is a type of
+ * its own, so an array<int> is not an array<dyn> (a store of a string
+ * through the second name would land in the first's int storage), nor
+ * the reverse. */
 static bool static_type_elem_compat(StaticTypeRef a, StaticTypeRef b)
 {
     a = static_type_resolve(a);
     b = static_type_resolve(b);
-    if (a->kind == StaticTypeKind::None || b->kind == StaticTypeKind::None ||
+    if (a->kind == StaticTypeKind::None || b->kind == StaticTypeKind::None)
+        return true;
+    return static_type_equal(a, b);
+}
+
+/*
+ * The SIGNATURE analogue, for one component of a function type (a param or
+ * the return). Same tolerant invariance as the container rule above, plus
+ * one more escape: **Unknown defers too**.
+ *
+ * That extra case is the whole reason deep function subtyping was
+ * deferred before (see the Func arm below). A callback's own param/return
+ * types are THEMSELVES inferred, and the fixpoint may not have pinned them
+ * at the moment some other symbol's assignment is checked - so demanding
+ * equality against an un-pinned component would refuse ordinary
+ * higher-order code for a reason that is inference ORDER, not a real type
+ * mismatch. Deferring on Unknown means the check only ever fires between
+ * two SETTLED concrete types, which is exactly the case it exists for.
+ * (`dyn` defers as the declared variant escape hatch: a `dyn`-typed
+ * component opts that position out, as everywhere else.)
+ */
+static bool static_type_sig_compat(StaticTypeRef a, StaticTypeRef b)
+{
+    a = static_type_resolve(a);
+    b = static_type_resolve(b);
+    if (a->kind == StaticTypeKind::Unknown ||
+        b->kind == StaticTypeKind::Unknown ||
+        a->kind == StaticTypeKind::None || b->kind == StaticTypeKind::None ||
         a->kind == StaticTypeKind::Dyn  || b->kind == StaticTypeKind::Dyn)
         return true;
     return static_type_equal(a, b);
@@ -315,20 +356,51 @@ static bool static_type_same_underlying(StaticTypeRef a, StaticTypeRef b)
         case StaticTypeKind::Array:
             return static_type_elem_compat(a->elem, b->elem);
 
+        case StaticTypeKind::Box:
+            /* invariant, as a reference must be (a box<int> stored where a
+             * box<float> is expected would hold an int a float reader
+             * finds); an unsettled element defers */
+            return static_type_sig_compat(a->elem, b->elem);
+
         case StaticTypeKind::Dict:
             return static_type_elem_compat(a->key, b->key) &&
                    static_type_elem_compat(a->val, b->val);
 
         case StaticTypeKind::Func:
-            /* Assignability between function types checks ARITY only. Deep
-             * function subtyping over *inferred* signatures is fragile (a
-             * callback's own param/return types are themselves inferred and may
-             * finalize to dyn after the type that captured them was frozen) and
-             * yields false positives on ordinary higher-order code (e.g.
-             * apply(sq, i)). Calls through the function are still checked at
-             * their own site, and the body type-checks independently. Precise
-             * function subtyping is deferred (plans/type-inference.md). */
-            return a->params.size() == b->params.size();
+            /*
+             * Assignability between function types checks the ARITY and
+             * every SETTLED signature component (option B, 2026-08-12).
+             * It used to check arity ALONE, which made a function type a
+             * promise the runtime did not keep:
+             *
+             *     func a(int k) { return k; }
+             *     func b(int k) { return 2.5; }
+             *     var g = a; g = b;        # was ACCEPTED
+             *     var s = 0; s = s + g(1); # -> s = 2.500000
+             *
+             * `g` is inferred `func(int)->int`, so every consumer of
+             * `g(1)` - the inferencer, M8, the JIT's unboxed tiers - is
+             * entitled to treat the result as an int, and none of them
+             * could. That is why a typed call-result tier (H4) was not
+             * implementable soundly without a per-call runtime guard.
+             * Checking the signature here makes the static type a real
+             * guarantee instead, once, for every consumer.
+             *
+             * The check is TOLERANT invariance (static_type_sig_compat):
+             * an Unknown / None / dyn component DEFERS. That answers the
+             * objection this comment used to record - a callback's own
+             * param/return types are themselves inferred, so a strict
+             * rule would fire on inference ORDER (`apply(sq, i)`) rather
+             * than on a mismatch. Only two settled concretes can refuse.
+             * `param_opt` is deliberately NOT compared: opt-ness governs
+             * call arity, which check_call already enforces per site.
+             */
+            if (a->params.size() != b->params.size())
+                return false;
+            for (size_t i = 0; i < a->params.size(); i++)
+                if (!static_type_sig_compat(a->params[i], b->params[i]))
+                    return false;
+            return static_type_sig_compat(a->ret, b->ret);
 
         case StaticTypeKind::Struct:
             return a->struct_def == b->struct_def;
@@ -346,8 +418,11 @@ bool static_type_assignable(StaticTypeRef src, StaticTypeRef dst)
     if (src == dst)
         return true;
 
+    /* anything fits dyn - but rule 3 (plans/strict-container-types.md):
+     * a `dyn` never holds none, so a value that may be none fits only a
+     * `dyn?` */
     if (dst->kind == StaticTypeKind::Dyn)
-        return true;                      /* anything fits dyn */
+        return dst->opt || !(src->opt || src->kind == StaticTypeKind::None);
 
     if (src->kind == StaticTypeKind::Dyn)
         return false;                     /* dyn does not implicitly narrow */
@@ -379,20 +454,8 @@ bool static_type_assignable(StaticTypeRef src, StaticTypeRef dst)
 
 /* -------------------------------- join ----------------------------------- */
 
-/* Record a dropped finfo set (see the header comment) - called at every
- * join outcome that does NOT produce a Func from a finfo-carrying input. */
-static void note_escaped_into(std::vector<void *> &ledger, StaticTypeRef t)
-{
-    if (t && t->kind == StaticTypeKind::Func)
-        for (void *fi : t->finfos)
-            ledger.push_back(fi);
-}
-
 StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
 {
-    const auto note_escaped = [this](StaticTypeRef t) {
-        note_escaped_into(escaped_finfos, t);
-    };
     a = static_type_resolve(a);
     b = static_type_resolve(b);
 
@@ -402,8 +465,6 @@ StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
     if (a->kind == StaticTypeKind::Dyn || b->kind == StaticTypeKind::Dyn) {
         /* Nullability is orthogonal to dyn (Phase B): collapsing a mix to dyn
          * keeps the opt bit, so `dyn | none` / `dyn | opt T` is `opt dyn`. */
-        note_escaped(a);
-        note_escaped(b);
         return with_opt(g_dyn[0],
                         a->opt || b->opt ||
                         a->kind == StaticTypeKind::None ||
@@ -445,11 +506,8 @@ StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
         return ground(k, anyopt);
     }
 
-    if (a->kind != b->kind) {
-        note_escaped(a);                  /* a finfo-carrying Func lost here */
-        note_escaped(b);
+    if (a->kind != b->kind)
         return nullptr;                   /* irreconcilable conflict */
-    }
 
     switch (a->kind) {
 
@@ -475,13 +533,38 @@ StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
         }
 
         case StaticTypeKind::Func: {
-            /* Same arity: join componentwise (Unknown children fill in, mixed
-             * concretes fall to dyn) so a func-valued var assigned the "same"
-             * function across fixpoint rounds does not spuriously conflict.
-             * Different arity: a real conflict. */
+            /* Same arity: join componentwise (Unknown children fill in) so a
+             * func-valued var assigned the "same" function across fixpoint
+             * rounds does not spuriously conflict. Different arity: a real
+             * conflict. */
             if (a->params.size() != b->params.size()) {
-                note_escaped(a);
-                note_escaped(b);
+                return nullptr;
+            }
+            /*
+             * ...and a SETTLED signature MISMATCH is a real conflict too
+             * (option B, 2026-08-12). This arm used to let mixed concretes
+             * "fall to dyn" - the `rj ? rj : g_dyn[0]` below - which
+             * silently widened a genuine disagreement into a variant:
+             *
+             *     func a(int k) { return k; }
+             *     func b(int k) { return 2.5; }
+             *     var g = a; g = b;      # joined ret int|float -> float
+             *
+             * so `g` ended up with a signature NEITHER function has, and
+             * `g(1)`'s static type was a promise the runtime did not keep.
+             * The tightened assignable() alone could not catch this,
+             * because a REASSIGNMENT contributes through the fixpoint's
+             * join, not through assignable. Both doors had to be closed.
+             *
+             * Deferring on an unsettled component (static_type_sig_compat)
+             * is what keeps the fixpoint's own rounds from tripping it -
+             * see that helper for why Unknown must defer.
+             */
+            for (size_t i = 0; i < a->params.size(); i++)
+                if (!static_type_sig_compat(a->params[i], b->params[i])) {
+                    return nullptr;
+                }
+            if (!static_type_sig_compat(a->ret, b->ret)) {
                 return nullptr;
             }
             std::vector<StaticTypeRef> ps;
@@ -493,15 +576,30 @@ StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
                                (i < b->param_opt.size() && b->param_opt[i]));
             }
             StaticTypeRef rj = join(a->ret, b->ret);
-            StaticTypeRef fj = func_of(ps, popt, rj ? rj : g_dyn[0], anyopt);
-            /* Union the value-template sets (plans/value-template-
-             * instantiation.md) - the set rides the ordinary lattice flow. */
-            fj->finfos = a->finfos;
-            for (void *fi : b->finfos)
-                if (std::find(fj->finfos.begin(), fj->finfos.end(), fi)
-                        == fj->finfos.end())
-                    fj->finfos.push_back(fi);
-            return fj;
+            return func_of(ps, popt, rj ? rj : g_dyn[0], anyopt);
+        }
+
+        case StaticTypeKind::Struct:
+            /* nominal: the same struct or class joins to itself, with
+             * either side's nullability (`c ? P(1) : mp` with a `P?` mp
+             * is a `P?`, as `c ? 1 : mi` is an `int?`) - two equal types
+             * returned above, so here they differ in `opt` alone. Two
+             * different structs are a conflict. */
+            if (a->struct_def != b->struct_def)
+                return nullptr;
+            return struct_ty(a->struct_def, a->struct_name, anyopt);
+
+        case StaticTypeKind::Box: {
+            /* invariant: no numeric climb inside a box; an unsettled
+             * element takes the other's */
+            const StaticTypeRef ea = static_type_resolve(a->elem);
+            const StaticTypeRef eb = static_type_resolve(b->elem);
+            if (ea->kind == StaticTypeKind::Unknown)
+                return box_of(eb, anyopt);
+            if (eb->kind == StaticTypeKind::Unknown
+                || static_type_equal(ea, eb))
+                return box_of(ea, anyopt);
+            return nullptr;
         }
 
         default:
@@ -520,7 +618,36 @@ StaticTypeRef StaticTypeArena::join_elem(StaticTypeRef a, StaticTypeRef b)
     return join(a, b);
 }
 
+StaticTypeRef StaticTypeArena::fill_unfilled(StaticTypeRef t)
+{
+    t = static_type_resolve(t);
+    auto comp = [&](StaticTypeRef c) {
+        c = static_type_resolve(c);
+        return c->kind == StaticTypeKind::None ? g_dyn[0] : fill_unfilled(c);
+    };
+
+    if (t->kind == StaticTypeKind::Array && t->elem) {
+        StaticTypeRef e = comp(t->elem);
+        return e == static_type_resolve(t->elem) ? t : array_of(e, t->opt);
+    }
+    if (t->kind == StaticTypeKind::Dict && t->key && t->val) {
+        StaticTypeRef k = comp(t->key);
+        StaticTypeRef v = comp(t->val);
+        if (k == static_type_resolve(t->key)
+                && v == static_type_resolve(t->val))
+            return t;
+        return dict_of(k, v, t->opt);
+    }
+    return t;
+}
+
 /* ----------------------------- to_string --------------------------------- */
+
+static std::string component_to_string(StaticTypeRef c)
+{
+    c = static_type_resolve(c);
+    return c->kind == StaticTypeKind::None ? "dyn" : static_type_to_string(c);
+}
 
 std::string static_type_to_string(StaticTypeRef t)
 {
@@ -543,12 +670,17 @@ std::string static_type_to_string(StaticTypeRef t)
         case StaticTypeKind::Exception: return "exception" + q;
         case StaticTypeKind::Dyn:       return "dyn" + q;   /* `dyn` / `dyn?` */
 
+        /* an UNFILLED component (`none`: `[]`, `{}`, array(N)) is the
+         * `dyn` a reader of it finalizes to (Inferencer::component_read) */
         case StaticTypeKind::Array:
-            return "array<" + static_type_to_string(t->elem) + ">" + q;
+            return "array<" + component_to_string(t->elem) + ">" + q;
+
+        case StaticTypeKind::Box:
+            return "box<" + static_type_to_string(t->elem) + ">" + q;
 
         case StaticTypeKind::Dict:
-            return "dict<" + static_type_to_string(t->key) + "," +
-                   static_type_to_string(t->val) + ">" + q;
+            return "dict<" + component_to_string(t->key) + "," +
+                   component_to_string(t->val) + ">" + q;
 
         case StaticTypeKind::Func: {
             std::string r = "func(";

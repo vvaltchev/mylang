@@ -1,0 +1,125 @@
+# README "Where a function can end": a function whose body can finish
+# without a `return` returns `none` there, so its return type is nullable;
+# one whose end cannot be reached is not. "Cannot finish" covers a loop
+# whose condition is a constant true with no `break` of its own, and a
+# `try` whose body and every catch cannot finish (or whose finally
+# cannot). Each function below reports its STATIC return type through
+# `typestr` (folded by inference; `-nti` reports the run-time one, so the
+# type assertions run only in a typed run) and its value through `+ 1`,
+# which a nullable type refuses at compile time. And a guard clause may
+# end in a `break` or a `continue` (README *narrowing*).
+
+var typed = typestr(runtime(0)) == "dyn";
+func want(str t, str s) { if (typed) assert(t == s); }
+
+func w_true(int n) {                     # left only by the return
+    while (true) {
+        if (n > 3) return n;
+        n++;
+    }
+}
+func w_one(int n) { while (1) { n += 2; if (n > 5) return n; } }
+func w_cmp(int n) { while (1 == 1) { if (n++ > 2) return n; } }
+func f_ever(int n) { for (;;) { if (n-- < 0) return n; } }
+func f_true(int n) { for (var i = 0; true; i++) if (i * n > 6) return i; }
+func nested_break(int n) {               # the break leaves the INNER loop
+    while (true) {
+        for (var i = 0; i < 10; i++)
+            if (i == n) break;
+        return n * 10;
+    }
+}
+func try_both(str s) {
+    try {
+        return int(s);
+    } catch (InvalidValueEx) {
+        return -1;
+    }
+}
+func try_fin(int n) {                    # the finally decides
+    try {
+        n = 10 / n;
+    } finally {
+        return n + 100;
+    }
+}
+func try_no_catch(int n) { try { return n * 3; } finally { n = 0; } }
+func block_mid(int n) { { return n + 7; } }
+
+print(w_true(int(runtime(1))) + 1, w_one(int(runtime(0))) + 1,
+      w_cmp(int(runtime(0))) + 1, f_ever(int(runtime(2))) + 1,
+      f_true(int(runtime(2))) + 1, nested_break(int(runtime(4))) + 1);
+print(try_both(runtime("41")) + 1, try_both(runtime("x")) + 1,
+      try_fin(int(runtime(5))) + 1, try_fin(int(runtime(0))) + 1,
+      try_no_catch(int(runtime(4))) + 1, block_mid(int(runtime(1))) + 1);
+want(typestr(w_true(1)), "int");
+want(typestr(f_ever(1)), "int");
+want(typestr(try_both("1")), "int");
+want(typestr(try_fin(1)), "int");
+
+# ... and these CAN finish, so they return a nullable type
+func w_runtime(int n) {
+    while (runtime(true)) { if (n > 3) return n; n++; }
+}
+func w_break(int n) {
+    while (true) { if (n > 3) break; if (n == 2) return n; n++; }
+}
+func w_break_try(int n) {                # a break inside a try still leaves
+    while (true) {
+        try { if (n > 0) break; } finally { n++; }
+        return n;
+    }
+}
+func w_break_finally(int n) {            # a break in a finally cancels
+    while (true) {
+        try { return n; } finally { break; }
+    }
+}
+func try_falls(str s) {
+    try { return int(s); } catch (InvalidValueEx) { print("bad " + s); }
+}
+func if_no_else(int n) { if (n > 0) return n; }
+
+want(typestr(w_runtime(1)), "int?");
+want(typestr(w_break(1)), "int?");
+want(typestr(w_break_try(1)), "int?");
+want(typestr(w_break_finally(1)), "int?");
+want(typestr(try_falls("1")), "int?");
+want(typestr(if_no_else(1)), "int?");
+print(w_runtime(int(runtime(0))), w_break(int(runtime(0))),
+      w_break(int(runtime(5))), w_break_try(int(runtime(1))),
+      w_break_try(int(runtime(-3))), w_break_finally(int(runtime(8))));
+print(try_falls(runtime("7")), try_falls(runtime("q")),
+      if_no_else(int(runtime(3))), if_no_else(int(runtime(-3))));
+
+# a guard clause may end in a continue or a break
+func total(array<int?> a) {
+    var t = 0;
+    foreach (x in a) {
+        if (x == none) continue;
+        t += x;
+    }
+    return t;
+}
+func upto_none(array<int?> a) {
+    var t = 0;
+    var i = 0;
+    while (i < len(a)) {
+        var x = a[i++];
+        if (x == none) break;
+        t = t * 10 + x;
+    }
+    return t;
+}
+var vals = [3, none, 4, 1];
+print(total(vals), upto_none(vals), upto_none([5, 6]));
+
+# `break;` / `continue;` end a brace-less branch before its `else`, and a
+# brace-less `for` body is a loop body
+var seen = "";
+for (var i = 0; i < 6; i++)
+    if (i == 4) break; else if (i % 2 == 1) continue; else seen += str(i);
+var j = 0;
+while (j < 5)
+    if (j++ == 3) break; else seen += "w";
+print(seen);

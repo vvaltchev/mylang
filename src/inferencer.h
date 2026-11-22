@@ -15,7 +15,7 @@ class EvalContext;
 struct AnalysisInfo;
 
 /*
- * Whole-program static type inference + checking (see plans/type-inference.md).
+ * Whole-program static type inference + checking (see plans/archived/type-inference.md).
  *
  * Runs after parsing (and parse-time const-folding) but BEFORE resolve_names,
  * on the clean source tree. It infers a fixed static type for every variable,
@@ -32,12 +32,39 @@ struct AnalysisInfo;
 void infer_types(Construct *root, bool enable = true, bool strict = true);
 
 /*
+ * Question 5: type the synthetic program of a PARSE-TIME call
+ * (pt_typed_call, parser.cpp) - inference as a compile runs it, then each
+ * declaration's decl_type carried to its uses (the resolver's job in a
+ * compile; a parse-time run does not resolve). `static_type_key` renders
+ * the static type inference gives a constant value: the cache key of a
+ * typed parse-time run.
+ */
+void infer_parse_time(Construct *root);
+class EvalValue;
+std::string static_type_key(const EvalValue &v);
+
+/*
  * --debug-ti: run inference (non-strict) and dump every declared identifier's
  * inferred type + use sites (machine-readable, tab-separated) to `os`. Used to
  * audit the corpus for spurious `dyn`s. See
- * plans/type-driven-specialization.md.
+ * plans/archived/type-driven-specialization.md.
  */
 void dump_type_info(Construct *root, std::ostream &os);
+
+/*
+ * -dcs: run inference (non-strict) and dump THE CALLEE SET of every
+ * call site - which function(s) the callee expression can evaluate to,
+ * or ⊤ ("top") when the analysis cannot name them - plus one
+ * `dcs-esc` line per function whose value left the analysed program.
+ *
+ * ⛔ THIS IS THE ANALYSIS'S PRIMARY NET, not a convenience. A
+ * better-analysed program computes the SAME answers, so the engine
+ * differential is blind to it by construction (CLAUDE.md, *Testing an
+ * AST TRANSFORM*): the set itself is what a test must assert, and
+ * this is what makes that possible. Same role -dti plays for the
+ * mandatory-`dyn` work. See plans/callee-set-analysis.md.
+ */
+void dump_callee_sets(Construct *root, std::ostream &os);
 
 /*
  * The COMPLETE per-node child visitor (every Construct edge, incl. try/catch
@@ -46,8 +73,22 @@ void dump_type_info(Construct *root, std::ostream &os);
  * descriptor/struct-def ownership transfer (vm_compile). Calls `f` on each
  * DIRECT child of `c` (some may be null-skipped internally).
  */
+/* #97 (#72): the value-site guard-chain cap - inferencer.cpp */
+extern int g_value_cands_max;
+
 void for_each_child_of(Construct *c,
                        const std::function<void (Construct *)> &f);
+
+/* The struct a TYPE ALIAS's initializer names (`const T = S;`, README
+ * *Type aliases*): `rv` is a constant declaration's initializer as the
+ * parser left it - a literal of the descriptor, or for a
+ * multi-declaration (`element`) its i-th element. Null for any other
+ * value. The inferencer binds the alias's symbol from it, and the
+ * resolver's warning tier reads it to know a construction through an
+ * alias is no call it cannot analyse. */
+struct StructTypeDef;
+const StructTypeDef *type_alias_struct(const Construct *rv, size_t i,
+                                       bool element);
 
 /*
  * M8 specialization pass: rewrite hot scalar expression nodes (int/float
@@ -55,7 +96,7 @@ void for_each_child_of(Construct *c,
  * into TypedScalarExpr, which evaluates without num_bin_op dispatch or
  * intermediate EvalValue boxing. Run AFTER resolve_names (it benefits from
  * resolved slots via Identifier's typed fast paths). A no-op when inference is
- * disabled (no TypeHints are set). See plans/type-inference.md M8.
+ * disabled (no TypeHints are set). See plans/archived/type-inference.md M8.
  *
  * `analyze` (the `-a`/`:analyze` pipeline only; null in a normal run) gets a
  * counted_for annotation on each `for` keyword this pass rewrites to a
@@ -64,6 +105,73 @@ void for_each_child_of(Construct *c,
 void specialize_types(Construct *root, bool enable = true,
                       EvalContext *prior_scope = nullptr,
                       AnalysisInfo *analyze = nullptr);
+
+/*
+ * PER-PASS KILL SWITCHES for the AST transforms specialize_types performs.
+ *
+ * These exist for TESTABILITY as much as debugging. An AST transform rewrites
+ * the tree BEFORE either engine sees it, so the tree-walker-vs-VM differential
+ * - the project's main correctness net - cannot see a bug in one: both engines
+ * faithfully run the same wrong tree. The only oracle is the SAME program with
+ * the transform turned off, which is what these switches provide inside ONE
+ * binary (the `-nj` JIT kill switch is the same idea one layer down).
+ *
+ * `opt_layer_equivalence` (-rt) runs a corpus through every single-pass-off
+ * configuration AND the all-off one, on BOTH engines, requiring identical
+ * output and identical exceptions. A new AST transform belongs here on the day
+ * it is written - see CLAUDE.md "Testing an AST transform".
+ *
+ * CLI: `--no-opt <name>[,<name>...]` (mylang.cpp).
+ */
+enum OptPass : unsigned {
+    opt_licm        = 1u << 0,   /* try_hoist_loop_subscripts (LICM)     */
+    opt_slice_hoist = 1u << 1,   /* try_hoist_loop_slices                */
+    opt_for_range   = 1u << 2,   /* try_for_range -> ForRangeStmt        */
+    opt_typed       = 1u << 3,   /* M8 TypedScalarExpr specialization    */
+    opt_all_passes  = 0xfu,
+};
+
+/* Bitmask of DISABLED passes; 0 (the default) = everything on. */
+extern unsigned g_opt_disabled;
+
+/* `--strict`: every non-local must be declared above its first use (step 7's
+ * opt-in half - see strict_forward_globals in resolver.cpp). */
+extern bool g_strict_mode;
+
+/*
+ * COMPILE WARNINGS (step 7 tier 3). The three tiers are: a violation decided
+ * by a SPECIFIED rule is a hard error (FIX-1, the TDZ), a failure a heuristic
+ * can PROVE is a hard error too (prove_unbound_calls), and anything merely
+ * SUSPICIOUS is a warning, in GCC's spirit ("this variable might be
+ * uninitialized").
+ *
+ * COLLECTED, not printed at the raise site: the compiler has no diagnostic
+ * stream of its own, and a pass that wrote to stderr directly would be
+ * untestable and would interleave with a script's own output. The driver
+ * drains the list and renders each one with the same caret machinery errors
+ * use; the `-rt` harness reads it instead.
+ */
+/*
+ * How many typed instances one function template gets: past it, a call
+ * with a NEW signature runs the template itself, boxed (a one-time
+ * warning names the template). A backstop for polymorphism that never
+ * settles - `f([x], n - 1)` makes a new signature per level. Default 64;
+ * the driver's `--max-instances N` sets it, and a global for the reason
+ * g_strict_mode is one.
+ */
+extern int g_tmpl_max_instances;
+
+struct CompileWarning {
+    const char *msg;    /* interned (intern_msg) - stable for the program */
+    Loc start, end;
+};
+extern std::vector<CompileWarning> g_warnings;
+void compile_warn(const char *msg, Loc start, Loc end);
+
+/* Map a CLI name ("licm", "slice-hoist", "for-range", "typed", "all") to its
+ * bit. Returns false for an unknown name. `names` for --help/diagnostics. */
+bool opt_pass_bit(const std::string &name, unsigned &bit);
+const char *opt_pass_names();
 
 /*
  * REPL incremental type inference + checking. A persistent type-checker that
@@ -75,7 +183,7 @@ void specialize_types(Construct *root, bool enable = true,
  * which the REPL catches to reject just that input. `undef_global` drops a name
  * from the committed set (so a later `var x` of a new type is fresh, not a
  * conflict). The one-shot `infer_types` (scripts + all tests) is untouched.
- * See plans/repl.md section 3.1.
+ * See plans/archived/repl.md section 3.1.
  */
 class ReplInfer {
 
@@ -86,6 +194,20 @@ public:
 
     void check_input(Construct *input);
     void undef_global(const UniqueId *name);
+
+    /* An input check_input ACCEPTED and a later stage then refused (the
+     * optimizers raised while compiling it): take back everything its
+     * check committed - its globals and its template instances - as a
+     * rejected check does, so the session goes on as if it was never
+     * typed. */
+    void reject_input();
+
+    /* An input check_input accepted that then FAILED WHILE RUNNING: the
+     * declarations it never reached bound nothing, so each global it
+     * committed and `ran(name)` denies goes back to what it was before
+     * the input (unbound, or its earlier binding) - its committed type
+     * must not stand for a name the run never defined. */
+    void forget_unbound(const std::function<bool (const UniqueId *)> &ran);
 
     /* The inferred static type string of a committed global (or "" if the name
      * is not a committed inferred symbol - e.g. a const scalar folded away).

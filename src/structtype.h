@@ -12,7 +12,7 @@
 #include <memory>
 
 /*
- * Custom struct types (see plans/structs.md). A `struct` decl builds one
+ * Custom struct types (see plans/archived/structs.md). A `struct` decl builds one
  * StructTypeDef (AST-owned, program-lifetime); the type descriptor value
  * (t_structtype) holds a raw pointer to it, exactly like a FuncObject holds a
  * FuncDeclStmt*. A struct *instance* (t_struct) is a StructObject.
@@ -24,8 +24,19 @@
 
 /* The static kind of a field, derived from its explicit type annotation. */
 enum class FieldKind : unsigned char {
-    f_bool, f_int, f_float, f_str, f_array, f_dict, f_dyn, f_struct
+    f_bool, f_int, f_float, f_str, f_array, f_dict, f_dyn, f_struct,
+    f_box        /* `box<T> f;` - a reference (its annot gives the T) */
 };
+
+/* A field of this kind names its whole type in FieldDef::annot (and a
+ * field of any other kind has none): `array<T>`, `dict<K, V>`, `box<T>`.
+ * The parser refuses a bare `array` / `dict` field (rule 5), the loader
+ * an image's (v46). */
+inline bool field_kind_has_annot(FieldKind k)
+{
+    return k == FieldKind::f_array || k == FieldKind::f_dict
+        || k == FieldKind::f_box;
+}
 
 struct StructTypeDef;
 
@@ -54,6 +65,59 @@ struct TypeAnnot {
     std::shared_ptr<TypeAnnot> key, val;        /* kind == dict */
 };
 
+/*
+ * Q2 (plans/typed-containers.md): THE TYPE INTERN TABLE. One node per
+ * distinct annotation, for the life of the process, so two equal types
+ * are one pointer and comparing them is a pointer compare. An interned
+ * node's children are interned too (held by a non-owning shared_ptr).
+ * What a container carries as its own type (`ctype`: array<T> or
+ * dict<K, V>, its top-level opt cleared) is such a node. A struct type
+ * is held by its def pointer and never dereferenced by the table, so a
+ * node naming a def that died is merely unused.
+ */
+const TypeAnnot *annot_intern(const TypeAnnot &a);
+/* `a` (interned) with its top-level `opt` cleared */
+const TypeAnnot *annot_nonopt(const TypeAnnot *a);
+/* the interned array<dyn?> / dict<dyn?, dyn?>: a DYNAMIC container's
+ * type (it refuses nothing) */
+const TypeAnnot *annot_dyn_array();
+const TypeAnnot *annot_dyn_dict();
+/* the interned array<dyn>: the fixed type whose elements are variants
+ * that are never none (rule 2) */
+const TypeAnnot *annot_array_of_dyn();
+/* the interned array<P> of a struct type `d` (a flat struct literal's) */
+const TypeAnnot *annot_array_of_struct(const StructTypeDef *d);
+/* the interned array<str> (argv's) */
+const TypeAnnot *annot_str_array();
+/* how a type reads in a message ("array<int>"); "untyped" for null */
+std::string annot_text(const TypeAnnot *a);
+/* ...written as a TYPE (`int?`, `array<int>?`), where annot_text writes
+ * a declaration's form (`opt int`); `a` is never null */
+std::string annot_type_text(const TypeAnnot *a);
+
+/*
+ * #49: a value entering a place whose type is fixed - a parameter, a
+ * declared variable, an element, a field, a dict value or key - from a
+ * `dyn` (or from a container whose element is `dyn`) is checked at run
+ * time against the place's type: what the check compares the value
+ * against (`annot`, the place's type as a run-time annotation - see
+ * value_fits, eval.h), and which place it is, for the message. Built by
+ * the inferencer (Expr14::rv_fit, ExprList::arg_fit) and pooled by
+ * codegen (Chunk::fit_specs); immutable once built, so freely shared.
+ */
+struct FitSpec {
+    enum class Place : unsigned char {
+        var,            /* a declared variable: `name` */
+        field,          /* a struct field: `name` */
+        elem,           /* an array element (a store or an append) */
+        dict_val,       /* a dict value */
+        dict_key,       /* a dict key */
+    };
+    std::shared_ptr<const TypeAnnot> annot;
+    Place place = Place::elem;
+    const UniqueId *name = nullptr;
+};
+
 struct FieldDef {
     const UniqueId *name = nullptr;
     FieldKind kind = FieldKind::f_dyn;
@@ -63,17 +127,26 @@ struct FieldDef {
      * (recursive POD); otherwise the field is a boxed pointer. */
     const StructTypeDef *struct_def = nullptr;
     bool is_opt = false;
-    /* For a parameterized container field (`array<int> xs;`): the recursive
-     * element/key/value type. Null for a generic `array`/`dict` field. */
+    /* For a container or box field (`array<int> xs;`, `box<P> b;`): the
+     * recursive element/key/value type - present exactly when
+     * field_kind_has_annot(kind). */
     std::shared_ptr<TypeAnnot> annot;
     int slot = -1;        /* boxed: index into StructObject::fields */
     int offset = -1;      /* POD: byte offset into the bytes buffer; else -1 */
+    /* Where the field is declared - for a compile-time error about it
+     * (an `opt` on a field whose type turns out to be a struct). Not
+     * stored in a .myv image. */
+    Loc loc;
+    /* Where an f_struct field's type NAME is written - for the error when
+     * no struct or class of that name is declared (a forward reference is
+     * decided once the whole program is parsed). Not stored either. */
+    Loc type_loc;
 };
 
 /*
  * POD field metrics: our OWN fixed alignment rules so a struct's C-style layout
  * depends only on the word size (sizeof(int_type)), never on host `alignof`.
- * This is the one place an arch assumption lives (see plans/structs.md s6); on
+ * This is the one place an arch assumption lives (see plans/archived/structs.md s6); on
  * the LE x86/arm/riscv targets only the int width (4 vs 8) varies. -1 marks a
  * non-POD-scalar kind (a struct is then boxed).
  */
@@ -118,7 +191,7 @@ bool try_construct_into_struct_array(EvalContext *ctx, SharedArrayObj &arr,
  * by layout()) holds general info + an `array<StructField>`; each `StructField`
  * has name/type/offset/size/align. Built once, program-lifetime. The inferencer
  * registers them in struct_by_name so field access on the result type-checks.
- * Defined in eval.cpp. See plans/reflection.md.
+ * Defined in eval.cpp. See plans/archived/reflection.md.
  */
 const StructTypeDef *native_struct_field_def();
 const StructTypeDef *native_struct_layout_def();
@@ -137,6 +210,15 @@ struct StructTypeDef {
     enum class Layout : unsigned char { boxed, pod };
 
     const UniqueId *name = nullptr;
+    /*
+     * A `class` (plans/class-and-box.md): the same declaration with
+     * REFERENCE semantics. An instance is shared, never copied on write
+     * (struct_own hands back the object itself), compares and hashes by
+     * IDENTITY, and is never embedded by value - its layout is always
+     * boxed, so a field of a class type is a pointer, an array<C> holds
+     * references and nothing copies its bytes.
+     */
+    bool is_class = false;
     std::vector<FieldDef> fields;                      /* declaration order */
     std::vector<std::pair<const UniqueId *, EvalValue>> consts;
     Layout layout = Layout::boxed;
@@ -201,10 +283,20 @@ struct StructTypeDef {
         size = 0;
         align = 1;
 
-        if (fields.empty())
+        /* a class is never POD: a POD def is what may be embedded BY
+         * VALUE (inline in another struct, flat in an array) */
+        if (fields.empty() || is_class)
             return;
 
-        int sz, al;
+        /* Initialized because the SECOND loop ignores the return value:
+         * the first loop already proved every field POD-inline-able, so
+         * the call cannot fail there - but that is a cross-loop fact no
+         * compiler can see, and GCC reports `sz`/`al` "may be used
+         * uninitialized" on the strength of the false path it cannot
+         * rule out. The values are dead (every use is preceded by a
+         * successful call); they exist so the claim is written down
+         * rather than assumed. Only a non-LTO build diagnoses this. */
+        int sz = 0, al = 1;
         for (const auto &f : fields)
             if (!pod_field_metrics(f, sz, al))
                 return;                       /* not all POD-inline-able */
@@ -226,20 +318,45 @@ struct StructTypeDef {
 };
 
 /*
- * A struct instance. COW value semantics like arrays/dicts (RefCounted; a
- * shared instance is cloned before a mutation; a const instance is deep
- * read-only). v1 storage is `fields` (a boxed LValue slot array); the POD byte
- * buffer is added later.
+ * A class instance's IDENTITY, for its hash (TypeStruct::hash). An
+ * address would do for == but not for hash: a dict keyed by class
+ * instances iterates in bucket order, and an address-based order would
+ * differ between engines and between runs (RULE 2). So every class
+ * instance is numbered when it is made, from one counter every engine
+ * advances in the same program order; equality stays the pointer
+ * compare, so two numbers that collide cost a probe, never an answer.
+ * class_ident_reset() restarts the count where a program starts.
+ */
+inline uint64_t g_class_ident = 0;
+inline uint64_t class_ident_next() { return ++g_class_ident; }
+inline void class_ident_reset(uint64_t base) { g_class_ident = base; }
+/* The base a RUN restarts from: far above any count compile time can
+ * reach, so a constant's number never meets a run's. */
+static const uint64_t CLASS_IDENT_RUN_BASE = uint64_t(1) << 40;
+
+/*
+ * A struct instance. VALUE semantics (eval.h, struct_own): a shared
+ * instance is copied by the holder that writes it; a const instance is
+ * deep read-only. A CLASS instance (def->is_class) is the same object
+ * with reference semantics: never copied on write, compared by identity.
+ * Storage is `fields` (a boxed LValue slot array) or, for a POD struct,
+ * the `bytes` buffer.
  */
 class StructObject : public RefCounted {
 
 
 public:
 
-    ML_POOL_NEW_DELETE
+    ML_POOL_NEW_DELETE_K(IOK_STRUCT)
 
     StructTypeDef *def = nullptr;
     bool readonly = false;
+    /* a `box<P>` (plans/class-and-box.md, step 3): a struct VALUE boxed
+     * into a reference - it behaves as a class instance does (is_ref) */
+    bool boxed = false;
+    /* a reference instance's identity number (0 for a struct value): see
+     * g_class_ident. A copy is a NEW instance, so it gets a new one. */
+    uint64_t ident = 0;
     /*
      * Exactly one is used, per def->layout: `fields` (a boxed LValue slot
      * array) for a boxed struct, `bytes` (a C-laid-out buffer of def->size
@@ -253,9 +370,35 @@ public:
     explicit StructObject(StructTypeDef *d) : def(d) {
         if (d->is_pod())
             bytes.resize(static_cast<size_t>(d->size));
+        if (d->is_class)
+            ident = class_ident_next();
     }
-    StructObject(const StructObject &) = default;
+    /* RefCounted() names the base: a copy owns a fresh count */
+    StructObject(const StructObject &o)
+        : RefCounted()
+        , def(o.def)
+        , readonly(o.readonly)
+        , boxed(o.boxed)
+        , ident(o.is_ref() ? class_ident_next() : 0)
+        , fields(o.fields)
+        , bytes(o.bytes)
+    { }
     StructObject(StructObject &&) = default;
+    /* A VALUE copy - not boxed, no identity, mutable: what `*b` reads out
+     * of a box<P>, and the struct box() copies in. It consumes no identity
+     * number (a copy-ctor copy of a reference instance would), so how many
+     * such copies an engine makes is unobservable. */
+    struct value_copy_t { };
+    StructObject(const StructObject &o, value_copy_t)
+        : RefCounted()
+        , def(o.def)
+        , fields(o.fields)
+        , bytes(o.bytes)
+    { }
+
+    /* REFERENCE semantics - a class instance or a boxed struct: written in
+     * place by every holder (struct_own), compared and hashed by identity */
+    bool is_ref() const { return boxed || (def && def->is_class); }
 
     bool is_pod() const { return def->is_pod(); }
     bool is_readonly() const { return readonly; }
@@ -264,10 +407,16 @@ public:
 
     /* Load a POD field as an EvalValue (a typed scalar at its byte offset). */
     EvalValue pod_get(int slot) const {
+        ML_UNTRUSTED_CHECK(slot >= 0
+                           && slot < static_cast<int>(def->fields.size()),
+                           "struct field index");
         ML_CHECK(slot >= 0 && slot < static_cast<int>(def->fields.size()));
         const FieldDef &f = def->fields[slot];
         /* offset == -1 marks a non-POD (boxed) field: pod_get on it would read
          * at bytes.data()-1. A POD instance must only pod_get POD fields. */
+        ML_UNTRUSTED_CHECK(f.offset >= 0
+                           && f.offset < static_cast<int>(bytes.size()),
+                           "struct field offset");
         ML_CHECK(f.offset >= 0 && f.offset < static_cast<int>(bytes.size()));
         const char *p = bytes.data() + f.offset;
         switch (f.kind) {
@@ -297,8 +446,118 @@ public:
 
     /* Store a (coerced) scalar value into a POD field's byte slot. */
     void pod_set(int slot, const EvalValue &v) {
+        ML_UNTRUSTED_CHECK(slot >= 0
+                           && slot < static_cast<int>(def->fields.size()),
+                           "struct field index");
         ML_CHECK(slot >= 0 && slot < static_cast<int>(def->fields.size()));
+        ML_UNTRUSTED_CHECK(def->fields[slot].offset >= 0,
+                           "struct field offset");
         ML_CHECK(def->fields[slot].offset >= 0);
         pod_store_field(def->fields[slot], bytes.data(), v);
     }
 };
+
+/*
+ * The flat CLASS storage of an array (SharedArrayObj::ovec_type) holds
+ * class references, a null pointer standing for `none`. These convert
+ * between an element and a value: is_obj_elem(v) - does the storage hold
+ * `v` as it is (a class instance, or none)? obj_elem_ptr(v) - the
+ * reference it stores for one; obj_elem_value(p) - the value an element
+ * reads as (a retain).
+ */
+inline bool is_class_instance(const EvalValue &v)
+{
+    return v.is<intrusive_ptr<StructObject>>() &&
+           v.get_ref<intrusive_ptr<StructObject>>()->is_ref();
+}
+
+inline bool is_obj_elem(const EvalValue &v)
+{
+    if (v.is<NoneVal>())
+        return true;
+    return v.is<intrusive_ptr<StructObject>>() &&
+           v.get_ref<intrusive_ptr<StructObject>>()->is_ref();
+}
+
+inline StructObject *obj_elem_ptr(const EvalValue &v)
+{
+    if (v.is<NoneVal>())
+        return nullptr;
+    return v.get_ref<intrusive_ptr<StructObject>>().get();
+}
+
+inline EvalValue obj_elem_value(StructObject *p)
+{
+    if (!p)
+        return EvalValue();
+    return EvalValue(intrusive_ptr<StructObject>(p));
+}
+
+/*
+ * A box of a scalar or a string - `box<int>`, `box<float>`, `box<bool>`,
+ * `box<str>` (plans/class-and-box.md, step 3): one cell, a reference to
+ * it shared by every copy of the box. `kind` is the element kind it was
+ * made with ('i', 'f', 'b', 's'): a store reached through a `dyn` alias is
+ * checked against it (box_store), so a typed reader never finds a misfit.
+ * Identity, like a class instance's: `==` is the object, `hash` its number.
+ * (A box of a struct is a StructObject with `boxed` set, not one of these.)
+ */
+class BoxObj : public RefCounted {
+
+public:
+
+    ML_POOL_NEW_DELETE_K(IOK_BOX)
+
+    EvalValue v;
+    char kind;
+    bool readonly = false;
+    uint64_t ident;
+
+    BoxObj(EvalValue val, char k)
+        : v(std::move(val)), kind(k), ident(class_ident_next()) { }
+    /* a copy (clone) is a NEW box: a fresh count, a fresh identity */
+    BoxObj(const BoxObj &o)
+        : RefCounted(), v(o.v), kind(o.kind), readonly(o.readonly)
+        , ident(class_ident_next()) { }
+};
+
+/* A box value of either representation: a BoxObj, or a boxed struct */
+inline bool is_box_value(const EvalValue &v)
+{
+    return v.is<intrusive_ptr<BoxObj>>()
+        || (v.is<intrusive_ptr<StructObject>>()
+            && v.get_ref<intrusive_ptr<StructObject>>()->boxed);
+}
+
+/* The BoxObj element kind of a declared box element type ('i', 'f', 'b',
+ * 's'), or 0 for a struct (or no) element (eval.cpp) */
+char box_kind_of(DeclType k);
+/* Does `v` hold a box of the declared `box<T>` (`a`, its kind box; null
+ * for no element type)? A run-time check for a value a `dyn` laundered
+ * (eval.cpp). */
+bool box_fits_annot(const EvalValue &v, const TypeAnnot *a);
+
+/*
+ * G3: does this value ALREADY hold exactly the field's declared scalar
+ * kind, so coerce_struct_field would hand it straight back?
+ *
+ * Worth a predicate because that coercion is NOT cheap for a no-op: it
+ * takes its EvalValue BY VALUE - a 32-byte non-trivial type, so a copy in
+ * and a copy out - and then calls coerce_to_decl_type, which does the same
+ * again. That is the by-value-parameter disease vm_frame_leave (#82) and
+ * lever 1 were cured of; here it ran once PER FIELD of every struct built.
+ *
+ * EXACT-match only, deliberately. Every real conversion still goes through
+ * coerce_struct_field: bool -> int, bool/int -> float (all supported and
+ * kept working), `none` into an opt field, and every non-scalar kind. This
+ * skips the identity case and nothing else.
+ */
+inline bool field_exact_scalar(const FieldDef &fd, const EvalValue &v)
+{
+    switch (fd.kind) {
+        case FieldKind::f_int:   return v.is<int_type>();
+        case FieldKind::f_float: return v.is<float_type>();
+        case FieldKind::f_bool:  return v.is<bool>();
+        default:                 return false;
+    }
+}

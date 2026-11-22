@@ -3,9 +3,13 @@
 
 #include "defs.h"
 #include "poolalloc.h"
+#include "uniqueid.h"
 
+#include <memory>
+#include <new>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 #include <deque>
 #include "operators.h"
@@ -97,14 +101,38 @@ struct BacktraceFrame {
  * callee first, outer callers via `parent`) lets the backtrace reconstruct the
  * call frames that have no physical do_func_call frame. Each element maps 1:1
  * to a BacktraceFrame. See flush_inline_frames() in backtrace.cpp and the
- * plans/function-inlining.md design. (No inliner emits these yet.)
+ * plans/archived/function-inlining.md design. (No inliner emits these yet.)
  */
 struct InlineCtx {
     std::string callee_name;
     std::vector<std::string> params;
     Loc call_site;
     const InlineCtx *parent = nullptr;
+    /* where the call ENDS (call_site is where it starts): the call's whole
+     * span, which an error the CALLER's operation raises about the call's
+     * value carets (inline_operand_span). Compile-time only: a chunk's
+     * inline_frames store the start alone. */
+    Loc call_end;
 };
+
+/*
+ * #68: the span an error that a PARENT operation raises about one of its
+ * operands carets - the operand as written at the parent's level (the
+ * divisor of a division by zero, the operand of a type error). When the
+ * operand is the root of an inlined call's body, `call` is that call
+ * (Construct::inline_call) and the span is the CALL's: `100 / sq(x - 2)`
+ * with sq inlined carets `sq(x - 2)`, as with -ni, where it careted
+ * `x * x` inside sq. [s, e) holds the operand's own span on entry and is
+ * replaced only then. The one site that sets inline_call (the expression
+ * engine) passes a parsed call's span, so both ends are always set.
+ */
+inline void inline_operand_span(const InlineCtx *call, Loc &s, Loc &e)
+{
+    if (call) {
+        s = call->call_site;
+        e = call->call_end;
+    }
+}
 
 struct Exception {
 
@@ -124,6 +152,93 @@ struct Exception {
      */
     bool inline_origin_emitted = false;
 
+    /*
+     * The INLINED-AT chain to flush, baked by the code that conveyed this
+     * exception; -1 = "look it up by pc" (the ordinary path).
+     *
+     * WHY (#56): `vm_flush_inline` normally resolves the chain from the
+     * raising op's pc via `Chunk::inline_frame_at`. That breaks once a native
+     * run's interpreted ORIGINALS are deleted: every pc in the run collapses
+     * onto the head EnterNative, so a run holding ops from two DIFFERENT
+     * inlined bodies could no longer say which chain a raise belonged to -
+     * which is exactly what kept such runs from being deleted. A conveying
+     * fragment therefore stamps its op's chain index HERE, the same way it
+     * already stamps the op's caret into loc_start/loc_end (emit_exc_stamp,
+     * jit.cpp), and the flush prefers it. First conveyor wins, like the caret.
+     *
+     * `int32_t` (not the pool's index type) because the fragment writes it
+     * with one `mov dword [rax+off], imm32`.
+     */
+    int32_t jit_inline_frame = -1;
+
+    /*
+     * THE FAILING ARGUMENT of a call's bind (RULE 2, 2026-09-20): the
+     * parameter index a BIND COERCION rejected - `func f(int k)` handed a
+     * `dyn` float - so the call site can caret THAT argument's own span
+     * instead of the whole argument list. Set ONLY by a bind performed for
+     * a CALL SITE (the tree-walker's do_func_bind_params over argument
+     * expressions / the VM's arg run, vm_frame_setup's coercing loop) -
+     * never by a builtin CALLBACK's bind, whose parameter index names no
+     * argument of the enclosing builtin call, and never by an assignment's
+     * coercion (CoerceNumV, a typed decl), which has no argument at all.
+     * -1 = "not a bind failure": the stamp uses the list span.
+     *
+     * A stale value is harmless by construction: every stamp that reads it
+     * is guarded by `!loc_start`, and the innermost setup catch of the call
+     * whose bind failed stamps first. `int32_t` because the fragment reads
+     * it with one `mov r32, dword [rax+off]` (emit_exc_stamp's args form).
+     */
+    int32_t bind_arg = -1;
+
+    /*
+     * RAISED BY A COMPOUND ASSIGNMENT'S OPERATION (RULE 2): nonzero when
+     * this exception came out of the arithmetic / shift / type step of
+     * `lv OP= rhs` (or `lv++`) - apply_compound_op, or a flat store's
+     * own div0 / negative-shift check - rather than out of reaching the
+     * lvalue. The tree-walker carets the two differently: an access
+     * error (OOB, a missing key, not-an-lvalue) at the LVALUE, which is
+     * the node that raised it, and an operation error at the WHOLE
+     * compound expression, whose Construct::eval is the first to stamp
+     * a loc-less throw. A VM store op carries both spans - `locs` the
+     * lvalue, `op_locs` the whole expression (bytecode.h) - and a stamp
+     * site selects on this flag (vm_stamp_caret; the JIT's
+     * emit_exc_stamp reads it at run time). Only meaningful while the
+     * exception is LOC-LESS: every stamp that reads it is guarded by
+     * `!loc_start`. `int32_t` because the fragment tests it with one
+     * `cmp dword [rax+off], 0`.
+     */
+    int32_t op_caret = 0;
+
+    /*
+     * Record a PHYSICAL frame - the one place every engine appends one
+     * (#38 repro B). `inline_origin_emitted` and `jit_inline_frame` are
+     * facts about the frame the exception is CURRENTLY unwinding
+     * through, not about the exception: "this frame's inlined-at chain
+     * was flushed" / "this frame's conveyor baked this chain". Crossing
+     * a physical frame boundary moves the exception into the CALLER,
+     * whose inlined regions have not been flushed yet - so both reset
+     * here. They used to persist, and a callee's virtual frame then
+     * suppressed its caller's: `top` vanished from
+     * `top -> sort -> cmpw -> weight` (every engine, with inlining on),
+     * and a callee's baked chain index was looked up in the CALLER's
+     * pool. A call-site flush that follows (do_func_call's
+     * call_site_inl, vm_flush_inline_call) sets the flag again, which
+     * is what keeps the enclosing call node from re-emitting.
+     */
+    void push_frame(const FuncDescriptor *d, Loc cs)
+    {
+        backtrace.emplace_back(d, cs);
+        inline_origin_emitted = false;
+        jit_inline_frame = -1;
+    }
+
+    void push_frame(std::string n, std::vector<std::string> p, Loc cs)
+    {
+        backtrace.emplace_back(std::move(n), std::move(p), cs);
+        inline_origin_emitted = false;
+        jit_inline_frame = -1;
+    }
+
     Exception(const char *name,
               const char *msg,
               Loc start = Loc(),
@@ -135,7 +250,24 @@ struct Exception {
     { }
 
     virtual ~Exception() = default;
+
+    /* May a SCRIPT handle this? Never for a plain Exception - a compile
+     * error, raised before anything runs; RuntimeException says when. */
+    virtual bool is_catchable() const { return false; }
 };
+
+/* The identity a RuntimeException keeps across its clones (see `serial`) */
+inline uint64_t exc_next_serial()
+{
+    static uint64_t n = 0;
+    return ++n;
+}
+
+/* How many earlier exceptions one exception's chain keeps (question 12):
+ * exc_note_context attaches no more, and format_exception prints no more,
+ * so neither walks an unbounded chain - a recursion through catch bodies
+ * would otherwise make every escape cost its depth and print every level. */
+constexpr int EXC_CONTEXT_MAX = 16;
 
 struct RuntimeException : public Exception {
 
@@ -150,7 +282,7 @@ struct RuntimeException : public Exception {
      * `throw X` value still uses the EH runtime's own allocation - only
      * explicit new/clone routes through this.)
      */
-    ML_POOL_NEW_DELETE
+    ML_POOL_NEW_DELETE_K(IOK_EXC)
 
     RuntimeException(const char *name,
                      const char *msg,
@@ -161,7 +293,137 @@ struct RuntimeException : public Exception {
 
     virtual RuntimeException *clone() const = 0;
     [[ noreturn ]] virtual void rethrow() const = 0;
+
+    /* The catch-matching NAME (a user struct exception's type name, else
+     * the built-in `name`) and the ExceptionObject discriminator - cheap
+     * VIRTUALS, not dynamic_cast: the catch matcher runs these once per
+     * caught exception, and the RTTI cast measured ~218 Ir per call on the
+     * multiple-inheritance ExceptionObjectTempl graph (70_exc profile,
+     * task #74) vs a ~3 Ir virtual dispatch. `is_exception_object()`
+     * true guarantees the object IS an ExceptionObjectTempl (only that
+     * class overrides it), so callers may static_cast. */
+    virtual std::string_view match_name() const { return name; }
+    virtual bool is_exception_object() const { return false; }
+
+    /* The catch-matching name as an INTERNED pointer (#74 inc 3): the
+     * matcher compares pointers instead of strings (the per-match
+     * string_view(name) paid a strlen + memcmp, ~13% of the catch
+     * bench). The DECL_RUNTIME_EX macro overrides this with a per-class
+     * lazy static; ExceptionObjectTempl carries the thrown struct's
+     * already-interned type name. nullptr = "match by string" - the
+     * safe fallback for any subclass without the override. */
+    virtual const UniqueId *match_uid() const { return nullptr; }
+
+    /*
+     * May a SCRIPT handle this? See UncatchableRuntimeException below.
+     * Checked by BOTH catch matchers (vm_catch_match, do_catch) before any
+     * name comparison, so it also defeats the parenless catch-all.
+     */
+    bool is_catchable() const override { return true; }
+
+    /*
+     * IMPLICIT CHAINING (question 12, Python's __context__): the exception
+     * that was being HANDLED when this one left the body handling it - a
+     * catch body, or a finally that runs while an exception propagates.
+     * exc_note_context sets it as the exception leaves each such body, the
+     * innermost first, so an outer one goes to the chain's TAIL; the
+     * uncaught report prints the chain oldest first (format_exception). A
+     * node is a CLONE taken when it was attached, its backtrace dropped:
+     * only its header and caret are printed. Clones of this exception share
+     * the chain.
+     */
+    std::shared_ptr<RuntimeException> context;
+
+    /* Assigned at construction and copied by clone(), so a `rethrow` of the
+     * handled exception is recognised as that exception, not a new one. */
+    uint64_t serial = exc_next_serial();
+
+    /* exc_note_context left older exceptions out (EXC_CONTEXT_MAX) */
+    bool context_cut = false;
+
+    ~RuntimeException() override
+    {
+        /* free a long chain one link at a time, not one nested destructor
+         * per link (a deep recursion through catch bodies builds one) */
+        while (context && context.use_count() == 1) {
+            std::shared_ptr<RuntimeException> next =
+                std::move(context->context);
+            context = std::move(next);
+        }
+    }
 };
+
+/*
+ * Record that `e` left a body handling `handled` (question 12): `e` is
+ * leaving a catch body that caught `handled`, or a finally that runs while
+ * `handled` propagates. Attaches a clone of `handled` at the tail of e's
+ * chain - unless `e` IS `handled` (a rethrow, or a `throw` of the caught
+ * value), which keeps the context `handled` had, or the chain already holds
+ * it or is full. Shared by every engine (eval.cpp).
+ */
+void exc_note_context(RuntimeException &e, const RuntimeException &handled);
+
+/*
+ * A RUNTIME exception a script may NEVER handle.
+ *
+ * `RuntimeException` used to mean two unrelated things at once: "travels the
+ * VM/JIT conveyance, so it gets backtrace frames and a caret" (an
+ * IMPLEMENTATION property) and "a `catch` clause may name it" (a LANGUAGE
+ * property). Splitting them is what lets an error be reported PROPERLY
+ * without becoming script-catchable.
+ *
+ * It matters because the two channels out of a JIT fragment are not equal:
+ * `g_vm_jit_exc` is typed on RuntimeException and re-raises through vm_raise
+ * (frames + the baked caret), while a plain `Exception` is not carried at all
+ * and propagates as a raw C++ throw through JIT-generated code - which has no
+ * unwind information, so the unwinder finds no handler and calls
+ * std::terminate. That was a real SIGABRT (`var c = func[zz]() => zz;`).
+ *
+ * Enforcement is BOTH ways: naming one in a catch clause is a COMPILE error
+ * (is_uncatchable_ex_name, checked in the parser), and the matchers refuse it
+ * at run time so no catch-all can swallow it.
+ */
+struct UncatchableRuntimeException : public RuntimeException {
+
+    using RuntimeException::RuntimeException;
+
+    bool is_catchable() const override { return false; }
+};
+
+/*
+ * TESTS builds: every run-time exception CLASS registers its name and
+ * whether a script may catch it, at static initialization, from its own
+ * declaration - DECL_RUNTIME_EX_BASE for the macro classes, and an
+ * ML_EX_REGISTER line in a class declared by hand. The -rt check
+ * `catch_names_every_builtin_ex` (tests.cpp) compares that registry with
+ * is_catchable_ex_name / is_uncatchable_ex_name, so a new exception class
+ * missing from the right list fails the suite with no list of classes to
+ * keep up to date by hand.
+ */
+#ifdef TESTS
+struct ExTestClass {
+    const char *name;
+    bool catchable;
+};
+
+inline std::vector<ExTestClass> &ex_test_classes()
+{
+    static std::vector<ExTestClass> v;
+    return v;
+}
+
+inline bool ex_test_register(const char *name, bool catchable)
+{
+    ex_test_classes().push_back({name, catchable});
+    return true;
+}
+
+#define ML_EX_REGISTER(name, catchable)                         \
+        static inline const bool ex_test_registered_ =          \
+            ex_test_register(#name, catchable);
+#else
+#define ML_EX_REGISTER(name, catchable)
+#endif
 
 #define DECL_SIMPLE_EX(name, msg)                  \
                                                    \
@@ -172,26 +434,55 @@ struct RuntimeException : public Exception {
         { }                                        \
     };
 
-#define DECL_RUNTIME_EX(name, msg)                        \
+/* Same shape as DECL_RUNTIME_EX but NOT script-catchable - see
+ * UncatchableRuntimeException. No match_uid(): both catch matchers ask
+ * is_catchable() first, so nothing ever asks an uncatchable exception
+ * which clause it matches (its lazy uid init was code no run reached). */
+#define DECL_UNCATCHABLE_EX(name, msg)                              \
+    DECL_RUNTIME_EX_BASE(name, msg, UncatchableRuntimeException, )
+
+#define DECL_RUNTIME_EX(name, msg)                                  \
+    DECL_RUNTIME_EX_BASE(name, msg, RuntimeException,               \
+                         DECL_EX_MATCH_UID(name))
+
+/* the catch matchers' interned-name fast path (#74 inc 3) */
+#define DECL_EX_MATCH_UID(name)                           \
+        const UniqueId *match_uid() const override {      \
+            /* hand-rolled lazy init: a plain zero-init   \
+             * pointer, no __cxa_guard acquire (the       \
+             * interpreter is single-threaded; the guard  \
+             * measured 18 Ir per catch on 70_exc) */     \
+            static const UniqueId *u;                     \
+            if (!u)                                       \
+                u = UniqueId::get(#name);                 \
+            return u;                                     \
+        }
+
+#define DECL_RUNTIME_EX_BASE(name, msg, base, match_uid_decl) \
                                                           \
-    struct name : public RuntimeException {               \
+    struct name : public base {                           \
                                                           \
         name(Loc start = Loc(), Loc end = Loc())          \
-            : RuntimeException(#name, msg, start, end)    \
+            : base(#name, msg, start, end)                \
         { }                                               \
                                                           \
         name(const char *custom_msg,                      \
              Loc s = Loc(), Loc e = Loc())                \
-            : RuntimeException(#name, custom_msg, s, e)   \
+            : base(#name, custom_msg, s, e)               \
         { }                                               \
                                                           \
         name *clone() const override {                    \
             return new name(*this);                       \
         }                                                 \
                                                           \
+        match_uid_decl                                    \
+                                                          \
         [[ noreturn ]] void rethrow() const override {    \
             throw *this;                                  \
         }                                                 \
+                                                          \
+        ML_EX_REGISTER(name, (!std::is_same<base,         \
+                       UncatchableRuntimeException>::value)) \
     };
 
 struct InvalidTokenEx : public Exception {
@@ -211,17 +502,55 @@ struct InvalidTokenEx : public Exception {
     { }
 };
 
-DECL_SIMPLE_EX(InternalErrorEx, "Internal error")
-DECL_SIMPLE_EX(CannotRebindConstEx, "Cannot rebind const")
-DECL_SIMPLE_EX(CannotRebindBuiltinEx, "Cannot rebind builtin")
+/* An interpreter BUG tripwire, never a user error - but it must RENDER
+ * (message, caret, frames) instead of aborting when one fires inside a JIT
+ * fragment, which is why it is a RuntimeException. Still unhandleable. */
+DECL_UNCATCHABLE_EX(InternalErrorEx, "Internal error")
+/* Rebinding a const or a builtin name. Raised at compile time when the
+ * target is a declaration, at run time for an assignment - and then it must
+ * travel the VM/JIT conveyance like any runtime error, or the VM printed it
+ * with no backtrace (the tree-walker records every frame for any exception).
+ * Never handled by a script. */
+DECL_UNCATCHABLE_EX(CannotRebindConstEx, "Cannot rebind const")
+DECL_UNCATCHABLE_EX(CannotRebindBuiltinEx, "Cannot rebind builtin")
 DECL_SIMPLE_EX(ExpressionIsNotConstEx, "The expression is not const")
 DECL_SIMPLE_EX(AlreadyDefinedEx, "Already defined error")
-DECL_SIMPLE_EX(InvalidArgumentEx, "Invalid argument error")
-DECL_SIMPLE_EX(InvalidNumberOfArgsEx, "Invalid number of arguments error")
-DECL_SIMPLE_EX(CannotChangeConstEx, "Cannot change constant")
+/* All three are RUNTIME (script-catchable) exceptions - builtins throw them at
+ * runtime, and the JIT's exception conveyance (g_vm_jit_exc) is
+ * RuntimeException-shaped, so a native builtin call (CallBuiltinV /
+ * CallBuiltinLV / AppendV) that throws one must carry it without a
+ * std::terminate. InvalidArgumentEx is inherently DYNAMIC (a bad VALUE into
+ * max/min/round). CannotChangeConstEx (mutating a const/readonly container via a
+ * LVALUE builtin - append/push/insert/erase/sort) is inherently DYNAMIC too (the
+ * const-ness is a runtime property of the value, e.g. an aliased const passed as
+ * a param), so both belong here permanently. InvalidNumberOfArgsEx is here FOR
+ * NOW; the deeper fix is FIXED builtin arities (e.g. write(str) +
+ * fwrite(file_or_handle, str)) so arity becomes a COMPILE-time check and the
+ * runtime throw disappears - see plans/archived/callbuiltinv-nativization.md #1. */
+/*
+ * THE TEMPORAL DEAD ZONE, runtime half (#131) - see UseBeforeBindingEx. A
+ * function body reading a GLOBAL whose declaration has not run yet:
+ *
+ *     func fetch() { return g; }
+ *     var dyn t = fetch();          # called BEFORE the binding
+ *     var g = 5;
+ *
+ * The function may be called from anywhere, so this is NOT decidable in
+ * general (an indirect or conditional call defeats any analysis) - hence a
+ * runtime error rather than a compile one. It IS catchable: the condition is
+ * a defined, ordinary runtime fact, and by HARD RULE 1 every program must
+ * have a defined outcome. Catching it should nonetheless be extremely rare
+ * in real code - where the failure is PROVABLE the compiler refuses the
+ * program with UseBeforeBindingEx instead, even inside a `try`.
+ */
+DECL_RUNTIME_EX(UnboundSymbolEx, "Unbound symbol")
+
+DECL_RUNTIME_EX(InvalidArgumentEx, "Invalid argument error")
+DECL_RUNTIME_EX(InvalidNumberOfArgsEx, "Invalid number of arguments error")
+DECL_RUNTIME_EX(CannotChangeConstEx, "Cannot change constant")
 
 /*
- * Compile-time type-inference errors (see plans/type-inference.md). They are
+ * Compile-time type-inference errors (see plans/archived/type-inference.md). They are
  * plain Exceptions (NOT RuntimeExceptions), so script `try/catch` cannot catch
  * them: a type violation fails the build, like a SyntaxError. Each takes a
  * custom message (the inferencer interns it so it outlives the throw) and the
@@ -249,12 +578,35 @@ struct WrongArgCountEx : public Exception {
  * A plain `var`/`const` whose type the inferencer could only conclude is `dyn`.
  * Under the mandatory-dyn rule a plain declaration must have a concrete static
  * type; a genuinely dynamic one must be declared `dyn` (see
- * plans/type-driven-specialization.md). Compile-time, uncatchable.
+ * plans/archived/type-driven-specialization.md). Compile-time, uncatchable.
  */
 struct DynRequiredEx : public Exception {
     DynRequiredEx(const char *m = "Declaration requires an explicit 'dyn'",
                   Loc start = Loc(), Loc end = Loc())
         : Exception("DynRequiredEx", m, start, end) { }
+};
+
+/*
+ * THE TEMPORAL DEAD ZONE, compile half (#131). Every declaration's NAME
+ * exists from the top of its scope; its VALUE is bound when the declaration
+ * statement runs. Reading it in between is the "temporal dead zone" - the
+ * term is JavaScript's, for `let`, and MyLang adopts the same model.
+ *
+ * This is the DECIDABLE half: the reader is not inside a function body, so
+ * its position relative to the declaration is fixed and the error is a
+ * COMPILE error (uncatchable, like the other compile diagnostics).
+ *
+ *     func f() { var r = t; var t = 5; return r; }   # same scope
+ *     var q = g; var g = 5;                          # top-level statement
+ *
+ * Distinct from UndefinedVariableEx, which means the name is declared in NO
+ * scope at all (FIX-1, #130), and from UnboundSymbolEx below, which is the
+ * same condition where it CANNOT be decided at compile time.
+ */
+struct UseBeforeBindingEx : public Exception {
+    UseBeforeBindingEx(const char *m = "Use before binding",
+                       Loc start = Loc(), Loc end = Loc())
+        : Exception("UseBeforeBindingEx", m, start, end) { }
 };
 
 /*
@@ -279,6 +631,49 @@ struct ShadowingEx : public Exception {
 /* Runtime errors */
 DECL_RUNTIME_EX(DivisionByZeroEx, "Division by zero")
 DECL_RUNTIME_EX(StackOverflowEx, "Maximum call depth exceeded")
+
+/*
+ * OUT OF MEMORY (2026-10-05; catchable - the maintainer's choice). It is a
+ * std::bad_alloc too, so it is what the process's new_handler throws
+ * (ml_out_of_memory, mylang.cpp): operator new may only throw a bad_alloc,
+ * and as a RuntimeException every existing catch - the VM's dispatch, each
+ * JIT status helper, a script's `catch` - conveys it unchanged. A builtin
+ * that builds a result of a size the program gives reserves it before
+ * filling it (reserve_or_oom, arr.cpp.h), so a refusal leaves nothing
+ * half-built. Not covered, and not coverable: a refusal inside a noexcept
+ * path (std::terminate), and the OS killing the process under overcommit.
+ */
+struct OutOfMemoryEx : public RuntimeException, public std::bad_alloc {
+
+    OutOfMemoryEx(Loc start = Loc(), Loc end = Loc())
+        : RuntimeException("OutOfMemoryEx", "Out of memory", start, end)
+    { }
+
+    OutOfMemoryEx(const char *custom_msg, Loc s = Loc(), Loc e = Loc())
+        : RuntimeException("OutOfMemoryEx", custom_msg, s, e)
+    { }
+
+    OutOfMemoryEx *clone() const override {
+        return new OutOfMemoryEx(*this);
+    }
+
+    const UniqueId *match_uid() const override {
+        static const UniqueId *u;       /* as DECL_RUNTIME_EX_BASE's */
+        if (!u)
+            u = UniqueId::get("OutOfMemoryEx");
+        return u;
+    }
+
+    [[ noreturn ]] void rethrow() const override {
+        throw *this;
+    }
+
+    const char *what() const noexcept override {
+        return "OutOfMemoryEx";
+    }
+
+    ML_EX_REGISTER(OutOfMemoryEx, true)
+};
 DECL_RUNTIME_EX(AssertionFailureEx, "Assertion failure")
 DECL_RUNTIME_EX(NotLValueEx, "Not an lvalue error")
 DECL_RUNTIME_EX(TypeErrorEx, "Type error")
@@ -288,17 +683,82 @@ DECL_RUNTIME_EX(OutOfBoundsEx, "Out of bounds error")
 DECL_RUNTIME_EX(KeyNotFoundEx, "Key not found in dict")
 DECL_RUNTIME_EX(CannotOpenFileEx, "Cannot open file error")
 
-struct UndefinedVariableEx : public Exception {
+/*
+ * Since FIX-1 (#130) a SCRIPT cannot reach this - a name declared nowhere is
+ * a compile error - so it fires only in the REPL, which is open-world. It is
+ * an UncatchableRuntimeException rather than a plain Exception so that the
+ * REPL path still gets frames and a caret through the ordinary conveyance,
+ * without ever becoming something a script can handle.
+ */
+struct UndefinedVariableEx : public UncatchableRuntimeException {
 
     const std::string_view name;
     bool in_pure_func;
 
-    UndefinedVariableEx(const std::string_view &name, Loc start = Loc(), Loc end = Loc())
-        : Exception("UndefinedVariable", nullptr, start, end)
+    UndefinedVariableEx(const std::string_view &name,
+                        Loc start = Loc(), Loc end = Loc())
+        : UncatchableRuntimeException("UndefinedVariable", nullptr, start, end)
         , name(name)
         , in_pure_func(false)
     { }
+
+    UndefinedVariableEx *clone() const override {
+        return new UndefinedVariableEx(*this);
+    }
+
+    [[ noreturn ]] void rethrow() const override {
+        throw *this;
+    }
+
+    ML_EX_REGISTER(UndefinedVariableEx, false)
 };
+
+/*
+ * Is `n` the name of an exception a script may NOT name in a catch clause?
+ * The compile-time half of UncatchableRuntimeException (the run-time half is
+ * the `is_catchable()` test in both catch matchers): every
+ * UncatchableRuntimeException class, and "UndefinedVariable", the name
+ * UndefinedVariableEx carries. `catch_names_every_builtin_ex` (tests.cpp)
+ * checks the list against the classes themselves (ML_EX_REGISTER).
+ */
+inline constexpr const char *uncatchable_ex_names[] = {
+    "InternalErrorEx", "UndefinedVariable", "UndefinedVariableEx",
+    "CannotRebindConstEx", "CannotRebindBuiltinEx",
+};
+
+inline bool is_uncatchable_ex_name(const std::string_view &n)
+{
+    for (const char *k : uncatchable_ex_names)
+        if (n == k)
+            return true;
+    return false;
+}
+
+/*
+ * Question 25: is `n` the name of a built-in exception a catch clause may
+ * name? A clause names a struct by IDENTITY (the struct the name resolves
+ * to where the clause is written); a name no struct in scope takes must
+ * be one of these, or it is a compile error. Every catchable run-time
+ * exception the interpreter raises: the DECL_RUNTIME_EX classes and
+ * OutOfMemoryEx. A new one joins this list, or naming it in a clause is a
+ * compile error - and `catch_names_every_builtin_ex` (tests.cpp) fails,
+ * since every exception class registers itself (ML_EX_REGISTER).
+ */
+inline constexpr const char *catchable_ex_names[] = {
+    "UnboundSymbolEx", "InvalidArgumentEx", "InvalidNumberOfArgsEx",
+    "CannotChangeConstEx", "DivisionByZeroEx", "StackOverflowEx",
+    "OutOfMemoryEx", "AssertionFailureEx", "NotLValueEx",
+    "TypeErrorEx", "InvalidValueEx", "NotCallableEx",
+    "OutOfBoundsEx", "KeyNotFoundEx", "CannotOpenFileEx",
+};
+
+inline bool is_catchable_ex_name(const std::string_view &n)
+{
+    for (const char *k : catchable_ex_names)
+        if (n == k)
+            return true;
+    return false;
+}
 
 struct SyntaxErrorEx : public Exception {
 

@@ -1,0 +1,770 @@
+# THE FRAMELESS CALLEE — the plan (#97, opened 2026-08-29)
+
+Every number here was measured on this box, on the SHIPPING lane
+(`OPT=1 ASSERTS=0`), with `-npc`, before any code was written. Where a
+number came from a TESTS lane it says so and it is not used.
+
+---
+
+## 0. WHERE WE ACTUALLY ARE
+
+### 0.1 The gate exists and reaches nobody
+
+`jit_chunk_frameless_ok` (#97 step 6) was built as a REACH PROBE and
+decides nothing. `MYLANG_JITSTATS` on the shipping build, scale 1:
+
+    bench                 frameless_chunks   frameless_calls   total calls
+    09_fib_recursive             0                  0             555,823
+    76_funcval_dispatch          4                  0             999,999
+    63_closures                  6                  2             999,999
+    11_closure_counter           3                  1           1,000,000
+    78_typed_param_call          4                  0           2,000,001
+
+**3 sites out of 4.5 million calls.** `frameless_chunks` counts BODIES
+that qualify; `frameless_calls` counts CALL SITES that could use one.
+The gap between those two columns is the whole problem: the bodies are
+fine, the SITES cannot name their callee.
+
+### 0.2 Why each bench declines — `MYLANG_FRAMELESS_WHY=1`, verbatim
+
+    09_fib_recursive
+      [frameless] not a leaf          slots=3+8 ops=40 refs=[0 3 4 5] last=91
+      [frameless] not a leaf          slots=1+9 ops=50 refs=[]        last=52
+
+    78_typed_param_call
+      [frameless] not a leaf          slots=7+4 ops=33 refs=[0 2 3 7 8 10]
+      [frameless] OK                  slots=1+1 ops=2  refs=[1]
+      [frameless] OK                  slots=1+2 ops=3  refs=[]
+      [frameless] OK                  slots=1+1 ops=2  refs=[1]
+      [frameless] OK                  slots=1+2 ops=3  refs=[]
+
+    76_funcval_dispatch
+      [frameless] ref_slots too many  slots=6+4 ops=33 refs=[0 2 3 5 6 7 8]
+      [frameless] OK                  slots=2+2 ops=4  refs=[0 1 2 3]   x4
+
+### 0.3 What a call costs today — `scripts/jitprofile.py`
+
+09_fib_recursive, scale 1, 555,823 calls:
+
+    Ir in JIT code   122,514,518   72.4%     220 Ir per call
+    elsewhere         46,694,700   27.6%
+    run total        169,209,218
+
+and the only hot C++ helper left is
+
+    jit_cached_probe  13,339,968    7.9%      24 Ir per call
+
+everything else outside the fragment is compile-time (dynamic_cast,
+dl_lookup, printf). The call protocol has already moved into emitted
+code; what remains is what that emitted code DOES.
+
+### 0.4 The per-call bookkeeping, as emitted (fib$0#0, `--top 34`)
+
+    +0    push rbp                       555,832   <- every call
+    +1    mov rbp, rsp
+    +4    push rbx
+    +5    sub rsp, 8                               <- alignment pad
+    +9    mov rbx, rdi                             <- the window
+    +12   mov rax, s0
+    +19   cmp rax, 2                               <- THE FIRST REAL WORK
+    +23   jge +724
+    +29   mov r8, [<addr>]               278,905   <- the activation
+    +37   mov r10, [r8+0x40]                       <- act.back_rec()
+    +44   cmp rbx, [r10+0x0]                       <- rec identity
+    +51   jne +513
+    +57   cmp byte [r10+0x68], 0                   <- boundary?
+    +65   jne +401
+    +71   cmp [r10+0x58], 0                        <- cache_key?
+    +79   jne +707
+    +85   cmp [r10+0x70], 0
+    +93   jne +707
+    +99   cmp [r8+0x270], 0
+    +107  jne +707
+    +113  mov rdx, [r10+0x30]                      <- the parent's dst
+    +120  test rdx, rdx
+    +123  js +222
+    +129  imul rax, rdx, 48                        <- dst slot address
+    +136  mov rcx, [r10+0x88]
+    +143  add rcx, rax
+    +146  mov rax, [rcx+0x18]                      <- the OLD value's type
+    +153  cmp [rax+0x8], 8                         <- trivial?
+    +160  jge +707
+    +166..+194  the four-word result copy
+
+That is **~21 instructions of RECORD INTERROGATION** before a 32-byte
+store, and the head of it —
+
+    mov r8,[addr] -> mov r10,[r8+0x40] -> cmp rbx,[r10+0x0] -> jne
+
+— is a THREE-DEEP DEPENDENT LOAD CHAIN FEEDING A COMPARE THAT GATES THE
+NEXT INSTRUCTION. That exact shape is what #111 removed for a 0.86x wall
+clock while twenty instructions of #97 steps 1-6 moved the suite 1.002x.
+**The dependency chain is the thing that costs time**, and this tier's
+argument rests on removing one, not on the instruction count.
+
+### 0.5 What the RECORD is already worth — the norec A/B
+
+`MYLANG_JIT_OFF=norec` turns the record-LESS tier off, so the delta is
+what NOT writing a record already buys. It is a lower bound on frameless,
+which additionally removes the record READ above.
+
+    bench                 norec on       norec off     the record costs
+    11_closure_counter    132,279,738   176,261,165        +33.25%
+    78_typed_param_call   358,136,934   446,101,906        +24.56%
+    76_funcval_dispatch   334,676,075   375,648,512        +12.24%
+    09_fib_recursive      152,679,514   145,422,118         -4.75%
+
+⛔ **09_fib IS NEGATIVE AND THAT IS NOT NOISE** (callgrind Ir,
+deterministic). On the one bench this tier exists for, the record-less
+tier is a net LOSS of 4.75%. Nothing in the record says why. **Increment
+0 is to find out**, because the answer decides whether frameless is a
+20% win there or a 0% one, and it is one profile away.
+
+#### ✅ ANSWERED — increment 0, 2026-09-02 (commit `50af0f4`)
+
+**The tier never fired on fib.** 555,823 call gates, ZERO record-less
+pushes; 78 makes 2,000,001. Every gate was refused by
+`norec_had_cached` — fib is a pure tree-recursion, so the optimizer
+rewrites its self-calls into `CachedCallV`, and that flag means *"this
+body could acquire a live vframe pure cache, which a record-less return
+cannot stash"*.
+
+**And the hazard cannot occur in the configuration this table was
+measured in.** `-npc` disables the pure-call cache and does NOT change
+codegen (`-vd` byte for byte), so the body carries the opcode, can
+never build a cache, and was refused anyway. The `-4.75%` was therefore
+never the tier's cost; it was the cost of the runtime FORK plus a dead
+record-less arm, paid on every call for a tier that then declined.
+
+The fix is one conjunct — `chunk.norec_had_cached && g_pure_cache_enabled`
+— with the soundness precondition made an `ML_CHECK` inside
+`Frame::ensure_pure_cache()`, the single allocation site. The row now
+reads:
+
+    09_fib_recursive      120,995,037   145,422,118        +20.74%
+
+so the record-less tier wins on **all four** benches, and the frameless
+tier — which additionally removes the record READ — keeps its premise
+intact. Blast radius nil: 16 benches, max |delta| 0.12%.
+
+**WALL CLOCK, 2026-09-03** (interleaved `--baseline`, `OPT=1
+ASSERTS=0`, `-npc`, 90 benches): **09_fib 0.250s -> 0.177s = 0.71x**,
+suite geomean 0.996x. The clock moved MORE than the Ir (-29% vs
+-20.7%) — this is a store burst removed, not free instructions, which
+is why it does not show the guard-elision signature §4 warns about.
+
+⛔ **THIS DOES NOT MAKE FRAMELESS CHEAPER TO BUILD.** It moves 09_fib's
+BASELINE, which means the frameless tier now has to beat a faster
+starting point on its flagship bench. Increment 3 (E2, drop the leaf
+rule) is the increment that serves 09_fib, and its gate should be
+re-derived from the new baseline rather than from the -4.75% row.
+
+Full record: `docs/jit-optimizations.md`, the *#97 increment 0* entry —
+including the smaller fix that was built, measured at -4.01%, and
+DROPPED because it CONFLICTS (eliding the fork stops the tier from ever
+firing).
+
+---
+
+## 1. THE THREE ENABLERS
+
+They are independent. Each is stated as a program, what it does today
+verbatim, and what it should do.
+
+### E1 — the SITE cannot name a callee the compiler ALREADY named
+
+    func make_adder(int base) {
+        return func [base] (int k) { return base + k; };
+    }
+    var add = make_adder(7);
+    for (var i = 0; i < N; i++) s = s + add(i);      # 1,000,000 calls
+
+TODAY:
+
+    $ mylang -dcs 78_typed_param_call.my
+    dcs 33  13  -  one  lambda@19:12          <- the compiler KNOWS
+    $ MYLANG_FRAMELESS_WHY=1 mylang ...
+    [frameless] OK  slots=1+1 ops=2 refs=[1]  <- the BODY qualifies
+    $ MYLANG_JITSTATS=1 mylang ...
+    frameless_calls 0                         <- and the site declines
+
+CAUSE, one line — `jit_baked_callee`, jit.cpp:7357:
+
+    if (is_value)                    /* the callee is a runtime VALUE */
+        return nullptr;
+
+The emitter's only naming source is a WRITE-ONCE GLOBAL FUNCTION SLOT.
+`add` holds a closure a factory built at run time, so it has no such
+slot — even though #116's callee-set analysis names it exactly, and
+#116 increment 4 ALREADY stamps that answer on the AST as
+`CallExpr::callee_fn` for the escape analysis to read.
+
+PROPOSED: a second naming source. `jit_baked_callee` gains a value-callee
+arm that reads the callee-set answer, subject to the same five
+descriptor gates the named path uses, plus the identity compare that is
+already emitted. The compare is what makes it sound: a value callee
+CAN change, so the baked entry is a PREDICTION and the compare is the
+check, exactly as it is today for a reassignable slot under
+`MYLANG_JIT_FORCE=bakecallee`.
+
+⛔ **THIS IS THE ONE THE MAINTAINER ASKED FOR FIRST**, and it is not
+"the inference pass is not smart enough" — the inference is done. It is
+a CONSUMER that never asked.
+
+### E2 — a frameless callee may not contain a CALL
+
+    func fib(n) {
+        if (n < 2) return n;
+        return fib(n-1) + fib(n-2);
+    }
+
+TODAY: `[frameless] not a leaf slots=1+9 ops=50 refs=[] last=52`. The
+body passes every other gate — window 10 slots, `refs=[]` empty, a
+terminal ReturnV — and is rejected solely for containing `CallV`.
+
+PROPOSED: drop the leaf rule. "Frameless" means the frame carries no
+RECORD; it does not mean the frame has no CALLS below it. What the rule
+is really protecting is the unwinder: a frame with a call below it must
+be walkable when the callee throws. That is a property of the MARKER
+(§2.2), not of the op list.
+
+⛔ The existing comment already says the reach here would be zero
+without this: 09_fib is self-recursive, so E1 without E2 serves it not
+at all.
+
+### E3 — a callee resolved at RUNTIME
+
+    func add_op(st, x) { st[0] = st[0] + x; }
+    func sub_op(st, x) { st[0] = st[0] - x; }
+    var ops = [add_op, sub_op];
+    for (var i = 0; i < N; i++) { var fn = ops[i % 2]; fn(st, i); }
+
+TODAY:
+
+    dcs 19  5  -  many  add_op$0,sub_op$0
+
+Two candidates, and which one runs depends on `i`. This is the case the
+maintainer named as genuinely needing runtime resolution.
+
+PROPOSED: a per-site POLYMORPHIC INLINE CACHE, two entries, keyed on the
+FuncObject pointer, each entry holding a frameless entry address. Both
+candidates are known at compile time, so both entry addresses are baked;
+what is decided at run time is only WHICH. A miss falls to today's path.
+
+⛔ NOT A NEW ANALYSIS. `callee_set(e)` already returns the two-element
+set. What is new is spending it.
+
+---
+
+## 2. THE CALLEE-SIDE PROTOCOL — the shared bulk
+
+All three enablers need this, and it is most of the work.
+
+### 2.1 What changes
+
+    TODAY, per call
+      caller   writes a VmCallRec (ret_chunk, ret_pc, dst, boundary,
+               cache_key, caller_captures) + a window on the segment
+      callee   push rbp / mov rbp,rsp / push rbx / sub rsp,8 / mov rbx,rdi
+      return   read the record, verify 5 conditions, compute the parent
+               dst slot, type-check the old value, store 4 words
+
+    FRAMELESS
+      caller   binds arguments into the callee window; NO record
+      callee   the same prologue, with the alignment pad repurposed (2.2)
+      return   the value in RAX (or XMM0), a status in RDX; the CALLER
+               stores it where it already knows it goes
+
+The window does not go away — it is the callee's locals. The RECORD goes
+away, and with it the return-side interrogation in §0.4.
+
+### 2.2 The stack marker — free, by construction
+
+An unwinder walking the rbp chain must tell a frameless frame from a C++
+frame and from a recorded one. The prologue already emits `sub rsp, 8`
+purely for 16-byte alignment; that slot becomes the marker
+(`mov qword [rbp-16], FRAMELESS_MAGIC`), so the frame costs ONE store
+and no extra bytes of stack.
+
+⛔ The magic must be a value no legitimate slot content can hold, and the
+walker must ALSO verify the frame's shape, not the word alone — a
+constant matched by luck is a wrong answer, not a missed one.
+
+### 2.3 The four sub-problems
+
+1. **A SECOND ENTRY per chunk.** The existing entry expects a record;
+   the frameless one does not. Two prologues, one body. `Chunk` gains
+   `frameless_entry_off`. The two entries share everything after the
+   prologue, so the body is emitted once.
+
+2. **The RETURN arm.** `emit_ret_native` writes the parent's dst today.
+   The frameless arm puts the value in RAX/XMM0 and `ret`s; the ref-slot
+   release scan still runs (the window is still addressable through rbx),
+   which is why the gate keeps `ref_slots.size() <= RET_REF_GUARD_MAX`
+   rather than requiring it empty.
+
+3. **The EXCEPTION path.** A frameless callee has no record for
+   `vm_dispatch_exc` to resume on, so the throw must be conveyed to the
+   caller. RECOMMENDED: a status in RDX, tested by the caller with
+   `test rdx,rdx; jnz <site landing pad>` — one compare and a
+   never-taken branch per call. The two alternatives are worse:
+   forbidding throws is the `op_never_exits` gate that already measured
+   a reach of ZERO, and a stashed landing-pad address is more mechanism
+   for the same result.
+
+4. **The BACKTRACE.** Settled with the maintainer: reconstruct from rbp.
+   The VIRTUAL (inlined) frames are not at risk — the two sources are
+   already disjoint, PHYSICAL from the rbp chain and VIRTUAL from
+   pc-keyed side tables baked at compile time, and neither consults the
+   other. The no-record tier's `norec_walk_chain` already does this walk
+   and has three nets on it (Nets 2, 3 and 4).
+
+---
+
+## 3. THE INCREMENTS, in the order the evidence supports
+
+Each ends with a MEASUREMENT that can kill the next one.
+
+**0. WHY IS 09_fib NEGATIVE UNDER norec?** ✅ **DONE 2026-09-02,
+   commit `50af0f4`.** The guess in this line was close and not right:
+   the tier does decline for fib and does pay the fork anyway, but the
+   reason is `norec_had_cached`, a refusal whose hazard only exists
+   when the pure-call cache is ON — and every measurement runs `-npc`.
+   One conjunct, **09_fib -20.74% Ir**, tier reach 0 -> 555,823 pushes,
+   blast radius nil. It was NOT "most of E2's win": E2 removes the
+   record READ in the CALLER, which is untouched. See §0.5.
+
+**1. E1 — the value callee gets named.** ✅ **DONE 2026-09-03.**
+
+   ⛔ **THE GATE AS WRITTEN WAS IN THE WRONG UNIT, and that is worth more
+   than the increment.** `frameless_calls` is bumped by a C++ `++` inside
+   the emitter, so it counts SITES × their emission — 78 has TWO hot
+   sites, not two million. The number ~2,000,000 belongs to
+   `bake_push`, which is bumped by EMITTED code and so counts
+   EXECUTIONS. Reading the two as one unit is the same mistake #103
+   recorded (`rax_pin` vs `rax_retries`): **ask what a counter is bumped
+   BY before you write a threshold against it.**
+
+   MEASURED, restated per counter (`-npc`, scale 1):
+
+       bench                 bake_push (exec)      frameless_calls (sites)
+       11_closure_counter    1 -> 1,000,001        1 -> 2
+       63_closures           400,000 -> 1,000,000  2 -> 5
+       12_higher_order       -                     0 -> 1
+       09_fib_recursive      555,832 (unchanged - already named)
+       76_funcval_dispatch   unchanged             unchanged
+       78_typed_param_call   unchanged             unchanged
+
+   **WALL CLOCK, 2026-09-04** (interleaved `--baseline`, `OPT=1
+   ASSERTS=0`, `-npc`, 90 benches): **11_closure_counter 0.95x**,
+   63_closures 0.99x, suite geomean **0.999x**. Four benches read
+   outside ±5% and are PROVEN noise — 19_foreach_indexed 0.80x,
+   18_foreach_array 0.83x, 20_foreach_unpack 1.09x, 60_bit_sieve 1.09x,
+   none of which contains a value call, and whose Ir deltas are
+   −0.00% / −0.00% / −0.56% / −0.01%.
+
+   ⛔ **AND THAT IS THE MOST USEFUL NUMBER THIS PLAN HAS PRODUCED, for
+   a reason that is not about E1.** Put it beside increment 0, in the
+   same arc, on the same benches:
+
+       increment 0   removed a ~19-field VmCallRec STORE BURST
+                     -20.7% Ir  ->  0.71x   (clock moved MORE than Ir)
+       E1            removed a cache PROBE + five descriptor GATES
+                     -3.0% Ir   ->  0.95x   (about flat)
+
+   §4 says this plan is only worth doing because what it removes is a
+   dependent load chain gating a branch. E1 has now measured the OTHER
+   half of that claim directly: collapsing GATES is the guard-elision
+   family and pays ~nothing on the clock. **So the frameless tier's
+   value is the record WRITE it removes — increment 0's family, which
+   paid 0.71x — and NOT the gates it collapses.** Size increment 2 on
+   the store burst, and expect nothing from the gate collapse.
+
+   **76 IS A CORRECT DECLINE, NOT A MISS.** Its `ops[i % 2]` really can
+   reach two different functions, so the callee set has two candidates
+   and no stamp is written. That is the analysis answering honestly.
+
+   ⛔ **78 IS BLOCKED BY A GATE THAT HAS NOTHING TO DO WITH NAMING, AND
+   THE PLAN PICKED IT AS THE HEADLINE BY ACCIDENT.** Its callees ARE
+   named (`-dcs` says `one lambda@19:12`). They are refused by the FIRST
+   bake gate, `bake->fast_bind`, because `compute_bind_flags` clears
+   `fast_bind` for ANY parameter annotated `int` or `float` - and 78
+   exists precisely to measure ANNOTATED parameters. 11's lambda takes
+   no parameter at all, which is the whole reason it moved and 78 did
+   not. Extending the bake to a COERCING callee (per-argument coercion
+   in the emitted bind) is real work and was explicitly out of v1 scope
+   in #97 step 4; it is now the thing standing between this arc and its
+   own flagship bench. **It should be its own increment, sized on its
+   own, not smuggled into E1.**
+
+**1b. THE CALL SITE BRACKETS ITS PINS (§3b, inherited from #123).**
+   ✅ DONE 2026-09-19 — as a PRECISE classification of the CALL family
+   in `pick_visit_op` (args + callee temp read, dst written), after the
+   BARRIER form was built first and measured to cost 3 instructions per
+   executed call for nothing (09_fib +2.6% Ir, 11_closure_counter 1.10x
+   on the clock). A callee-saved pin now stays live across the `call`;
+   the flush moved to the two SWITCH exits. Record:
+   `docs/jit-optimizations.md`, *#97 increment 1b*. See §3b for what it
+   found on the way and what it leaves open.
+
+**1c. THE COERCING-CALLEE BAKE — added 2026-09-04, from E1's own
+   measurement.** ✅ DONE 2026-09-19, with the PROBE ELISION beside it:
+   the baked arm accepts a coercing callee (per-parameter checks from
+   `bind_req` at emit time: 2 instructions for an exact argument, 7
+   for the int -> float widening 78 does on every call), and the
+   CachedCallV site no longer emits the pure-cache probe, fork test,
+   stash and key store while the cache is off. 78 -13.6% Ir, 09_fib
+   -17.5% Ir. Record: `docs/jit-optimizations.md`, *#97 increment 1c*.
+   The analysis below is kept as written.
+   E1 named 78_typed_param_call's callees and the bench
+   did not move one instruction, because naming was never what stopped
+   it. The FIRST bake gate is
+
+       if (bake && !(bake->fast_bind
+                     && (int)bake->params.size() == NARGS
+                     && bake_ck && bake_ck->plain_frame))
+           bake = nullptr;
+
+   and `compute_bind_flags` (eval.cpp) clears `fast_bind` for ANY
+   parameter annotated `int` or `float`:
+
+       for (const auto &p : d->params)
+           if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
+               fast = false;
+
+   THE TWO PROGRAMS, and they differ in one word:
+
+       func mk(base)  { return func [base] (k)     { return base + k; }; }
+       var add = mk(7);  for (...) s = s + add(i);
+       # bakes: bake_push 1 -> 1,000,001               (11's shape)
+
+       func mk(int base) { return func [base] (int k) { return base+k; }; }
+       var add = mk(7);  for (...) s = s + add(i);
+       # DECLINES: fast_bind is false, bake_push stays 0   (78's shape)
+
+   The annotated one is the shape 78 exists to measure - *"the shape a
+   typed language should make FASTER, not slower"*, its own header
+   comment - and it is the one that loses the tier. It was kept out of
+   #97 step 4 as *"a coercing one … its per-argument checks are a
+   separate shape"*, which was right then and is now the thing standing
+   between this arc and its flagship bench.
+
+   WHAT IT NEEDS: the emitted bind currently copies each argument raw.
+   A coercing callee needs, per parameter, either a proven-exact copy or
+   a widening (`int -> float`) - and the per-argument decision is a
+   COMPILE-TIME constant once the callee is baked, which is exactly what
+   E1 just made available at a value site. `FuncDescriptor::bind_req`
+   already holds the per-parameter Type singleton the copy must match,
+   computed by the same `compute_bind_flags`; the gate can consult it
+   instead of refusing outright.
+
+   GATE: `bake_push` on 78 must go 0 -> ~2,000,001, and `-vdj` must show
+   the widening emitted inline for `scale_it` (int argument, float
+   parameter) rather than a call to the coercing helper. If the emitted
+   per-argument sequence is longer than the helper call it replaces,
+   STOP - that is a decline, not a tier.
+
+   ⛔ SIZE IT ON THE STORE BURST, NOT ON THE GATES. E1 measured the gate
+   collapse at ~0 wall clock (§3 increment 1). What this increment
+   removes is a per-argument HELPER CALL and its argument marshalling,
+   which is real work, not a predicted branch - but say so with a
+   profile before building, the way increment 0 was.
+
+**2. The callee-side protocol (§2), behind `MYLANG_JIT_OFF=frameless`.**
+   ✅ **DONE 2026-09-19**, in six micro-steps F1-F6 (the gate, the
+   entry, the residue bit, the site, the walkers - which need no change
+   while the tier admits only LEAVES, a leaf being never an ancestor -
+   and the frameless return arm told apart by `rbx == rsp`). GATE MET:
+   **78 -32.9% Ir per scale unit / 0.70x, 11 -35.0% / 0.64x, 63
+   -18.1% / 0.80x**, everything else flat to the instruction, every
+   matrix green. Record: `docs/jit-optimizations.md`, *#97 increment
+   2* - including the four things the first version got wrong (a raw
+   copy of a reference argument; raw stack is not a segment slot; the
+   exit epilogue must release before the teardown; the loader must
+   recompute `frameless_ok`), the PRE-EXISTING -2 conveyance bug it
+   exposed (a warmed call's callee frame rendered at line 0 - a RULE 2
+   divergence no net could reach), and the `refcount()` dev instrument
+   that made the release scan testable.
+   Original text: The bulk. Landed with the tier ADMITTING ONLY LEAF
+   CALLEES first, so E2's unwinder question is not entangled with the
+   entry/return/exception work. GATE: Ir on 78 and 11; `corpus_diff`
+   over the five matrices; the norec nets re-run, since the rbp chain
+   now has a second kind of frame in it.
+
+   **WHAT IS LEFT PER CALL (78's `add(i)`, 105 Ir with the loop
+   share, C++ ~10), in the order the profile ranks it - each its own
+   micro-increment. INCREMENT 3 (2026-09-20) TAKES THEM IN THE ORDER
+   THAT MAKES THE PATCHES SIMPLER (the maintainer's instruction), each
+   verified on the expected `-vdj` text before any number: the
+   caller-built window FIRST (W1 ✅ - a relocation, net zero per call,
+   record: docs/jit-optimizations.md *#97 increment 3, W1*; it puts
+   every per-callee decision at the site), then the fusion it enables
+   (W2), then the init elision and the capture base at the site:**
+   - the BIND of a REFERENCE argument and the parameter tails: ✅ W5
+     (2026-09-21) - the callee is baked, so `noescape_params` is an
+     emit-time bit and the site borrows inline (a raw four-qword copy
+     with the flag byte set; an ARRAY whose slice byte is set is the
+     one decline, to the helper), the arm tests the flag byte before
+     calling the release helper, and a proven-scalar parameter's two
+     tail stores go (W3's mask already knew). 76 -33 per call (-13.5%
+     Ir: the two helper bodies; the emitted site grew by 4), 78's
+     add(i) 17 -> 15 at the site (-2.5% Ir). The stored format learned
+     the bit (myv v17). Record: *#97 increment 3, W5*. 76's remaining
+     tails and its four-slot arm scan waited on #25 - ✅ DONE
+     2026-09-21 (record: the *#25* entry): `refs=[0 1]`, the callee
+     92 -> 76 per call, the site 112.5 -> 109.5, 76 -9.0% Ir - and the
+     same table fix read -23% on 60_bit_sieve, -20% on 14 and 86,
+     -18% on 68, none of them call benches;
+   - the CAPTURE PROTOCOL: ✅ W4 (2026-09-21) - the frameless entry
+     loads the capture data pointer from the FuncObject in rdx into
+     the run's capbase register (one load), every access goes through
+     it (the helper arms take it as an argument), and ctx.captures is
+     left alone: no site repoint, no arm restore. Sound exactly when no
+     op in the body can reach `ctx->captures` (a per-instruction
+     whitelist, a post-emission check over the emitted call targets,
+     and a TESTS-build poison installed as ctx.captures). 78's add(i):
+     58 -> 52 per call; 76 -5 per call for free (no captures). Record:
+     *#97 increment 3, W4*. Not recovered: the capbase push/pop (2);
+   - the WINDOW INIT: ✅ W3 (2026-09-20) - a slot that is not a
+     parameter, not ref-listed and written ONLY by ops that store
+     their dst raw (`jit_instr_stores_dst_raw`, a per-instruction
+     whitelist; `Chunk::frameless_init_free`) is left uninitialised;
+     a TESTS build poisons it with `jit_poison_type` so a wrongly
+     admitted op aborts by name. 78's add(i): 73 -> 66 per call
+     (record: *#97 increment 3, W3*). What the "3 stores" note above
+     did not know: the derivation must run at CODEGEN, beside
+     `frameless_ok` - by the time main's site emits, the callee's
+     originals are deleted;
+   - the CALLER-BUILT WINDOW: ✅ W1 (2026-09-20) - the site fills the
+     callee's window on its own stack, at [rbp+32] from the callee's
+     anchor; ✅ W2 (2026-09-20) - the fusion it exists for: the staging
+     move is not emitted, a pinned argument is stored from its
+     register with its tag an immediate (the coercing check an
+     emit-time fact; a declared-float param gets one cvtsi2sd), a
+     memory one takes the 1c dispatch widening INTO the window, a
+     reference one binds straight from the caller slot. 78's add(i):
+     90 -> 73 instructions per call (record: *#97 increment 3, W2*);
+   - the SITE's staging guard on a ref-listed argument temp: ✅ gone
+     with W2 (the temp is not written at all);
+   - the float pin spill/reload around the call - #124's territory.
+
+**3. E2 — drop the leaf rule.** Serves 09_fib, and only after the
+   marker and the walker are proven by increment 2. GATE: 09_fib Ir, and
+   `norec_enum --depth 4` (2272 programs x 4 engines) because a throw
+   crossing a frameless frame is exactly its shape space.
+
+**4. E3 — the two-entry inline cache.** ✅ **DONE 2026-09-20** as the
+   TWO-WAY FRAMELESS SITE: the inferencer stamps both candidates, the
+   pool carries the pair at one pc, the site dispatches on the live
+   descriptor into one of two site-local tails. 76 -20.2% Ir; record:
+   `docs/jit-optimizations.md`, *#97 E3*. Original text: Serves 76.
+   Last because it is the only one that adds a RUNTIME decision, and
+   because it is worth nothing until 2 exists.
+
+---
+
+## 3b. INHERITED FROM #123 — THE CALL SITE MUST BRACKET ITS PINS
+## (added 2026-08-29, when #123 deleted the register pools)
+
+**⛔ THE SYMPTOM AS FIRST WRITTEN WAS WRONG, AND THE CORRECTION IS THE
+WHOLE OF THIS INCREMENT (measured 2026-09-04).** It said *"a fragment
+that emits a MyLang call gets 4 pinnable registers of 13"*, i.e. that
+`jit_run_blocks_xcache`'s denial of the caller-saved half leaves such a
+run pinning from the callee-saved four.
+
+**It gets ZERO.** `MYLANG_JITSTATS` on 09_fib_recursive prints
+`pick_decided 2` and `runs_compiled 2` and NO pin row at all — no
+`cache`, no `lsra_pins`, no `xcache`. Same for 78, 11, 63 and 76. The
+two-program experiment isolates it: one identical hot loop, five live
+accumulators, differing only in whether the body calls an impure
+function that survives to codegen —
+
+    # A - no call in the loop
+    func hot(int n) {
+        var a = 0; var b = 1; var c = 2; var d = 3; var e = 4;
+        for (var i = 0; i < n; i++) {
+            a = a + i * 3;  b = b ^ (i >> 1);  c = c + a - b;
+            d = d + c * 2;  e = e ^ (d + i);
+        }
+        return a + b + c + d + e;
+    }
+    ->  lsra_pins 1   lsra_trans 11
+
+    # B - the SAME loop, plus `g = g + sink(i);`  (sink is impure and
+    #     over the inline weight gate, so `call.v` survives to pc 19)
+    ->  no pin row at all
+
+**THE REAL BLOCKER IS ONE LEVEL UP, AND THE SOURCE ALREADY SAYS SO.**
+`pick_visit_op` (jit.cpp) classifies which slots an op touches; its
+`default` arm returns FALSE, which means *"an unclassified op - the
+caller must assume EVERY slot is touched"*, and the CALL family lands
+there deliberately. Its own comment names this increment:
+
+    the CALL family (CallV/CachedCallV/CallValueV/CallValueGenericV -
+    whether a call should be a barrier instead is #97's decision,
+    entangled with the call protocol)
+
+So a run containing a MyLang call is disqualified from pinning
+ENTIRELY, and `jit_run_blocks_xcache` is a SECOND gate denying half of
+a pool the run never reaches in the first place. Deleting the denial
+alone — which is what this section used to prescribe — would change
+nothing at all.
+
+**WHAT 1b ACTUALLY IS, THEREFORE: classify the CALL family** rather
+than leave it unclassified. ✅ DONE 2026-09-19, in two measured steps:
+
+  - the BARRIER first (`IncDecChainV`'s precedent, `v.mark_barrier(pc)`
+    - flush every pin before the call, reload after). It makes the run
+    pin, and then charges 3 instructions per EXECUTED call for
+    registers a SysV `call` preserves: 09_fib +2.6% Ir (+5.0 per
+    invocation, `mov s0.type; mov s0, r12` before each of 8 sites and
+    `mov r12, s0` after), 10_recursion_deep +5.1%, 11_closure_counter
+    +2.4% Ir and **1.10x on the clock** - the extra instructions are
+    STORES on the call path, the family the wall clock does see. A
+    read-only parameter in a register saves nothing (`sub rax, k` off
+    r12 costs what it costs off memory), so the barrier is pure cost.
+    Measured, rejected, and the reason the answer is precise;
+  - then the PRECISE form: the argument run and (for a value call) the
+    callee temp are `bad()` (memory-read), the dst is `bad()`
+    (memory-written), nothing else - a callee cannot reach the caller's
+    frame (globals live in the global table, captures are by-value
+    snapshots). `CallValueGenericV` stays a barrier: its arg0 lvalue
+    descriptor names a slot only the call_sites pool knows. The pins
+    stay live across the `call`; the price moved to the exits (the two
+    SWITCH `ret`s flush first, since the post-call resume stub loads
+    pins from memory).
+
+  Measured on `fib$0`: +2.0 Ir per invocation, exactly the `push`/`pop
+  r12` the pin costs and nothing at any call site; program B's loop
+  (five accumulators + a call per iteration) hot fragment **-8.1%**.
+
+**WHAT IT FOUND ON THE WAY (all recorded in the JIT record entry):**
+  the sync emitter's tracker bracket count went to -4 per call (one
+  prologue, five per-path epilogues; an emission-affecting imbalance
+  only a pinned call run could expose); argfuse's `pinned()` gate did
+  not consult the scan's transitions (the #162 slice test printed 590
+  for 780 - a loop counter in r13 fused and read from never-written
+  memory); the element STORE family is absent from `visit_use_def`, so
+  `compute_ref_slots` lists EVERY slot of any function with `a[i] = v`
+  (why a loop counter was a fusion candidate at all - NOT fixed here;
+  fixed as #25 on 2026-09-21);
+  and at K=4 the scan leaves a register unused under pressure
+  (program B homes `c` while r15 sits idle; reproducible on the
+  call-free twin with `MYLANG_JIT_MAXPINS=4`).
+
+**WHAT 1b LEAVES OPEN.** Two things, both measurable now that a call run
+pins: (i) whether to admit CALLER-saved pins into a call run - the
+denial below stands, and the trade is the prologue/epilogue spill per
+call, which the barrier measurement says to expect no wall-clock gain
+from on a call-dense body; (ii) ✅ DONE 2026-09-22 - `lea rax,
+[r12 - k]` for an IntSubRI/IntAddRI off a pinned source, plus the
+two-register `+`. 09_fib -2.69% Ir, 51_purefunc_fold -5.26%,
+03_int_arith -2.17%, 22_multi_assign -2.15%; wall geomean 1.007x, i.e.
+flat, the instruction-count family's usual answer. It needed an
+ENCODER fix first: `emit_modrm_disp` refused an rsp/r12 base, and r12
+is a pin the allocator hands out constantly - it writes the SIB byte
+now. Record: *#97 1b(ii)* in the JIT record, which also carries the
+maintainer's call that a shape test asserts on an INSTRUCTION MODEL -
+`decode_one` fills a DecodedIns and -vdj renders from it - and not on
+disassembly strings; (iii) PROFITABILITY on a
+loop-free body: a recursive function pays the pin's `push`/`pop` on
+every invocation, and for a read-only parameter with three uses that
+is a pure cost - 10_recursion_deep +3.2% Ir / 1.03x, fib flat - while
+every call-containing LOOP wins 4-6%. Neither allocator weighs a
+fragment's entry cost against its dynamic uses. None of the three is
+1b.
+
+**THE OLD SYMPTOM TEXT, kept because its analysis of the DENIAL is
+still correct:** `jit_run_blocks_xcache` denies the whole CALLER-SAVED
+half of the pin pool to any run containing `CallV`, `CachedCallV` or
+`CallValueV`.
+
+**⛔ AND THE DENIAL IS CORRECT TODAY. The first write-up of this called
+it a register wasted for nothing, and that was wrong.** Read
+`emit_sync_push_native`: it holds
+
+    rax  rbx  rcx  rdx  rsi  r8  r9  r10  r11
+
+as PROTOCOL across one long straight-line sequence — **8 allocatable
+registers of 13**, plus rbx which is reserved anyway. So the tempting
+fix, *"route its r10/r11 raw scratch through `alloc_scratch()`"*, cannot
+work: there is no spare register to route them to. And a MyLang call is
+a real SysV `call` — the callee clobbers every caller-saved register
+regardless of what the emitter does with them first.
+
+`jit_assert_no_volatile_pin` is the standing check that no caller-saved
+pin ever reaches that emitter, and it fires in every debug build.
+
+**THE ACTUAL FIX: BRACKET THE CALL SITE.** Emit the same
+`emit_call_prologue` / `emit_call_epilogue` pair that every HELPER call
+already uses:
+
+  - the prologue stores each caller-saved pin to its slot's PAYLOAD
+    (the type word stays stale, which is fine — a pinned slot is never
+    memory-read by any op in the run) and bumps `trk_bracket`, after
+    which the allocator treats those registers as free scratch;
+  - the emitter's r8/r10/r11 use is then legitimate rather than
+    scratch-by-convention;
+  - the epilogue reloads.
+
+The denial then drops to nothing, or at most to the registers the
+protocol needs live ACROSS the `call` itself.
+
+**THE COST is a store/load pair per pin per call site** — which is
+exactly the trade the caller-saved extension already makes for helper
+calls, and was measured worth it there (#96). It is NOT obviously worth
+it here, which is why it needs its own gate.
+
+**WHY IT BELONGS TO #97 AND NOT TO #123.** It changes the emitted CALL
+SEQUENCE, which is this task's subject and not the register model's.
+It also overlaps §2 directly: a frameless callee changes what the
+caller must preserve, so bracketing and the callee-side protocol want
+designing together rather than one on top of the other's assumptions.
+
+**SEQUENCING.** Do it AFTER increment 1 and BEFORE increment 2, for a
+reason that is not aesthetic: increment 2's gate is *"Ir on 78 and 11
+plus the wall clock"*, and if the caller is still running on 4 of 13
+registers then a flat wall clock there cannot be distinguished from
+"the frameless tier does not pay". Fixing the register starvation first
+removes a confounder from the measurement this plan turns on.
+
+**GATE, and it is a two-sided one:**
+  - `-vdj` on `fib$0` must show the entry pushing more than the
+    callee-saved four, i.e. the pin count actually rises;
+  - suite geomean must not regress. A run whose pins all sit in
+    callee-saved registers pays NOTHING new (the prologue's loop skips
+    them), so a regression would mean the newly-admitted pins are worth
+    less than their spill — in which case the honest answer is to admit
+    caller-saved pins only when the run's call count is low, and to say
+    so rather than to keep the widened pool.
+
+**⛔ AND RE-READ `jit_run_blocks_xcache`'s OPCODE LIST WHEN DOING
+THIS.** It is an audited table with the documented staleness risk, and
+its own comment records why ReturnV and Halt are deliberately absent
+(`emit_ret_native`'s first act is `flush_cache()`). If the bracket
+lands, the list may be deletable outright — which is the better outcome,
+one fewer table to go stale.
+
+---
+
+## 4. THE HONEST RISK
+
+**#97's own central finding argues against this tier**: instruction
+shaving on the call protocol has a wall-clock ceiling near zero — steps
+1-6 removed ~20 instructions per call for a suite geomean of 1.002x.
+This plan is only worth doing because what it removes is NOT twenty
+independent instructions: it is a dependent load chain gating a branch
+(§0.4), which is the one shape that has moved the clock every time
+(#111: 0.86x; #112: ~1%).
+
+**If increment 2's gate comes back byte-flat on the wall clock while Ir
+drops, STOP AND SAY SO.** That is the guard-elision signature this
+project has recorded three times, and it would mean the record read is
+retiring free alongside the real work — in which case E2 and E3 buy
+nothing and should not be built.
+
+Second risk, smaller: the tier adds a SECOND FRAME KIND to the rbp
+chain, and every consumer of that chain (backtrace, exception
+reconstruction, the norec walker, `MYLANG_RECON_AT`'s sweep) has to
+learn it. Those consumers have good nets; the nets must run at every
+increment, not at the end.

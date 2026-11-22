@@ -1,13 +1,18 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "eval.h"
+#include "inttest.h"
 #include "vm.h"    /* VmInvoker - the prepared callback invoker */
+#include "vminvoke.h"  /* ...and its inline test() hot path (#84) */
 #include "bitops.h"
 #include "hashing.h"
+#include "cyclewalk.h"   /* the cycle guard: print / == / hash terminate */
 #include "poolalloc.h"
 #include "env.h"      /* env_get - shared by builtins/io.cpp.h (tmpdir) */
 
+#include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include "evaltypes.cpp.h"
 #include "types/int.cpp.h"
@@ -19,12 +24,33 @@
 #include "types/float.cpp.h"
 #include "types/dict.cpp.h"
 #include "types/struct.cpp.h"
+#include "types/box.cpp.h"
 
 /* Build the AST-free ArgLocs a func_v/func_lv takes, from an ExprList. Defined
  * below (after the type tables), forward-declared here so a builtin's custom
  * tree-walker `func` (append_tw / sort_arr / reverse_arr) can build one to hand
  * to the shared, now-ArgLocs core. */
 static inline ArgLocs build_arglocs(ExprList *exprList, ArgLoc *locbuf, size_t n);
+
+/* The target of an in-place builtin (append, pop, insert, sort, ...): its
+ * first argument's LValue - or, when that argument is a VALUE (a call
+ * result, a literal), `hold` holding it, so the builtin works on the value
+ * as `{ var t = f(); append(t, x); }` does (README, *Storing through a
+ * value*; the VM holds it in a temp). An UNDEFINED name (the REPL's open
+ * world; a script refuses it at compile time) is the name's error, at the
+ * argument - as `zz[0] = 1` and `zz += 1` report it - not a NotLValueEx
+ * about a value that does not exist. */
+static inline LValue *lv_builtin_target(EvalValue &a0, LValue &hold,
+                                        const Construct *arg0)
+{
+    if (a0.is<LValue *>())
+        return a0.get<LValue *>();
+    if (a0.is<UndefinedId>())
+        throw UndefinedVariableEx(a0.get<UndefinedId>().id, arg0->start,
+                                  arg0->end);
+    hold = LValue(std::move(a0), false);
+    return &hold;
+}
 
 #include "builtins/str.cpp.h"
 #include "builtins/io.cpp.h"
@@ -33,9 +59,11 @@ static inline ArgLocs build_arglocs(ExprList *exprList, ArgLoc *locbuf, size_t n
 #include "builtins/dict.cpp.h"
 #include "builtins/generic.cpp.h"
 #include "builtins/reflect.cpp.h"
+#include "builtins/inttest.cpp.h"
 
 #include <cmath>
 #include <limits>
+#include "lowmem.h"
 
 static const std::array<SharedStr, Type::t_count> TypeNames =
 {
@@ -53,7 +81,17 @@ static const std::array<SharedStr, Type::t_count> TypeNames =
     string("exception"),
     string("dict"),
     string("struct"),
+    string("box"),
 };
+
+/* The run-time type name of a value (`int`, `array`, ...) - eval.h */
+std::string runtime_type_name(const EvalValue &v)
+{
+    return std::string(TypeNames[v.get_type()->t].get_view());
+}
+
+#include "types/fit.cpp.h"
+#include "types/cast.cpp.h"
 
 EvalValue builtin_exit(EvalContext *ctx, const ArgLocs *exprList,
                        const EvalValue *args, size_t n)
@@ -67,6 +105,8 @@ EvalValue builtin_exit(EvalContext *ctx, const ArgLocs *exprList,
     if (!e.is<int_type>())
         throw TypeErrorEx("Expected integer", arg->start, arg->end);
 
+    /* #107 P4: an exit() leaves main's state alive - not a leak */
+    ML_INT_ONLY(int_census_exiting();)
     exit(static_cast<int>(e.get<int_type>()));
 }
 
@@ -75,11 +115,26 @@ EvalValue builtin_exit(EvalContext *ctx, const ArgLocs *exprList,
  * the -nti fallback for type()/decltype() (no inference, so no static type to
  * bake; the normal path folds a recursive Type at compile time instead).
  */
+/* The bare kind of a runtime value (kindstr, Type.kind): its TypeE name,
+ * except that a CLASS instance is a "class", not a "struct" - the name
+ * the inferencer's fold gives it (static_type_kind_string). */
+static EvalValue runtime_kind_name(const EvalValue &v)
+{
+    if (v.is<intrusive_ptr<StructObject>>()) {
+        const StructObject &o = *v.get_ref<intrusive_ptr<StructObject>>();
+        if (o.boxed)
+            return EvalValue(SharedStr(std::string("box")));
+        if (o.def->is_class)
+            return EvalValue(SharedStr(std::string("class")));
+    }
+    return EvalValue(TypeNames[v.get_type()->t]);
+}
+
 static EvalValue make_runtime_type_value(const EvalValue &v)
 {
     StructTypeDef *td = const_cast<StructTypeDef *>(native_struct_type_def());
     auto obj = make_intrusive<StructObject>(td);
-    obj->fields.emplace_back(EvalValue(TypeNames[v.get_type()->t]), false);
+    obj->fields.emplace_back(runtime_kind_name(v), false);
     obj->fields.emplace_back(EvalValue(SharedStr(reflect_typeof(v))), false);
     obj->fields.emplace_back(EvalValue(false), false);   /* nullable */
     obj->fields.emplace_back(EvalValue(), false);         /* elem (none) */
@@ -139,7 +194,7 @@ EvalValue builtin_kindstr(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
-    return TypeNames[RValue(exprList->elems[0]->eval(ctx)).get_type()->t];
+    return runtime_kind_name(RValue(exprList->elems[0]->eval(ctx)));
 }
 
 /*
@@ -177,28 +232,40 @@ EvalValue builtin_kindstr_v(EvalContext *, const ArgLocs *el, const EvalValue *a
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(el->start, el->end);
-    return TypeNames[args[0].get_type()->t];
+    return runtime_kind_name(args[0]);
 }
 
+/*
+ * #96: the singletons are placed in the LOW-ADDRESS ARENA when one is
+ * available (see lowmem.h), so the JIT can write a type tag with a
+ * sign-extended `imm32` instead of keeping it in a pinned register.
+ * `ml_lowmem_new` falls back to plain `new` wherever the arena is not -
+ * Darwin, Windows, a non-x86-64 host, or simply a failed MAP_32BIT -
+ * and nothing but the JIT's choice of ENCODING depends on which
+ * happened. Identity is unchanged: these are the same one-per-kind
+ * objects, still never destroyed.
+ */
 const std::array<Type *, Type::t_count> AllTypes =
 {
     /* Trivial types */
-    new TypeNone(),
-    new Type(Type::t_lval),       /* internal type: not visible from outside */
-    new Type(Type::t_undefid),    /* internal type: not visible from outside */
-    new TypeInt(),
-    new TypeBuiltin(),
-    new TypeFloat(),
-    new TypeBool(),
-    new TypeStructType(),
+    ml_lowmem_new<TypeNone>(),
+    /* internal types: not visible from outside */
+    ml_lowmem_new<Type>(Type::t_lval),
+    ml_lowmem_new<Type>(Type::t_undefid),
+    ml_lowmem_new<TypeInt>(),
+    ml_lowmem_new<TypeBuiltin>(),
+    ml_lowmem_new<TypeFloat>(),
+    ml_lowmem_new<TypeBool>(),
+    ml_lowmem_new<TypeStructType>(),
 
     /* Non-trivial types */
-    new TypeStr(),
-    new TypeFunc(),
-    new TypeArr(),
-    new TypeException(),
-    new TypeDict(),
-    new TypeStruct(),
+    ml_lowmem_new<TypeStr>(),
+    ml_lowmem_new<TypeFunc>(),
+    ml_lowmem_new<TypeArr>(),
+    ml_lowmem_new<TypeException>(),
+    ml_lowmem_new<TypeDict>(),
+    ml_lowmem_new<TypeStruct>(),
+    ml_lowmem_new<TypeBox>(),
 };
 
 
@@ -217,6 +284,7 @@ static const SharedArrayObj empty_arr_actual((std::vector<LValue>()));
 const EvalValue empty_str(SharedStr(empty_str_actual, 0, 0));
 const EvalValue empty_arr(SharedArrayObj(empty_arr_actual, 0, 0));
 const EvalValue none;
+const EvalValue *g_arr_sum_copy = nullptr;   /* eval.h, ArrSumScope */
 
 std::set<UniqueId, UniqueId::Comparator> UniqueId::unique_set;
 
@@ -229,33 +297,31 @@ std::set<UniqueId, UniqueId::Comparator> UniqueId::unique_set;
  * static destruction touches only the POD free-list heads + block
  * memory (the blocks are never freed). Compiled to pass-through under
  * ASan (see poolalloc.h - reuse would mask a node use-after-free). */
+/* The pool STATE (the fast paths are inline in poolalloc.h - #74; the
+ * classes: 16..256 bytes, #6 raised from 160: FuncObject is ~176-200). */
+PoolFreeNode *g_pool_free[ML_POOL_NCLASSES];
+
 namespace {
 
-struct PoolFreeNode { PoolFreeNode *next; };
-constexpr size_t POOL_CLASS_STEP = 16;
-constexpr size_t POOL_NCLASSES = 16;      /* classes: 16..256 bytes (#6
-                                           * raised it from 160: FuncObject
-                                           * is ~176-200) */
 constexpr size_t POOL_BLOCK_BYTES = 4096;
-PoolFreeNode *g_pool_free[POOL_NCLASSES];
 std::vector<void *> g_pool_blocks;        /* leak-checker visibility */
 
 } /* anon namespace */
 
-void *pool_alloc_one(size_t size)
+/* The COLD tiers behind the inline fast paths: the arena refill for an
+ * empty class freelist, and the plain-heap fallback for an out-of-range
+ * size (the inline path never reaches here for a warm class). */
+void *pool_alloc_slow(size_t size)
 {
-#ifdef ML_POOLALLOC_PASSTHROUGH
-    return ::operator new(size);     /* ASan: keep full UAF coverage */
-#endif
-    const size_t cls = (size + POOL_CLASS_STEP - 1) / POOL_CLASS_STEP;
+    const size_t cls = (size + ML_POOL_CLASS_STEP - 1) / ML_POOL_CLASS_STEP;
 
-    if (cls == 0 || cls > POOL_NCLASSES)
+    if (cls == 0 || cls > ML_POOL_NCLASSES)
         return ::operator new(size);      /* out-of-range: plain heap */
 
     PoolFreeNode *&head = g_pool_free[cls - 1];
 
     if (!head) {
-        const size_t csz = cls * POOL_CLASS_STEP;
+        const size_t csz = cls * ML_POOL_CLASS_STEP;
         const size_t count = POOL_BLOCK_BYTES / csz;
         char *block = static_cast<char *>(::operator new(count * csz));
         g_pool_blocks.push_back(block);
@@ -271,22 +337,9 @@ void *pool_alloc_one(size_t size)
     return n;
 }
 
-void pool_free_one(void *p, size_t size) noexcept
+void pool_free_slow(void *p, size_t size) noexcept
 {
-#ifdef ML_POOLALLOC_PASSTHROUGH
-    ::operator delete(p);
-    return;
-#endif
-    const size_t cls = (size + POOL_CLASS_STEP - 1) / POOL_CLASS_STEP;
-
-    if (cls == 0 || cls > POOL_NCLASSES) {
-        ::operator delete(p);
-        return;
-    }
-
-    auto *n = static_cast<PoolFreeNode *>(p);
-    n->next = g_pool_free[cls - 1];
-    g_pool_free[cls - 1] = n;
+    ::operator delete(p);                 /* out-of-range only */
 }
 
 inline auto make_const_builtin(const char *name, decltype(Builtin::func) f)
@@ -308,6 +361,7 @@ inline auto make_const_builtin_lv(const char *name, decltype(Builtin::func) f,
     Builtin b{f};        /* the custom func (value-or-lvalue arg0) */
     b.func_lv = flv;     /* the VM's lvalue form */
     b.kind = Builtin::Kind::lvalue;
+    b.arg0_value_ok = true;   /* see Builtin::arg0_value_ok */
     return make_pair(UniqueId::get(name), LValue(b, true));
 }
 
@@ -356,6 +410,16 @@ bool is_dev_builtin(const UniqueId *uid)
     return g_dev_builtin_ids.count(uid) != 0;
 }
 bool g_dev_builtins_allowed = false;
+
+/*
+ * The INTRUSIVE-TEST builtins (#107): registered only in an INT_TESTS build,
+ * and recorded here so the builtin TABLE puts them AFTER every other builtin
+ * (build_builtin_table_once). Sorting them in among the rest by name would
+ * shift the slot index of every builtin named after them, so an INT build
+ * would emit different bytecode - and an INT build may not decide anything
+ * differently (plans/intrusive-tests.md, section 2).
+ */
+static std::set<const UniqueId *> g_int_builtin_ids;
 
 /*
  * The LAZY-ARG builtin category (see eval.h): a builtin whose argument is
@@ -419,6 +483,8 @@ build_arglocs(ExprList *exprList, ArgLoc *locbuf, size_t n)
     al.args = locbuf;
     al.nargs = n;
     al.arr_hint = exprList->arr_hint;
+    al.ctype = exprList->ctype;
+    al.ct_store = exprList->ct_store;
     return al;
 }
 
@@ -463,6 +529,39 @@ EvalValue builtin_v_adapter(EvalContext *ctx, ExprList *exprList)
     return FV(ctx, &al, stackbuf, n);
 }
 
+/*
+ * Q2 (plans/typed-containers.md): a builtin that BUILDS a container gives
+ * it the type the compiler stamped on the call (ArgLocs::ctype, the args
+ * list's Construct::ctype; null when nothing was stamped). One wrapper per
+ * ABI around the registered function, so every engine's call of it - the
+ * tree-walker's adapters, the VM's ops, the JIT's helpers - stamps alike.
+ */
+template <decltype(Builtin::func_v) FV>
+EvalValue ctyped_v(EvalContext *ctx, const ArgLocs *al, const EvalValue *args,
+                   size_t n)
+{
+    EvalValue r = FV(ctx, al, args, n);
+    stamp_ctype(r, al->ctype);
+    return r;
+}
+
+template <decltype(Builtin::func_lv) FLV>
+EvalValue ctyped_lv(EvalContext *ctx, const ArgLocs *al, LValue *target,
+                    const EvalValue *rest, size_t n)
+{
+    EvalValue r = FLV(ctx, al, target, rest, n);
+    stamp_ctype(r, al->ctype);
+    return r;
+}
+
+template <decltype(Builtin::func) F>
+EvalValue ctyped_tw(EvalContext *ctx, ExprList *exprList)
+{
+    EvalValue r = F(ctx, exprList);
+    stamp_ctype(r, exprList->ctype);
+    return r;
+}
+
 template <decltype(Builtin::func_v) FV>
 inline auto make_const_builtin_v(const char *name)
 {
@@ -477,23 +576,30 @@ inline auto make_builtin_v(const char *name)
                      LValue(Builtin{builtin_v_adapter<FV>, FV}, false));
 }
 
+template <decltype(Builtin::func_v) FV>
+inline auto make_int_builtin(const char *name)
+{
+    g_int_builtin_ids.insert(UniqueId::get(name));
+    return make_builtin_v<FV>(name);
+}
+
 /*
  * The tree-walker adapter for a MUTATING (lvalue-arg0) builtin: evaluate arg0
  * to an lvalue (NOT RValue - keep the LValue* the builtin needs to mutate the
  * caller's storage) and hand it over; the builtin self-evaluates its remaining
  * args. Registered as `func`, so the tree-walker + const-eval reach the same
- * impl as the VM's CallBuiltinLV. A non-lvalue arg0 (or none) passes a null
- * target, and the builtin throws NotLValueEx / the arity error, matching the
- * pre-migration behavior byte-for-byte.
+ * impl as the VM's CallBuiltinLV. A VALUE arg0 is held (lv_builtin_target),
+ * an undefined name is its UndefinedVariableEx; with no arg0 the target is
+ * null and the builtin raises the arity error.
  */
 template <decltype(Builtin::func_lv) FLV>
 EvalValue builtin_lv_adapter(EvalContext *ctx, ExprList *exprList)
 {
     LValue *target = nullptr;
+    LValue hold;
     if (!exprList->elems.empty()) {
-        EvalValue a0 = exprList->elems[0]->eval(ctx);
-        if (a0.is<LValue *>())
-            target = a0.get<LValue *>();
+        EvalValue a0 = store_base_value(ctx, exprList->elems[0].get(), hold);
+        target = lv_builtin_target(a0, hold, exprList->elems[0].get());
     }
     /* NO-VALUE-ARG form (pop/intptr - both 1-arg): no rest; the builtin uses
      * arg0 (target) + the ArgLocs carets/arity only (no self-eval of a node). */
@@ -503,14 +609,27 @@ EvalValue builtin_lv_adapter(EvalContext *ctx, ExprList *exprList)
     return FLV(ctx, &al, target, nullptr, 0);
 }
 
+/* #49: an argument an in-place builtin stores (append's value, insert's
+ * key and value) checked against the container's declared type where it
+ * may misfit (ExprList::arg_fit) - the VM's CheckFitV on its run slot */
+static inline void lv_arg_fit(const ExprList *el, size_t i,
+                              const EvalValue &v)
+{
+    if (const FitSpec *f = el->fit_of(i))
+        check_fit_loc(v, *f, el->elems[i]->start, el->elems[i]->end);
+}
+
 /* Cold >8-rest path for the REST-NATIVE lvalue adapter (heap arg buffer). */
 static ML_NOINLINE EvalValue
 builtin_lv_v_adapter_big(decltype(Builtin::func_lv) flv, EvalContext *ctx,
                          ExprList *exprList, LValue *target, size_t n_rest)
 {
     std::vector<EvalValue> heapbuf(n_rest);
-    for (size_t i = 0; i < n_rest; i++)
-        heapbuf[i] = RValue(exprList->elems[i + 1]->eval(ctx));
+    for (size_t i = 0; i < n_rest; i++) {
+        heapbuf[i] = literal_widen(RValue(exprList->elems[i + 1]->eval(ctx)),
+                                   exprList->widen_of(i + 1));
+        lv_arg_fit(exprList, i + 1, heapbuf[i]);
+    }
     std::vector<ArgLoc> locbuf(exprList->elems.size());
     ArgLocs al = build_arglocs(exprList, locbuf.data(), locbuf.size());
     return flv(ctx, &al, target, heapbuf.data(), n_rest);
@@ -529,18 +648,21 @@ template <decltype(Builtin::func_lv) FLV>
 EvalValue builtin_lv_v_adapter(EvalContext *ctx, ExprList *exprList)
 {
     LValue *target = nullptr;
+    LValue hold;
     if (!exprList->elems.empty()) {
-        EvalValue a0 = exprList->elems[0]->eval(ctx);
-        if (a0.is<LValue *>())
-            target = a0.get<LValue *>();
+        EvalValue a0 = store_base_value(ctx, exprList->elems[0].get(), hold);
+        target = lv_builtin_target(a0, hold, exprList->elems[0].get());
     }
     const size_t total = exprList->elems.size();
     const size_t n_rest = total ? total - 1 : 0;
     if (n_rest > 8)
         return builtin_lv_v_adapter_big(FLV, ctx, exprList, target, n_rest);
     EvalValue stackbuf[8];
-    for (size_t i = 0; i < n_rest; i++)
-        stackbuf[i] = RValue(exprList->elems[i + 1]->eval(ctx));
+    for (size_t i = 0; i < n_rest; i++) {
+        stackbuf[i] = literal_widen(RValue(exprList->elems[i + 1]->eval(ctx)),
+                                    exprList->widen_of(i + 1));
+        lv_arg_fit(exprList, i + 1, stackbuf[i]);
+    }
     ArgLoc locbuf[8];
     ArgLocs al = build_arglocs(exprList, locbuf, total < 8 ? total : 8);
     return FLV(ctx, &al, target, stackbuf, n_rest);
@@ -553,6 +675,17 @@ inline auto make_builtin_lv(const char *name)
     b.func_lv = FLV;                      /* the mutating-form pointer */
     b.kind = Builtin::Kind::lvalue;
     return make_pair(UniqueId::get(name), LValue(b, false));
+}
+
+/* The DEV-ONLY twin of make_builtin_lv (refcount): the same lvalue ABI on
+ * both engines, plus the name recorded in g_dev_builtin_ids so a SCRIPT
+ * call is a compile-time error - the instrument is for the harnesses. */
+template <decltype(Builtin::func_lv) FLV>
+inline auto make_dev_builtin_lv(const char *name)
+{
+    auto p = make_builtin_lv<FLV>(name);
+    g_dev_builtin_ids.insert(p.first);
+    return p;
 }
 
 /* Custom-func mutating registration (append/push): NON-const analogue of
@@ -591,36 +724,39 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin_v<builtin_str>("str"),
     make_const_builtin_v<builtin_int>("int"),
     make_const_builtin_v<builtin_float>("float"),
-    make_const_builtin_v<builtin_clone>("clone"),
+    make_const_builtin_v<ctyped_v<builtin_clone>>("clone"),
     make_const_builtin_v<builtin_hash>("hash"),
 
     /* Array or container builtins */
-    make_const_builtin_v<builtin_make_array>("make_array"),
+    make_const_builtin_v<ctyped_v<builtin_make_array>>("make_array"),
     make_const_builtin_v<builtin_top>("top"),
-    make_const_builtin_v<builtin_range>("range"),
+    make_const_builtin_v<ctyped_v<builtin_range>>("range"),
     make_const_builtin_v<builtin_find>("find"),
-    make_const_builtin_lv("sort", builtin_sort, builtin_sort_lv),
-    make_const_builtin_lv("rev_sort", builtin_rev_sort, builtin_rev_sort_lv),
-    make_const_builtin_lv("reverse", builtin_reverse, builtin_reverse_lv),
+    make_const_builtin_lv("sort", ctyped_tw<builtin_sort>,
+                          ctyped_lv<builtin_sort_lv>),
+    make_const_builtin_lv("rev_sort", ctyped_tw<builtin_rev_sort>,
+                          ctyped_lv<builtin_rev_sort_lv>),
+    make_const_builtin_lv("reverse", ctyped_tw<builtin_reverse>,
+                          ctyped_lv<builtin_reverse_lv>),
     make_const_builtin_v<builtin_sum>("sum"),
-    make_const_builtin_mf("map", builtin_map, false),
-    make_const_builtin_mf("filter", builtin_filter, true),
+    make_const_builtin_mf("map", ctyped_tw<builtin_map>, false),
+    make_const_builtin_mf("filter", ctyped_tw<builtin_filter>, true),
 
     /* Dictionary builtins */
-    make_const_builtin_v<builtin_keys>("keys"),
-    make_const_builtin_v<builtin_values>("values"),
-    make_const_builtin_v<builtin_kvpairs>("kvpairs"),
-    make_const_builtin_v<builtin_dict>("dict"),
-    make_const_builtin_v<builtin_make_dict>("make_dict"),
+    make_const_builtin_v<ctyped_v<builtin_keys>>("keys"),
+    make_const_builtin_v<ctyped_v<builtin_values>>("values"),
+    make_const_builtin_v<ctyped_v<builtin_kvpairs>>("kvpairs"),
+    make_const_builtin_v<ctyped_v<builtin_dict>>("dict"),
+    make_const_builtin_v<ctyped_v<builtin_make_dict>>("make_dict"),
     make_const_builtin_v<builtin_get>("get"),         /* dict lookup -> opt V */
     make_const_builtin_v<builtin_get_throw>("get!"),  /* lookup or throw -> V */
 
     /* String builtins */
-    make_const_builtin_v<builtin_split>("split"),
+    make_const_builtin_v<ctyped_v<builtin_split>>("split"),
     make_const_builtin_v<builtin_join>("join"),
     make_const_builtin_v<builtin_ord>("ord"),
     make_const_builtin_v<builtin_chr>("chr"),
-    make_const_builtin_v<builtin_splitlines>("splitlines"),
+    make_const_builtin_v<ctyped_v<builtin_splitlines>>("splitlines"),
     make_const_builtin_v<builtin_lpad>("lpad"),
     make_const_builtin_v<builtin_rpad>("rpad"),
     make_const_builtin_v<builtin_lstrip>("lstrip"),
@@ -681,6 +817,11 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin_v<builtin_assert>("assert"),
     make_builtin_v<builtin_exit>("exit"),
     make_builtin_v<builtin_runtime>("runtime"), /* optimization barrier */
+    /* #131/#133 step 6: the TDZ pair's runtime half - `defined` asks whether
+     * the name EXISTS, `isbound` whether its declaration has RUN. Lazy (the
+     * argument is never evaluated - reading an unbound global is the very
+     * error this lets a script avoid). */
+    mark_lazy_builtin(make_builtin("isbound", builtin_isbound)),
     mark_lazy_builtin(make_builtin("isconst", builtin_isconst)),
     mark_lazy_builtin(make_builtin("isconstdecl", builtin_isconstdecl)),
     make_builtin_v<builtin_ispure>("ispure"),
@@ -697,25 +838,31 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin_customv("kindstr", builtin_kindstr, builtin_kindstr_v),
 
     /* Runtime reflection (see builtins/reflect.cpp.h) */
-    make_builtin_v<builtin_globals>("globals"),
+    make_builtin_v<ctyped_v<builtin_globals>>("globals"),
     make_builtin_v<builtin_signature>("signature"),
     make_builtin_v<builtin_layout>("layout"),
-    make_builtin_v<builtin_specializations>("specializations"),
+    make_builtin_v<ctyped_v<builtin_specializations>>("specializations"),
     /* show() is a DEV-ONLY builtin (it decompiles the AST): available in the
      * REPL / tests, a compile-time error in a script (use :show at the REPL). */
     make_dev_builtin("show", builtin_show),
+    /* refcount() is DEV-ONLY too: the use_count of a reference, in place */
+    make_dev_builtin_lv<builtin_refcount>("refcount"),
+#ifdef INT_TESTS
+    /* The intrusive-test builtins (builtins/inttest.cpp.h) - INT builds only */
+    make_int_builtin<builtin_int_hits>("int_hits"),
+    make_int_builtin<ctyped_v<builtin_int_events>>("int_events"),
+    make_int_builtin<builtin_int_live>("int_live"),
+    make_int_builtin<builtin_int_ctype>("int_ctype"),
+#endif
 
     /* Diagnostic tracing (see trace.h) */
     make_builtin_v<builtin_trace>("trace"),
     make_builtin_v<builtin_traceoff>("traceoff"),
     make_builtin_v<builtin_tracing>("tracing"),
-    /* dynarray(a): manual promotion - a fresh general (polymorphic) copy of an
-     * array. Non-const (fresh mutable value). See builtin_dynarray. */
-    make_builtin_v<builtin_dynarray>("dynarray"),
     /* array() is non-const: it never folds to a baked literal, so array(N) is
      * always a runtime call (uniform const/runtime type-driven fill) and a huge
      * array(1000000) isn't baked into the AST. */
-    make_builtin_v<builtin_array>("array"),
+    make_builtin_v<ctyped_v<builtin_array>>("array"),
 
     /* Array builtins. append/push: a CUSTOM tree-walker func (append_tw, for
      * construct-in-place) + the rest-native func_lv core (builtin_append). */
@@ -726,7 +873,9 @@ EvalContext::SymbolsType EvalContext::builtins =
     /* Generic-container builtins */
     make_builtin_lv_v<builtin_erase>("erase"),
     make_builtin_lv_v<builtin_insert>("insert"),
-    make_builtin_v<builtin_deepclone>("deepclone"), /* deep mutable copy */
+    /* deep mutable copy */
+    make_builtin_v<ctyped_v<builtin_deepclone>>("deepclone"),
+    make_builtin_v<builtin_box>("box"),     /* a reference to a value */
 
     /* Numeric builtins */
     make_builtin_v<builtin_rand>("rand"),
@@ -738,7 +887,7 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin_v<builtin_writeln>("writeln"),
     make_builtin_v<builtin_read>("read"),
     make_builtin_v<builtin_write>("write"),
-    make_builtin_v<builtin_readlines>("readlines"),
+    make_builtin_v<ctyped_v<builtin_readlines>>("readlines"),
     make_builtin_v<builtin_writelines>("writelines"),
     make_builtin_v<builtin_remove>("remove"),
     make_builtin_v<builtin_tmpdir>("tmpdir"),
@@ -756,6 +905,7 @@ EvalContext::SymbolsType EvalContext::builtins =
  * mutated (it outlives any one program, e.g. across -rt tests).
  */
 static std::vector<LValue> g_builtin_slots;
+static std::vector<const UniqueId *> g_builtin_names;   /* slot -> name */
 /* Per slot: did this builtin come from const_builtins? A const-eval context
  * (AutoConst / the inliner's refold) must see ONLY const builtins - mirroring
  * the const EvalContext, which loads only const_builtins - so a runtime-builtin
@@ -775,14 +925,56 @@ build_builtin_table_once()
             return;
         g_builtin_index[uid] = static_cast<int>(g_builtin_slots.size());
         g_builtin_slots.emplace_back(lv.get(), /*is_const=*/true);
+        g_builtin_names.push_back(uid);
         g_builtin_is_const.push_back(is_const ? 1 : 0);
     };
 
+    /* NAME order, NOT map order: SymbolsType is keyed by the interned
+     * UniqueId POINTER, whose values differ per process - so a pointer-
+     * ordered table would give a builtin a DIFFERENT slot index in the
+     * compiling process than in the loading one, and a `.myv`'s baked
+     * SymKind::builtin slots would resolve to the WRONG builtin
+     * (plans/archived/myv-serializer.md). Sorting by name makes the table a
+     * deterministic function of the builtin SET; the image additionally
+     * carries a fingerprint of that set and refuses a mismatch. */
+    std::vector<std::pair<const UniqueId *, bool>> all;
     for (const auto &kv : EvalContext::const_builtins)
-        add(kv.first, kv.second, /*is_const=*/true);
-
+        all.push_back({ kv.first, true });
     for (const auto &kv : EvalContext::builtins)
-        add(kv.first, kv.second, /*is_const=*/false);
+        all.push_back({ kv.first, false });
+    std::sort(all.begin(), all.end(),
+              [](const std::pair<const UniqueId *, bool> &a,
+                 const std::pair<const UniqueId *, bool> &b) {
+                  /* the intrusive-test builtins last (see
+                   * g_int_builtin_ids), so they move no other slot */
+                  const bool ia = g_int_builtin_ids.count(a.first) != 0;
+                  const bool ib = g_int_builtin_ids.count(b.first) != 0;
+                  if (ia != ib)
+                      return ib;
+                  return a.first->val < b.first->val;
+              });
+    for (const auto &e : all) {
+        const auto &m = e.second ? EvalContext::const_builtins
+                                 : EvalContext::builtins;
+        add(e.first, m.find(e.first)->second, e.second);
+    }
+}
+
+/* A fingerprint of the BUILTIN SET (count + a name hash), stored in a .myv
+ * and checked at load: a file compiled by a binary with a different builtin
+ * set has stale slot indices, and is refused with "recompile from source"
+ * instead of silently calling the wrong builtin. */
+uint64_t builtin_set_fingerprint()
+{
+    build_builtin_table_once();
+    uint64_t h = 1469598103934665603ull;             /* FNV-1a basis */
+    for (const UniqueId *u : g_builtin_names)
+        for (char c : u->val) {
+            h ^= static_cast<unsigned char>(c);
+            h *= 1099511628211ull;
+        }
+    h ^= g_builtin_names.size();
+    return h;
 }
 
 int
@@ -793,10 +985,60 @@ builtin_slot_index(const UniqueId *uid)
     return it != g_builtin_index.end() ? it->second : -1;
 }
 
+#if ML_UNTRUSTED_CHECKS
+/*
+ * #137 tier 2 (provenance). FALSE for bytecode this process just compiled -
+ * which is every run except one that loaded a `.myv`. myv_read sets it, and
+ * nothing clears it: once an untrusted image is in the program, the checks
+ * stay on for the rest of the run.
+ */
+bool g_untrusted_bytecode = false;
+
+/* An InternalErrorEx: uncatchable by script (a corrupt image is not a
+ * condition a program can handle) but a normal exception to the driver, so
+ * it RENDERS and exits instead of aborting. */
+void ml_untrusted_fail(const char *what)
+{
+    throw InternalErrorEx(intern_msg("corrupt bytecode image (" 
+                                     + std::string(what) + ")"));
+}
+#endif
+
 LValue &
 builtin_slot(int index)
 {
     return g_builtin_slots[index];
+}
+
+/* #137: the table's size - what a baked SymKind::builtin slot index must be
+ * below. Builds the table first, so an early caller (a `.myv` load happens
+ * before any script resolution) does not read an empty one. */
+size_t
+builtin_slot_count()
+{
+    build_builtin_table_once();
+    return g_builtin_slots.size();
+}
+
+/* The registered NAME of a builtin-table slot (works for any entry -
+ * a Builtin function OR a value like `argv`, which find_builtin_name
+ * cannot resolve). For the disassembler's `load.builtin` annotation. */
+std::string_view
+builtin_slot_name(int index)
+{
+    build_builtin_table_once();
+    if (index >= 0 && static_cast<size_t>(index) < g_builtin_names.size())
+        return g_builtin_names[index]->val;
+    return "?";
+}
+
+/* True for a slot holding an INTRUSIVE-TEST builtin (#107) - the group the
+ * table sorts after every other builtin. Always false outside INT_TESTS. */
+bool builtin_slot_is_int(int index)
+{
+    build_builtin_table_once();
+    return index >= 0 && static_cast<size_t>(index) < g_builtin_names.size()
+        && g_int_builtin_ids.count(g_builtin_names[index]) != 0;
 }
 
 bool

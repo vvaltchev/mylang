@@ -1,0 +1,52 @@
+# A value stored where the static type is wider holds the WIDER type (the
+# #75 follow-up): a function returning `float` returns its int paths as
+# floats, a dict<float, _> stores an int key as a float key, a
+# dict<_, float> element or member stored from an int holds a float, a
+# `var` joined to float stores its int contributions as floats, and a
+# float global assigned from inside a function does too. Before, each of
+# these held the int: the tree-walker printed `1` where the VM's typed
+# reads printed `1.000000`, and keys() of such a dict raised TypeErrorEx.
+var fi = int(runtime(1));
+var i = int(runtime(0));
+
+func g(b) { if (b) return fi; return 2.5; }
+var y = g(runtime(true));
+print(y, typestr(y), y / 2);
+func h(int n) { var r = 0.5; if (n > 0) { return n; } return r; }
+print(h(fi), h(fi) / 4);
+
+var e = {0.5: "x"};
+e[fi] = "y";
+var ks = sort(keys(e));
+print(ks[0] + ks[1], typestr(ks), len(e));
+foreach (var k1, v1 in e) { if (v1 == "y") print(k1, k1 / 2); }
+var lit = {fi: "a", 2.5: "b"};
+foreach (var k, v in lit) { print(k, v, k / 2); }
+
+var d = {"a": 0.5};
+d["b"] = fi;
+var kb = str(runtime("b"));
+print(d[kb], d[kb] / 2);
+var ob = {"k": 0.5};
+ob.k = fi;
+print(ob[str(runtime("k"))]);
+var dd = {"a": {"b": 0.5}};
+dd["a"]["c"] = fi;
+print(dd["a"][str(runtime("c"))]);
+
+var x = fi;
+print(x, typestr(x), x / 2);
+x = 2.5;
+var bi = true;
+print(bi);
+bi = 3;
+print(bi);
+
+float gl = 0.5;
+func setg(int v) { gl = v; }
+setg(fi);
+print(gl, gl / 2);
+var g2 = 0.5;
+func s2(v) { g2 = v; }
+s2(fi);
+print(g2);

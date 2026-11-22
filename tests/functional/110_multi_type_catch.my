@@ -1,0 +1,50 @@
+# A `catch` may list several types (README *Exceptions*): built-in runtime
+# exceptions, user struct exceptions, or both, with or without `as`. The
+# clause matches any listed type, in order of the clauses; a type no
+# clause lists propagates to the next enclosing handler. The struct
+# fields the listed types share are read through the bound `e`.
+
+struct NotFound { str path; }
+struct Denied   { str path; int code; }
+
+func fail(int k) {
+    if (k == 0)
+        return 10 / k;
+    if (k == 1)
+        return [1, 2][k + 5];
+    if (k == 2)
+        throw NotFound("a.txt");
+    if (k == 3)
+        throw Denied("b.txt", 13);
+    return int("x" + str(k));
+}
+
+var trail = "";
+for (var k = 0; k < 5; k++) {
+    try {
+        try {
+            fail(int(runtime(k)));
+        } catch (TypeErrorEx, DivisionByZeroEx as e) {
+            trail += "arith ";
+        } catch (NotFound, Denied as e) {
+            trail += "io:" + e.path + " ";
+        } catch (OutOfBoundsEx, KeyNotFoundEx) {
+            trail += "index ";
+        }
+    } catch (InvalidValueEx) {
+        trail += "outer ";
+    }
+}
+assert(trail == "arith index io:a.txt io:b.txt outer ");
+
+# both kinds in one clause
+var both = 0;
+foreach (var k in [0, 3]) {
+    try {
+        fail(int(runtime(k)));
+    } catch (DivisionByZeroEx, Denied) {
+        both++;
+    }
+}
+assert(both == 2);
+print(trail, both);

@@ -1,0 +1,9 @@
+# a throwing LOCAL of an inlined body is not dropped when the body never
+# reads it (collapse_locals)
+func unused(a, b) { var q = a / b; return 1; }
+func drive(int m) {
+    var s = 0;
+    for (var i = 0; i < m; i++) s = s + unused(i, m - 1 - i);
+    return s;
+}
+print(drive(runtime(4)));

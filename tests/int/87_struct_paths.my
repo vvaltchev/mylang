@@ -1,0 +1,55 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): struct values off the common paths. A BOXED struct
+# built through a `dyn` callee (construct_struct_v: the arity range, a
+# trailing opt field filled with none, the per-field check), and the
+# field reads of a POD struct array that a cold op (`insert`) promoted to
+# GENERAL storage: the struct-foreach and counted-loop direct reads
+# (vm_struct_field_int / _float), each field kind, and an int field read
+# into float arithmetic. Last, the typed member reads of a BOXED struct,
+# which get no baked byte offset (vm_load_member_scalar's generic arm):
+# int, float, bool, an int field read as a float, and a const member read
+# through an instance. Every engine must print what the tree-walker
+# prints.
+
+struct P { int x; float y; bool b; }
+struct Q { str s; array<int> a; opt dyn o; }
+var out = [];
+func note(str what, dyn v) { append(out, what + "=" + str(v)); }
+
+var dyn mkq = Q;
+note("q1", mkq("s", [1, 2]));
+note("q2", mkq("t", [3], 7));
+try { mkq(); } catch (InvalidNumberOfArgsEx) { note("arity", "raised"); }
+try { mkq("u", [1], 2, 3); }
+catch (InvalidNumberOfArgsEx) { note("many", "raised"); }
+try { mkq(1, [2]); } catch (TypeErrorEx) { note("fit", "raised"); }
+
+array<P> ps = [P(1, 1.5, true), P(2, 2.5, false)];
+insert(ps, 0, P(3, 3.5, true));
+note("storage", array_storage(ps));
+var sx = 0;
+var sy = 0.0;
+var nb = 0;
+foreach (p in ps) { sx += p.x; sy += p.y; if (p.b) nb++; }
+note("foreach", str(sx) + "/" + str(sy) + "/" + str(nb));
+sx = 0;
+sy = 0.0;
+for (var i = 0; i < len(ps); i++) { sx += ps[i].x; sy += ps[i].y; }
+note("for", str(sx) + "/" + str(sy));
+var f = 0.0;
+for (var i = 0; i < len(ps); i++) f += ps[i].x * 0.5;
+note("half", f);
+
+struct R { str s; int n; float f; bool b; const K = 4; }
+func rd(R r) {
+    var a = r.n * 2;
+    var c = r.f + 1.0;
+    var d = r.b ? 1 : 0;
+    var e = r.n + 0.5;
+    var k = r.K + 1;
+    return str(a) + "/" + str(c) + "/" + str(d) + "/" + str(e) + "/" +
+           str(k);
+}
+note("boxed", rd(R("q", int(runtime(5)), 0.25, true)));
+print(join(out, " "));

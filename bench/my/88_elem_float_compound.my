@@ -1,0 +1,29 @@
+# Compound arith stores on FLAT array<float> elements: f[j] += / *= / -= /
+# /= / %= in a hot loop - the float element-store tier's COMPOUND arm
+# (StoreElemFloat: the farith four inline, %= the fmod helper), which no
+# other bench reaches. The time-varying add keeps the result history-
+# dependent (a pure fixed point proved nothing); the contraction plus the
+# final %= 1.0 keep every value in [0, 1) - positive, so float % sign
+# semantics agree across the three languages - and bounded.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 400000 * scale;
+var f = array(64, 0.0);                      # flat array<float>
+for (var i = 0; i < 64; i++)
+    f[i] = float(i) * 0.75 + 0.5;
+
+for (var t = 0; t < N; t++) {
+    var j = t & 63;
+    f[j] += 1.25 + float(t & 7) * 0.375;
+    f[j] *= 0.5;
+    f[j] -= 0.125;
+    f[j] /= 1.5;
+    f[j] %= 1.0;
+}
+
+var s = 0.0;
+for (var i = 0; i < 64; i++)
+    s += f[i];
+print("result:", str(s, 4));

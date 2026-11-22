@@ -1,0 +1,226 @@
+# A multi-assignment (`a, b = [5, 6]`) in every form it takes - a
+# destructure, a spread, a compound, a `_` placeholder - into locals,
+# typed locals, globals and a closure's captures. It is a STATEMENT with
+# no value (README; question 11): `w = a, b = ...` or `return a, b = ...`
+# is a compile error (the -rt `multi-assign has no value` cases). It used
+# to evaluate to none, which every check below asserted alongside the
+# stores. The VM once refused any multi-assignment into a global or a
+# closure's capture (NotLoweredEx); those targets are below. Values come
+# from runtime().
+
+var events = [];
+func val(v) { append(events, "val"); return v; }
+
+func ri(int v) => int(runtime(v));
+
+# the destructure, in a function, returned and stored
+func pair(n) {
+    var a = 0;
+    var b = 0;
+    a, b = [n, n + 1];
+    return [a, b];
+}
+func ret(n) {
+    var a = 0;
+    var b = 0;
+    a, b = [n, n * 3];
+    return a + b;
+}
+assert(pair(ri(5)) == [5, 6]);
+assert(ret(ri(4)) == 16);
+
+var a = 1;
+var b = 2;
+
+# a spread, a compound, a placeholder
+a, b = ri(7);
+assert(a == 7 && b == 7);
+a, b += [ri(10), ri(20)];
+assert(a == 17 && b == 27);
+a, _ = [ri(3), ri(4)];
+assert(a == 3 && b == 27);
+
+# the right-hand side runs once, before the stores
+a, b = val([ri(8), ri(9)]);
+assert(a == 8 && b == 9 && events == ["val"]);
+
+# in a loop (a JIT-compiled run)
+func loop(n) {
+    var x = 0;
+    var y = 0;
+    for (var i = 0; i < n; i++)
+        x, y = [i, i * 2];
+    return [x, y];
+}
+assert(loop(ri(5)) == [4, 8]);
+
+# typed targets (the stores coerce, so the fast paths decline to the
+# general unpack), and a dyn right-hand side that is a scalar (a run-time
+# spread) or an array. (A failing coercion is a -rt case: with no
+# inference, -nti, a plain `var` is not typed and does not coerce.)
+func typed(n) {
+    int x = 0;
+    float y = 0.0;
+    x, y = [n, n + 1];
+    assert(x == 2 && y == 3.0 && typestr(y) == "float");
+    x, y = ri(3);
+    assert(x == 3 && y == 3.0);
+    x, y += [n, n];
+    assert(x == 5 && y == 5.0);
+    var p = 0;
+    var q = 0;
+    var dyn d = runtime(9);
+    p, q = d;
+    assert(p == 9 && q == 9);
+    var dyn e = [ri(4), ri(5)];
+    p, q = e;
+    assert(p == 4 && q == 5);
+    x, _ = [ri(6), ri(7)];
+    assert(x == 6);
+    y, x = [ri(1), ri(6)];
+    assert(y == 1.0 && x == 6);
+    return [x, y, p, q];
+}
+assert(typed(ri(2)) == [6, 1.0, 4, 5]);
+
+# targets that are not plain locals: globals (a function reads them) and a
+# closure's captures
+var ga = 0;
+var gb = 0;
+int gi = 0;
+float gf = 0.0;
+var gs = "s";
+func globals() { return [ga, gb, gi, gf, gs]; }
+ga, gb = [ri(1), ri(2)];
+assert(globals() == [1, 2, 0, 0.0, "s"]);
+gb, ga = [ga, gb];
+assert(ga == 2 && gb == 1);
+gi, gf = [ri(3), ri(4)];
+assert(gi == 3 && gf == 4.0);
+ga, gs += [ri(1), ri(2)];
+assert(ga == 3 && gs == "s2");
+var dyn gd = runtime(7);
+ga, gb = gd;
+assert(ga == 7 && gb == 7);
+var dyn ge = [ri(8), ri(9)];
+ga, gb = ge;
+assert(ga == 8 && gb == 9);
+gb, _ = [ri(5), ri(6)];
+assert(gb == 5);
+ga, gb = [ri(10), ri(11)];
+assert(ga == 10 && gb == 11);
+ga = 12;
+# a local beside a global in one multi-assignment: a plain store, a typed
+# local (int, and a float that widens) and a compound
+var lx = 0;
+int li = 0;
+float lf = 0.0;
+lx, ga = [ri(21), ri(22)];
+assert(lx == 21 && ga == 22);
+li, lf, ga = [ri(23), ri(24), ri(25)];
+assert(li == 23 && lf == 24.0 && ga == 25);
+lx, ga += [ri(1), ri(2)];
+assert(lx == 22 && ga == 27);
+ga = 12;
+
+# a parameter named after a builtin is a plain local target, not the
+# builtin's const binding
+func sh(abs) {
+    var q = 0;
+    q, abs = [ri(1), ri(2)];
+    return [q, abs];
+}
+assert(sh(ri(0)) == [1, 2]);
+
+var gx, gy = [ri(13), ri(14)];
+func gxy() { return [gx, gy]; }
+assert(gxy() == [13, 14]);
+for (var i = 0; i < 3; i++)
+    ga, gb = [i, i * 10];
+assert(globals() == [2, 20, 3, 4.0, "s2"]);
+
+func counter() {
+    var x = 0;
+    var y = 0;
+    return func [x, y] (n) {
+        x, y = [x + n, y + 2 * n];
+        return [x, y];
+    };
+}
+var cf = counter();
+assert(cf(ri(1)) == [1, 2] && cf(ri(2)) == [3, 6]);
+
+# a multi-assignment is a write to each target for inference too: a
+# function name rebound through one calls the new function (every engine
+# still ran the declared body), and a target's type takes the stored
+# element's (`mx` held 2.5 typed int, so a typed `mx + 1` raised)
+func sq(x) { return x * x; }
+func neg(x) { return 0 - x; }
+func callsq(v) { return sq(v); }
+var sq_was = callsq(ri(3));
+var mq = 0;
+mq, sq = [ri(1), neg];
+assert(sq_was == 9 && callsq(ri(3)) == -3 && mq == 1);
+func widen() {
+    var mx = 0;
+    var my = 0;
+    mx, my = [2.5, ri(1)];
+    return mx + 1;
+}
+assert(widen() == 3.5);
+
+# unpacking a LITERAL assigns each element as written: `[ri(12), 2.5]` as a
+# value is an array<float>, but `x, y = [...]` gives x the int 12. The
+# tree-walker widened it to 12.0 while x was typed int (a typed `x == 12`
+# raised), the VM's general unpack (a `_`, a global target) read it as a
+# float too - the JIT then read the float's bits as an int - and a fully
+# constant literal was baked widened, which typed x float
+func asis() {
+    var x = 0;
+    var y = 0.0;
+    x, y = [ri(12), 2.5];
+    var p = 0;
+    p, _ = [ri(7), 2.5];
+    var c = 0;
+    var e = 0.0;
+    c, e = [12, 2.5];
+    var m = 0;
+    var n = [0.0];
+    m, n = [ri(1), [2, 2.5]];
+    return [x == 12, p == 7, c == 12, typestr(c), x + p + c + m, n[0]];
+}
+assert(asis() == [true, true, true, "int", 32, 2.0]);
+ga, gf = [ri(5), 0.5];
+assert(ga == 5 && gf == 0.5 && ga + 1 == 6);
+
+# a failing destructure raises before anything is stored
+var caught = false;
+try {
+    a, b = [ri(1), ri(2), ri(3)];
+} catch (TypeErrorEx) {
+    caught = true;
+}
+assert(caught && a == 8 && b == 9);
+
+print(pair(ri(5)), ret(ri(4)), a, b, events, loop(ri(5)), typed(ri(2)),
+      globals(), gxy(), cf(ri(1)));
+
+# a compound multi-assignment into a dyn target, and of a dyn element into
+# an int target (the dyn-into-numeric coercion keeps it int)
+var dyn dd = runtime(1);
+var dw = 0;
+dd, dw += [1, 2];
+var di = 1;
+var dj = 2;
+di, dj += runtime([3, 4]);
+assert(dd == 2 && dw == 2 && di == 4 && dj == 6);
+# typed locals take a literal unpack element by element, each coerced to
+# its target's type as a single store would be
+func typed_lit(int n) {
+    int ta = 0;
+    float tb = 0.0;
+    ta, tb = [n, n];
+    return str(ta) + " " + str(tb);
+}
+assert(typed_lit(runtime(3)) == "3 3.000000");
+print(dd, dw, di, dj, typed_lit(runtime(3)));

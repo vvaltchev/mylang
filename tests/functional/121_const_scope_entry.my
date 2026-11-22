@@ -1,0 +1,81 @@
+# A run-time `const` - a container, a function, a type alias - binds at
+# SCOPE ENTRY, like a named function or struct (question 21, decision A;
+# README *Constants*). A read that runs before the declaration's line
+# sees the value in every engine and configuration; before, the
+# optimizers folded some such reads and others raised UnboundSymbolEx.
+# Every call here is conditional on a run-time value, so none is refused
+# at compile time, and the reads are not folded away.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+func rt(int k) => int(runtime(k));
+
+# a const container read by a function called above it
+if (rt(1) > 0) want("container", use(1), 20);
+const K = [10, 20, 30];
+func use(int k) { return K[k]; }
+
+# a const pure function
+if (rt(1) > 0) want("pure function", triple_plus(1), 7);
+const lf = pure func(x) => x * 3;
+func triple_plus(int k) { return lf(2) + k; }
+
+# a type alias
+struct S { int v; }
+func mk(x) { var r = T(x); return r.v; }
+if (rt(1) > 0) want("alias", mk(rt(4)), 4);
+const T = S;
+
+# isbound() is true from the top of the scope
+want("isbound above", isbound(K2), true);
+const K2 = {"a": 1};
+
+# inside a function body, read above the declaration
+func body() {
+    var s = M[0] + M[1];
+    const M = [3, 4];
+    return s;
+}
+want("function body", body(), 7);
+
+# a nested block's const hides an outer name from the block's top
+var R = [1];
+{
+    want("block scope", R[0], 2);
+    const R = [2];
+}
+want("outer name after the block", R[0], 1);
+
+# a named function declared below its call in a LOOP body: bound at the
+# body's entry, every iteration, in every engine (the loop-body compiler
+# emitted it where it was written: UnboundSymbolEx under -ni -nj)
+var t = 0;
+for (var i = 0; i < rt(2); i++) {
+    t += g(i);
+    func g(int x) { return x + 1; }
+}
+want("loop body function", t, 3);
+
+# a const declared below a slice of it in a LOOP body: the const is the
+# body's own declaration, bound at each entry, so the slice is not
+# loop-invariant (the slice hoister moved it above the loop, where the
+# const was not bound yet: TypeErrorEx in every typed configuration)
+func sl_sum(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var sl = KS[1:3];
+        s += sl[0] + sl[1];
+        const KS = [1, 2, 3, 4];
+    }
+    return s;
+}
+want("loop body slice", sl_sum(rt(3)), 15);
+
+assert(bad == 0);
+print("ok");

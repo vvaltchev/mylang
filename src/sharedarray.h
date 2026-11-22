@@ -9,11 +9,23 @@
 #include "intrusiveptr.h"
 #include "errors.h"
 #include <vector>
-#include <unordered_set>
+#include <unordered_map>
+#include <utility>
+#include <cstdint>
 #include <cassert>
 #include <new>
 
 struct StructTypeDef;   /* a struct type (structtype.h); only a pointer here */
+class StructObject;     /* a struct or class instance (structtype.h) */
+struct TypeAnnot;       /* Q2: a container's own type (structtype.h) */
+
+/*
+ * The count of a class instance held by the flat CLASS storage below.
+ * StructObject is not complete here, so the count is taken and dropped
+ * out of line (types/struct.cpp.h); a null pointer (`none`) is skipped.
+ */
+void sobj_retain(StructObject *p) noexcept;
+void sobj_release(StructObject *p) noexcept;
 
 
 /*
@@ -47,6 +59,23 @@ public:
     }
 };
 
+#ifdef TESTS
+/* the group counter's renumbering point, lowered by a test that must
+ * reach the renumbering without four billion slices (types.cpp) */
+extern uint32_t g_slice_group_limit;
+#endif
+
+/* where SharedArrayObjTempl::new_slice_group renumbers its storage's
+ * slice groups: before the counter could wrap */
+inline uint32_t slice_group_limit()
+{
+#ifdef TESTS
+    return g_slice_group_limit;
+#else
+    return UINT32_MAX;
+#endif
+}
+
 template <class LValueT>
 class SharedArrayObjTempl final {
 
@@ -64,7 +93,70 @@ public:
     typedef std::vector<SharedStr>    tvec_type;
 
     /*
-     * Flat storage for an array of POD structs (plans/structs.md phase 7): the
+     * Flat CLASS storage (plans/class-and-box.md step 2): an array<C> of a
+     * class C holds one 8-byte reference per element (a class instance is
+     * never copied into an array, only referenced) where a general array
+     * holds a 48-byte LValue; a null pointer is `none` (array<opt C>).
+     * Each non-null entry OWNS one count. Any class instance fits, of any
+     * class; anything else stored (a struct, a scalar, a string - only a
+     * `dyn` alias can try) PROMOTES the array to general first, and every
+     * op without a flat case promotes it in place through get_vec(), as a
+     * strs or structs array does. TYPE-driven creation (ArrHint::flat_c).
+     */
+    struct ovec_type {
+        std::vector<StructObject *> v;
+
+        ovec_type() = default;
+        ovec_type(const ovec_type &) = delete;
+        ovec_type &operator=(const ovec_type &) = delete;
+        ovec_type(ovec_type &&o) noexcept : v(std::move(o.v)) { }
+        ovec_type &operator=(ovec_type &&o) noexcept
+        {
+            if (this != &o) {
+                std::vector<StructObject *> old;
+                old.swap(v);
+                v = std::move(o.v);
+                for (StructObject *p : old)
+                    sobj_release(p);
+            }
+            return *this;
+        }
+        ~ovec_type() { for (StructObject *p : v) sobj_release(p); }
+
+        size_t size() const { return v.size(); }
+        StructObject *operator[](size_t i) const { return v[i]; }
+
+        void push(StructObject *p)
+        {
+            v.push_back(p);           /* may throw: retain after it */
+            sobj_retain(p);
+        }
+        void set(size_t i, StructObject *p)
+        {
+            sobj_retain(p);           /* first: p may be v[i] itself */
+            StructObject *old = v[i];
+            v[i] = p;
+            sobj_release(old);
+        }
+        void pop()
+        {
+            StructObject *p = v.back();
+            v.pop_back();
+            sobj_release(p);
+        }
+        /* a copy of the entries [from, to), each one retained */
+        ovec_type copy_range(size_t from, size_t to) const
+        {
+            ovec_type r;
+            r.v.reserve(to - from);
+            for (size_t i = from; i < to; i++)
+                r.push(v[i]);
+            return r;
+        }
+    };
+
+    /*
+     * Flat storage for an array of POD structs (plans/archived/structs.md phase 7): the
      * elements laid out contiguously as raw C-struct bytes, `stride`
      * bytes each.
      * `def` (a StructTypeDef*) is the element type - used only by the impl
@@ -80,11 +172,11 @@ public:
         int stride = 0;
         svec_type() = default;
         svec_type(std::vector<char> &&b, StructTypeDef *d, int s)
-            : buf(move(b)), def(d), stride(s) { }
+            : buf(std::move(b)), def(d), stride(s) { }
     };
 
     /*
-     * Backing-storage kind (see plans/typed-arrays.md). A homogeneous
+     * Backing-storage kind (see plans/archived/typed-arrays.md). A homogeneous
      * int/float/bool array keeps an *unboxed* vector instead of vector<LValue>
      * (48-byte slots), which makes bulk ops (reverse/sort/sum/foreach) move far
      * less memory: int/float are 8-byte slots, bool is a single byte (48x
@@ -93,7 +185,7 @@ public:
      * the hot ops branch on the kind and touch the flat vector directly.
      */
     enum class Storage : unsigned char {
-        general, ints, floats, bools, structs, strs
+        general, ints, floats, bools, structs, strs, objs
     };
 
 private:
@@ -101,7 +193,7 @@ private:
 
     struct SharedObject final : RefCounted {
 
-        ML_POOL_NEW_DELETE
+        ML_POOL_NEW_DELETE_K(IOK_ARR)
 
 
         Storage kind;
@@ -118,9 +210,48 @@ private:
             bvec_type bvec;    /* kind == bools */
             svec_type svec;    /* kind == structs */
             tvec_type tvec;    /* kind == strs */
+            ovec_type ovec;    /* kind == objs */
         };
 
-        std::unordered_set<SharedArrayObjTempl *> slices;
+        /*
+         * Every live handle of a slice VIEW over this storage, keyed by the
+         * slice's GROUP (its identity - see SharedArrayObjTempl::group):
+         * all handles of one slice share a key, so a write through any of
+         * them finds its siblings in O(group size), and a write to this
+         * storage finds every view it would show through.
+         *
+         * Lever 3 inc 1 (2026-07-27): POOLED nodes - the per-slice
+         * register/unregister was ~27% malloc/free on the slice-loop
+         * bench (a hashtable node per insert). Same drop-in as the dict's
+         * inner_type (H2 v2): node-POINTER stability untouched, ASan
+         * pass-through via the pool itself. Elements are raw pointers -
+         * no held-node invariants beyond the container's own.
+         */
+        std::unordered_multimap<
+            uint32_t, SharedArrayObjTempl *,
+            std::hash<uint32_t>, std::equal_to<uint32_t>,
+            PoolAlloc<std::pair<const uint32_t, SharedArrayObjTempl *>>>
+            slices;
+
+        /* the last group number handed out for a view over this storage
+         * (new_slice_group; renumbered densely before it would wrap) */
+        uint32_t slice_groups = 0;
+
+        /*
+         * MIRROR of `!slices.empty()`, maintained by slices_add/slices_del
+         * below - EVERY mutation of the set goes through those two, so this
+         * cannot drift, and an ASSERTS-only check in the interpreted store
+         * body (vm_store_elem_int_body) re-verifies it on every store.
+         *
+         * It exists because the JIT's inline element-store tier must ask
+         * "are there live slice VIEWS?" from machine code: a store through
+         * an aliased array is fine (two variables sharing an array is
+         * MyLang's reference semantics) but a store that would be visible
+         * through a live SLICE needs clone_aliased_slices first. The set's
+         * own size lives at a libstdc++-internal offset, so it is not
+         * safely machine-checkable; this byte is.
+         */
+        bool has_slices = false;
 
         /*
          * When set, this array's data is read-only: it backs a `const` value,
@@ -143,24 +274,58 @@ private:
         size_t hash_cache = 0;
         bool hash_valid = false;
 
+        /*
+         * THE SHIFT EPOCH (#53, option 1). Bumped by every operation that
+         * MOVES existing elements of this storage in place - pop, erase,
+         * an insert that is not at the end (note_shift below, called at
+         * each in-place site AFTER the slice detach). A foreach over a
+         * NON-slice handle records it at its start and raises
+         * OutOfBoundsEx at its next step if it moved: removing an element
+         * already visited would otherwise silently SKIP the next one, and
+         * a middle insert would visit one twice. Appends, element stores,
+         * sort/reverse (a reorder in place, the length unchanged) and the
+         * in-place strs/structs promotion do NOT bump it - they move no
+         * element to another position the loop has not reached. A slice
+         * view never shifts: every shifting op on its parent detaches the
+         * overlapping views first, and an op through the view materializes
+         * it - so a foreach over a slice marks -1 and checks only once the
+         * slice was materialized under it (fe_shifted). An int_type so the
+         * JIT can compare it against a frame slot's payload in one
+         * instruction.
+         */
+        int_type shift_epoch = 0;
+
+        /*
+         * Q2 (plans/typed-containers.md): THIS ARRAY'S OWN TYPE - an
+         * interned array<T> (structtype.h, annot_intern), or null for an
+         * UNTYPED array (one only `dyn` reaches, or a constant's). Every
+         * handle and every slice of the storage shares it; a copy keeps
+         * it (clone_internal_vec). Last in the object: the JIT bakes the
+         * offsets of the fields above.
+         */
+        const TypeAnnot *ctype = nullptr;
+
         SharedObject() : kind(Storage::general) { new (&vec) vec_type(); }
         SharedObject(vec_type &&a) : kind(Storage::general) {
-            new (&vec) vec_type(move(a));
+            new (&vec) vec_type(std::move(a));
         }
         SharedObject(ivec_type &&a) : kind(Storage::ints) {
-            new (&ivec) ivec_type(move(a));
+            new (&ivec) ivec_type(std::move(a));
         }
         SharedObject(fvec_type &&a) : kind(Storage::floats) {
-            new (&fvec) fvec_type(move(a));
+            new (&fvec) fvec_type(std::move(a));
         }
         SharedObject(bvec_type &&a) : kind(Storage::bools) {
-            new (&bvec) bvec_type(move(a));
+            new (&bvec) bvec_type(std::move(a));
         }
         SharedObject(svec_type &&a) : kind(Storage::structs) {
-            new (&svec) svec_type(move(a));
+            new (&svec) svec_type(std::move(a));
         }
         SharedObject(tvec_type &&a) : kind(Storage::strs) {
-            new (&tvec) tvec_type(move(a));
+            new (&tvec) tvec_type(std::move(a));
+        }
+        SharedObject(ovec_type &&a) : kind(Storage::objs) {
+            new (&ovec) ovec_type(std::move(a));
         }
 
         ~SharedObject() {
@@ -171,6 +336,7 @@ private:
                 case Storage::bools:   bvec.~bvec_type(); break;
                 case Storage::structs: svec.~svec_type(); break;
                 case Storage::strs:    tvec.~tvec_type(); break;
+                case Storage::objs:    ovec.~ovec_type(); break;
             }
         }
 
@@ -189,91 +355,168 @@ public:
     size_type len;
     bool slice;
 
+    /*
+     * THE SLICE'S IDENTITY (question 3, plans/open-language-questions.md:
+     * Python's rule, 2026-10-18). A slice is a separate array the moment
+     * it is TAKEN, and every later copy of it - an assignment, an
+     * argument, an element stored or read back - is the SAME array, as
+     * any array is. Internally it stays a lazy VIEW (copy-on-write): each
+     * handle carries the window, and `group` names the slice it belongs
+     * to among the views of its storage. Every handle copy keeps it, a new
+     * slice expression takes a fresh one (new_slice_group), and a write
+     * through ANY handle of the slice turns the whole group into one
+     * ordinary array at once (materialize_slice), so every name holding
+     * the slice sees the write. Meaningful only while `slice` is set; it
+     * sits in the handle's tail padding, so the handle did not grow.
+     */
+    uint32_t group;
+
     /* Special constructors */
 
     SharedArrayObjTempl(const vec_type &arr) = delete;
 
     SharedArrayObjTempl(vec_type &&arr)
-        : shobj(make_intrusive<SharedObject>(move(arr)))
+        : shobj(make_intrusive<SharedObject>(std::move(arr)))
         , off(0)
         , len(shobj->vec.size())
         , slice(false)
+        , group(0)
     { }
 
-    /* Flat (unboxed) int/float storage - see plans/typed-arrays.md. */
+    /* Flat (unboxed) int/float storage - see plans/archived/typed-arrays.md. */
     SharedArrayObjTempl(ivec_type &&arr)
-        : shobj(make_intrusive<SharedObject>(move(arr)))
+        : shobj(make_intrusive<SharedObject>(std::move(arr)))
         , off(0)
         , len(shobj->ivec.size())
         , slice(false)
+        , group(0)
     { }
 
     SharedArrayObjTempl(fvec_type &&arr)
-        : shobj(make_intrusive<SharedObject>(move(arr)))
+        : shobj(make_intrusive<SharedObject>(std::move(arr)))
         , off(0)
         , len(shobj->fvec.size())
         , slice(false)
+        , group(0)
     { }
 
     SharedArrayObjTempl(bvec_type &&arr)
-        : shobj(make_intrusive<SharedObject>(move(arr)))
+        : shobj(make_intrusive<SharedObject>(std::move(arr)))
         , off(0)
         , len(shobj->bvec.size())
         , slice(false)
+        , group(0)
     { }
 
-    /* Flat POD-struct storage (plans/structs.md phase 7). `len` is the element
+    /* Flat POD-struct storage (plans/archived/structs.md phase 7). `len` is the element
      * count (buf bytes / stride). */
     SharedArrayObjTempl(svec_type &&arr)
-        : shobj(make_intrusive<SharedObject>(move(arr)))
+        : shobj(make_intrusive<SharedObject>(std::move(arr)))
         , off(0)
         , len(shobj->svec.stride
                   ? static_cast<size_type>(shobj->svec.buf.size() /
                                            shobj->svec.stride)
                   : 0)
         , slice(false)
+        , group(0)
     { }
 
     /* Flat STRING storage (top-10 #7). */
     SharedArrayObjTempl(tvec_type &&arr)
-        : shobj(make_intrusive<SharedObject>(move(arr)))
+        : shobj(make_intrusive<SharedObject>(std::move(arr)))
         , off(0)
         , len(shobj->tvec.size())
         , slice(false)
+        , group(0)
     { }
 
+    /* Flat CLASS storage (plans/class-and-box.md step 2). */
+    SharedArrayObjTempl(ovec_type &&arr)
+        : shobj(make_intrusive<SharedObject>(std::move(arr)))
+        , off(0)
+        , len(static_cast<size_type>(shobj->ovec.size()))
+        , slice(false)
+        , group(0)
+    { }
+
+    /* THE ONLY places shobj->slices is mutated from this class (besides
+     * materialize_slice and the renumbering, which go through the same
+     * map) - see SharedObject::has_slices for why the mirror must not
+     * drift. Each handle `p` is entered under its own group. */
+    void slices_add(SharedArrayObjTempl *p)
+    {
+        shobj->slices.emplace(p->group, p);
+        shobj->has_slices = true;
+    }
+    void slices_del(SharedArrayObjTempl *p)
+    {
+        shobj->slices.erase(slices_entry(p));
+        shobj->has_slices = !shobj->slices.empty();
+    }
+    /* a moved handle: the registry entry follows it to its new address */
+    void slices_move(SharedArrayObjTempl *from, SharedArrayObjTempl *to)
+    {
+        slices_entry(from)->second = to;
+    }
+    /* `p`'s entry - every slice handle has one, among the adjacent
+     * entries of its group */
+    auto slices_entry(SharedArrayObjTempl *p)
+    {
+        const auto r = shobj->slices.equal_range(p->group);
+        auto it = r.first;
+        while (it->second != p) {
+            ++it;
+            ML_CHECK(it != r.second); /* INT-COV-EXEMPT: p is registered */
+        }
+        return it;
+    }
+
+    /* a group number no live view of this storage has (see `group`) */
+    uint32_t new_slice_group()
+    {
+        if (shobj->slice_groups >= slice_group_limit())
+            renumber_slice_groups();
+        return ++shobj->slice_groups;
+    }
+    void renumber_slice_groups();
+
+    /* A NEW slice - a separate array, with its own group - of `obj`'s
+     * storage. A copy of an existing slice is the copy constructor. */
     SharedArrayObjTempl(const SharedArrayObjTempl &obj, size_type off, size_type len)
         : shobj(obj.shobj)
         , off(off)
         , len(len)
         , slice(true)
+        , group(0)
     {
-        shobj->slices.insert(this);
+        group = new_slice_group();
+        slices_add(this);
     }
 
     /* Regular constructors */
 
-    SharedArrayObjTempl() : off(0), len(0), slice(false) { }
+    SharedArrayObjTempl() : off(0), len(0), slice(false), group(0) { }
 
     SharedArrayObjTempl(const SharedArrayObjTempl &obj)
         : shobj(obj.shobj)
         , off(obj.off)
         , len(obj.len)
         , slice(obj.slice)
+        , group(obj.group)
     {
         if (slice)
-            shobj->slices.insert(this);
+            slices_add(this);
     }
 
     SharedArrayObjTempl(SharedArrayObjTempl &&obj)
-        : shobj(move(obj.shobj))
+        : shobj(std::move(obj.shobj))
         , off(obj.off)
         , len(obj.len)
         , slice(obj.slice)
+        , group(obj.group)
     {
         if (slice) {
-            shobj->slices.erase(&obj);
-            shobj->slices.insert(this);
+            slices_move(&obj, this);
             obj.slice = false;
         }
     }
@@ -287,15 +530,16 @@ public:
          * overwritten with another value, is exactly this path (a tree-walker
          * temporary is torn down via the dtor instead, which masked it. */
         if (slice)
-            shobj->slices.erase(this);
+            slices_del(this);
 
         shobj = obj.shobj;
         off = obj.off;
         len = obj.len;
         slice = obj.slice;
+        group = obj.group;
 
         if (slice)
-            shobj->slices.insert(this);
+            slices_add(this);
 
         return *this;
     }
@@ -303,16 +547,16 @@ public:
     SharedArrayObjTempl &operator=(SharedArrayObjTempl &&obj)
     {
         if (slice)                     /* unregister THIS from its old shobj */
-            shobj->slices.erase(this);
+            slices_del(this);
 
-        shobj = move(obj.shobj);
+        shobj = std::move(obj.shobj);
         off = obj.off;
         len = obj.len;
         slice = obj.slice;
+        group = obj.group;
 
         if (slice) {
-            shobj->slices.erase(&obj);
-            shobj->slices.insert(this);
+            slices_move(&obj, this);
             obj.slice = false;
         }
 
@@ -322,10 +566,28 @@ public:
     ~SharedArrayObjTempl()
     {
         if (slice)
-            shobj->slices.erase(this);
+            slices_del(this);
     }
 
+    /* THIS handle only gets its own copy of its range (clone(), and
+     * building a fresh array from a handle) - never what a WRITE through
+     * a slice does: that is materialize_slice, which moves every handle
+     * of the slice. */
     void clone_internal_vec();
+    void clone_internal_vec_raw();
+
+    /*
+     * A write through a slice: the slice - EVERY handle of its group -
+     * becomes one ordinary array holding a copy of the window, so all the
+     * names that share the slice see the write and the storage it was
+     * taken from does not. A no-op on a non-slice. A read-only view stays
+     * read-only (materializing is invisible to a program).
+     */
+    void materialize_slice();
+
+    /* A write to this (non-slice) storage at `index` (or anywhere, for
+     * all_slices): every slice whose window it would show through is
+     * materialized first, one copy per slice. */
     void clone_aliased_slices(size_type index);
     void clone_all_slices() { clone_aliased_slices(all_slices); }
 
@@ -339,6 +601,10 @@ public:
      */
     void promote_structs_to_general();
     void promote_strs_to_general();     /* flat strings (top-10 #7) */
+    void promote_objs_to_general();     /* flat class references */
+    /* A fresh general copy of this handle's elements; the shared storage is
+     * untouched (for a read-only general walk - see types/arr.cpp.h). */
+    SharedArrayObjTempl general_copy() const;
 
     /*
      * General (vector<LValue>) access. mylang does NOT promote flat int/float
@@ -358,6 +624,8 @@ public:
             promote_structs_to_general();
         if (shobj->kind == Storage::strs)
             promote_strs_to_general();  /* same cold-path model as structs */
+        if (shobj->kind == Storage::objs)
+            promote_objs_to_general();  /* and as strs */
         if (shobj->kind != Storage::general)
             throw InternalErrorEx();
         return shobj->vec;
@@ -378,50 +646,104 @@ public:
      * skind() first. (Compiled out of a plain release.)
      */
     ivec_type &flat_ints() {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::ints,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::ints);
         return shobj->ivec;
     }
     fvec_type &flat_floats() {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::floats,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::floats);
         return shobj->fvec;
     }
     bvec_type &flat_bools() {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::bools,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::bools);
         return shobj->bvec;
     }
     const ivec_type &flat_ints() const {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::ints,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::ints);
         return shobj->ivec;
     }
     const fvec_type &flat_floats() const {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::floats,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::floats);
         return shobj->fvec;
     }
     const bvec_type &flat_bools() const {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::bools,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::bools);
         return shobj->bvec;
     }
     svec_type &flat_structs() {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::structs,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::structs);
         return shobj->svec;
     }
     const svec_type &flat_structs() const {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::structs,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::structs);
         return shobj->svec;
     }
 
     tvec_type &flat_strs() {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::strs,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::strs);
         return shobj->tvec;
     }
     const tvec_type &flat_strs() const {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::strs,
+                           "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::strs);
         return shobj->tvec;
+    }
+
+    ovec_type &flat_objs() {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::objs,
+                           "flat array storage kind");
+        ML_CHECK(shobj && shobj->kind == Storage::objs);
+        return shobj->ovec;
+    }
+    const ovec_type &flat_objs() const {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::objs,
+                           "flat array storage kind");
+        ML_CHECK(shobj && shobj->kind == Storage::objs);
+        return shobj->ovec;
     }
 
     int_type use_count() const { return shobj.use_count(); }
 
     bool is_readonly() const { return shobj && shobj->readonly; }
+
+    /* Q2: the array's own type (SharedObject::ctype), null if untyped */
+    const TypeAnnot *ctype() const { return shobj ? shobj->ctype : nullptr; }
+    /* Give a FRESH array its type (stamp_ctype, eval.h): an untyped array
+     * that no slice shares - never the shared empty storage an empty
+     * slice is a view of, never a type already given. */
+    void set_ctype(const TypeAnnot *t)
+    {
+        if (shobj && !slice)
+            shobj->ctype = t;
+    }
+    /* #92: true iff a raw in-place store needs NO copy-on-write work -
+     * not a slice view itself, and no live slice views over the storage.
+     * The prep helper re-checks this after cloning so the emitted retry
+     * loop can NEVER spin: prep either normalizes or reports "go slow". */
+    bool jit_cow_clean() const
+    { return !slice && (!shobj || !shobj->has_slices); }
+
+    /* #92: ASSERTS-only - the mirror must equal the set it mirrors. */
+    bool jit_has_slices_mirror_ok() const
+    { return !shobj || shobj->has_slices == !shobj->slices.empty(); }
     void set_readonly() { shobj->readonly = true; }
 
     /*
@@ -459,7 +781,78 @@ public:
     }
 
     bool is_slice() const { return slice; }
+
+    /* #53 option 1 - see SharedObject::shift_epoch. `fe_mark` is what a
+     * foreach records at its start; `fe_shifted(mark)` is its per-step
+     * test; `note_shift` is called by every op that moves elements in
+     * place. A mark of -1 means a SLICE view (or no storage): a view
+     * never shifts - every shifting op on its storage materializes the
+     * overlapping views first, and any op through the view materializes
+     * it - so it is not shifted while the handle is still a view. Once
+     * the slice was materialized (the loop's handle is one of its group,
+     * so it moved with it) it is an ordinary array on FRESH storage,
+     * whose epoch starts at 0: shifted iff that epoch moved. */
+    int_type fe_mark() const
+    { return (slice || !shobj) ? -1 : shobj->shift_epoch; }
+    bool fe_shifted(int_type mark) const   /* a loop's container has
+                                              * storage: size() reads it */
+    {
+        if (mark == -1)
+            return !slice && shobj->shift_epoch != 0;
+        return shobj->shift_epoch != mark;
+    }
+    void note_shift() { shobj->shift_epoch++; }
+
+    /*
+     * Native-AOT (jit.cpp) LAYOUT PROBE. Returns the runtime pointers the
+     * JIT's LoadElem fragment must navigate: the SharedObject, its `kind`
+     * byte, and the flat element vector (a std::vector whose first member
+     * is the data pointer). Co-located here with the layout ON PURPOSE -
+     * it reads the real members, so it CANNOT drift silently: a layout
+     * change relocates these pointers and the probe still returns the
+     * correct offsets. jit.cpp derives kind_off / data_field_off /
+     * slice_off from these + the object addresses. Only used by the probe
+     * (single call at startup), never on a hot path. */
+    struct JitProbe {
+        const void *shobj;      /* the SharedObject * */
+        const void *kind;       /* &shobj->kind */
+        const void *elem_vec;   /* &shobj->ivec (== the union base;
+                                 * fvec/etc. alias it) */
+        /* #92 (the inline STORE tier): the three a store needs that a read
+         * does not - it must refuse a read-only array, must not write past
+         * a live slice VIEW without cloning it away, and must invalidate
+         * the cached hash. */
+        const void *readonly;    /* &shobj->readonly   (bool) */
+        const void *hash_valid;  /* &shobj->hash_valid (bool) */
+        const void *has_slices;  /* &shobj->has_slices (bool, the mirror) */
+        /* #97 (the boxed-element inline tier): &shobj->intr_refcount,
+         * so the emitter can learn the RefCounted base's offset without
+         * SharedObject (private) being visible there. */
+        const void *refcnt;
+        /* #53 option 1: &shobj->shift_epoch (int_type), which the
+         * foreach's ArrEpochCheck compares against its recorded mark. */
+        const void *shift_epoch;
+        /* Q2: &shobj->ctype, which the inline store tier reads to keep
+         * a checked store inline for an array that takes anything */
+        const void *ctype;
+    };
+    JitProbe jit_probe() const {
+        return { static_cast<const void *>(shobj.get()),
+                 static_cast<const void *>(&shobj->kind),
+                 static_cast<const void *>(&shobj->ivec),
+                 static_cast<const void *>(&shobj->readonly),
+                 static_cast<const void *>(&shobj->hash_valid),
+                 static_cast<const void *>(&shobj->has_slices),
+                 static_cast<const void *>(&shobj->intr_refcount),
+                 static_cast<const void *>(&shobj->shift_epoch),
+                 static_cast<const void *>(&shobj->ctype) };
+    }
     size_type offset() const { return slice ? off : 0; }
+
+    /* The shared storage, as an IDENTITY: two handles that alias one array
+     * (or slice it) answer the same address. The cycle guard
+     * (cyclewalk.h) keys a container on it. */
+    const void *storage_id() const { return shobj.get(); }
 
     /* Element count without promoting (kind-aware). */
     size_type size() const {
@@ -475,6 +868,8 @@ public:
                                              shobj->svec.stride)
                     : 0;
             case Storage::strs:   return shobj->tvec.size();
+            case Storage::objs:
+                return static_cast<size_type>(shobj->ovec.size());
             default:              return shobj->vec.size();
         }
     }
@@ -482,4 +877,56 @@ public:
     ArrayConstViewTempl<LValueT> get_view() const {
         return ArrayConstViewTempl<LValueT>(get_vec(), offset(), size());
     };
+
+#ifdef INT_TESTS
+    /*
+     * #107 P4, the VM state checker's slice half: what a slice view
+     * promises its parent's storage. Returns null when consistent, else
+     * what is wrong. A slice must be registered in its storage's set
+     * (an element write detaches only the registered views) and its
+     * window must lie inside that storage; the `has_slices` mirror the
+     * JIT's inline store reads must equal the set's emptiness; and every
+     * registered view must be a slice of THIS storage - a stale entry
+     * is a dangling pointer the next detach writes through (an ASan
+     * build reports the read itself).
+     */
+    /* the refcounted storage, as an identity (the refcount check) */
+    const void *int_storage() const noexcept { return shobj.get(); }
+
+    const char *int_slice_fault() const noexcept
+    {
+        const SharedObject *o = shobj.get();
+        if (!o)
+            return nullptr;
+        if (o->has_slices != !o->slices.empty())
+            return "the storage's has_slices mirror disagrees with its set";
+        for (const auto &e : o->slices) {
+            const SharedArrayObjTempl *p = e.second;
+            if (p->shobj.get() != o || !p->slice || p->group != e.first)
+                return "the storage's slice set names a view that is not "
+                       "a slice of it";
+            if (e.first > o->slice_groups)
+                return "a slice's group was never handed out";
+        }
+        if (!slice)
+            return nullptr;
+        bool found = false;
+        auto r = o->slices.equal_range(group);
+        for (auto it = r.first; it != r.second; ++it) {
+            const SharedArrayObjTempl *p = it->second;
+            if (p == this)
+                found = true;
+            else if (p->off != off || p->len != len)
+                return "two handles of one slice disagree on its window";
+        }
+        if (!found)
+            return "a slice is not registered in its storage's set";
+        SharedArrayObjTempl whole;
+        whole.shobj = shobj;
+        const size_type n = whole.size();
+        if (off > n || len > n - off)
+            return "a slice's window runs past its storage";
+        return nullptr;
+    }
+#endif
 };

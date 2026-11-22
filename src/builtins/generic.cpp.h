@@ -22,6 +22,53 @@ EvalValue builtin_defined(EvalContext *ctx, ExprList *exprList)
     return !arg->eval(ctx).is<UndefinedId>();
 }
 
+/*
+ * isbound(name) - has `name`'s DECLARATION run yet? The other half of the TDZ
+ * pair (#131): `defined(name)` asks whether the name EXISTS (declared anywhere
+ * in an enclosing scope, so true throughout its scope including above the
+ * declaration), `isbound(name)` asks whether it has a VALUE yet.
+ *
+ * A LAZY builtin: the argument is NOT evaluated, and it MUST NOT be - reading
+ * an unbound global is exactly the UnboundSymbolEx this call exists to let a
+ * script avoid. So it reads the resolved symbol off the Identifier node
+ * instead. (`defined` can still afford to evaluate, because it only ever sees
+ * the REPL / non-identifier cases at run time; every script case folds.)
+ *
+ * Reachable at run time for a GLOBAL only - the lexical kinds fold in
+ * try_fold_isbound, and the VM lowers the global to DefinedGlobalV. This is
+ * the tree-walker's body for that same query.
+ */
+EvalValue builtin_isbound(EvalContext *ctx, ExprList *exprList)
+{
+    if (exprList->elems.size() != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    Construct *arg = exprList->elems[0].get();
+    const Identifier *id = node_cast<const Identifier>(arg);
+
+    if (!id)
+        throw TypeErrorEx("isbound() requires an identifier",
+                          arg->start, arg->end);
+
+    switch (id->sym.kind) {
+
+    case SymKind::global:
+        /* the genuine runtime question: has the declaration executed? */
+        return ctx->gfuncs && ctx->gfuncs->defined[id->sym.slot];
+
+    case SymKind::local:
+    case SymKind::capture:
+    case SymKind::builtin:
+        return true;
+
+    default:
+        /* unresolved: a SCRIPT cannot get here (a name declared nowhere is a
+         * compile error since #130, and isbound's argument is deliberately NOT
+         * exempt from that), so this is the REPL's open world - ask the map. */
+        return !arg->eval(ctx).is<UndefinedId>();
+    }
+}
+
 EvalValue builtin_len(EvalContext *ctx, const ArgLocs *exprList,
                       const EvalValue *args, size_t n)
 {
@@ -54,32 +101,20 @@ EvalValue builtin_str(EvalContext *ctx, const ArgLocs *exprList,
             const ArgLoc *arg1 = exprList->arg(1);
             const EvalValue &p = args[1];
 
-            if (!p.is<int_type>() || p.get<int_type>() < 0 || p.get<int_type>() > 64) {
+            if (!p.is<int_type>())
+                throw TypeErrorEx("Expected an integer digit count",
+                                  arg1->start, arg1->end);
 
-                throw TypeErrorEx(
-                    "Expected an integer in the range [0, 64]",
-                    arg1->start,
-                    arg1->end
-                );
-            }
+            ML_INT_ONLY(int_vc_str_digits(e.get<float_type>(),
+                                          p.get<int_type>());)
+            /* an int of the wrong value, not a wrong type */
+            if (p.get<int_type>() < 0 || p.get<int_type>() > 64)
+                throw InvalidValueEx("Expected a digit count in [0, 64]",
+                                     arg1->start, arg1->end);
 
-            const int precision = static_cast<int>(p.get<int_type>());
-            const float_type fval = e.get<float_type>();
-
-            /*
-             * Size the buffer to the exact length: a fixed buffer would
-             * silently truncate for large-magnitude values at high precision
-             * (e.g. str(1e30, 64) needs ~96 chars).
-             */
-            const int slen = snprintf(nullptr, 0, "%.*f", precision, fval);
-
-            if (slen < 0)
-                throw InternalErrorEx(exprList->arg(0)->start,
-                                      exprList->arg(0)->end);
-
-            std::vector<char> buf(static_cast<size_t>(slen) + 1);
-            snprintf(buf.data(), buf.size(), "%.*f", precision, fval);
-            return SharedStr(string(buf.data(), static_cast<size_t>(slen)));
+            /* the same renderer as print / str(x): a NaN is `nan` */
+            return SharedStr(float_text(e.get<float_type>(),
+                                        static_cast<int>(p.get<int_type>())));
         }
 
     } else {
@@ -204,6 +239,31 @@ EvalValue builtin_deepclone(EvalContext *ctx, const ArgLocs *exprList,
     return make_deep_mutable_clone(args[0]);
 }
 
+/*
+ * box(v) (plans/class-and-box.md, step 3): a box of an int / float / bool /
+ * str, or a boxed copy of a struct value - a REFERENCE, shared by every
+ * copy, read and written with `*b`. An array, a dict, a function, a class
+ * instance or a box is a reference already and is returned as it is. A
+ * run-time (non-const) builtin, so no compile-time pass can duplicate or
+ * merge a box's identity.
+ */
+EvalValue builtin_box(EvalContext *ctx, const ArgLocs *exprList,
+                      const EvalValue *args, size_t n)
+{
+    if (n != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+    try {
+        return box_make(args[0]);
+    } catch (Exception &e) {
+        if (!e.loc_start) {
+            const ArgLoc *arg = exprList->arg(0);
+            e.loc_start = arg->start;
+            e.loc_end = arg->end;
+        }
+        throw;
+    }
+}
+
 EvalValue builtin_intptr(EvalContext *ctx, const ArgLocs *exprList,
                          LValue *target, const EvalValue *rest, size_t n_rest)
 {
@@ -217,6 +277,34 @@ EvalValue builtin_intptr(EvalContext *ctx, const ArgLocs *exprList,
 
     const EvalValue &e = target->get();
     return e.get_type()->intptr(e);
+}
+
+/*
+ * refcount(symbol) - DEV-ONLY (the test harness and the REPL): the number
+ * of handles sharing the reference `symbol` holds, i.e. use_count(); 1 for
+ * a scalar. An LVALUE builtin like intptr, so the slot is read in place
+ * and the answer is not perturbed by an argument copy. It exists because a
+ * LEAKED reference is otherwise unobservable from a program: a plain alias
+ * never triggers a copy (assignment aliases, only a slice is a COW view),
+ * and a pooled object is invisible to LeakSanitizer - so a call protocol
+ * that forgets to release a window slot passes every value check. The
+ * frameless-call tests (#97 inc 2) assert the count after a caught
+ * exception left the callee's window on a dead native frame.
+ */
+EvalValue builtin_refcount(EvalContext *ctx, const ArgLocs *exprList,
+                           LValue *target, const EvalValue *rest,
+                           size_t n_rest)
+{
+    if (exprList->nargs != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+
+    const ArgLoc *arg = exprList->arg(0);
+
+    if (!target)
+        throw NotLValueEx(arg->start, arg->end);
+
+    const EvalValue &e = target->get();
+    return EvalValue(e.get_type()->use_count(e));
 }
 
 EvalValue builtin_assert(EvalContext *ctx, const ArgLocs *exprList,
@@ -303,9 +391,18 @@ EvalValue builtin_insert(EvalContext *ctx, const ArgLocs *exprList,
 
     if (lval->is<intrusive_ptr<DictObject>>()) {
 
-        if (lval->getval<intrusive_ptr<DictObject>>()->is_readonly())
+        const DictObject &d = *lval->getval<intrusive_ptr<DictObject>>();
+        if (d.is_readonly())
             throw CannotChangeConstEx(arg0->start, arg0->end);
 
+        /* Q2: an insert through `dyn` (ArgLocs::ct_store): a value that
+         * is stored fits the dict's own value type (its key is checked
+         * where it is inserted) */
+        if (exprList->ct_store && !d.get_ref().count(index_val))
+            return builtin_insert_dict(
+                lval, index_val,
+                ct_fit_value(lval->get(), val, exprList->start,
+                             exprList->end));
         return builtin_insert_dict(lval, index_val, val);
 
     } else if (lval->is<SharedArrayObj>()) {
@@ -316,6 +413,12 @@ EvalValue builtin_insert(EvalContext *ctx, const ArgLocs *exprList,
         if (!index_val.is<int_type>())
             throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
 
+        /* Q2: through `dyn`, the element fits the array's own type */
+        if (exprList->ct_store)
+            return builtin_insert_arr(
+                lval, index_val.get<int_type>(),
+                ct_fit_value(lval->get(), val, exprList->start,
+                             exprList->end));
         return builtin_insert_arr(lval, index_val.get<int_type>(), val);
 
     } else {
@@ -363,7 +466,8 @@ EvalValue builtin_find(EvalContext *ctx, const ArgLocs *exprList,
             key = key_holder.get();
         }
 
-        return builtin_find_arr(container_val.get<SharedArrayObj>(), elem_val, key, ctx);
+        return builtin_find_arr(container_val.get<SharedArrayObj>(),
+                                elem_val, key, ctx, exprList->start);
 
     } else if (container_val.is<SharedStr>()) {
 
@@ -410,62 +514,146 @@ EvalValue builtin_hash(EvalContext *ctx, const ArgLocs *exprList,
  */
 EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
                         const EvalValue &container, bool is_filter,
-                        Loc cstart, Loc cend)
+                        Loc cstart, Loc cend, Loc site, int flat_hint)
 {
     FuncObject &funcObj = *func_val.get<intrusive_ptr<FuncObject>>().get();
 
     /* Prepared per-loop callback invoker (VmInvoker, vm.h): under -vm the
      * callback frame is pushed ONCE and each element just rebinds the param
-     * slot(s); tree-walk/const-eval fall back to eval_func per element. */
-    VmInvoker inv(ctx, funcObj);
+     * slot(s); tree-walk/const-eval fall back to eval_func per element.
+     * `site` (the container argument's start, which every engine can
+     * supply - the JIT bakes it) names the callback's frame (#44). */
+    VmInvoker inv(ctx, funcObj, site);
+
+    /*
+     * The result ARRAY - map's over either container, filter's over an
+     * array. #97 CB3: a destination PROVEN array<int>/<float>/<bool> (the
+     * flat_hint - see map_filter_flat_hint) gets a FLAT result, built as
+     * the flat vector of that scalar, whichever container is walked (a
+     * map over a dict built a general one until 2026-11-14, so a `dyn`
+     * alias of an array<int> took a string). A flat result is what lets
+     * a following map/filter/sort hand ITS callback raw elements
+     * (CB1/CB2). Never in a const-eval context, whose general elements
+     * carry the const flag.
+     */
+    const int fmode = ctx->const_ctx ? 0 : flat_hint;
+    /* ...and every element HAS the hinted type: a `dyn` callback's bool
+     * widens and a misfit raises (flat_hint_value) - it spilled the array
+     * to general, a string in an array<int> (RULE 1). So a value past
+     * flat_hint_value is the hinted kind, and nothing spills any more. */
+    const ArrHint fit = fmode == 1 ? ArrHint::flat_i
+                      : fmode == 2 ? ArrHint::flat_f
+                      : fmode == 3 ? ArrHint::flat_b
+                      : ArrHint::dflt;
+    SharedArrayObj::vec_type result;
+    SharedArrayObj::ivec_type fi;
+    SharedArrayObj::fvec_type ff;
+    SharedArrayObj::bvec_type fb;
+    auto push_res = [&](EvalValue &&v0) {
+        EvalValue v = flat_hint_value(v0, fit);
+        if (fmode == 1)
+            fi.push_back(v.get<int_type>());
+        else if (fmode == 2)
+            ff.push_back(v.get<float_type>());
+        else if (fmode == 3)
+            fb.push_back(v.get<bool>() ? 1 : 0);
+        else
+            result.emplace_back(std::move(v), ctx->const_ctx);
+    };
+    auto finish = [&]() -> SharedArrayObj {
+        if (fmode == 1) return SharedArrayObj(std::move(fi));
+        if (fmode == 2) return SharedArrayObj(std::move(ff));
+        if (fmode == 3) return SharedArrayObj(std::move(fb));
+        return SharedArrayObj(std::move(result));
+    };
 
     if (container.is<SharedArrayObj>()) {
 
         /* Read element-by-element WITHOUT promoting flat storage (arr_elem_at);
          * build a fresh array. */
         const SharedArrayObj &arr = container.get<SharedArrayObj>();
-        const size_type n = arr.size();
-        SharedArrayObj::vec_type result;
 
-        for (size_type i = 0; i < n; i++) {
-            const EvalValue e = arr_elem_at(arr, i);
-            const EvalValue r = inv.ready() ? inv.invoke(&e, 1)
-                                            : eval_func(ctx, funcObj, e);
+        /* #49: the size is re-read per step - the callback is arbitrary
+         * script code and may shrink the array under us; a count read
+         * once indexed past its end. */
+        for (size_type i = 0; i < arr.size(); i++) {
+            /* #97 CB2: a FLAT int/float/bool element goes to the callback
+             * RAW (VmInvoker::call_scalars binds it in place, no argv);
+             * filter boxes it only if it keeps it. The kind is re-read
+             * per step, like the size: the callback may promote the array
+             * (a non-scalar store), after which the general arm serves. */
+            const size_type at = arr.offset() + i;
+            switch (arr.skind()) {
+                case SharedArrayObj::Storage::ints: {
+                    const int_type v = arr.flat_ints()[at];
+                    if (!is_filter)
+                        push_res(inv.call(v));
+                    else if (inv.test(v))
+                        push_res(EvalValue(v));
+                    continue;
+                }
+                case SharedArrayObj::Storage::floats: {
+                    const float_type v = arr.flat_floats()[at];
+                    if (!is_filter)
+                        push_res(inv.call(v));
+                    else if (inv.test(v))
+                        push_res(EvalValue(v));
+                    continue;
+                }
+                case SharedArrayObj::Storage::bools: {
+                    const bool v = arr.flat_bools()[at] != 0;
+                    if (!is_filter)
+                        push_res(inv.call(v));
+                    else if (inv.test(v))
+                        push_res(EvalValue(v));
+                    continue;
+                }
+                default:
+                    break;
+            }
+            /* e / r non-const so the kept one is MOVED into the result vector
+             * (avoiding a per-element retain for a general/str/dyn element),
+             * not copied (#60 Tier 1). e is passed to the callback FIRST,
+             * so it is dead by the time filter moves it. */
+            EvalValue e = arr_elem_at(arr, i);
+            EvalValue r = inv.call(e);
             if (!is_filter)
-                result.emplace_back(r, ctx->const_ctx);
-            else if (r.is_true())
-                result.emplace_back(e, ctx->const_ctx);
+                push_res(std::move(r));
+            else if (r.truthy())
+                push_res(std::move(e));
         }
 
-        return SharedArrayObj(move(result));
+        return finish();
 
     } else if (container.is<intrusive_ptr<DictObject>>()) {
 
+        /*
+         * #49: iterate a SNAPSHOT of the pairs, taken before the first
+         * call. The callback is arbitrary script code and may insert into
+         * or erase from this very dict; walking the live map then used
+         * an iterator the mutation had invalidated (ASan:
+         * heap-use-after-free on an erase, an unbounded walk on inserts).
+         * The callback sees the pairs that were there when the call
+         * began, with the values they had then (README).
+         */
         const DictObject::inner_type &data =
             container.get<intrusive_ptr<DictObject>>()->get_ref();
-
-        auto call_kv = [&](const EvalValue &k, const EvalValue &v) {
-            if (inv.ready()) {
-                const EvalValue argv[2] = { k, v };
-                return inv.invoke(argv, 2);
-            }
-            return eval_func(ctx, funcObj, make_pair(k, v));
-        };
+        std::vector<std::pair<EvalValue, LValue>> snap;
+        snap.reserve(data.size());
+        for (auto const &e : data)
+            snap.emplace_back(e.first, e.second);
 
         if (!is_filter) {
-
-            SharedArrayObj::vec_type result;
-            for (auto const &e : data)
-                result.emplace_back(call_kv(e.first, e.second.get()),
-                                    ctx->const_ctx);
-            return SharedArrayObj(move(result));
+            for (auto const &e : snap)
+                push_res(inv.call(e.first, e.second.get()));
+            return finish();
         }
 
-        DictObject::inner_type result;
-        for (auto const &e : data)
-            if (call_kv(e.first, e.second.get()).is_true())
-                result.insert(e);
-        return make_intrusive<DictObject>(move(result));
+        DictObject::inner_type kept;
+        for (auto const &e : snap)
+            if (inv.test(e.first, e.second.get()))
+                kept.insert(e);
+        return make_intrusive<DictObject>(std::move(kept));
     }
 
     throw TypeErrorEx(is_filter ? "Unsupported container type for filter()"
@@ -478,6 +666,15 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
 EvalValue vm_arr_elem(const EvalValue &arr_val, size_type i)
 {
     return arr_elem_at(arr_val.get_ref<SharedArrayObj>(), i);
+}
+
+/* The same read for a caller that ALREADY holds the extracted array - every
+ * unpack site does, since it had to check the element count first. Saves the
+ * per-element type-tag check + cast that re-deriving it from the EvalValue
+ * costs, which in a 2-var unpack is two of them per row. */
+EvalValue vm_arr_elem(const SharedArrayObj &arr, size_type i)
+{
+    return arr_elem_at(arr, i);
 }
 
 /* map/filter validate arg0 (the function) BEFORE evaluating arg1 (the
@@ -499,7 +696,8 @@ EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)
 
     const EvalValue val1 = RValue(arg1->eval(ctx));
     return vm_map_filter(ctx, val0, val1, /*is_filter=*/false,
-                         arg1->start, arg1->end);
+                         arg1->start, arg1->end, arg1->start,
+                         map_filter_flat_hint(exprList->arr_hint));
 }
 
 EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
@@ -516,5 +714,6 @@ EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
 
     const EvalValue val1 = RValue(arg1->eval(ctx));
     return vm_map_filter(ctx, val0, val1, /*is_filter=*/true,
-                         arg1->start, arg1->end);
+                         arg1->start, arg1->end, arg1->start,
+                         map_filter_flat_hint(exprList->arr_hint));
 }

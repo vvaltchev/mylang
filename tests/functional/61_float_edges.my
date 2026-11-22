@@ -1,0 +1,60 @@
+# Float edges, each engine against the tree-walker (corpus_diff) and
+# against README.md (the asserts). Three were wrong until 2026-10-05:
+#  - the typed negation lowered to `0.0 - x`, so `-x` of 0.0 printed
+#    0.000000 under the VM and the JIT and -0.000000 in the tree-walker
+#    (RULE 2), where IEEE - and the README - say -0.0;
+#  - int() of a NaN, an infinity or an out-of-range float was a bare C++
+#    cast: undefined (x86 gave INT_MIN for all of them) - it throws
+#    InvalidValueEx now;
+#  - a NaN printed as C's `-nan` on x86 and `nan` on ARM; it is always
+#    `nan` now.
+# Operands come from runtime(): a constant would fold at compile time.
+
+var z = float(runtime(0.0));
+var i = float(runtime(inf));
+var dyn dz = runtime(0.0);
+
+print(-z, -dz, z * -1.0, -(-z));          # -0.0 -0.0 -0.0 0.0
+print(str(-z), str(-z, 2), -z == z);
+assert(str(-z) == "-0.000000");
+assert(str(-dz) == "-0.000000");
+assert(-z == z);
+
+var nn = i - i;
+print(nn, str(nn), str(nn, 3), [nn, -i, i]);
+assert(str(nn) == "nan");
+assert(str(nn, 3) == "nan");
+assert(str(-nn) == "nan");
+assert(nn != nn);
+assert(!(nn == nn) && !(nn < 1.0) && !(nn > 1.0) && !(nn <= nn));
+assert(str(i) == "inf" && str(-i) == "-inf");
+assert(str(float(runtime(1e308)) * 10.0) == "inf");
+
+func int_of(float f) {
+    try {
+        return str(int(f));
+    } catch (InvalidValueEx) {
+        return "InvalidValueEx";
+    }
+}
+var no_int = [nn, i, -i, float(runtime(1e19)), float(runtime(-1e19)),
+              float(runtime(9223372036854775807.0))];
+foreach (f in no_int)
+    assert(int_of(f) == "InvalidValueEx");
+assert(int_of(float(runtime(-9223372036854775808.0))) ==
+       "-9223372036854775808");
+assert(int_of(float(runtime(-2.7))) == "-2");
+assert(int_of(float(runtime(2.7))) == "2");
+assert(int_of(-z) == "0");
+print(int_of(nn), int_of(i), int_of(float(runtime(-2.7))));
+
+func div_of(float a, float b) {
+    try {
+        return str(a / b);
+    } catch (DivisionByZeroEx) {
+        return "DivisionByZeroEx";
+    }
+}
+assert(div_of(1.0, z) == "DivisionByZeroEx");
+assert(div_of(1.0, -z) == "DivisionByZeroEx");
+print(div_of(1.0, z), div_of(i, 2.0));

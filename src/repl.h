@@ -14,7 +14,7 @@ class Construct;
  * const-eval context, the runtime global scope, the retained input ASTs and the
  * accumulated source - and evaluates one input at a time, faithfully running
  * real pipeline so each input behaves like a script augmented with the existing
- * globals (see plans/repl.md). The TTY / line-editor layer is separate; this
+ * globals (see plans/archived/repl.md). The TTY / line-editor layer is separate; this
  * core is headless and is exactly what the `repl:` tests drive (a sequence of
  * input -> output pairs, to exercise the persisted global context).
  */
@@ -39,6 +39,18 @@ public:
      * to keep reading. Side-effect-free (no parsing, no state change).
      */
     static bool is_incomplete(const std::string &src);
+
+    /*
+     * True when the COMPLETE input `src` ends with a top-level `if` /
+     * `else if` or `try` / `catch` chain whose last block closes at its end
+     * - so a following line starting with `else`, `catch` or `finally`
+     * still continues it, as in a script - only when that last block spans
+     * lines: one typed on a single line runs at once.
+     */
+    static bool may_continue(const std::string &src);
+
+    /* True when `line`'s first token is `else`, `catch` or `finally`. */
+    static bool continues_chain(const std::string &line);
 
     /*
      * Tab-completion candidates for the identifier ending at `cursor` in `buf`:
@@ -68,3 +80,11 @@ private:
  * process exit code. Launched by mylang.cpp when there is no FILE/-e argument.
  */
 int run_repl();
+
+/* The history file (~/.mylang_history): one input per entry, an entry that
+ * spans lines written on one line with its newlines escaped. Loading a
+ * file of the old format (one entry per line) works too. */
+void repl_load_history(const std::string &path,
+                       std::vector<std::string> &history);
+void repl_save_history(const std::string &path,
+                       const std::vector<std::string> &history);

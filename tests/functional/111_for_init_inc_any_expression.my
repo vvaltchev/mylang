@@ -1,0 +1,83 @@
+# The initializer and the increment of a `for` may be any expression, as in
+# C: a value nobody reads is computed and dropped. Until 2026-11-13 every
+# VM / JIT engine refused to COMPILE a `for` whose init or increment was a
+# plain expression - a call, a literal, a name, an operator, a subscript -
+# with an uncatchable "construct not lowered" error, while the tree-walker
+# ran it (RULE 2). A write-once variable folded to its value there by the
+# compiler (`var z = 0; for (z; ...; z)`) reached the same refusal from a
+# program that names no literal at all.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+# ---- a call: the init runs once, the increment after each pass
+var ticks = 0;
+func tick() { ticks++; return ticks; }
+var s = 0;
+for (tick(); s < 3; tick())
+    s++;
+want("call init + inc: passes", s, 3);
+want("call init + inc: calls", ticks, 4);
+
+# ---- a literal, a name, an operator, a comparison: computed and dropped
+s = 0;
+for (0; s < 3; s++) {}
+want("literal init", s, 3);
+s = 0;
+for (; s < 3; 0)
+    s++;
+want("literal inc", s, 3);
+s = 0;
+for (s; s < 3; s + 1)
+    s++;
+want("name init, operator inc", s, 3);
+s = 0;
+for (s < 1; s < 3; s == 2)
+    s++;
+want("comparison init and inc", s, 3);
+s = 0;
+for ("x"; s < 2; [1, 2])
+    s++;
+want("string init, array inc", s, 2);
+
+# ---- a write-once variable the compiler folds to its value there
+func folded(int n) {
+    var z = 0;
+    var k = 0;
+    for (z; k < n; z)
+        k++;
+    return k;
+}
+want("folded write-once init and inc", folded(int(runtime(4))), 4);
+
+# ---- a subscript: read, dropped - and its error is still raised
+var d = [5, 6];
+s = 0;
+for (d[0]; s < 3; d[1])
+    s++;
+want("subscript init and inc", s, 3);
+var where = "";
+try {
+    for (d[int(runtime(7))]; s < 9; s++)
+        where += "body";
+} catch (OutOfBoundsEx) {
+    where += "init";
+}
+want("subscript init out of bounds", where, "init");
+where = "";
+s = 0;
+try {
+    for (; s < 9; d[s + 1])
+        s++;
+} catch (OutOfBoundsEx) {
+    where = str(s);
+}
+want("subscript inc out of bounds after one pass", where, "1");
+
+assert(bad == 0);
+print("ok");

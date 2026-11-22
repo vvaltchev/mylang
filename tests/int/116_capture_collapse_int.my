@@ -1,0 +1,63 @@
+# INT-ENGINES: tw default nj noopt
+# INT-CONFIGS: default ; MYLANG_BCINLINE_SRAC=0
+#
+# INT unit (#107): #97 increment 5's MOVE COLLAPSE, over a capture
+# written by each producer the RETARGET rule admits - an int division
+# (IntBin), a modulo by a literal and an add (IntModRI and IntAddRR,
+# both of the specialized family), the fused (a + b) % k (IntAddModRI),
+# an int immediate (LoadImmInt) and a float division (FloatBin) - and
+# by one it refuses: a call's result (CallV), whose move into the
+# capture stays. Each closure is built in the loop and never escapes,
+# so it is scalar-replaced and its capture becomes a frame slot the
+# producer may write directly. Six closures here and five in 117: with
+# all eleven in one main its frame passes BC_INLINE_MAX_FRAME, and
+# nothing is replaced at all. The second configuration is the same
+# program without the collapse; every engine of both must print the
+# same, and the program asserts its own sums.
+func m_div(int n) {
+    var c = n + 7;
+    return func [c] (int k) { c = c / k; return c + 3; };
+}
+func m_mod(int n) {
+    var c = n;
+    return func [c] (int k) { c = c % 5; c = c + k; return c; };
+}
+func m_addmod(int n) {
+    var c = n;
+    return func [c] (int k) { c = (c + k) % 7; return c; };
+}
+func m_imm(int n) {
+    var c = n;
+    return func [c] (int k) { c = 4; return c + k; };
+}
+func m_fdiv(float x) {
+    var f = x;
+    return func [f] (float y) { f = f / y; return f; };
+}
+# linear recursion: neither inliner removes the call
+func fact(int n) {
+    if (n < 2) return 1;
+    return n * fact(n - 1);
+}
+func m_call(int n) {
+    var c = n;
+    return func [c] (int k) { c = fact(k); return c + 1; };
+}
+var s = 0;
+var fs = 0.0;
+for (var i = 1; i < 6; i++) {
+    var d = m_div(i);
+    s = s + d(2) + d(3);
+    var m = m_mod(i);
+    s = s + m(i) + m(1);
+    var am = m_addmod(i);
+    s = s + am(i) + am(2);
+    var im = m_imm(i);
+    s = s + im(i) + im(1);
+    var fd = m_fdiv(float(i));
+    fs = fs + fd(2.0) + fd(4.0);
+    var cl = m_call(i);
+    s = s + cl(i) + cl(3);
+}
+assert(s == 388 && fs == 9.375);
+print(s, fs);

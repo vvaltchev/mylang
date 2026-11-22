@@ -1,0 +1,72 @@
+# UNJUSTIFIED hardcoded-register floors for scripts/regcensus.py --gate.
+# The maintainer mandate (2026-08-22): every count here must reach ZERO -
+# a site either converts to alloc_scratch(caps) or carries a reg:isa /
+# reg:abi / reg:conv tag with a hard reason. A conversion batch LOWERS
+# its floors in the same commit; the gate fails on ANY drift in either
+# direction, so progress is monotonic and slippage is loud.
+# RAWENC = hand-encoded instruction lines (the census blind spot).
+RAX   0
+RCX    0
+RDX    0
+RSI     0
+RDI     0
+R8      0
+R9      0
+R10     0
+R11     0
+# Phase C3 (2026-08-22): the xmm mandate's conversion is COMPLETE -
+# the staging pair is a run-scoped grant (Emitter::grant_fstage) and
+# every former X0/X1 site queries fsa()/fsb(); what remains justified
+# is the SysV float ABI (libm args/returns, helper float arg0).
+XMM0    0
+XMM1    0
+TOTAL   0
+RAWENC  6
+# 2026-09-19 (#97 inc 2): the residue push's `push qword [rcx]` and
+# the frameless site's `lea rcx,[rbx+d]` got encoders (push_base0,
+# lea_base): 15 -> 14.
+# 2026-09-22 (SP3): the two hand-encoded `mov rax,[rsp+N]` reads of
+# the descriptor spill became Emitter::load_rsp_disp, whose
+# displacement the rsp model DERIVES instead of a comment counting
+# pushes and a parity filler: 14 -> 12.
+# 2026-09-22 (SP3 follow-up): emit_reg_shift's three hand-encoded
+# branches (`0F 88`, `0F 8C`, `E9` + a bare patch32) went through
+# j32/jmp32/patch32_here - byte-identical, and the seams can see them
+# now, which is what the rsp model needs: 12 -> 10.
+CONV 0    # 103: CLOSED 2026-08-25 - the mandate's zero. The final
+# 3 uses were ALREADY-BUILT conversions hiding behind stale struct
+# comments ('this lands INERT, and making them allocatable is the
+# next step' - written when the plan landed inert, false since
+# #96 (c) turned the picks live on 2026-08-20): elem_read_plan
+# allocates data AND count, elem_scratch_plan allocates data, and
+# the tagged literals are pick()'s preferred seeds (reg:proto,
+# like their idx/val siblings). Every one of the original 499
+# conv uses is now read and dispositioned: isa 71 / abi 173 /
+# proto 497 / conv 0.
+# 2026-08-25 batch 3, every remaining site READ: the model-check's
+# CL assert + ElemScratch count are the ISA (retagged reg:isa);
+# the allocated elem roles' default seeds, the ELEM_CAND pool
+# definition, the R9 ctx-chain pairing and the switch tbl's
+# ask+evict fallback are protocol (reg:proto). The 3 uses LEFT
+# are the real conversions, named by their own comments as 'the
+# next step': ElemRead's data/count and ElemScratch's data -
+# making those roles allocatable is an emission-changing batch
+# with its own Ir ledger, not a retag.
+# 2026-08-25 batch 2: 15 more uses read site-by-site and promoted -
+# every one was the ask-fallback bracket again (emit_op/emit_branch
+# tmp: hold() ASKS alloc_scratch first, RCX is its refusal path;
+# emit_ref_check's scr default feeds RefScratch = the ask bracket;
+# div_magic is 'ask-first, like RefScratch's ctor'; store_dst passes
+# the same scr). The 23 left are the UNREAD sites: the elem
+# base-gate/bounds roles, the R9 ctx-chain preference, the
+# model-check probes, the switch tbl=RDX - read each before moving
+# it.
+# 2026-08-25 phase-E re-litigation: 461 uses promoted to the
+# TERMINAL reg:proto tag (rax value conveyance, the tag grant,
+# the call/ctx-chain protocol, the bump + ask-fallback brackets
+# - each a genuine fragment protocol, argued in the plan's
+# five-family map). What remains conv IS the priced worklist:
+# the per-emitter scratch DEFAULTS (emit_op/emit_branch tmp,
+# store_dst/ref_check/div_magic scratch, the elem base-gate
+# data role + pool list, the R9 ctx-chain preference, the
+# model-check's own probes).

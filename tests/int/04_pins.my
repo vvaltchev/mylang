@@ -1,0 +1,83 @@
+# INT-ENGINES: default
+# INT-CONFIGS: default ; MYLANG_JIT_OFF=lsra
+#
+# INT test (#107 P2): the JIT records a `pin` event for each (variable,
+# register) a chunk's FINAL emission held in a register. It asserts the
+# register CLASS, not the register: which one is the allocator's choice
+# and free to change; that an int lives in a GP register and a float in
+# an xmm one is not. And one variable that must NEVER be GP-pinned: a
+# reference (the array) - GP admission needs int-op evidence, or the
+# exit flush would write t_int over it. Default engine only: -nj and the
+# tree-walker have no register allocator.
+
+func hot(int n) {
+    var a = [1, 2, 3];
+    var s = 0;
+    var f = 0.5;
+    for (var i = 0; i < n; i++) {
+        s += i * 3 + a[i % 3];
+        f = f * 1.0001 + 0.25;
+    }
+    return s + int(f);
+}
+var r = hot(int(runtime(1000)));
+print(r);
+assert(r == 1500762);
+
+var ev = int_events("pin");
+foreach (e in ev) print(e);
+func has(arr, needle) {
+    foreach (e in arr)
+        if (find(e, needle) != none) return true;
+    return false;
+}
+assert(has(ev, "func=\"hot\" var=\"s\" reg=\"r"));
+assert(has(ev, "func=\"hot\" var=\"i\" reg=\"r"));
+assert(has(ev, "func=\"hot\" var=\"f\" reg=\"xmm"));
+assert(!has(ev, "func=\"hot\" var=\"a\" reg=\"r"));
+
+# The float literal pool's load BORROWS rcx (push/pop) when the scratch
+# ask is refused - which nine hot ints and a float literal make happen
+# under the legacy allocator (the MYLANG_JIT_OFF=lsra run of this file),
+# which pins at fragment entry and puts one of them in rcx. The value is
+# the oracle for the clobber; the coverage gate (int_run --gcov) is what
+# proves this file reaches the borrow arm. tests/functional/
+# 58_flit_pinned_rcx.my is the same shape for corpus_diff --levers.
+func press(int n) {
+    var a = 1; var b = 2; var c = 3; var d = 4; var e = 5;
+    var f = 6; var g = 7; var h = 8; var k = 9;
+    var x = 0.5;
+    for (var i = 0; i < n; i++) {
+        a += i; b += a; c += b; d += c; e += d; f += e; g += f; h += g;
+        k += h;
+        x = x * 0.5 + 0.75;         # -> 1.5, int(x) == 1
+        a = a & 65535; b = b & 65535; c = c & 65535; d = d & 65535;
+        e = e & 65535; f = f & 65535; g = g & 65535; h = h & 65535;
+        k = k & 65535;
+    }
+    return a + b + c + d + e + f + g + h + k + int(x) % 7;
+}
+var pr = press(int(runtime(1000)));
+print(pr);
+assert(pr == 263075);
+
+# The run's PIN BUDGET is an enumerated decision too (`pin_budget`, #107
+# P3): one instance per run, keyed `<fn>@<run begin pc>/budget`, whose
+# default is the maximum and whose alternatives are every smaller cap -
+# tests/int_enum forces each one. Unforced, every run takes the
+# default, and `hot`'s run has room for at least the three values above.
+func bfield(e, name) {
+    var parts = split(e, " ");
+    foreach (p in parts)
+        if (startswith(p, name + "="))
+            return p[len(name) + 1:];
+    return "";
+}
+var hot_budget = false;
+foreach (e in int_events("pin_budget")) {
+    assert(bfield(e, "pick") == bfield(e, "dflt"));
+    if (startswith(bfield(e, "key"), "\"hot@") && int(bfield(e, "n")) > 3)
+        hot_budget = true;
+}
+print(hot_budget);
+assert(hot_budget);

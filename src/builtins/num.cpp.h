@@ -12,6 +12,7 @@
 #include "eval.h"
 #include "evaltypes.cpp.h"
 #include "syntax.h"
+#include "numtext.h"
 
 #include <random>
 #include <cmath>
@@ -39,27 +40,37 @@ EvalValue builtin_int(EvalContext *ctx, const ArgLocs *exprList,
 
     } else if (val.is<float_type>()) {
 
-        return static_cast<int_type>(val.get<float_type>());
+        /* RULE 1: a NaN, an infinity or a value outside int's range has
+         * no int, and the C++ cast is UNDEFINED there (x86 happened to
+         * give INT_MIN for all of them, ARM saturates) - it throws.
+         * [-2^63, 2^63) is exactly the doubles whose truncation fits;
+         * a NaN fails both comparisons. */
+        const float_type f = val.get<float_type>();
+        ML_INT_ONLY(int_vc_float_int(f);)
+        const float_type lim = static_cast<float_type>(
+            -static_cast<float_type>(std::numeric_limits<int_type>::min()));
+        if (!(f >= -lim && f < lim))
+            throw InvalidValueEx("float has no int value (NaN, infinite or "
+                                 "out of range)", arg->start, arg->end);
+        return static_cast<int_type>(f);
 
     } else if (val.is<SharedStr>()) {
 
-        const string &strval = string(val.get<SharedStr>().get_view());
-
-        try {
-
-            if constexpr (sizeof(int_type) == sizeof(int))
-               return static_cast<int_type>(stoi(strval));
-            else if constexpr(sizeof(int_type) == sizeof(long))
-               return static_cast<int_type>(stol(strval));
-            else if constexpr(sizeof(int_type) == sizeof(long long))
-               return static_cast<int_type>(stoll(strval));
-            else
-               assert(0);
-
-        } catch (...) {
-
-            throw TypeErrorEx("The string cannot be converted to integer", arg->start, arg->end);
-        }
+        /* The WHOLE string is the integer (numtext.h): stoll read a prefix,
+         * so int("12abc") was 12 and int("3.7") was 3. A string that is not
+         * one, or does not fit, is a wrong VALUE of the right type. */
+        const std::string_view sv = val.get<SharedStr>().get_view();
+        int_type r = 0;
+        const NumText o = numtext_int(sv, r);
+        ML_INT_ONLY(int_vc_str_int(sv.data(), sv.size(),
+                                   static_cast<int>(o), r);)
+        if (o == NumText::overflow)
+            throw InvalidValueEx("the string's integer does not fit an int",
+                                 arg->start, arg->end);
+        if (o != NumText::ok)
+            throw InvalidValueEx("the string is not an integer",
+                                 arg->start, arg->end);
+        return r;
 
     } else {
 
@@ -90,14 +101,24 @@ EvalValue builtin_float(EvalContext *ctx, const ArgLocs *exprList,
 
     } else if (val.is<SharedStr>()) {
 
-        try {
-
-            return stod(string(val.get<SharedStr>().get_view()));
-
-        } catch (...) {
-
-            throw TypeErrorEx("The string cannot be converted to float", arg->start, arg->end);
-        }
+        /* The WHOLE string is the number (numtext.h). Out of the double
+         * range, it is the maintainer's hybrid (2026-10-05): known at
+         * COMPILE time - a const evaluation, the same moment a literal is
+         * read - it is refused like an out-of-range literal; at run time it
+         * rounds as IEEE does, to an infinity or a signed zero. */
+        const std::string_view sv = val.get<SharedStr>().get_view();
+        float_type r = 0;
+        const NumText o = numtext_float(sv, r);
+        const bool at_compile = ctx->in_const_eval();
+        ML_INT_ONLY(int_vc_str_float(sv.data(), sv.size(),
+                                     static_cast<int>(o), r, at_compile);)
+        if (o == NumText::bad)
+            throw InvalidValueEx("the string is not a number",
+                                 arg->start, arg->end);
+        if (o != NumText::ok && at_compile)
+            throw InvalidValueEx("the string's number is outside the "
+                                 "float range", arg->start, arg->end);
+        return r;
 
     } else {
 
@@ -129,22 +150,40 @@ EvalValue builtin_abs(EvalContext *ctx, const ArgLocs *exprList,
     }
 }
 
+/*
+ * #50: min/max of an EMPTY array has no answer. Its static type is the
+ * array's (non-opt) element type, so the `none` this used to return put a
+ * none in a slot inference had proven int/float/... (RULE 1) - the same
+ * hole #48 closed for sum(). Unlike a sum there is no identity element to
+ * give, so it is the InvalidArgumentEx README documents.
+ */
 template <bool is_max>
-EvalValue b_min_max_arr(const SharedArrayObj &arr)
+[[noreturn]] static void b_min_max_empty(const ArgLoc *arg)
 {
+    throw InvalidArgumentEx(is_max ? "max() of an empty array"
+                                   : "min() of an empty array",
+                            arg->start, arg->end);
+}
+
+template <bool is_max>
+EvalValue b_min_max_arr(const SharedArrayObj &arr, const ArgLoc *arg)
+{
+    ML_INT_ONLY(int_vc_size(is_max ? IntVc::max_empty : IntVc::min_empty,
+                            is_max ? IntVc::max_one : IntVc::min_one,
+                            arr.size());)
     /* Flat fast path: scan the unboxed int/float vector directly, no promotion
-     * and no per-element virtual compare (see plans/typed-arrays.md).
+     * and no per-element virtual compare (see plans/archived/typed-arrays.md).
      * strs/structs take the general path below (a LOCAL handle promote -
      * min/max of strings compares lexically as before; the else-chain here
      * would misread their union member). */
-    if (arr.skind() != SharedArrayObj::Storage::general
-        && arr.skind() != SharedArrayObj::Storage::strs
-        && arr.skind() != SharedArrayObj::Storage::structs) {
+    if (arr.skind() == SharedArrayObj::Storage::ints
+        || arr.skind() == SharedArrayObj::Storage::bools
+        || arr.skind() == SharedArrayObj::Storage::floats) {
 
         const size_type n = arr.size(), off = arr.offset();
 
         if (n == 0)
-            return EvalValue();
+            b_min_max_empty<is_max>(arg);
 
         if (arr.skind() == SharedArrayObj::Storage::ints) {
             const auto &iv = arr.flat_ints();
@@ -178,32 +217,32 @@ EvalValue b_min_max_arr(const SharedArrayObj &arr)
         return EvalValue(best);
     }
 
-    /* strs/structs: promote a LOCAL handle copy (the caller's array keeps
-     * its flat storage) and run the general compare loop. */
-    SharedArrayObj marr = arr;
-    if (marr.skind() != SharedArrayObj::Storage::general)
-        (void)marr.get_vec();          /* promotes strs/structs in place */
+    /* any other storage: a general COPY (the caller's array keeps its flat
+     * storage - a promotion would be in place on the shared storage, #53b)
+     * and the general compare loop. */
+    const SharedArrayObj marr =
+        arr.skind() != SharedArrayObj::Storage::general ? arr.general_copy()
+                                                         : arr;
     const ArrayConstView &arr_view = marr.get_view();
-    EvalValue val;
 
-    if (arr_view.size() > 0) {
+    if (arr_view.size() == 0)
+        b_min_max_empty<is_max>(arg);
 
-        val = arr_view[0].get();
+    EvalValue val = arr_view[0].get();
 
-        for (size_type i = 1; i < arr_view.size(); i++) {
+    for (size_type i = 1; i < arr_view.size(); i++) {
 
-            const EvalValue &other = arr_view[i].get();
+        const EvalValue &other = arr_view[i].get();
 
-            if constexpr(is_max) {
+        if constexpr(is_max) {
 
-                if (other > val)
-                    val = other;
+            if (other > val)
+                val = other;
 
-            } else {
+        } else {
 
-                if (other < val)
-                    val = other;
-            }
+            if (other < val)
+                val = other;
         }
     }
 
@@ -230,7 +269,7 @@ EvalValue b_min_max(EvalContext *ctx, const ArgLocs *exprList,
             );
         }
 
-        return b_min_max_arr<is_max>(val.get<SharedArrayObj>());
+        return b_min_max_arr<is_max>(val.get<SharedArrayObj>(), first_arg);
     }
 
     for (size_type i = 1; i < n; i++) {
@@ -249,6 +288,29 @@ EvalValue b_min_max(EvalContext *ctx, const ArgLocs *exprList,
         }
     }
 
+    /*
+     * Numbers of different kinds give a result of their COMMON kind, the
+     * promotion chain bool <= int <= float - exactly the type inference
+     * gives the call (`max(one, 2, 0.5)` is a float). The selected value
+     * itself was returned untouched: an int in a slot proven float, which
+     * one engine printed as `2` and another as `2.000000` (RULE 1). A
+     * non-number among the arguments converts nothing.
+     */
+    bool any_f = false, any_i = false;
+    for (size_t i = 0; i < n; i++) {
+        if (args[i].is<float_type>())
+            any_f = true;
+        else if (args[i].is<int_type>())
+            any_i = true;
+        else if (!args[i].is<bool>())
+            return val;
+    }
+    if (any_f && !val.is<float_type>())
+        return EvalValue(val.is<int_type>()
+                             ? static_cast<float_type>(val.get<int_type>())
+                             : (val.get<bool>() ? 1.0 : 0.0));
+    if (!any_f && any_i && val.is<bool>())
+        return EvalValue(static_cast<int_type>(val.get<bool>() ? 1 : 0));
     return val;
 }
 
@@ -298,7 +360,7 @@ float_func(EvalContext *ctx, const ArgLocs *exprList,
         return f(x[0], x[1]);
     else
         /* We should never get here */
-        assert(0);
+        ML_CHECK(false);
 }
 
 /* The std::<name> overload for float_type (double), selected by an explicit
@@ -405,8 +467,12 @@ EvalValue builtin_rand(EvalContext *ctx, const ArgLocs *exprList,
     if (!v1.is<int_type>())
         throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
 
+    /* An empty range has no value to draw. rand() is typed `int`, so the
+     * `none` this used to return landed in a slot inference had proven
+     * int (RULE 1, the #50 family). */
     if (v1.get<int_type>() < v0.get<int_type>())
-        return none;
+        throw InvalidArgumentEx("rand(lo, hi) needs lo <= hi",
+                                exprList->start, exprList->end);
 
     if (v0.get<int_type>() == v1.get<int_type>())
         return v0;
@@ -435,11 +501,24 @@ EvalValue builtin_randf(EvalContext *ctx, const ArgLocs *exprList,
     if (!v1.is<float_type>())
         throw TypeErrorEx("Expected float", arg1->start, arg1->end);
 
-    if (v1.get<float_type>() < v0.get<float_type>())
-        return none;
+    const float_type lo = v0.get<float_type>();
+    const float_type hi = v1.get<float_type>();
 
-    if (v0.get<float_type>() == v1.get<float_type>())
+    /* An empty range (lo > hi) returned `none` into a slot typed `float`
+     * (RULE 1). And uniform_real_distribution's own precondition is
+     * lo <= hi with a FINITE width: a NaN bound, or [-inf, inf], was
+     * undefined behaviour in the C++ library. `!(lo <= hi)` also
+     * catches a NaN. */
+    if (!(lo <= hi))
+        throw InvalidArgumentEx("randf(lo, hi) needs lo <= hi",
+                                exprList->start, exprList->end);
+
+    if (lo == hi)
         return v0;
+
+    if (!std::isfinite(hi - lo))
+        throw InvalidArgumentEx("randf(lo, hi) needs a finite range",
+                                exprList->start, exprList->end);
 
     std::uniform_real_distribution<float_type> distrib(
         v0.get<float_type>(), v1.get<float_type>()

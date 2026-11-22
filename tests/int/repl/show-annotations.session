@@ -1,0 +1,45 @@
+# :show renders declared annotations: a struct declared in a function
+# with box, optional parameterized, opt dyn, struct and opt array
+# fields, and locals typed with a struct, an opt struct, a box and
+# optional parameterized containers.
+# What the unit OWNS is in the inferencer: `od2` below, a declared dict
+# whose literal's KEY is a parameter still untyped in the first round, is
+# has_unknown's dict-key arm.
+struct P { int x; int y; }
+func h(int k) {
+    struct Q {
+        box<int> b; array<int>? a; opt dyn d; P p
+        box<P> bp; dict<str,int>? m; opt array<dyn> e
+    }
+    P q = P(k, 2);
+    opt P r = k > 0 ? none : q;
+    box<int> bx = box(k);
+    array<int>? oa = k > 0 ? [k] : none;
+    dict<str,int>? od = k > 1 ? {"a": k} : none;
+    Q w = Q(box(1), oa, none, q, box(q), od, none);
+    *bx = *bx + 1;
+    return q.x + (r?.y ?? 0) + *bx + len(oa ?? []) + len(od ?? {}) + w.p.y;
+}
+h(runtime(2))
+:show h
+# ...and `od2`, whose literal's KEY is that parameter, is the key arm
+func hk(int k) {
+    dict<int, int>? od2 = k > 1 ? {k: 1} : none;
+    return len(od2 ?? {});
+}
+hk(runtime(2))
+# :analyze (a non-strict inference) of stores into declared element and
+# key types that refuse none - the refusals are a strict run's alone -
+# and a committed container nothing typed yet, which a none fills
+:analyze array<int> b = [1]; b[0] = none;
+:analyze dict<int, int> k = {}; k[none] = 1;
+:analyze func gq(int q) { if (q > 0) return q; return none; } array<int> c = [1]; c[0] = gq(1); dict<int, int> e = {}; e[gq(1)] = 2;
+var hn = {}
+hn[none] = 1
+var an = []
+append(an, none)
+an
+func gr(int q) { if (q > 0) return q; return none; }
+var ao = []
+append(ao, gr(1))
+ao

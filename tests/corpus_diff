@@ -1,0 +1,511 @@
+#!/bin/bash
+#
+# THE FUNCTIONAL DIFFERENTIAL: tree-walker vs the default engine (VM +
+# JIT + splice) over tests/functional and samples/.
+#
+# ⛔ IT DOES NOT RUN bench/. Benchmarks measure THROUGHPUT - millions of
+# iterations - and are not functional tests; using them as one makes a
+# correctness run take minutes for no extra coverage, because a JIT bug
+# shows on iteration 1 or not at all. tests/functional/ exists for this:
+# tiny, self-asserting programs that construct the hazard SHAPES on
+# purpose instead of hoping a benchmark happens to contain them.
+#
+# WHY IT EXISTS at all: a JIT register bug needs a program shape, a
+# runtime state AND an emitter decision to coincide, and -rt varies only
+# the first (hand-written tests have few locals, so their temps rarely
+# collide with reference-producing code). Two such bugs were green under
+# -rt AND the 400-program fuzzer.
+#
+#   tests/corpus_diff [binary]            - the differential
+#   tests/corpus_diff [binary] --levers   - once per JIT lever off
+#   tests/corpus_diff [binary] --cold     - once per forced cold tier
+#   tests/corpus_diff [binary] --xrot     - once per pin-pool rotation
+#   tests/corpus_diff [binary] --nolowmem - with the low-address arena
+#   tests/corpus_diff [binary] --spcheck  - with the emitted rsp
+#                                              alignment check at every
+#                                              call site (TESTS builds)
+#                                              REFUSED (the imm32 tags fall
+#                                              back to registers)
+#   tests/corpus_diff [binary] --list     - print the programs and stop
+#   tests/corpus_diff [binary] --only RE  - only the programs whose path
+#                                              the extended regex RE matches
+#                                              (how tests/run reproduces
+#                                              one failing program)
+#   tests/corpus_diff [binary] MODE...    - several modes in ONE run:
+#                                              the plain part and the
+#                                              tree-walker references run
+#                                              once, each mode's rows
+#                                              follow in the order given
+#
+# --nolowmem exists because the JIT emits MATERIALLY different code when
+# ml_lowmem_fits_imm32 is false: every type tag becomes a register read
+# instead of an imm32, which also decides whether rsi/r8 may hold a pin
+# at all. That configuration ships - lowmem.h says in bold that a failed
+# MAP_32BIT is reachable on Linux - and until MYLANG_NO_LOWMEM existed
+# NO build and NO lane could enter it. Its first run found 7 corpus
+# programs crashing or answering wrongly: store_dst_bool named a
+# fallback register for the t_bool tag and the movabs that filled it had
+# been deleted as "an instruction saved" when the imm32 form landed.
+#
+# --xrot exists because the allocator hands out registers in
+# PREFERENCE order, so its last member is reached only by a run with the
+# maximum pin count - and an unsafe register can therefore sit in the
+# pool exercised by nothing. r9 did, for a day, as a wrong answer
+# (939f5a9 .. 2026-08-17). Rotating puts every member in the
+# first-choice seat.
+#
+# Excluded from samples/: rand_sort (rand()), shopping/phonebook (they
+# read stdin and reprint their menu forever on EOF).
+#
+# PARALLEL, AND THE REPORT IS THE SERIAL ONE (2026-09-27). Every
+# (configuration x program) run is an independent process, so they all
+# run up front, `tests/jobs count` at a time (MYLANG_TEST_JOBS
+# overrides), in the IDLE scheduling class (tests/jobs run); the
+# report is then printed from the saved outputs in exactly the order,
+# and with exactly the text, the one-at-a-time version printed. The
+# tree-walker reference does not depend on the JIT configuration - the
+# serial script passed the env only to the default engine - so it runs
+# ONCE per flag set (plain, -nc, -nti) and every configuration compares
+# against that one run, and fold_same's two sides are the same runs as
+# the plain and -nc default-engine rows. Programs run with stdin from
+# /dev/null. Needs `xargs -P` (GNU and BSD both have it).
+set -u
+
+# ---- one unit of work, run by xargs: the parallel half ------------- #
+# $2 = results dir, $3 = unit id, $4 = env assignment or '-', $5 = the
+# mylang flags or '-', $6 = the program. Writes <id>.out and <id>.rc.
+if [ "${1:-}" = __unit ]; then
+    _d=$2 _id=$3 _e=$4 _fl=$5 _f=$6
+    [ "$_e" = - ] && _e=
+    [ "$_fl" = - ] && _fl=
+    # The program's own stdout/stderr go to the unit's file; this shell's
+    # stderr goes nowhere, so a signal death is not ALSO announced by
+    # bash ("Segmentation fault ...") on the report's stderr - the serial
+    # script ran each program in a $(...), where bash stays silent.
+    exec 2>/dev/null
+    # The limit catches a HANG, so it is far above the slowest honest
+    # run: samples/loop under -tw -nti takes 47 s on an idle ASan debug
+    # build, and 60 s timed it out on a loaded one (2026-10-12).
+    # shellcheck disable=SC2086
+    env $_e timeout 180 "$CORPUS_DIFF_BIN" $_fl "$_f" \
+        >"$_d/$_id.out" 2>&1 </dev/null
+    echo $? >"$_d/$_id.rc"
+    exit 0
+fi
+
+# ---- the idle policy, applied once at the top-level entry ---------- #
+if [ "${MYLANG_TEST_IDLED:-0}" != 1 ]; then
+    exec sh "$(dirname "$0")/jobs" run bash "$0" "$@"
+fi
+
+# ⛔ RESOLVE $BIN *BEFORE* THE cd, AND PROVE IT RUNS.
+#
+# This script cd's to the repo root, so a RELATIVE binary path given by
+# the caller is silently re-anchored - and CI passes exactly that:
+# `corpus_diff ./mylang` with working-directory `build/`. After the
+# cd, `./mylang` is <repo>/mylang, which does not exist.
+#
+# ⛔ THAT MADE THE WHOLE Nets DIFFERENTIAL VACUOUS, and it could not
+# have announced itself: run_one compares the tree-walker's output with
+# the default engine's, and when NEITHER binary runs both sides are the
+# same "No such file or directory" - so the comparison AGREED, printed
+# `33/33 agree`, and exited 0. An oracle whose two sides fail
+# identically reports success. It was the compile gate - the first
+# check here that reads an EXIT CODE rather than diffing two outputs -
+# that exposed it.
+#
+# Both halves are needed: resolving the path fixes it, and the
+# executable test is what stops it ever being silent again.
+# the binary is the first argument that is not an option; the rest are
+# modes, plus --list / --only RE (case selection, for tests/run)
+_bin_arg=build-claude/dbg/mylang
+MODES=
+LIST=0
+ONLY=
+_first=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --list) LIST=1 ;;
+    --only)
+      [ $# -ge 2 ] || { echo "corpus_diff: --only needs a regex" >&2; exit 2; }
+      ONLY=$2; shift ;;
+    -*) MODES="${MODES:+$MODES }$1" ;;
+    *)
+      if [ $_first = 1 ]; then _bin_arg=$1
+      else echo "corpus_diff: unexpected argument '$1'" >&2; exit 2
+      fi ;;
+  esac
+  _first=0
+  shift
+done
+case "$_bin_arg" in
+  /*) BIN=$_bin_arg ;;
+  *)  BIN=$PWD/$_bin_arg ;;
+esac
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+cd "$(dirname "$0")/.."
+# the programs, and --list / --only (needs no binary: tests/run lists
+# cases before anything is built)
+all_progs() {
+  ls tests/functional/*.my 2>/dev/null
+  for f in samples/*; do
+    [ -f "$f" ] || continue
+    case "$f" in *rand_sort*|*shopping*|*phonebook*) continue ;; esac
+    echo "$f"
+  done
+}
+progs() {
+  if [ -n "$ONLY" ]; then all_progs | grep -E -- "$ONLY"
+  else all_progs
+  fi
+}
+if [ $LIST = 1 ]; then
+  progs
+  exit 0
+fi
+if [ -n "$ONLY" ] && [ -z "$(progs)" ]; then
+  echo "corpus_diff: --only '$ONLY' matches no program" >&2
+  exit 2
+fi
+# ⛔ THE PROGRAM LIST IS READ ONCE. The runs below and the report after
+# them each walked the directory, so a program added while the runs went
+# (2026-10-12: a new tests/functional file, minutes into --levers) was in
+# the report and not in the runs - and every comparison row counted it
+# as agreeing, from result files that did not exist. Only the compile
+# gate, which compares an exit code with 0, noticed. The list is a
+# snapshot now, and a unit with no result is a failure (MISSING).
+PROGS_SNAP=$(progs)
+progs() { printf '%s\n' "$PROGS_SNAP"; }
+if [ ! -x "$BIN" ]; then
+    echo "corpus_diff: '$_bin_arg' is not an executable ($BIN)." >&2
+    echo "  This script cd's to the repo root, so a relative path is" >&2
+    echo "  resolved against your CURRENT directory, not the root." >&2
+    exit 2
+fi
+# MODES (above): in report order (none = the plain differential only)
+# ⛔ KEEP IN SYNC WITH jit_lever_names (jit.cpp) - this list went stale
+# once (#101 found argfuse/xcache/scache/rshare missing, so those four
+# levers' per-lever-off configs were tested by nothing but `all`).
+# `lsra` joined 2026-08-31 (#103 A'): it selects the LEGACY pick over
+# the linear scan, i.e. a different PIN SET for the same program.  It
+# was an env var (MYLANG_JIT_LSRA=0) and NOT a lever, so this matrix -
+# the one CI runs - never covered it, and a whole second allocator was
+# exercised by four hand-written -rt cases and nothing else.
+#
+# NOT VACUOUS, measured when it was added: 21 of the 35 programs below
+# emit DIFFERENT machine code under the two allocators (compare
+# `MYLANG_VDJ_ADDRS=0 mylang -vdj` with and without the lever).  So
+# this row buys 21 programs' worth of alternative (slot -> register)
+# assignment - the axis the r9 bug lived in, where a hot local landing
+# in a register that was also raw scratch was a WRONG ANSWER that only
+# appeared for the programs whose pin set happened to reach it.
+# Re-measure that ratio if it ever looks like this row is free.
+LEVERS="cache fcache telide fread flit fwd ffwd resreg hoist hoist2 \
+mfact cest relent norec argfuse xcache scache rshare peep bakecallee \
+lsra capbase frameless capprot vfquiet gproof ghoist regcall pincs retwb xcall tregs"
+
+# ⛔ AN ASan LANE MUST BOUND ITSELF, OR A RUNAWAY TAKES THE MACHINE DOWN
+# INSTEAD OF FAILING (2026-09-03).  This script spawns a process per
+# (config x program) - the levers matrix alone is 23 x 34 - and under
+# AddressSanitizer a single runaway allocation is not a bounded failure:
+# it is an out-of-memory kill of whatever else is running, with the
+# harness dying before it can print WHICH config was at fault.  That
+# happened twice, and the log said nothing at all because the shell died
+# with its output still buffered.
+#
+# `hard_rss_limit_mb` makes ASan itself abort the offending process, so
+# the failure arrives as a NAMED report attributed to one program and one
+# config - which is what an instrument owes its reader.  Only set when the
+# caller has expressed no preference; a real ASAN_OPTIONS always wins.
+: "${ASAN_OPTIONS:=hard_rss_limit_mb=8000}"
+export ASAN_OPTIONS
+COLD_TIERS="refstore guard"
+# ⛔ DERIVED FROM THE BINARY, NOT HARDCODED (2026-08-18). This was
+# `XROTS="0 1 2 3"`, a literal, and the whole point of the mode is that
+# `take_reg` scans the pool in preference order so its LAST member gets
+# first-choice traffic from nothing - which is how an unsafe r9 sat
+# there for a day as a shipping wrong answer. A hardcoded rotation
+# count re-creates exactly that blind spot one level up: admit a fifth
+# caller-saved register and the sweep silently stops covering the
+# newest, least-exercised member, while still printing PASS.
+#
+# It got lucky once already - the literal covered 0..3 while the pool
+# held THREE, so rotation 3 was a duplicate of 0; when rdi joined the
+# count happened to be right. Not a property to rely on twice.
+#
+# `mylang -v` reports `jit_pins N (int pin budget; M xrot rotations)`;
+# M is XROT's period. #123: it used to be the caller-saved ARRAY's
+# length, because the rotation permuted that array - the rotation now
+# moves the start of RegAlloc::take's scan over the whole register
+# file, so M is 16 and the sweep covers the FLOAT file too. A binary
+# that does not report it (an older build, a non-JIT platform) falls
+# back to the literal and SAYS SO.
+XCW=$("$BIN" -v 2>/dev/null | sed -n 's/.*; \([0-9][0-9]*\) xrot.*/\1/p')
+if [ -n "$XCW" ] && [ "$XCW" -gt 0 ] 2>/dev/null; then
+  XROTS=$(seq 0 $((XCW - 1)) | tr '\n' ' ')
+else
+  echo "warning: '$BIN' does not report its xrot width; --xrot is" >&2
+  echo "         falling back to a fixed 0..3 sweep, which may NOT" >&2
+  echo "         cover every pool member." >&2
+  XROTS="0 1 2 3"
+fi
+
+
+# ---- every unit of work, run up front ------------------------------ #
+# A key is a flag set or an env assignment reduced to a file-name-safe
+# word ('p' for none). The unit ids:
+#   nr.<i>            the compile gate's `-nr` run of program i
+#   tw.<fk>.<i>       the tree-walker reference, per FLAG SET only
+#   vm.<ek>.<fk>.<i>  the default engine under env <ek>, flags <fk>
+key() {
+  if [ -z "$1" ]; then echo p
+  else printf '%s' "$1" | tr -c 'A-Za-z0-9' _
+  fi
+}
+RES=$(mktemp -d "${TMPDIR:-/tmp}/corpus_diff.XXXXXX") || exit 2
+trap 'rm -rf "$RES"' EXIT
+JOBS=$(tests/jobs count)
+export CORPUS_DIFF_BIN="$BIN"
+
+# The configurations run_one reports, in report order, one
+# "env|flags" per line. The mode's rows all use the plain flag set.
+CONFIGS='|
+|-nc
+|-nti'
+SPCHECK_OK=1
+add_config() {
+  printf '%s\n' "$CONFIGS" | grep -Fqx "$1|" || CONFIGS="$CONFIGS
+$1|"
+}
+for MODE in $MODES; do
+case "$MODE" in
+  --levers)   for L in $LEVERS all; do add_config "MYLANG_JIT_OFF=$L"; done ;;
+  --cold)     for T in $COLD_TIERS all; do
+                add_config "MYLANG_JIT_COLD=$T"; done ;;
+  --xrot)     for K in $XROTS; do add_config "MYLANG_JIT_XROT=$K"; done ;;
+  --nolowmem) add_config "MYLANG_NO_LOWMEM=1" ;;
+  --spcheck)
+    if "$BIN" -v 2>/dev/null | grep -Eq '^ *tests +1'; then
+      add_config "MYLANG_JIT_SPCHECK=1"
+    else
+      SPCHECK_OK=0
+    fi ;;
+esac
+done
+
+emit_units() {
+  local i=0 f cfg e fl
+  for f in $(progs); do
+    i=$((i + 1))
+    printf '%s\0%s\0%s\0%s\0' "nr.$i" - -nr "$f"
+    for fl in "" -nc -nti; do
+      printf '%s\0%s\0%s\0%s\0' "tw.$(key "$fl").$i" - \
+        "-tw${fl:+ $fl}" "$f"
+    done
+    while IFS= read -r cfg; do
+      e=${cfg%%|*} fl=${cfg#*|}
+      printf '%s\0%s\0%s\0%s\0' "vm.$(key "$e").$(key "$fl").$i" \
+        "${e:--}" "${fl:--}" "$f"
+    done <<EOF_CFG
+$CONFIGS
+EOF_CFG
+  done
+}
+# PROGRESS: tests/testctl lists this run with its percentage - a
+# finished unit leaves its .rc file, which tests/testmon counts (it
+# exits by itself if this script dies; python3 is optional here)
+MON=
+if command -v python3 >/dev/null 2>&1; then
+  TOTAL=$(emit_units | tr -cd '\000' | wc -c)
+  tests/testmon corpus_diff $((TOTAL / 4)) "$RES" '*.rc' \
+    --pid $$ --phase runs &
+  MON=$!
+fi
+emit_units | xargs -0 -n 4 -P "$JOBS" bash "$SELF" __unit "$RES"
+if [ -n "$MON" ]; then
+  kill "$MON" 2>/dev/null
+  wait "$MON" 2>/dev/null
+fi
+
+# the saved output / exit status of unit $1
+out_of() { cat "$RES/$1.out"; }
+rc_of()  { cat "$RES/$1.rc"; }
+# true when any unit named has NO result: it never ran, which is a
+# failure to report, never a silent agreement
+missing() {
+  local u
+  for u; do [ -f "$RES/$u.rc" ] || return 0; done
+  return 1
+}
+
+# ---- the report: the serial loops, reading the saved results ------- #
+
+# ⛔ A PROGRAM THAT STOPS COMPILING "AGREES" WITH ITSELF.
+#
+# This is the `tail -3` lesson in a new shape (see run_one below): the
+# comparison is between two ENGINES, so a COMPILE-TIME refusal - which
+# happens before either engine runs and prints the identical message on
+# both sides - reads as perfect agreement. Watched: reopening #115's
+# multi-site hole made tests/functional/25_factory_closure_param.my
+# fail to compile at all, and this script still reported 33/33.
+#
+# `-nr` is the discriminator ("compile and validate, don't run": lex,
+# parse, infer AND run_optimizers, exit 1 on a refusal). Exit CODE
+# alone would not do - samples/gcd legitimately exits 1 with a usage
+# message when given no arguments.
+#
+# A comparison oracle must compare everything it claims to; this one
+# claims the corpus RUNS.
+compiles_all() {
+  local bad=0 n=0 out
+  for f in $(progs); do
+    n=$((n + 1))
+    if missing "nr.$n"; then
+      echo "MISSING [compile gate] $f (no result: the run did not happen)"
+      bad=$((bad + 1))
+    elif [ "$(rc_of "nr.$n")" != 0 ]; then
+      out=$(out_of "nr.$n")
+      echo "REFUSED $f"
+      printf '%s\n' "$out" | head -4 | sed 's/^/  /'
+      bad=$((bad + 1))
+    fi
+  done
+  printf "  %-28s %d/%d compile\n" "compile gate" "$((n - bad))" "$n"
+  return $bad
+}
+
+run_one() {     # $1 = env assignment ("" = plain), $2 = extra engine flags
+  local bad=0 n=0 a b ra rb fk ek
+  local flags=${2:-}
+  fk=$(key "$flags") ek=$(key "$1")
+  for f in $(progs); do
+    # ⛔ COMPARE THE WHOLE OUTPUT. This used to pipe both sides through
+    # `tail -3`, so a divergence anywhere but a program's last three
+    # lines was INVISIBLE - the tool answered "28/28 agree" for a
+    # binary that printed `1 0` where the tree-walker printed
+    # `true false`, because the offending lines were at the top. The
+    # truncation was only ever meant to keep the DIFF MESSAGE short,
+    # which is what the diff below does instead: compare everything,
+    # print the first few DIFFERING lines (more useful than the tail).
+    n=$((n + 1))
+    if missing "tw.$fk.$n" "vm.$ek.$fk.$n"; then
+      echo "MISSING [${1:-plain}${flags:+ $flags}] $f (no result: the" \
+           "run did not happen)"
+      bad=$((bad + 1))
+      continue
+    fi
+    a=$(out_of "tw.$fk.$n")
+    ra=$(rc_of "tw.$fk.$n")
+    b=$(out_of "vm.$ek.$fk.$n")
+    rb=$(rc_of "vm.$ek.$fk.$n")
+    # ⛔ A PROGRAM THAT CRASHES THE SAME WAY IN BOTH ENGINES "AGREES".
+    # The compile gate's lesson one step later: an assertion abort (or a
+    # sanitizer report, or a timeout) that both engines reach prints the
+    # same text, so the diff below is silent. Found 2026-09-25 while
+    # watching #53's dict-cursor sabotage fail: both engines tripped the
+    # cursor's ML_CHECK identically and this script said 41/41. A signal
+    # death (128+) or a timeout (124) is a failure on EITHER side.
+    if [ "$ra" -ge 124 ] || [ "$rb" -ge 124 ]; then
+      echo "CRASH [${1:-plain}${flags:+ $flags}] $f (tw rc=$ra, vm rc=$rb)"
+      printf '%s\n' "$b" | tail -4 | sed 's/^/  /'
+      bad=$((bad + 1))
+    # ⛔ AND A SELF-ASSERTING PROGRAM THAT FAILS IN EVERY ENGINE "AGREES"
+    # TOO: an assert prints the same error and exits 1 everywhere. Found
+    # 2026-10-05: 58_flit_pinned_rcx asserted a sum built on int() of a
+    # 1e97 float (undefined behaviour, which made int() throw once it was
+    # fixed) and this script stayed green. A tests/functional program
+    # must exit 0 (samples may not: gcd exits 1 with no arguments).
+    elif [ "$ra" -ne 0 ] && case "$f" in tests/functional/*) true ;;
+                               *) false ;; esac; then
+      echo "FAIL [${1:-plain}${flags:+ $flags}] $f (exit $ra in the" \
+           "tree-walker: a self-asserting program must exit 0)"
+      printf '%s\n' "$a" | tail -4 | sed 's/^/  /'
+      bad=$((bad + 1))
+    elif [ "$a" != "$b" ]; then
+      echo "DIFF [${1:-plain}${flags:+ $flags}] $f"
+      diff <(printf '%s\n' "$a") <(printf '%s\n' "$b") \
+        | head -8 | sed 's/^/  /'
+      bad=$((bad + 1))
+    fi
+  done
+  printf "  %-28s %d/%d agree\n" "${1:-plain}${flags:+ $flags}" \
+    "$((n - bad))" "$n"
+  return $bad
+}
+
+# #54: `-nc` turns off FOLDING - an optimization - so RULE 2 says the
+# program may not notice: default and `-nc` must print the same stdout
+# and stderr and exit the same way, on the SAME engine. This is stronger
+# than the engine differential below (both of whose sides would share a
+# -nc mistake): for months `-nc` refused struct programs, stored a nested
+# POD field boxed and let a const array element be assigned, and nothing
+# ran it. The default engine is compared; the -nc pass of run_one then
+# checks the engines agree within the mode, as the -nti pass does. Its
+# two sides are the plain and -nc default-engine runs run_one reports
+# too - the same command lines, so they run once.
+fold_same() {
+  local bad=0 n=0 a b ra rb
+  for f in $(progs); do
+    n=$((n + 1))
+    if missing "vm.p.p.$n" "vm.p.$(key -nc).$n"; then
+      echo "MISSING [-nc vs default] $f (no result: the run did not happen)"
+      bad=$((bad + 1))
+      continue
+    fi
+    a=$(out_of "vm.p.p.$n")
+    ra=$(rc_of "vm.p.p.$n")
+    b=$(out_of "vm.p.$(key -nc).$n")
+    rb=$(rc_of "vm.p.$(key -nc).$n")
+    if [ "$ra" -ge 124 ] || [ "$rb" -ge 124 ]; then
+      echo "CRASH [-nc vs default] $f (default rc=$ra, -nc rc=$rb)"
+      printf '%s\n' "$b" | tail -4 | sed 's/^/  /'
+      bad=$((bad + 1))
+    elif [ "$a" != "$b" ] || [ "$ra" != "$rb" ]; then
+      echo "DIFF [-nc vs default] $f (rc $ra vs $rb)"
+      diff <(printf '%s\n' "$a") <(printf '%s\n' "$b") \
+        | head -8 | sed 's/^/  /'
+      bad=$((bad + 1))
+    fi
+  done
+  printf "  %-28s %d/%d agree\n" "-nc vs default" "$((n - bad))" "$n"
+  return $bad
+}
+
+rc=0
+compiles_all || rc=1
+run_one "" || rc=1
+fold_same || rc=1
+run_one "" "-nc" || rc=1
+# #51: -nti (no type inference) had NO net - and the codegen, which
+# lowers a call only on a TYPE proof, refused every non-inlined user
+# call there (NotLoweredEx) while the tree-walker ran it. Both SIDES run
+# -nti: the typed and untyped programs may legitimately differ (typestr
+# reports the runtime type, a `float` parameter no longer coerces an
+# int), but the ENGINES must agree within either mode. Always on - it
+# is one more corpus pass.
+run_one "" "-nti" || rc=1
+for MODE in $MODES; do
+case "$MODE" in
+  --levers)
+    for L in $LEVERS all; do run_one "MYLANG_JIT_OFF=$L" || rc=1; done ;;
+  --cold)
+    for T in $COLD_TIERS all; do run_one "MYLANG_JIT_COLD=$T" || rc=1; done ;;
+  --xrot)
+    for K in $XROTS; do run_one "MYLANG_JIT_XROT=$K" || rc=1; done ;;
+  --nolowmem)
+    run_one "MYLANG_NO_LOWMEM=1" || rc=1 ;;
+  # SP: the emitted-call alignment check reads the REAL rsp, so it needs
+  # no emit-time model to be right - it is the ground truth the model is
+  # checked against, and this is the lane that executes it over every
+  # corpus program. A TESTS build only (the emission is #ifdef TESTS);
+  # elsewhere the lane runs the plain corpus and says so.
+  --spcheck)
+    if [ "$SPCHECK_OK" = 1 ]; then
+      run_one "MYLANG_JIT_SPCHECK=1" || rc=1
+    else
+      echo "  spcheck: SKIPPED - '$BIN' is not a TESTS build" >&2
+      rc=1
+    fi ;;
+esac
+done
+exit $rc

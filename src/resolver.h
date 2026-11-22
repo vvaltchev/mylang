@@ -38,7 +38,7 @@ void mark_implicit_globals(Construct *root,
  *
  * When `enable_inline` is true (the default), a final pass also inlines
  * eligible expression-bodied function calls (see the Inliner in resolver.cpp /
- * plans/function-inlining.md). The CLI's `-ni` disables it; `inline_threshold`
+ * plans/archived/function-inlining.md). The CLI's `-ni` disables it; `inline_threshold`
  * (CLI `-it N`) caps the inlined body size in nodes.
  */
 struct AnalysisInfo;

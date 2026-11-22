@@ -1,0 +1,16 @@
+# :show renders the types a function body declares as written: a class
+# (`class`, not `struct`), a struct with no members (`{}`), a struct whose
+# only member is a const, and a struct with fields and a const member (its
+# value folded).
+func shapes(int n) {
+    class C { int v; }
+    struct E {}
+    struct K { const LIMIT = 4 * 2; }
+    struct F { int a; float b; const TAG = "f" + "x"; }
+    var c = C(n)
+    var e = E()
+    var f = F(n, 1.5)
+    return [c.v, K.LIMIT, f.a, len(F.TAG), e == E() ? 1 : 0]
+}
+shapes(int(runtime(3)))
+:show shapes

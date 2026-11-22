@@ -1,0 +1,77 @@
+# A call through a var-bound lambda TEMPLATE still reads the variable
+# (README: "a lambda ... binds where it is written"). The inferencer
+# redirects such a call to a typed instance, `lambda$N`, a function bound
+# at the top of the program - and until 2026-11-14 that skipped the read:
+# a call made before `var lf = ...` had run answered 6 by default, where
+# -nti raised UnboundSymbolEx. The instances themselves stay: one per
+# call signature.
+
+func use(int k) { return lf(k); }
+func show(v) { return id(v); }
+# The AST inliner has four engines, and each must leave the read where a
+# call to the instance would otherwise go: `use` above is the expression
+# engine's; a BLOCK-bodied lambda in tail position is the tail engine's
+# (it finds its call through the `return`); a small one inside an
+# expression is the block engine's; and a constant argument is the
+# specializer's, once `spec` itself was inlined into its caller and the
+# call to the instance sits where the call to `spec` was.
+func tail(int k) { return blk(k); }
+func small(int k) { return sm(k) + 1; }
+func spec(int k) { return blk(k + 1); }
+
+var early = ["none", "none", "none", "none", "none"];
+if (runtime(true)) {
+    try {
+        early[0] = str(use(2));
+    } catch (UnboundSymbolEx) {
+        early[0] = "unbound";
+    }
+    try {
+        early[1] = str(tail(int(runtime(2))));
+    } catch (UnboundSymbolEx) {
+        early[1] = "unbound";
+    }
+    try {
+        early[2] = str(tail(2));
+    } catch (UnboundSymbolEx) {
+        early[2] = "unbound";
+    }
+    try {
+        early[3] = str(small(int(runtime(2))));
+    } catch (UnboundSymbolEx) {
+        early[3] = "unbound";
+    }
+    try {
+        early[4] = str(spec(2));
+    } catch (UnboundSymbolEx) {
+        early[4] = "unbound";
+    }
+}
+foreach (var e in early)
+    assert(e == "unbound");
+
+var lf = func(x) => x * 3;
+var id = func(x) => x;
+var blk = func(x) { var t = x * 3; if (t > 100) { return 0; } return t + 1; };
+var sm = func(x) { if (x > 5) { return 1; } return x; };
+assert(use(runtime(2)) == 6);
+assert(tail(runtime(4)) == 13 && tail(4) == 13);
+assert(small(runtime(2)) == 3 && small(9) == 2);
+assert(spec(2) == 10 && spec(runtime(40)) == 0);
+# ...and reads it through a variable, so it is not pure (as under -nti)
+assert(!ispure(use));
+assert(show(runtime(1)) == 1);
+assert(show(runtime("s")) == "s");
+assert(id(2.5) == 2.5);
+
+# a recursive lambda reads itself through the variable on every call
+var fib = func(n) => n < 2 ? n : fib(n - 1) + fib(n - 2);
+assert(fib(runtime(10)) == 55);
+
+# a local one needs no check: a use the compiler allows runs after it
+func local_lambda(int k) {
+    var twice = func(x) => x + x;
+    return str(twice(k)) + " " + str(twice(k * 0.5));
+}
+assert(local_lambda(runtime(3)) == "6 3.000000");
+print("ok");

@@ -1,0 +1,104 @@
+# INT-ENGINES: tw default nj nc nbi
+#
+# INT unit (plans/cast.md): the cast's RUN-TIME paths - each scalar
+# conversion the table allows and each it refuses (a float into a bool
+# only from 0.0 / 1.0, a string into a float, a bool and a float into a
+# string, a bool into an array), a none read through a `dyn`, two dict
+# keys that become one among several, a cast that fails inside a warmed
+# loop (the JIT's helper path), and a constant cast of a pure call,
+# which the parse defers to after inference (#96). Every engine must
+# agree.
+
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+func refusal(f) {
+    try { f(); } catch (InvalidValueEx) { return "value"; }
+    catch (TypeErrorEx) { return "type"; }
+    return "ok";
+}
+
+# ---- scalars
+want("float 1.0 -> bool", cast<bool>(runtime(1.0)), true);
+want("float 0.0 -> bool", cast<bool>(runtime(0.0)), false);
+want("float 2.5 -> bool", refusal(func () { cast<bool>(runtime(2.5)); }),
+     "value");
+want("bool -> float", cast<float>(runtime(true)), 1.0);
+want("bool -> str", cast<str>(runtime(false)), "false");
+want("float -> str", cast<str>(runtime(2.5)), "2.500000");
+want("bad str -> float", refusal(func () { cast<float>(runtime("x")); }),
+     "value");
+want("huge str -> float", cast<float>(runtime("1e999")) > 1e300, true);
+var dyn hole = runtime([none])[0];
+want("none -> int", refusal(func () { cast<int>(hole); }), "type");
+want("none -> int?", cast<int?>(hole), none);
+
+want("array -> str", refusal(func () { cast<str>(runtime([1])); }),
+     "type");
+want("bool -> array", refusal(func () { cast<array<int>>(runtime(true)); }),
+     "type");
+
+# ---- a struct, a box: only that type (run time, through `dyn`)
+struct P { int x; }
+struct Q { int x; }
+var dyn bp = runtime(box(P(1)));
+var dyn qv = runtime(Q(1));
+var dyn bi = runtime(box(1));
+want("box<P> -> P", refusal(func () { cast<P>(bp); }), "type");
+want("Q -> P", refusal(func () { cast<P>(qv); }), "type");
+want("box<int> -> box<P>", refusal(func () { cast<box<P>>(bi); }), "type");
+want("box<P> -> box<P>", (*cast<box<P>>(bp)).x, 1);
+
+# ---- a container met twice is converted once (the cast's memo)
+var dyn row = runtime([1, 2]);
+var dyn rows = runtime([row, row]);
+array<array<float>> fr = cast<array<array<float>>>(rows);
+want("memo", str(fr), "[[1.000000, 2.000000], [1.000000, 2.000000]]");
+want("memo shares", intptr(fr[0]) == intptr(fr[1]), true);
+
+# ---- a constant cast in a pure function's body (folded with it)
+pure func pf() => cast<str>(5);
+want("pure body", pf(), "5");
+
+# ---- a dict whose third key becomes the second's
+var dyn mixed = runtime({1: 1, 2: 2, "2": 3});
+want("collision", refusal(func () { cast<dict<str, int>>(mixed); }),
+     "value");
+
+# ---- a cast failing on the last turn of a warmed loop
+var caught = 0;
+var total = 0;
+for (var i = 0; i < 8; i++) {
+    var dyn v = runtime(i == 7 ? "x" : str(i));
+    try { total += cast<int>(v); } catch (InvalidValueEx) { caught++; }
+}
+want("loop refusal", caught, 1);
+want("loop total", total, 21);
+
+# ---- ...and inside a function's counted loop, the native code's helper
+func total_of(dyn xs) {
+    var t = 0;
+    for (var i = 0; i < len(xs); i++)
+        t += cast<int>(xs[i]);
+    return t;
+}
+var dyn nums = runtime(["1", "2", "3", "4", "5", "6", "7", "x"]);
+var refused_loop = 0;
+for (var k = 0; k < 3; k++) {
+    try { total_of(nums); } catch (InvalidValueEx) { refused_loop++; }
+}
+want("function loop refusal", refused_loop, 3);
+
+# ---- a constant cast of a pure call: deferred to after inference
+pure func twice(int x) => x * 2;
+want("deferred", cast<str>(twice(21)), "42");
+const K = cast<array<float>>([1, 2]);
+want("const", str(K), "[1.000000, 2.000000]");
+
+assert(bad == 0);
+print("ok");

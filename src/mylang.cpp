@@ -13,13 +13,20 @@
 #include "errfmt.h"
 #include "trace.h"
 #include "vm.h"
+#include "codegen.h"   /* g_bc_inline_enabled (-nbi) */
+#include "serialize.h"
+#include "jit.h"
+#include "lowmem.h"
 #include "disasm.h"
+#include "inttest.h"
 
 #include <initializer_list>
+#include <new>
 #include <fstream>
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
+#include <climits>
 #ifndef _WIN32
 #include <unistd.h>   /* isatty (REPL launch; Unix-only) */
 #endif
@@ -28,20 +35,33 @@ using std::string;
 
 static bool opt_show_tokens;
 static bool opt_show_syntax_tree;
-static bool opt_no_const_eval;
+static bool opt_no_const_fold;
 static bool opt_no_inline;
 static int opt_inline_threshold = 24;  /* max inlined body size (nodes) */
 static bool opt_no_run;
 static bool opt_no_type_infer;
 static bool opt_debug_ti;
+static bool opt_debug_cs;
 static bool opt_analyze;
 static bool opt_no_color;
 static bool opt_repl;
 static bool opt_vm;   /* -vm: explicit VM (the DEFAULT since 2026-07-18) */
 static bool opt_tw;   /* -tw: run via the TREE-WALKER instead of the VM */
 static bool opt_vm_disasm;   /* -vd: print the bytecode disassembly, no run */
+static bool opt_compile;     /* -c: write a .myv image, then exit (no run) */
+static bool opt_strip_source;/* -c --strip-source: store no source reference */
+static string opt_out_path;  /* -o <path> (default: the source's .myv twin) */
+static string opt_script_path;   /* the FILE argument (source or image) */
+static bool opt_run_image;       /* the file argument is a .myv image */
+static string opt_source_root;   /* --source ROOT: find an image's source
+                                  * under THIS root, not the stored path */
+static bool opt_force;           /* -f: use a source whose CRC32 mismatches */
 
 static std::vector<string> lines;
+/* The source file to NAME in errors ("" for -e / the REPL, which have none).
+ * For a .myv image it is what the stored reference resolved to - the ONLY
+ * source identity such a run has, and the whole point of storing it. */
+static string src_name;
 static std::vector<Tok> tokens;
 /* The whole source as one buffer (lines re-joined with '\n'). The lexer scans
  * it in one pass so strings / block comments can span lines; token string_views
@@ -61,7 +81,183 @@ lex_all()
     lexer(source, 1, tokens);
 }
 
-void run_tests(bool dump_syntax_tree);
+void run_tests(bool dump_syntax_tree, int argc, char **argv);
+
+/*
+ * `-v`: report HOW THIS BINARY WAS BUILT.
+ *
+ * The two lines that matter are `opt` and `asserts`: a performance number is
+ * only meaningful from an OPT=1 ASSERTS=0 build, and mixing configs silently
+ * invalidates a comparison (assertion cost is not a uniform multiplier - it
+ * sits unevenly across code paths, so it can flip the SIGN of an A/B). The
+ * bench runner parses this and refuses to measure a wrongly-built binary.
+ *
+ * Everything here is read from a COMPILER-SET or build-system macro rather
+ * than a hand-maintained string, so it cannot drift from what was actually
+ * compiled. `__OPTIMIZE__` and `NDEBUG` in particular are set by the
+ * toolchain itself, which is exactly the property the gate needs.
+ *
+ * Format: one `key value` line per fact, so it stays trivially parseable.
+ */
+static void show_build_config()
+{
+#if defined(__OPTIMIZE__)
+    const char *opt = "1";
+#elif defined(_MSC_VER)
+    const char *opt = "unknown";     /* MSVC sets no such macro */
+#else
+    const char *opt = "0";
+#endif
+
+#if defined(NDEBUG) || ML_COVERAGE
+    const char *asserts = "0";      /* a coverage build drops ML_CHECK */
+#else
+    const char *asserts = "1";
+#endif
+
+#if defined(_GLIBCXX_ASSERTIONS) || defined(_LIBCPP_HARDENING_MODE)
+    const char *stdlib_hardening = "1";
+#else
+    const char *stdlib_hardening = "0";
+#endif
+
+#if defined(__SANITIZE_ADDRESS__)
+    const char *asan = "1";
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+    const char *asan = "1";
+#  else
+    const char *asan = "0";
+#  endif
+#else
+    const char *asan = "0";
+#endif
+
+    /* UBSan is the one fact the compiler does not tell: GCC defines no
+     * macro for -fsanitize=undefined (13.3 said `ubsan 0` for a build with
+     * every check compiled in), so the build system passes ML_UBSAN, as
+     * it passes ML_LTO. Clang's __has_feature answers when it is absent;
+     * with neither, the answer is not known. */
+#if defined(ML_UBSAN)
+    const char *ubsan = ML_UBSAN ? "1" : "0";
+#elif defined(__has_feature)
+#  if __has_feature(undefined_behavior_sanitizer)
+    const char *ubsan = "1";
+#  else
+    const char *ubsan = "0";
+#  endif
+#else
+    const char *ubsan = "unknown";
+#endif
+
+#ifdef ML_LTO
+    const char *lto = ML_LTO ? "1" : "0";
+#else
+    const char *lto = "unknown";     /* no macro (e.g. a CMake build) */
+#endif
+
+    cout << "mylang build configuration" << endl;
+    cout << "  opt               " << opt
+         << "        (optimized: -O3)" << endl;
+    cout << "  asserts           " << asserts
+         << "        (C assert + ML_CHECK)" << endl;
+    cout << "  stdlib_hardening  " << stdlib_hardening
+         << "        (bounds-checked container access)" << endl;
+    cout << "  lto               " << lto << endl;
+    cout << "  asan              " << asan << endl;
+    cout << "  ubsan             " << ubsan << endl;
+    cout << "  vm_hardening      "
+#if defined(ML_VM_HARDENING) && ML_VM_HARDENING
+         << "1"
+#else
+         << "0"
+#endif
+         << "        (per-op slot/type checks)" << endl;
+    cout << "  cgoto             "
+#ifdef ML_NO_CGOTO
+         << "0"
+#else
+         << "1"
+#endif
+         << "        (computed-goto dispatch)" << endl;
+    cout << "  tests             "
+#ifdef TESTS
+         << "1"
+#else
+         << "0"
+#endif
+         << "        (-rt suite compiled in)" << endl;
+    cout << "  int_tests         "
+#ifdef INT_TESTS
+         << "1"
+#else
+         << "0"
+#endif
+         << "        (intrusive test instrumentation - never benchmark)"
+         << endl;
+    cout << "  coverage          "
+#if ML_COVERAGE
+         << "1"
+#else
+         << "0"
+#endif
+         << "        (gcov counters; ML_CHECK compiled out)" << endl;
+    cout << "  recycle           "
+#ifdef RECYCLE_ALLOC
+         << "1"
+#else
+         << "0"
+#endif
+         << "        (adversarial node allocator)" << endl;
+    cout << "  jit               "
+#if ML_JIT_SUPPORTED
+         << "1"
+#else
+         << "0"
+#endif
+         << "        (native x86-64 codegen)" << endl;
+    /* RUNTIME, unlike every line above it - the arena is an mmap that
+     * can fail, and MYLANG_NO_LOWMEM=1 refuses it on purpose. It is
+     * here so a lane exercising that configuration can ASSERT it is in
+     * it (the lto0 lane's trick: a test of a configuration must prove
+     * it is in that configuration, or it goes vacuous the day a default
+     * moves), and so a human on a box where MAP_32BIT fails can see
+     * WHY the emitted code looks different. */
+    cout << "  lowmem            " << (ml_lowmem_available() ? "1" : "0")
+         << "        (type tags as imm32; 0 = register form)" << endl;
+    /* #96: the JIT's pin budget, and the CALLER-saved half of it. The
+     * second number is what MYLANG_JIT_XROT rotates, so a test lane
+     * that sweeps the pool must READ it rather than hardcode a count -
+     * `tests/corpus_diff --xrot` does, and would otherwise
+     * under-sweep the day a register is admitted, leaving the newest
+     * (and least-exercised) member in the tail position that hid an
+     * unsafe r9 for a day. Printed even on a non-JIT build, where both
+     * are 0 and say so. */
+#if ML_JIT_SUPPORTED
+    cout << "  jit_pins          " << jit_pin_budget()
+         << "       (int pin budget; " << jit_xrot_width()
+         << " xrot rotations)" << endl;
+#else
+    cout << "  jit_pins          0        (no native codegen)" << endl;
+#endif
+    cout << "  compiler          "
+#if defined(__clang__)
+         << "clang " << __clang_major__ << "." << __clang_minor__
+#elif defined(__GNUC__)
+         << "gcc " << __GNUC__ << "." << __GNUC_MINOR__
+#elif defined(_MSC_VER)
+         << "msvc " << _MSC_VER
+#else
+         << "unknown"
+#endif
+         << endl;
+    cout << endl;
+    if (strcmp(opt, "1") || strcmp(asserts, "0"))
+        cout << "NOT a performance build - measure only with "
+                "OPT=1 ASSERTS=0." << endl;
+    else
+        cout << "This is a performance build (OPT=1 ASSERTS=0)." << endl;
+}
 
 void help()
 {
@@ -70,19 +266,56 @@ void help()
     cout << endl;
     cout << "   -t      Show all tokens" << endl;
     cout << "   -s      Dump the syntax tree" << endl;
-    cout << "  -nc      No const eval (debug)" << endl;
+    cout << "   -v      Show how this binary was BUILT (opt, asserts, ...)"
+         << endl;
+    cout << "  -nc      No const FOLDING (debug; same program)" << endl;
     cout << "  -ni      No function inlining (debug)" << endl;
+    cout << "  --no-opt L  Disable AST transforms (comma-separated): "
+         << opt_pass_names() << endl;
+    cout << "  --strict Require every non-local to be DECLARED before use"
+         << endl;
     cout << "  -it N    Inline threshold: max inlined body size (default 24)"
          << endl;
-    cout << "  -nr      Don't run, just validate" << endl;
+    cout << "  --max-instances N  Typed instances one function template gets"
+         << endl;
+    cout << "                  (default 64; past it a call runs the template"
+         << endl;
+    cout << "                  itself)" << endl;
+    cout << "  -nr      Compile and validate, don't run" << endl;
+    cout << "  -c       Compile to a .myv bytecode file, then exit" << endl;
+    cout << "  -o FILE  Output path for -c (default: the source's .myv twin)"
+         << endl;
+    cout << "  --strip-source  With -c: store no source reference at all"
+         << endl;
+    cout << "                  (errors then print no source line / caret,"
+         << endl;
+    cout << "                  and the image carries no local paths)" << endl;
+    cout << "  --source ROOT   Find a .myv image's source under ROOT instead"
+         << endl;
+    cout << "                  of the path stored when it was compiled"
+         << endl;
+    cout << "  -f       Render carets from a source whose CRC32 does not"
+         << endl;
+    cout << "           match the image (--force; a warning is printed)"
+         << endl;
     cout << "  -vm      Execute via the bytecode VM (the DEFAULT)." << endl;
+    cout << "  -nj      Disable the native x86-64 AOT tier (also"
+         << endl;
+    cout << "           MYLANG_JIT=0). See plans/archived/native-aot.md" << endl;
     cout << "  -tw      Execute via the tree-walking interpreter instead"
          << endl;
-    cout << "           of the VM. See plans/bytecode-vm.md" << endl;
+    cout << "           of the VM. See plans/archived/bytecode-vm.md" << endl;
     cout << "  -vd      Dump the VM bytecode disassembly, then exit" << endl;
+    cout << "  -vdj     Like -vd, plus the native x86-64 disassembly of"
+         << endl;
+    cout << "           each JIT fragment interleaved with the VM ops"
+         << endl;
     cout << " -nti      No type inference / checking (debug)" << endl;
     cout << " -dti      Dump inferred types of all identifiers, then exit"
          << endl;
+    cout << " -dcs      Dump each call site's CALLEE SET (which function(s)"
+         << endl;
+    cout << "           it can reach, or 'top'), then exit" << endl;
     cout << "  -a       Analyze: reprint the source with colors showing which"
          << endl;
     cout << "           optimizations fired (--analyze; --no-color for plain)"
@@ -95,29 +328,34 @@ void help()
          << endl;
 
 #ifdef TESTS
-    cout << "  -rt      Run unit tests" << endl;
+    cout << "  -rt      Run unit tests  (then: --list, --only REGEX, -s)"
+         << endl;
 #endif
 }
 
 void
 read_script(const char *filename)
 {
-    {
-        string line;
-        std::ifstream filestream(filename);
+    /* read_file refuses a READ error too (a directory opens on POSIX and
+     * then fails every read): not an empty program. The lines split as
+     * getline splits them - a trailing newline adds no empty line, a CR
+     * stays - so carets are unchanged. */
+    string text;
 
-        if (filestream.is_open()) {
+    if (!read_file(filename, text)) {
+        cout << "Failed to open file '" << filename << "'\n";
+        exit(1);
+    }
 
-            while (getline(filestream, line)) {
-                lines.push_back(move(line));
-                line.clear(); /* Put the string is a known state */
-            }
-
-        } else {
-
-            cout << "Failed to open file '" << filename << "'\n";
-            exit(1);
+    size_t b = 0;
+    while (b < text.size()) {
+        const size_t e = text.find('\n', b);
+        if (e == string::npos) {
+            lines.push_back(text.substr(b));
+            break;
         }
+        lines.push_back(text.substr(b, e - b));
+        b = e + 1;
     }
 
     lex_all();
@@ -171,13 +409,38 @@ parse_args(int argc, char **argv)
 
             help(); exit(0);
 
+        } else if (!strcmp(arg, "-v") || !strcmp(arg, "--version")) {
+
+            show_build_config(); exit(0);
+
         } else if (!strcmp(arg, "-rt")) {
 
-            run_tests(opt_show_syntax_tree); exit(0);
+            /*
+             * The arguments AFTER -rt are the test harness's own options
+             * (--list, --only REGEX, -s): tests.cpp parses them, so they
+             * add no branch to the product code the coverage gate counts.
+             */
+            run_tests(opt_show_syntax_tree, argc - 1, argv + 1); exit(0);
 
         } else if (!strcmp(arg, "--weights")) {
 
-            run_weight_bench(); exit(0);
+            /* an optional iteration count per measured node: a small one
+             * makes the numbers noise and the run instant, which is how
+             * driver_checks runs the tool. Anything after the flag must
+             * be that count - silently falling back to the default would
+             * turn a typo into a ten-minute run. */
+            long iters = 20000000;
+            if (argc >= 2) {
+                char *end = nullptr;
+                const long n = strtol(argv[1], &end, 10);
+                if (n <= 0 || end == argv[1] || *end != '\0') {
+                    cout << "error: --weights takes a positive iteration "
+                            "count" << endl;
+                    exit(1);
+                }
+                iters = n;
+            }
+            run_weight_bench(iters); exit(0);
 
         } else if (!strcmp(arg, "-t")) {
 
@@ -189,7 +452,7 @@ parse_args(int argc, char **argv)
 
         } else if (!strcmp(arg, "-nc")) {
 
-            opt_no_const_eval = true;
+            opt_no_const_fold = true;
 
         } else if (!strcmp(arg, "-ni")) {
 
@@ -198,6 +461,38 @@ parse_args(int argc, char **argv)
         } else if (!strcmp(arg, "-npc")) {
 
             g_pure_cache_enabled = false;   /* recursion unroll, no per-frame cache */
+
+        } else if (!strcmp(arg, "--no-opt")) {
+
+            /* Turn OFF one or more AST transforms - the same-binary A/B lever
+             * for an optimizer that rewrites the tree before either engine
+             * runs it (see OptPass in inferencer.h). */
+            if (argc < 2) {
+                cout << "error: --no-opt requires a pass list ("
+                     << opt_pass_names() << ")" << endl;
+                exit(1);
+            }
+            argc--; argv++;
+            std::string spec(*argv), one;
+            for (size_t i = 0; i <= spec.size(); i++) {
+                if (i == spec.size() || spec[i] == ',') {
+                    unsigned bit;
+                    if (!one.empty() && !opt_pass_bit(one, bit)) {
+                        cout << "error: unknown --no-opt pass '" << one
+                             << "' (known: " << opt_pass_names() << ")" << endl;
+                        exit(1);
+                    }
+                    if (!one.empty())
+                        g_opt_disabled |= bit;
+                    one.clear();
+                } else {
+                    one += spec[i];
+                }
+            }
+
+        } else if (!strcmp(arg, "--strict")) {
+
+            g_strict_mode = true;
 
         } else if (!strcmp(arg, "-it")) {
 
@@ -209,6 +504,55 @@ parse_args(int argc, char **argv)
 
             opt_inline_threshold = atoi(argv[1]);
             argc--; argv++;   /* consume the value; the loop skips it too */
+
+        } else if (!strcmp(arg, "--max-instances")) {
+
+            /* how many typed instances a function template gets
+             * (g_tmpl_max_instances, inferencer.h) */
+            char *end = nullptr;
+            const long n = argc < 2 ? -1 : strtol(argv[1], &end, 10);
+            if (argc < 2 || !*argv[1] || *end || n < 0 || n > INT_MAX) {
+                cout << "error: --max-instances requires a count (the "
+                        "typed instances one template gets, >= 0)"
+                     << endl;
+                exit(1);
+            }
+            g_tmpl_max_instances = static_cast<int>(n);
+            argc--; argv++;
+
+        } else if (!strcmp(arg, "-c")) {
+
+            /* .myv: compile to stored bytecode and EXIT (implies the VM) */
+            opt_compile = true;
+
+        } else if (!strcmp(arg, "-o")) {
+
+            if (argc < 2) {
+                cout << "-o requires an output path" << endl;
+                exit(1);
+            }
+            opt_out_path = argv[1];
+            argc--; argv++;
+
+        } else if (!strcmp(arg, "--strip-source")) {
+
+            opt_strip_source = true;
+
+        } else if (!strcmp(arg, "--source")) {
+
+            /* .myv: resolve the stored RELATIVE source path under this root
+             * instead of the compile-time paths (a moved / re-checked-out
+             * tree, or a build machine's paths on a different host) */
+            if (argc < 2) {
+                cout << "--source requires a project-root path" << endl;
+                exit(1);
+            }
+            opt_source_root = argv[1];
+            argc--; argv++;
+
+        } else if (!strcmp(arg, "-f") || !strcmp(arg, "--force")) {
+
+            opt_force = true;   /* trust a CRC32-mismatched source anyway */
 
         } else if (!strcmp(arg, "-nr")) {
 
@@ -223,17 +567,37 @@ parse_args(int argc, char **argv)
             opt_vm = true;   /* explicit VM - the default; kept for scripts/
                               * CI written before the 2026-07-18 flip */
 
-            if (opt_vm && opt_tw) {
+            if (opt_tw) {
                 cout << "-vm and -tw are mutually exclusive" << endl;
                 exit(1);
             }
+
+        } else if (!strcmp(arg, "-nj")) {
+
+            g_jit_enabled = false;   /* native-AOT off (plans/archived/native-aot.md);
+                                      * also MYLANG_JIT=0 */
+
+        } else if (!strcmp(arg, "-bi")) {
+
+            g_bc_inline_enabled = true;   /* the bytecode SPLICE on - the
+                                           * DEFAULT since 2026-08-02, kept
+                                           * as the explicit form; also
+                                           * MYLANG_BCINLINE=1 */
+
+        } else if (!strcmp(arg, "-nbi")) {
+
+            g_bc_inline_enabled = false;  /* the splice's kill switch - the
+                                           * same-binary A/B, since the
+                                           * un-inlined bytecode is a
+                                           * splice's only oracle; also
+                                           * MYLANG_BCINLINE=0 */
 
         } else if (!strcmp(arg, "-tw")) {
 
             opt_tw = true;   /* run via the tree-walker (the pre-flip
                               * default; also the const-eval/REPL engine) */
 
-            if (opt_vm && opt_tw) {
+            if (opt_vm) {
                 cout << "-vm and -tw are mutually exclusive" << endl;
                 exit(1);
             }
@@ -242,9 +606,21 @@ parse_args(int argc, char **argv)
 
             opt_vm_disasm = true;   /* dump the bytecode disassembly, no run */
 
+        } else if (!strcmp(arg, "-vdj")) {
+
+            opt_vm_disasm = true;      /* -vd + the native-AOT disasm: the
+                                        * dump is taken AFTER the JIT and
+                                        * interleaves each fragment's x86-64
+                                        * disassembly under its enter.nat */
+            g_jit_annotate = true;     /* record op marks during codegen */
+
         } else if (!strcmp(arg, "-dti")) {
 
             opt_debug_ti = true;
+
+        } else if (!strcmp(arg, "-dcs")) {
+
+            opt_debug_cs = true;
 
         } else if (!strcmp(arg, "-a") || !strcmp(arg, "--analyze")) {
 
@@ -263,7 +639,7 @@ parse_args(int argc, char **argv)
             const string cats = argv[1];
             argc--; argv++;   /* consume the value */
             size_t pos = 0;
-            while (pos <= cats.size()) {
+            for (;;) {
                 const size_t comma = cats.find(',', pos);
                 const size_t end =
                     (comma == string::npos) ? cats.size() : comma;
@@ -296,21 +672,57 @@ parse_args(int argc, char **argv)
 
         } else {
 
-            read_script(arg);
+            /* .myv: an IMAGE is detected by CONTENT (magic), not extension -
+             * it is loaded, not parsed (no source, no optimizer passes). */
+            opt_script_path = arg;
+            if (myv_is_image(arg)) {
+                opt_run_image = true;
+            } else {
+                read_script(arg);
+                src_name = arg;   /* name it in errors, like any compiler */
+            }
+
+            /* Under -c the remaining args are the COMPILER's, not the
+             * script's (there is no run): `mylang -c file.my -o out.myv
+             * [--strip-source]`, the documented form. */
+            if (opt_compile) {
+                /* register `argv` (empty) FIRST: it is a builtin, and the
+                 * builtin SET decides every baked builtin slot - a compile
+                 * must see exactly what a run sees. */
+                EvalContext::builtins.emplace(
+                    make_pair(UniqueId::get("argv"),
+                              LValue(SharedArrayObj(
+                                         SharedArrayObj::vec_type()), true)));
+                for (int i = 1; i < argc; i++) {
+                    if (!strcmp(argv[i], "-o") && i + 1 < argc)
+                        opt_out_path = argv[++i];
+                    else if (!strcmp(argv[i], "--strip-source"))
+                        opt_strip_source = true;
+                    else {
+                        cout << "unexpected argument after -c: "
+                             << argv[i] << endl;
+                        exit(1);
+                    }
+                }
+                return;
+            }
 
             SharedArrayObj::vec_type vec;
 
             for (int i = 1; i < argc; i++)
                 vec.emplace_back(SharedStr(string(argv[i])), false);
 
+            /* Q2: argv is an array<str>, and a typed name reaches it, so
+             * in a typed run it carries that type (a store through `dyn`
+             * is checked against it) */
+            SharedArrayObj args(std::move(vec));
+            if (!opt_no_type_infer)
+                args.set_ctype(annot_str_array());
             EvalContext::builtins.emplace(
 
                 make_pair(
                     UniqueId::get("argv"),
-                    LValue(
-                        EvalValue(SharedArrayObj(move(vec))),
-                        false
-                    )
+                    LValue(EvalValue(std::move(args)), false)
                 )
             );
 
@@ -319,7 +731,7 @@ parse_args(int argc, char **argv)
     }
 
     if (in_tokens) {
-        lines.emplace_back(move(inline_text));
+        lines.emplace_back(std::move(inline_text));
         lex_all();
     }
 }
@@ -327,8 +739,37 @@ parse_args(int argc, char **argv)
 /* anno_code + render_analysis now live in analyzer.cpp (shared with the REPL's
  * :analyze meta-command). */
 
+/*
+ * OUT OF MEMORY is a catchable OutOfMemoryEx (errors.h, README): the
+ * new_handler throws it wherever operator new is refused, and as a
+ * RuntimeException every catch already in place conveys it.
+ */
+[[ noreturn ]] static void ml_out_of_memory()
+{
+    throw OutOfMemoryEx();
+}
+
+/*
+ * The one copy of the ASan hook (a weak symbol ASan reads at start; unused
+ * without it). allocator_may_return_null: a request ASan cannot serve is
+ * REFUSED, as a plain build's allocator refuses it - ASan's default aborts,
+ * so a sanitized run would end where a release raises OutOfMemoryEx. A
+ * RECYCLE build also turns leak detection off: the recycler never frees,
+ * so every recycled block would read as a leak (intentional, bounded).
+ */
+extern "C" const char *__asan_default_options()
+{
+#ifdef RECYCLE_ALLOC
+    return "allocator_may_return_null=1:detect_leaks=0";
+#else
+    return "allocator_may_return_null=1";
+#endif
+}
+
 int main(int argc, char **argv)
 {
+    std::set_new_handler(ml_out_of_memory);
+
     /*
      * An uncaught struct exception's payload references its StructTypeDef (to
      * print field names), and values unwinding out of the run may reference
@@ -340,10 +781,16 @@ int main(int argc, char **argv)
      */
     unique_ptr<Construct> root;
     VmProgram prog;
+    /* until the program runs, a run-time kind of error comes from a constant
+     * expression the compiler evaluated (format_exception's note) */
+    bool compiling = true;
 
     try {
 
         parse_args(argc, argv);
+        /* #107 P4: the object census's baseline - after parse_args, which
+         * registers `argv` (a builtin that lives as long as the process) */
+        ML_INT_ONLY(int_census_mark();)
 
         /* Color the trace tags on a stderr TTY (the trace sink is stderr for a
          * script), unless --no-color. Harmless when no category is enabled. */
@@ -354,7 +801,54 @@ int main(int argc, char **argv)
         if (opt_repl)
             return run_repl();
 
-        ParseContext ctx(TokenStream(tokens), !opt_no_const_eval);
+        if (opt_run_image) {
+            /* .myv: LOAD AND GO - no lexer, no parser, no optimizer passes.
+             * The AOT native tier runs inside the loader (only the VM image
+             * is stored). `prog` is declared outside the try for the same
+             * reason a compiled one is: exception payloads and lazy
+             * backtrace frames reference its defs/descriptors. */
+            g_exec_engine = ExecEngine::Vm;
+
+            /* The image stores a source REFERENCE, not the text: the loader
+             * looks for the file (under --source ROOT if given) and uses it
+             * only when its CRC32 still matches. Absent or changed => errors
+             * render without the quoted line + caret, naming file/line and
+             * the backtrace. */
+            MyvLoadOpts lo;
+            lo.root = opt_source_root;
+            lo.force = opt_force;
+            MyvSource msrc;
+            compiling = false;
+            prog = myv_read(opt_script_path, msrc, lo);
+            lines = std::move(msrc.lines);
+            src_name = msrc.name;
+            if (!msrc.warning.empty())
+                cerr << msrc.warning << endl;
+
+            if (opt_vm_disasm) {
+                cout << disassemble_image(prog);
+                return 0;
+            }
+            vm_run(prog);
+            /*
+             * The image path had its OWN `return 0`, so it skipped both
+             * reports at the end of main - MYLANG_JITSTATS printed NOTHING
+             * for a `.myv` run. That is not cosmetic: the counters are how
+             * "which tier did this program's calls take?" is answered, and
+             * a SILENT instrument reads exactly like a tier that declined
+             * (it did: a loaded image was believed not to bake its callees,
+             * for as long as it took to instrument the emitter by hand).
+             */
+            jit_cache_audit_report();  /* no-op unless MYLANG_CACHEAUDIT=1 */
+            jit_stats_report();        /* no-op unless MYLANG_JITSTATS=1 */
+            return 0;
+        }
+
+        ParseContext ctx(TokenStream(tokens), !opt_no_const_fold);
+        /* -nti: nothing is typed, a parse-time call included (question 5),
+         * and no container takes a type (Q2 increment 3) */
+        ctx.const_ctx->parse_typed = !opt_no_type_infer;
+        g_ctype_adopt = !opt_no_type_infer;
 
         /* -a: the parser records parse-time folds/DCE it would otherwise erase
          * (magenta folded calls, dim dead branches) into this collector; the
@@ -403,6 +897,12 @@ int main(int argc, char **argv)
             return 0;
         }
 
+        /* -dcs: dump each call site's callee set (#116) and exit. */
+        if (opt_debug_cs) {
+            dump_callee_sets(root.get(), cout);
+            return 0;
+        }
+
         /* -a/--analyze: collect optimization decisions and reprint the source
          * with colors, then exit. Array-storage colors come from inference (on
          * the clean tree); the resolver passes run next and record auto-const /
@@ -422,21 +922,59 @@ int main(int argc, char **argv)
          * compile-time exception here. Validation-only (-nr) still runs it. */
         infer_types(root.get(), !opt_no_type_infer);
 
-        if (!opt_no_run) {
-            /* Run the optimizer pipeline (resolve_names + specialize_types -
-             * the SAME helper the REPL uses), then run the script. The root
-             * block builds its own "main" Frame for slotted top-level vars. */
-            run_optimizers(root.get(), !opt_no_inline, opt_inline_threshold,
-                           !opt_no_type_infer);
+        /*
+         * Run the optimizer pipeline (resolve_names + specialize_types - the
+         * SAME helper the REPL uses). The root block later builds its own
+         * "main" Frame for the slotted top-level vars.
+         *
+         * ⛔ THIS RUNS UNDER `-nr` TOO (#147, 2026-08-09), and skipping it
+         * was the bug: `-nr` says "don't run, just VALIDATE", but half the
+         * validation lives in resolve_names - the step 7 PROVER, the whole
+         * warning tier, FIX-1's undefined-name refusal, the TDZ, the
+         * same-scope duplicate check. So `mylang -nr prog.my` exited 0 in
+         * silence on a program `mylang prog.my` refuses outright, which is
+         * precisely backwards for the flag a CI job reaches for. The cost is
+         * that -nr is no longer a cheap parse: it now does the whole
+         * compile, minus execution.
+         */
+        run_optimizers(root.get(), !opt_no_inline, opt_inline_threshold,
+                       !opt_no_type_infer);
 
-            /* -s also dumps the tree AFTER the optimizer (inlining, unroll,
-             * specialization) so the actual optimized AST is inspectable. */
-            if (opt_show_syntax_tree) {
-                cout << "Optimized syntax tree" << endl;
-                cout << "--------------------------" << endl;
-                cout << *root << endl;
-                cout << "--------------------------" << endl;
+        /*
+         * Step 7 tier 3: render whatever the compile SUSPECTED but could
+         * not prove. To stderr, so a script's own stdout is untouched,
+         * and with the same caret machinery an error uses - a warning the
+         * reader cannot locate is barely a warning.
+         */
+        for (const CompileWarning &w : g_warnings) {
+            cerr << "warning: " << w.msg;
+            if (w.start)
+                cerr << " at line " << w.start.line
+                     << ", col " << w.start.col;
+            cerr << endl;
+            if (w.start && w.start.line >= 1
+                    && w.start.line <= static_cast<int>(lines.size())) {
+                cerr << endl;
+                dump_line_with_caret(
+                    cerr, lines[static_cast<size_t>(w.start.line - 1)],
+                    w.start.col,
+                    w.end.line == w.start.line ? w.end.col - 1 : 0);
+                cerr << endl;
             }
+        }
+
+        /* -s also dumps the tree AFTER the optimizer (inlining, unroll,
+         * specialization) so the actual optimized AST is inspectable. Under
+         * -nr as well, now that there IS an optimized tree there: -s
+         * promises both dumps, and printing one of them was the same gap. */
+        if (opt_show_syntax_tree) {
+            cout << "Optimized syntax tree" << endl;
+            cout << "--------------------------" << endl;
+            cout << *root << endl;
+            cout << "--------------------------" << endl;
+        }
+
+        if (!opt_no_run) {
 
             /* -vd: dump the bytecode disassembly (the bytecode analogue of -s)
              * and do NOT run. See disasm.{h,cpp}. */
@@ -461,18 +999,51 @@ int main(int argc, char **argv)
              * bench geomean, the two documented flip conditions), or the
              * tree-walker under -tw. The VM runs the SAME optimized AST
              * (it lowers `root`), so behavior is identical - see
-             * plans/bytecode-vm.md. g_exec_engine tells do_func_call to
+             * plans/archived/bytecode-vm.md. g_exec_engine tells do_func_call to
              * run function bodies via the VM too, not just the top-level
              * chunk. */
+            if (opt_compile) {
+                /* .myv (plans/archived/myv-serializer.md): the full pipeline, then
+                 * SERIALIZE and exit - no execution. Only the VM image is
+                 * stored; the native tier re-runs at load. */
+                g_exec_engine = ExecEngine::Vm;
+                prog = vm_compile(root.get(), /*jit=*/false);
+                string out = opt_out_path;
+                if (out.empty()) {
+                    out = opt_script_path;
+                    const size_t dot = out.find_last_of('.');
+                    const size_t slash = out.find_last_of('/');
+                    if (dot != string::npos
+                            && (slash == string::npos || dot > slash))
+                        out = out.substr(0, dot);
+                    out += ".myv";
+                }
+                /* Store a source REFERENCE (path + CRC32), not the text:
+                 * error carets then cost ~100 bytes instead of the whole
+                 * program, and a run verifies the file is still the one
+                 * compiled. --strip-source stores nothing at all. */
+                MyvSourceRef ref;
+                if (!opt_strip_source)
+                    ref = myv_source_ref(opt_script_path);
+                myv_write(prog, out, ref);
+                return 0;
+            }
             if (!opt_tw) {
                 g_exec_engine = ExecEngine::Vm;
-                prog = vm_compile(root.get());
+                prog = vm_compile(root.get());   /* the move REBINDS the
+                                                  * root's baked addresses
+                                                  * (vm.h) - the load path
+                                                  * above moves the same
+                                                  * way and used to skip
+                                                  * the rebind */
                 /* ASSERTS builds: free + zero the WHOLE AST and assert
                  * zero live nodes (no-op under ASSERTS=0) - the ZERO-AST
                  * proof; the VM runs without the tree. */
                 vm_ast_teardown(root, prog);
+                compiling = false;
                 vm_run(prog);
             } else {
+                compiling = false;
                 root->eval(nullptr);
             }
         }
@@ -488,14 +1059,16 @@ int main(int argc, char **argv)
             e.loc_end = tokens.back().loc + 2;
         }
 
-        format_exception(cerr, e, lines);
+        format_exception(cerr, e, lines, src_name);
         return 1;
 
     } catch (const Exception &e) {
 
-        format_exception(cerr, e, lines);
+        format_exception(cerr, e, lines, src_name, compiling);
         return 1;
     }
 
+    jit_cache_audit_report();   /* no-op unless MYLANG_CACHEAUDIT=1 */
+    jit_stats_report();         /* no-op unless MYLANG_JITSTATS=1 */
     return 0;
 }

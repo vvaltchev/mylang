@@ -1,0 +1,19 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> Undefined variable 'v1'
+>> SyntaxError at line 1, col 1
+
+    continue;
+    ^^^^^^^^^
+'break' and 'continue' are only allowed in a loop
+>> => -1
+>> Undefined variable 'S' at line 3, col 13:14
+
+    var print = S(none);
+                ^
+>> SyntaxError at line 4, col 1
+
+    break;
+    ^^^^^^
+'break' and 'continue' are only allowed in a loop
+>> >> => 201
+>> >> 

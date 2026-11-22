@@ -5,7 +5,7 @@
 #include <vector>
 
 /*
- * The REPL's `:help` documentation system (see plans/repl-introspection.md).
+ * The REPL's `:help` documentation system (see plans/archived/repl-introspection.md).
  * A self-contained, static documentation database + a query front end - no
  * interpreter state, so it is trivially unit-testable. `repl_help` renders the
  * output for a `:help` argument:

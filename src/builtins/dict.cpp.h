@@ -82,17 +82,23 @@ EvalValue
 builtin_erase_dict(LValue *lval, const EvalValue &key)
 {
     DictObject &dictObj = *lval->getval<intrusive_ptr<DictObject>>().get();
-    DictObject::inner_type &data = dictObj.get_ref();
-    return data.erase(key) > 0;
+    return dictObj.erase_key(key);     /* #53: restructures - see Cursor */
 }
 
 EvalValue
 builtin_insert_dict(LValue *lval, const EvalValue &key, const EvalValue &val)
 {
     DictObject &dictObj = *lval->getval<intrusive_ptr<DictObject>>().get();
-    DictObject::inner_type &data = dictObj.get_ref();
-    const auto &it = data.insert(make_pair(key, LValue(val, false)));
-    return it.second;
+    /* #53: restructures (see Cursor) only when the key is new. The key is
+     * FROZEN like every other insert site's (make_const_clone): a stored
+     * container key that the caller mutates afterwards would change its
+     * hash and strand the entry in the wrong bucket, findable by NO key. */
+    if (dictObj.get_ref().count(key))
+        return false;
+    /* Q2: a new key fits the dict's own key type */
+    return dictObj.insert_if_absent(
+        make_const_clone(ct_fit_key(dictObj, key), true),
+        LValue(val, false));
 }
 
 /*
@@ -112,32 +118,32 @@ dict_extract(const DictObject::inner_type &data, ArrHint hint)
     /* KEYS picks the pair's key, else its value (an LValue -> EvalValue). */
     #define DICT_ELEM(e) (KEYS ? (e).first : (e).second.get())
 
+    /* each key/value through flat_hint_value: a `dyn` dict's bool widens
+     * into an array<int>, a misfit raises the flat arrays' TypeErrorEx (a
+     * getter's bare "Type error" until 2026-10-09) */
     if (hint == ArrHint::flat_i) {
         SharedArrayObj::ivec_type v;
         v.reserve(data.size());
-        for (auto const &e : data) {
-            const EvalValue &kv = DICT_ELEM(e);
-            v.push_back(kv.get<int_type>());
-        }
-        return SharedArrayObj(move(v));
+        for (auto const &e : data)
+            v.push_back(flat_hint_value(DICT_ELEM(e), hint)
+                            .get<int_type>());
+        return SharedArrayObj(std::move(v));
     }
     if (hint == ArrHint::flat_f) {
         SharedArrayObj::fvec_type v;
         v.reserve(data.size());
-        for (auto const &e : data) {
-            const EvalValue &kv = DICT_ELEM(e);
-            v.push_back(kv.get<float_type>());
-        }
-        return SharedArrayObj(move(v));
+        for (auto const &e : data)
+            v.push_back(flat_hint_value(DICT_ELEM(e), hint)
+                            .get<float_type>());
+        return SharedArrayObj(std::move(v));
     }
     if (hint == ArrHint::flat_b) {
         SharedArrayObj::bvec_type v;
         v.reserve(data.size());
-        for (auto const &e : data) {
-            const EvalValue &kv = DICT_ELEM(e);
-            v.push_back(kv.get<bool>() ? 1 : 0);
-        }
-        return SharedArrayObj(move(v));
+        for (auto const &e : data)
+            v.push_back(flat_hint_value(DICT_ELEM(e), hint)
+                            .get<bool>() ? 1 : 0);
+        return SharedArrayObj(std::move(v));
     }
 
     /* Top-10 #7: VALUE-driven flat strings under a dflt hint only (an
@@ -153,7 +159,7 @@ dict_extract(const DictObject::inner_type &data, ArrHint hint)
             v.reserve(data.size());
             for (auto const &e : data)
                 v.push_back(SharedStr(DICT_ELEM(e).get<SharedStr>()));
-            return SharedArrayObj(move(v));
+            return SharedArrayObj(std::move(v));
         }
     }
 
@@ -161,7 +167,7 @@ dict_extract(const DictObject::inner_type &data, ArrHint hint)
     result.reserve(data.size());
     for (auto const &e : data)
         result.emplace_back(DICT_ELEM(e), false);
-    return SharedArrayObj(move(result));
+    return SharedArrayObj(std::move(result));
 
     #undef DICT_ELEM
 }
@@ -188,10 +194,10 @@ dict_kvpairs(const DictObject::inner_type &data, ArrHint /*hint*/)
         SharedArrayObj::vec_type pair_arr;
         pair_arr.emplace_back(e.first, false);
         pair_arr.emplace_back(e.second.get(), false);
-        result.emplace_back(SharedArrayObj(move(pair_arr)), false);
+        result.emplace_back(SharedArrayObj(std::move(pair_arr)), false);
     }
 
-    return SharedArrayObj(move(result));
+    return SharedArrayObj(std::move(result));
 }
 
 static EvalValue
@@ -300,12 +306,12 @@ builtin_dict(EvalContext *ctx, const ArgLocs *exprList,
          * mutated later and corrupt the dict.
          */
         data.insert_or_assign(
-            make_const_clone(arr_elem_at(pair, 0)),
+            make_const_clone(arr_elem_at(pair, 0), true),
             LValue(arr_elem_at(pair, 1), false)
         );
     }
 
-    return intrusive_ptr<DictObject>(make_intrusive<DictObject>(move(data)));
+    return intrusive_ptr<DictObject>(make_intrusive<DictObject>(std::move(data)));
 }
 
 /*
@@ -343,16 +349,22 @@ EvalValue builtin_make_dict(EvalContext *ctx, const ArgLocs *exprList,
     DictObject::inner_type data;
     data.reserve(n);   /* profile #5: kill the insert rehash chain */
 
-    VmInvoker inv(ctx, funcObj);   /* prepared per-loop invoker (vm.h) */
+    /* prepared per-loop invoker (vm.h); the call site names the frame */
+    VmInvoker inv(ctx, funcObj, exprList->start);
 
-    for (size_type i = 0; i < n; i++) {
+    /* #49: `i < keys.size()`, re-read per step - the callback is arbitrary
+     * script code and may shrink the keys array under us; a count read
+     * once indexed past its end. */
+    for (size_type i = 0; i < keys.size(); i++) {
 
+        /* the key stays BOXED to the callback: it is boxed anyway for
+         * the dict, and a raw bind on top of that measured +5 Ir per
+         * call on 67_make_dict (#97 CB4) */
         const EvalValue k = arr_elem_at(keys, i);
-        const EvalValue v = inv.ready() ? inv.invoke(&k, 1)
-                                        : eval_func(ctx, funcObj, k);
+        const EvalValue v = inv.call(k);
 
-        data.insert_or_assign(make_const_clone(k), LValue(v, false));
+        data.insert_or_assign(make_const_clone(k, true), LValue(v, false));
     }
 
-    return intrusive_ptr<DictObject>(make_intrusive<DictObject>(move(data)));
+    return intrusive_ptr<DictObject>(make_intrusive<DictObject>(std::move(data)));
 }

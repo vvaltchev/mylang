@@ -1,0 +1,237 @@
+# Values that contain themselves (README, *Values that contain
+# themselves*; plans/reference-cycles.md, Part A). Arrays, dicts and class
+# instances are references, so `append(a, a)` builds an array that holds
+# itself, and every walk over such a value must terminate - printing,
+# `==`, `hash`, a dict key, a deep copy, a constant's value. Each of them
+# overflowed the C stack before (a SIGSEGV in a release build).
+#
+# LEAKS: reference counting cannot free a cycle, so a cycle this program
+# builds is BROKEN at the end (pop / erase), or LeakSanitizer and the INT
+# object census would report it. Two cycles here cannot be broken by any
+# program - the cyclic constant C and the cyclic dict key are FROZEN
+# (read-only) - and the interpreter frees those when the program ends.
+
+struct Node { int v; dyn? next; }
+
+# a ring: the array is its own second element (the cast: `[1]` is a flat
+# int array under -nti, which has no type hints, and cannot hold an array)
+var dyn a = cast<array<dyn>>([1]);
+append(a, a);
+
+# 1. printing: a container already being printed further up is [...],
+#    {...} or Name(...); one shared at two places, not on the path, is
+#    printed at each. A struct is a VALUE: box holds a copy of s, printed
+#    in full, and the back edge is the array
+assert(str(a) == "[1, [...]]");
+assert(str([a, a]) == "[[1, [...]], [1, [...]]]");
+assert(str(clone(a)) == "[1, [1, [...]]]");    # a fresh top, then the ring
+var dyn d1 = {};
+d1["self"] = d1;
+assert(str(d1) == "{\"self\": {...}}");
+var dyn box = [];
+var s = Node(1, box);
+append(box, s);          # box -> s's object -> box
+assert(str(s) == "Node(v: 1, next: [Node(v: 1, next: [...])])");
+assert(str(box) == "[Node(v: 1, next: [...])]");
+
+# 2. == compares by SHAPE: a back edge must lead to the same depth on both
+#    sides
+var dyn b = cast<array<dyn>>([1]);
+append(b, b);
+assert(a == a);
+assert(a == b && !(a != b));
+assert([a] == [b]);
+assert({"r": a} == {"r": b});
+var dyn u = cast<array<dyn>>([1]);
+var dyn u2 = [1, u];
+append(u, u2);           # a ring of two: u -> u2 -> u
+assert(a != u);          # the same unfolding, a different shape
+assert(u == u2);         # two nodes alike: the same shape, shifted
+assert(clone(a) != a);   # the clone closes the ring one level deeper
+assert(a != [1, [1, [1]]]);
+var dyn d2 = {};
+d2["self"] = d2;
+assert(d1 == d2);
+var dyn box_b = [];
+var sb = Node(1, box_b);
+append(box_b, sb);
+assert(s == sb && box == box_b);
+assert(find([u, b], a) == 1);
+
+# 3. hash agrees with == on every cyclic shape
+assert(hash(a) == hash(b));
+assert(hash([a]) == hash([b]));
+assert(hash(u) == hash(u2));
+assert(hash(d1) == hash(d2));
+assert(hash({"r": a}) == hash({"r": b}));
+assert(hash(s) == hash(sb) && hash(box) == hash(box_b));
+
+# 4. a cyclic value is a dict key: frozen (deep read-only) on insert, the
+#    cycle included, and found by an equal value
+var dyn m = {};
+m[a] = "ring";
+assert(m[b] == "ring" && len(m) == 1);
+m[b] = "again";
+assert(len(m) == 1 && m[a] == "again");
+var dyn k0 = keys(m)[0];
+assert(k0 == a && str(k0) == "[1, [...]]");
+var dyn inner = k0[1];   # the frozen ring's back edge: frozen too
+var frozen = 0;
+try { inner[0] = 5; } catch (NotLValueEx) { frozen += 1; }
+try { append(inner, 5); } catch (CannotChangeConstEx) { frozen += 1; }
+assert(frozen == 2);
+append(a, 7);            # the original moved on; the key did not
+assert(len(m) == 1 && m[b] == "again" && len(k0) == 2);
+pop(a);
+
+# 5. deepclone reproduces the cycle INSIDE the copy; a value shared at two
+#    places that is not on a cycle is one value in the copy too (question
+#    10: Python's deepcopy rule, 103_deepclone_sharing.my)
+var dyn c = deepclone(a);
+assert(c == a && str(c) == "[1, [...]]");
+assert(intptr(c[1]) == intptr(c) && intptr(c) != intptr(a));
+c[0] = 99;
+assert(a[0] == 1 && c[1][0] == 99);
+var dyn s7 = [7];
+var dyn dag = [s7, s7];
+var dyn dc = deepclone(dag);
+dc[0][0] = 8;
+assert(dc[1][0] == 8 && s7[0] == 7);
+var dyn dd = deepclone(d1);
+assert(dd == d1 && str(dd) == "{\"self\": {...}}");
+dd["x"] = 1;
+assert(len(dd["self"]) == 2 && len(d1) == 1);
+var dyn sc = deepclone(s);
+assert(sc == s);
+var dyn box_c = sc.next;
+assert(intptr(box_c) != intptr(box) && box_c[0] == sc);
+
+# 6. a cyclic CONSTANT, built by a pure function at compile time: frozen,
+#    cycle included - and a `var` gets a mutable ring, the same whether the
+#    call was folded at compile time or ran
+pure func mk_ring(n) { var dyn r = [n, "x"]; r[1] = r; return r; }
+var dyn r2 = mk_ring(1);             # folded: a constant argument
+var dyn r3 = mk_ring(runtime(1));    # left to run time
+const C = mk_ring(1);
+assert(C == a && hash(C) == hash(a) && str(C) == "[1, [...]]");
+assert(typestr(C) == "array<dyn>");
+var dyn cv = C;
+var cfrozen = 0;
+try { cv[1][0] = 5; } catch (NotLValueEx) { cfrozen += 1; }
+assert(cfrozen == 1);
+assert(r2 == C && r3 == C && str(r2) == "[1, [...]]" && str(r3) == str(r2));
+assert(intptr(r2[1]) == intptr(r2) && intptr(r3[1]) == intptr(r3));
+r2[0] = 2;
+r3[0] = 3;
+assert(r2[1][0] == 2 && r3[1][0] == 3 && C[0] == 1);
+
+# 6b. a cycle a compile-time call leaves in a LOCAL is the compiler's to
+#     keep (until exit), like one it returns: unresolved at parse time, the
+#     function's locals live in its body's block scope, which died before
+#     the call's keep scan - LeakSanitizer reported the ring. (A const
+#     initializer is evaluated at parse time in every mode; the same call
+#     left to run time builds a ring the program cannot reach to break.)
+pure func local_ring(n) {
+    var dyn r = [n, "x"];
+    r[1] = r;
+    return len(r);
+}
+const LR = local_ring(2);
+assert(LR == 2);
+
+# 7. a closure captures the array it is stored in: nothing walks into a
+#    function, so the walks see only `<function>`
+var dyn fs = [];
+var dyn f = func [fs] () { return len(fs); };
+append(fs, f);
+assert(f() == 1 && str(fs) == "[<function>]" && fs == fs);
+var dyn fsc = deepclone(fs);
+assert(fsc[0] == f);
+
+# 8. ordering is not defined on arrays: refused, not a crash
+var refused = 0;
+try { sort([a, b]); } catch (TypeErrorEx) { refused += 1; }
+assert(refused == 1);
+
+# 9. a CLASS ring: a class's fields are printed and deep-copied through
+#    the same guard; == and hash are its identity, never a walk
+class CNode { int v; opt CNode next; array<dyn> kids; }
+var cr = CNode(int(runtime(1)), none, []);
+cr.next = cr;
+append(cr.kids, cr);
+assert(str(cr) == "CNode(v: 1, next: CNode(...), kids: [CNode(...)])");
+assert(str([cr]) == "[CNode(v: 1, next: CNode(...), kids: [CNode(...)])]");
+var cd = deepclone(cr);
+var cdn = cd.next;
+if (cdn != none)
+    assert(cdn == cd && cd != cr && cd.kids[0] == cd);
+assert(cr == cr && hash(cr) == hash(cr));
+var cm = {};
+cm[cr] = 1;
+assert(cm[cr] == 1 && len(cm) == 1);
+
+# 10. a FROZEN cycle that reaches a STRUCT: kept until exit, then
+#     emptied - after the program's struct defs are gone, so that release
+#     must read none (it read one: a heap-use-after-free at exit under
+#     ASan, in every engine)
+struct SN { int v; dyn? next; }
+pure func mk_sring(n) {
+    var dyn r = [n];
+    r[0] = SN(n, r);
+    return r;
+}
+const SR = mk_sring(2);
+assert(str(SR) == "[SN(v: 2, next: [...])]");
+var dyn sk = cast<array<dyn>>([0]);
+sk[0] = SN(1, none);
+append(sk, sk);
+var dyn skd = {};
+skd[sk] = 1;                         # a frozen copy: kept until exit
+assert(len(skd) == 1);
+pop(sk);
+
+# 11. a struct is a VALUE: two equal copies print, compare and hash alike,
+#     whether or not copy-on-write still shares one object between them
+#     (the cycle guard keyed a struct value by its address, so a write
+#     that changed nothing decided ==)
+var dyn ra = cast<array<dyn>>([0]);
+ra[0] = SN(1, ra);
+var dyn rc1 = clone(ra);
+var dyn rc2 = clone(ra);
+rc2[0].v = 1;                        # splits the copy, changes no value
+assert(str(rc1) == str(rc2) && rc1 == rc2 && hash(rc1) == hash(rc2));
+assert(str(rc1) == "[SN(v: 1, next: [SN(v: 1, next: [...])])]");
+
+# 12. a ring through a box<P>: its back edge prints box(Name(...)) (the
+#     declaration's zero value calls the builtin box(), which a variable
+#     above shadows)
+struct BN { opt box<BN> next; int v; }
+box<BN> bn;
+bn.v = int(runtime(1));
+bn.next = bn;
+assert(str(bn) == "box(BN(next: box(BN(...)), v: 1))");
+assert(str([bn]) == "[box(BN(next: box(BN(...)), v: 1))]");
+
+print("ok");
+
+# break every cycle the program built (see LEAKS above)
+pop(ra);
+bn.next = none;
+cr.next = none;
+pop(cr.kids);
+cd.next = none;
+pop(cd.kids);
+pop(a);
+pop(b);
+pop(u);
+erase(d1, "self");
+erase(d2, "self");
+pop(box);
+pop(box_b);
+pop(c);
+erase(dd, "self");
+pop(box_c);
+pop(r2);
+pop(r3);
+pop(fs);
+pop(fsc);
