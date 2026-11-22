@@ -2794,6 +2794,48 @@ struct Codegen {
      * other expression compiles to a slot. Returns false if a non-literal can't
      * lower.
      */
+    /* #77: `lv OP= rvalue` for an int variable given a value that may be
+     * a float - see the caller */
+    void compile_compound_coerced(const Construct *s, const Expr14 *e,
+                                  const Identifier *lv, Op cbase,
+                                  std::vector<CgInstr> &ops)
+    {
+        /* the read of a name always lowers; the rvalue is an operand of
+         * `x OP v`, which lowers it with the same compile_boxed_expr */
+        Operand cur, rhs_op;
+        const bool ok_lv = boxed_operand(lv, cur, ops);
+        const bool ok_rv = boxed_operand(e->rvalue.get(), rhs_op, ops);
+        ML_CHECK(ok_lv && ok_rv);
+        (void)ok_lv;
+        (void)ok_rv;
+        const int t = alloc_temp();
+        CgInstr in;
+        in.op = OpCode::BinOpV;
+        in.node_idx = add_ast_node(s);
+        in.loc_node_idx = add_ast_node(s);      /* the whole compound */
+        in.target = t;
+        in.set_a(cur);
+        in.set_b(rhs_op);
+        in.aop = cbase;
+        ops.push_back(in);
+        const bool local = lv->sym.kind == SymKind::local;
+        CgInstr co;
+        co.op = OpCode::CoerceNumV;
+        co.node_idx = add_ast_node(s);           /* the Expr14 caret */
+        co.target = local ? lv->sym.slot : alloc_temp();
+        co.target2 = 0;                          /* to an int */
+        co.set_a(slot_op(t));
+        ops.push_back(co);
+        if (!local) {
+            CgInstr st;
+            st.op = lv->sym.kind == SymKind::global ? OpCode::StoreGlobalV
+                                                    : OpCode::StoreCaptureV;
+            st.target = lv->sym.slot;
+            st.set_a(slot_op(co.target));        /* a plain store */
+            ops.push_back(st);
+        }
+    }
+
     bool boxed_operand(const Construct *e, Operand &out,
                        std::vector<CgInstr> &ops)
     {
@@ -3509,14 +3551,31 @@ struct Codegen {
          * inferencer's coerces_dyn accumulator stamp (`var s = 0; s = s + d`
          * with a dyn `d` - the proven-scalar case went to
          * compile_int/float_stmt already, and an EXPLICIT `int x = <dyn>` is
-         * compile-rejected). A COMPOUND does NOT coerce
-         * (handle_single_expr14 coerces op==assign only), so it lowers below
-         * as a plain CompoundV / StoreGlobalV compound. Every OTHER declared
+         * compile-rejected). A COMPOUND lowers below as a plain CompoundV /
+         * StoreGlobalV compound - its result already has the variable's
+         * type - except an int variable's given a value that may be a float
+         * (#77, compile_compound_coerced). Every OTHER declared
          * type (bool/str/array/dict/struct/typed-container) coerces to a
          * NO-OP, so a plain boxed store is byte-identical. */
         const bool coerce_num = is_assign
             && (lv->decl_type == DeclType::i
                 || lv->decl_type == DeclType::f);
+        /* #77: an INT variable's COMPOUND whose rvalue may be a float at
+         * run time (a `dyn` - a typed float is refused at compile time)
+         * stores a result that may not fit. It is `x = x OP v`, so it
+         * converts as that does: the operation into a temp (a boxed
+         * BinOpV, its caret the whole compound, as CompoundV's op error
+         * carets it) and the store through CoerceNumV, which refuses a
+         * float (handle_single_expr14 refuses it the same way). A float
+         * variable's compound result is a float whatever it is given. */
+        if (!is_assign && lv->decl_type == DeclType::i
+                && e->rvalue->th != TypeHint::i) {
+            /* a const scalar has no variable (it is inlined), and a store
+             * into a const binding is refused at compile time */
+            ML_CHECK(!lv->is_const);
+            compile_compound_coerced(s, e, lv, cbase, ops);
+            return true;
+        }
         /* A CONST DECL (a const arr/dict/func kept as a runtime symbol; const
          * SCALARS are inlined, so never here). `pInConstDecl` on the Expr14
          * distinguishes it from a REASSIGN (which has no such flag and must
@@ -3594,9 +3653,11 @@ struct Codegen {
             }
             /* H1b: a PROVEN int/float capture `cap OP= rhs` recomposes
              * into read + IntBin/FloatBin + a plain store. The rhs must
-             * compile in the CAPTURE's OWN type - a float rhs into an
-             * int capture declines here and keeps the boxed compound,
-             * whose num_bin_op promotion is what that case needs. */
+             * compile in the CAPTURE's OWN type - one the typed path
+             * cannot read (an element of a captured dict) declines here
+             * and keeps the boxed compound. (A `dyn` rhs into an int
+             * capture does not get here: its result is converted,
+             * compile_compound_coerced, #77.) */
             if (typed_capture_update_ok(lv, cbase)
                     && (lv->th == TypeHint::i || lv->th == TypeHint::f)) {
                 const bool flt = lv->th == TypeHint::f;

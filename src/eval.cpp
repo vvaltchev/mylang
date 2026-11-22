@@ -5647,6 +5647,17 @@ member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
  * non-widening values pass through unchanged; the inferencer has already
  * rejected anything not assignable to the declared type.
  */
+/* The refusal of a value an `int` place cannot hold: coerce_to_decl_type's,
+ * and an int variable's compound whose result is a float (#77) */
+[[noreturn]] static void throw_not_int(int site_arg)
+{
+    TypeErrorEx ex(
+        "cannot store a non-int value in an 'int' variable "
+        "(a float doesn't narrow implicitly - use int(...) to convert)");
+    ex.bind_arg = site_arg;
+    throw ex;
+}
+
 static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt,
                                      int site_arg)
 {
@@ -5683,11 +5694,7 @@ static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt,
             return v;
         if (v.is<bool>())
             return EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
-        TypeErrorEx ex(
-            "cannot store a non-int value in an 'int' variable "
-            "(a float doesn't narrow implicitly - use int(...) to convert)");
-        ex.bind_arg = site_arg;
-        throw ex;
+        throw_not_int(site_arg);
     }
     return v;
 }
@@ -6786,8 +6793,9 @@ handle_single_expr14(EvalContext *ctx,
      * For a plain `=` to an explicitly-typed scalar variable, coerce a widening
      * value to the declared type (float <- int/bool, int <- bool). The decl's
      * type is on the Identifier (the resolver also copied it to every use, so a
-     * later reassignment coerces too). Compound ops (`+=`) already produce the
-     * right type via num_bin_op, so only `assign` is handled here.
+     * later reassignment coerces too). A compound op (`+=`) produces the
+     * right type via num_bin_op - except an int variable's given a float,
+     * a `dyn` value, which is refused below (#77).
      */
     EvalValue rval_storage;
     const EvalValue *rvalp = &rval_in;
@@ -6797,6 +6805,19 @@ handle_single_expr14(EvalContext *ctx,
             rval_storage = coerce_to_decl_type(RValue(rval_in), dt);
             rvalp = &rval_storage;
         }
+    } else if (lvalue->is_id()
+               && static_cast<const Identifier *>(lvalue)->decl_type
+                      == DeclType::i
+               && rval_in.is<float_type>()) {
+        /* #77: an int variable's compound given a float (a `dyn` - a typed
+         * float is refused at compile time) is `x = x OP v`, whose result
+         * does not fit: refused as that store refuses it, after the
+         * operation (whose own error comes first, as there). Every caller
+         * passes an rvalue, and an int OP a float is a float. */
+        EvalValue acc = RValue(lvalue->eval(ctx));
+        apply_compound_op(acc, rval_in, op);
+        ML_CHECK(acc.is<float_type>());
+        throw_not_int(-1);
     }
     const EvalValue &rval = *rvalp;
 

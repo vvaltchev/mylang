@@ -1,0 +1,10 @@
+# INT-SOURCE: ../functional/141_compound_dyn_store.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#77): a compound assignment into an int variable given a
+# `dyn` value converts or refuses its result as `x = x OP v` does. The
+# functional program runs as a coverage unit too, under the engines
+# above, with no second copy (INT-SOURCE). It owns the codegen lowering
+# of such a compound (the operation into a temp, the store through
+# CoerceNumV, for a local, a global and a capture) and the
+# tree-walker's conversion of its result, which no other unit reaches.

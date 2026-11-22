@@ -1,0 +1,67 @@
+# A compound assignment is `x = x OP v` (README, *Assignment*), so an int
+# variable given a `dyn` value converts - or refuses - its RESULT as that
+# store does (RULE 1). Until 2026-11-22 the compound stored the float a
+# `dyn` 2.5 made: the JIT then read its bits as an int, -nj printed 1, the
+# tree-walker threw at the next typed read - for a local, a global and a
+# captured variable alike.
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+func refused(dyn f, dyn v) {
+    try { f(v); } catch (TypeErrorEx) { return true; }
+    return false;
+}
+
+var g = 1;
+func add_g(dyn v) { g += v; return g; }
+func mk() {
+    var c = 10;
+    return func [c] (dyn v) { c -= v; return c; };
+}
+
+# ---- an int that fits is stored, every target kind
+func local_add(dyn v) {
+    var n = 2;
+    n *= v;
+    return n;
+}
+want("a local", local_add(runtime(3)), 6);
+want("a global", add_g(runtime(2)), 3);
+var cl = mk();
+want("a capture", cl(runtime(4)), 6);
+
+# ---- a float result is refused, and the variable keeps its value
+if (typed) {
+    want("a local's float", refused(local_add, runtime(0.5)), true);
+    want("a global's float", refused(add_g, runtime(0.5)), true);
+    want("the global kept", g, 3);
+    want("a capture's float", refused(cl, runtime(0.5)), true);
+    want("the capture kept", cl(runtime(1)), 5);
+}
+
+# ---- a float variable's result is a float whatever it is given
+func float_add(dyn v) {
+    var f = 0.5;
+    f += v;
+    return f;
+}
+want("a float variable", str(float_add(runtime(2))), "2.500000");
+
+# ---- the operation's own error comes first, as in `x = x OP v`
+func shl(dyn v) {
+    var s = 1;
+    s <<= v;
+    return s;
+}
+var op_refused = false;
+try { shl(runtime(0.5)); } catch (TypeErrorEx as e) { op_refused = true; }
+want("a shift by a float", op_refused, true);
+
+assert(bad == 0);
+print("ok");

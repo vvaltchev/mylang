@@ -32908,8 +32908,17 @@ static bool capture_typed_arith_shapes()
             "var c = mk(7); print(c(runtime(2)));" }, 0, 0, 0, 1 },
         /* DECLINE: a float rhs into an INT capture needs num_bin_op's
          * promotion - the typed path would be the wrong type */
+        /* (#77: and its result is checked at the store - a boxed
+         * BinOpV into a temp, then CoerceNumV - as `a = a + k` is) */
         { "no recompose: float rhs into an int capture", {
             "func mk(int a) { return func [a] (dyn k) { a += k; "
+                "return a; }; }",
+            "var c = mk(1); print(c(runtime(2)));" }, 0, 0, 1, 0 },
+        /* DECLINE: an int rhs the typed path cannot read (an element of
+         * a captured dict) keeps the boxed compound */
+        { "no recompose: a captured dict's element into an int capture", {
+            "func mk(int a) { var d = {\"k\": 4}; "
+                "return func [a, d] (int k) { a += d[\"k\"]; "
                 "return a; }; }",
             "var c = mk(1); print(c(runtime(2)));" }, 0, 0, 0, 1 },
     };
@@ -39912,6 +39921,8 @@ static bool disasm_opcode_families()
         "    var a3 = [[[1, 2]], [[3, 4]]];",
         "    a3[1][0][1] = 5;",
         "    a3[0][0][0] += 1;",
+        "    var dyn dn = runtime(1);",
+        "    dn += 2;",
         "    var n = 0;",
         "    foreach (var e in aa[1]) { n += e + len(rows(e)); }",
         "    var pairs = [[1, 2], [3, 4]];",

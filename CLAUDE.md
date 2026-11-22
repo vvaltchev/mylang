@@ -5027,6 +5027,16 @@ decisions behind it: `plans/archived/type-inference.md`,
   slot (the JIT printed its bits as an int, `-nj` printed 1, the
   tree-walker threw at the next read) - RULE 1 and RULE 2 at once.
   `tests/functional/140_capture_decl_type.my`.
+  **And so does a COMPOUND (#77, 2026-11-22):** `x OP= v` is `x = x OP
+  v`, so an INT variable given a value that may be a float (a `dyn` - a
+  typed float is refused at compile time) has its RESULT refused at the
+  store: `compile_compound_coerced` (codegen: a boxed BinOpV into a
+  temp, its caret the whole compound, then CoerceNumV) and the
+  tree-walker's matching check in `handle_single_expr14`. It stored the
+  float until then - for a local, a global and a capture alike. A float
+  variable's compound result is a float whatever it is given. (A
+  compound into an inferred dict<_, int> VALUE still stores the float:
+  task #79.) `tests/functional/141_compound_dyn_store.my`.
 - **⛔ A `dyn` VALUE ENTERING A TYPED PLACE IS CHECKED AT RUN TIME, BY
   ONE FUNCTION (#49, 2026-10-12; README *A `dyn` value entering a typed
   place*).** `value_fits(v, annot, FitMisfit &)` (types/fit.cpp.h) is
