@@ -5018,6 +5018,15 @@ decisions behind it: `plans/archived/type-inference.md`,
   arrived). A FRESH `var r = 3 + d` (only a dyn contribution) correctly stays
   `dyn` → `DynRequiredEx`; `var dyn r = 3 + d` holds the actual result.
   (`TypeSym::{round_got_dyn,coerces_dyn,decl_id}`.)
+  **A CAPTURE converts the same way (2026-11-22):** a closure stores into
+  its OWN copy of a captured variable, and that copy has the variable's
+  type - the inferencer carries the declaration's `decl_type` to each
+  capture-list Identifier (after the stamps above), and the resolver's
+  capture scope hands it to every use in the body. Without it `var n = 0;
+  func [n] (dyn x) { n = n + x; ... }` given 2.5 left a float in an `int`
+  slot (the JIT printed its bits as an int, `-nj` printed 1, the
+  tree-walker threw at the next read) - RULE 1 and RULE 2 at once.
+  `tests/functional/140_capture_decl_type.my`.
 - **⛔ A `dyn` VALUE ENTERING A TYPED PLACE IS CHECKED AT RUN TIME, BY
   ONE FUNCTION (#49, 2026-10-12; README *A `dyn` value entering a typed
   place*).** `value_fits(v, annot, FitMisfit &)` (types/fit.cpp.h) is

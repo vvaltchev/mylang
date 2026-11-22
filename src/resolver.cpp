@@ -4322,9 +4322,12 @@ Resolver::process_function(FuncDeclStmt *fd)
         if (fd->captures) {
             st.scopes.emplace_back();
             int ci = 0;
+            /* (each capture keeps its variable's declared type - the
+             * inferencer carries it to the capture-list name - so a
+             * store in the body converts as one outside does) */
             for (auto &cap : fd->captures->elems)
                 st.scopes.back().decls.push_back(
-                    { cap->uid, ci++, SymKind::capture, DeclType::none });
+                    { cap->uid, ci++, SymKind::capture, cap->decl_type });
         }
 
         st.scopes.emplace_back();   /* the function's outermost (param) scope */

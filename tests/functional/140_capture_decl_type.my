@@ -1,0 +1,52 @@
+# A closure stores into ITS copy of a captured variable, and that copy has
+# the variable's type: a `dyn` value stored there converts or is refused
+# exactly as it is outside the closure (RULE 1). Until 2026-11-22 the
+# capture's copy had no type of its own, so `n = n + x` given 2.5 left a
+# float in an `int` slot - the JIT printed its bits as an int, -nj printed
+# 1, the tree-walker threw at the next read - and a captured float given
+# an int held the int.
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+
+# ---- a captured int refuses a float, inside a function and at the top
+func mk() {
+    var n = 0;
+    return func [n] (dyn x) { n = n + x; return n + 1; };
+}
+var f = mk();
+want("an int that fits", f(runtime(2)), 3);
+var refused = false;
+try { f(runtime(2.5)); } catch (TypeErrorEx) { refused = true; }
+if (typed)
+    want("a float into a captured int", refused, true);
+var cnt = 0;
+var g = func [cnt] (dyn x) { cnt = cnt + x; return cnt + 1; };
+var refused2 = false;
+try { g(runtime(0.5)); } catch (TypeErrorEx) { refused2 = true; }
+if (typed)
+    want("at the top level", refused2, true);
+
+# ---- a captured float converts an int
+var t = 0.5;
+var h = func [t] (dyn x) { t = x; return t; };
+want("an int into a captured float", str(h(runtime(3))),
+     typed ? "3.000000" : "3");
+func mkf() {
+    var u = 0.5;
+    return func [u] (dyn x) { u = x; return u * 2; };
+}
+want("inside a function", str(mkf()(runtime(4))), typed ? "8.000000" : "8");
+
+# ---- the variable outside is its own copy, untouched
+want("the outer int", cnt, 0);
+want("the outer float", str(t), "0.500000");
+
+assert(bad == 0);
+print("ok");

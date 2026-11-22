@@ -2658,6 +2658,28 @@ void Inferencer::infer_one(Block *rootBlock)
                 s->decl_id->decl_type = DeclType::f;
         }
     }
+    /*
+     * A CAPTURE stores into the closure's copy of the variable, and that
+     * copy has the variable's type: carry the declaration's decl_type to
+     * each capture-list name, which the resolver's capture scope hands
+     * to every use in the closure's body. A dyn stored there used to
+     * land unconverted - `var cnt = 0; func [cnt] (dyn x) { cnt = cnt +
+     * x; ... }` given 2.5 left a float in an `int` slot: the JIT printed
+     * its bits as an int, the VM aborted, the tree-walker threw (RULE 1).
+     * (A top-level closure's body is resolved before its capture list,
+     * so the resolver cannot do this itself.)
+     */
+    for (auto &up : all_funcs) {
+        FuncDeclStmt *fd = up->decl;
+        if (!fd || !fd->captures || up->pinned)
+            continue;
+        for (auto &cap : fd->captures->elems) {
+            auto it = id_sym.find(cap.get());
+            const TypeSym *o = it != id_sym.end() ? it->second : nullptr;
+            if (o && o->decl_id && cap->decl_type == DeclType::none)
+                cap->decl_type = o->decl_id->decl_type;
+        }
+    }
     for (auto &up : all_funcs) {
         /*
          * An Unknown return means the function has return statement(s) whose

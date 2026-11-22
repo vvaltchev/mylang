@@ -3282,8 +3282,13 @@ struct Codegen {
             if (id) {
                 const bool numeric = inc->th == TypeHint::i
                                   || inc->th == TypeHint::f;
+                /* (a variable DECLARED int / float - a capture carries
+                 * its variable's declared type - holds its kind, and
+                 * inc-dec keeps it: no conversion either) */
                 const bool untyped_decl = id->decl_type == DeclType::none
-                                       || id->decl_type == DeclType::dyn;
+                                       || id->decl_type == DeclType::dyn
+                                       || id->decl_type == DeclType::i
+                                       || id->decl_type == DeclType::f;
                 /* A PROVEN int/float global/capture -> StoreGlobalV/StoreCaptureV
                  * compound (`x += 1`; the operand is numeric so `+` == inc-dec).
                  * A proven int/float LOCAL was handled by compile_int/float_stmt
