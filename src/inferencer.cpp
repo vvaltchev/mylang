@@ -646,6 +646,7 @@ private:
                           const std::string &what);
     void refuse_compound_misfit(Op op, StaticTypeRef place,
                                 StaticTypeRef v, Construct *at);
+    bool compound_into_int_value(Expr14 *e);
     void check_builtin_store(CallExpr *call);
     std::vector<TypeSym *> *known_params(CallExpr *call);
     StaticTypeRef arg_type(Construct *arg, TypeSym *param);
@@ -5251,6 +5252,29 @@ static bool ct_unsettled(StaticTypeRef t)
         || t->kind == StaticTypeKind::Unknown;
 }
 
+/* #79: is `e` a compound into a DICT's `int` value whose result may be a
+ * float (`d.k += v`, `v` a dyn)? `d.k = d.k + v` refuses the float at the
+ * store; the compound computes its result inside the store, so it is
+ * checked there, against the type the dict carries (ct_rmw), as a store
+ * through `dyn` is. (An element of an array<int> is flat storage, which
+ * refuses a float itself; a struct field's store refuses it too.) */
+bool Inferencer::compound_into_int_value(Expr14 *e)
+{
+    if (e->op == Op::assign)
+        return false;
+    Construct *lv = e->lvalue.get();
+    Construct *base = ctag(lv) == ConstructType::subscript
+        ? static_cast<Subscript *>(lv)->what.get()
+        : static_cast<MemberExpr *>(lv)->what.get();
+    if (static_type_resolve(type_of(base))->kind != StaticTypeKind::Dict
+            || static_type_resolve(type_of(lv))->kind != StaticTypeKind::Int)
+        return false;
+    /* (an int OP anything is an int, a float or a dyn - never a bool) */
+    return static_type_resolve(binop_result(
+        compound_binop(e->op), type_of(lv), type_of(e->rvalue.get())))->kind
+        != StaticTypeKind::Int;
+}
+
 /* the builtins that store a value into the container they are given */
 static bool in_place_store(std::string_view n)
 {
@@ -5494,10 +5518,12 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
         /* Q2 increment 2: a store into an element, a dict value or a
          * member whose type the compiler does not know - through a `dyn`
          * name, into an array<dyn> - checks the value against the
-         * container's own type at run time */
+         * container's own type at run time; so does a compound whose
+         * result may not fit a dict's `int` value (#79) */
         if (ctag(e->lvalue.get()) == ConstructType::subscript
                 || ctag(e->lvalue.get()) == ConstructType::member)
-            e->lvalue->ct_store = ct_unsettled(type_of(e->lvalue.get()));
+            e->lvalue->ct_store = ct_unsettled(type_of(e->lvalue.get()))
+                || compound_into_int_value(e);
         if (e->op == Op::assign) {
             /* checked where it lands; or stored through a `dyn` container,
              * whose element type is unknown here */

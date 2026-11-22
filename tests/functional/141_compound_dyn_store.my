@@ -3,7 +3,8 @@
 # store does (RULE 1). Until 2026-11-22 the compound stored the float a
 # `dyn` 2.5 made: the JIT then read its bits as an int, -nj printed 1, the
 # tree-walker threw at the next typed read - for a local, a global and a
-# captured variable alike.
+# captured variable alike; a dict's int value held the float in every
+# engine until it was checked at the store (#79).
 var typed = typestr(runtime(0)) == "dyn";
 var bad = 0;
 func want(str what, opt dyn got, opt dyn exp) {
@@ -19,6 +20,7 @@ func refused(dyn f, dyn v) {
 }
 
 var g = 1;
+var gd = {"k": 1};
 func add_g(dyn v) { g += v; return g; }
 func mk() {
     var c = 10;
@@ -43,6 +45,37 @@ if (typed) {
     want("the global kept", g, 3);
     want("a capture's float", refused(cl, runtime(0.5)), true);
     want("the capture kept", cl(runtime(1)), 5);
+}
+
+# ---- a dict's int value (#79): checked at the store against the type the
+# dict carries, for a member, a subscript, a nested dict and a global dict
+func dict_add(dyn v) {
+    var d = {"k": 1, "j": 10};
+    d.k += v;
+    d["j"] -= v;
+    var m = {"a": {"k": 1}};
+    m.a.k += v;
+    m["a"]["k"] *= v;
+    gd.k += v;
+    return [d.k, d["j"], m.a.k, gd.k];
+}
+want("a dict's int values", str(dict_add(runtime(2))), "[3, 8, 6, 3]");
+want("a dict's bool values", str(dict_add(runtime(true))),
+     "[2, 9, 2, 4]");
+if (typed) {
+    want("a dict value's float", refused(dict_add, runtime(0.5)), true);
+    want("the global dict kept", gd.k, 4);
+    func each_refused(dyn v) {
+        var d = {"k": 1};
+        var n = 0;
+        try { d["k"] += v; } catch (TypeErrorEx) { n++; }
+        try { d.k /= v; } catch (TypeErrorEx) { n++; }
+        var ad = [{"k": 1}];
+        try { ad[0].k -= v; } catch (TypeErrorEx) { n++; }
+        return [n, d.k, ad[0].k];
+    }
+    want("each dict form refused", str(each_refused(runtime(0.5))),
+         "[3, 1, 1]");
 }
 
 # ---- a float variable's result is a float whatever it is given

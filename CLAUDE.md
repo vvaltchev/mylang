@@ -5034,9 +5034,13 @@ decisions behind it: `plans/archived/type-inference.md`,
   temp, its caret the whole compound, then CoerceNumV) and the
   tree-walker's matching check in `handle_single_expr14`. It stored the
   float until then - for a local, a global and a capture alike. A float
-  variable's compound result is a float whatever it is given. (A
-  compound into an inferred dict<_, int> VALUE still stores the float:
-  task #79.) `tests/functional/141_compound_dyn_store.my`.
+  variable's compound result is a float whatever it is given. A
+  compound into a DICT's `int` value (#79) is a Q2 checked store
+  instead: `compound_into_int_value` sets `ct_store` on its lvalue, so
+  every engine checks the result against the type the dict carries
+  (`ct_rmw`), as a store through `dyn` is - an element of an array<int>
+  is flat storage and a struct field's store refuses a float itself.
+  `tests/functional/141_compound_dyn_store.my`.
 - **⛔ A `dyn` VALUE ENTERING A TYPED PLACE IS CHECKED AT RUN TIME, BY
   ONE FUNCTION (#49, 2026-10-12; README *A `dyn` value entering a typed
   place*).** `value_fits(v, annot, FitMisfit &)` (types/fit.cpp.h) is
