@@ -6150,6 +6150,24 @@ call site and was checked with unconstrained parameters - a never-called
 the enclosing template is a fresh copy whose calls instantiate normally, and
 a KEPT base (value-used) calls the other template's base, which #149's
 closure keeps.
+**⛔ A REDIRECTED CALL IS RE-KEYED EVERY ROUND (#78, 2026-11-22).** An
+argument's type can widen AFTER its call was redirected - a global a later
+instance assigns a float to - and the call used to stay on the instance
+made for the old key, whose parameter then widened under every call that
+kept that key: `f(3)` ran an instance typed float with the int 3 in it
+(`-ni`'s bind converted it, so the engines disagreed). `Inferencer::
+inst_of` records each instance's template and key, and `instantiate_round`
+asks every call to an instance again, moving it to the instance for its
+current key (a commit REPLACES each type with the round's accumulator, so
+the old instance's parameter narrows back). Two rules: a key with an
+unsettled part (`InstOf::open` - a closure template's withheld return,
+rule 8.2) is never re-keyed, since by design two closures key alike there;
+and an instance no live code reaches any more is set aside as an
+un-instantiated template (`mark_orphan_instances`, each round once a call
+moved - a template body does not type-check with unconstrained
+parameters), then retired from the tree with its cache entry and global
+binding, so `specializations()` does not list it.
+`tests/functional/142_template_rekey.my`.
 **The `(template, signature)` cache (`tmpl_cache`) is SESSION-persistent, NOT
 cleared per input** — a signature already instantiated by a prior input
 **reuses** that instance instead of building a duplicate (`f(2,3)` then `f(2,3)`

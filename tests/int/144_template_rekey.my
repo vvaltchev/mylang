@@ -1,0 +1,10 @@
+# INT-SOURCE: ../functional/142_template_rekey.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#78): a template call whose argument widens after it was
+# redirected to an instance moves to the instance for its new key. The
+# functional program runs as a coverage unit too, under the engines
+# above, with no second copy (INT-SOURCE). It owns the re-key in
+# instantiate_round, the setting aside of an instance no live code
+# reaches (mark_orphan_instances) and its retirement from the tree,
+# which no other unit reaches.

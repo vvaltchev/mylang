@@ -487,6 +487,28 @@ private:
      * dynamically (no clone) - a backstop for runaway polymorphism (D4). */
     std::unordered_map<FuncInfo *, int> tmpl_inst_count;
     /*
+     * #78: what each instance was made FOR - its template and signature
+     * key (arena-stable FuncInfo pointers). A call redirected to an
+     * instance is asked again every round (instantiate_round): an
+     * argument's type may widen after the redirect - a global a later
+     * instance assigns a float to - and the call then moves to the
+     * instance for its new key. Before, it kept feeding the old one, whose
+     * parameter widened under the calls that stayed: `f(3)` ran f$0 with
+     * an int in a float parameter. `rekeyed`: a call moved this run, so
+     * an instance may be left with no live use (mark_orphan_instances).
+     */
+    struct InstOf {
+        FuncInfo *tmpl;
+        std::string key;
+        /* the key has an unsettled part (a closure template's withheld
+         * return): it does not say which function it holds, and two
+         * closures key alike by design (rule 8.2) - never re-keyed */
+        bool open = false;
+    };
+    std::unordered_map<FuncInfo *, InstOf> inst_of;
+    bool rekeyed = false;
+    void mark_orphan_instances(Block *root);
+    /*
      * REPL: the state the last infer_input started from. A rejected
      * input restores it - infer_input itself when the check refuses it,
      * reject_input() when a LATER stage does (the optimizers raised while
@@ -1630,6 +1652,9 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
      * template's, and not skipped on a stale func_of_decl entry). */
     ML_CHECK(cfi && cfi != tmpl);
     cfi->is_template = false;             /* an instantiation is concrete */
+    InstOf &rec = inst_of[cfi];           /* #78: re-keyed from here */
+    rec.tmpl = tmpl;
+    rec.key = key;
 
     FuncDeclStmt *raw = fc;
     rootBlock->elems.insert(rootBlock->elems.begin(), std::move(cl));
@@ -1857,8 +1882,24 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         CallExpr *call = call_pair.first;
         const bool call_in_func = call_pair.second;
         FuncInfo *tmpl = callee_funcinfo(call->what.get());
-        if (!tmpl || !tmpl->is_template)
+        if (!tmpl)
             continue;
+        /* #78: a call an earlier round redirected to an instance is asked
+         * again, with its template's parameters - its arguments may have
+         * widened since */
+        bool rekey = false;
+        std::string was_key;
+        if (!tmpl->is_template) {
+            auto io = inst_of.find(tmpl);
+            if (io == inst_of.end())
+                continue;                   /* a concrete function */
+            if (io->second.open)
+                continue;
+            rekey = true;
+            was_key = io->second.key;
+            tmpl = io->second.tmpl;
+            ML_CHECK(tmpl->is_template);   /* (instances record templates) */
+        }
 
         /* (cross-input re-enabled; instrumented to root-cause the MSVC bug) */
 
@@ -1903,6 +1944,14 @@ bool Inferencer::instantiate_round(Block *rootBlock)
             continue;       /* args not settled yet; a later round */
 
         const std::string key = template_sig_key(tmpl, sig);
+        if (rekey && key == was_key)
+            continue;       /* still the instance it was redirected to */
+        /* rule 8.2: a signature with anything unsettled in it - a
+         * closure template's return is withheld while the instances are
+         * made - does not say WHICH function it holds (two closures key
+         * alike). Such an instance is never re-keyed (InstOf::open). */
+        const bool open_sig = std::any_of(sig.begin(), sig.end(),
+            [&](StaticTypeRef t) { return has_unknown(t); });
 
         /*
          * Get-or-make the instance for this (template, signature). The cache is
@@ -1915,14 +1964,9 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         TypeSym *clone_sym = nullptr;
         bool reused = false;
 
-        /* rule 8.2: a signature with anything unsettled in it - a
-         * closure template's return is withheld while the instances are
-         * made - does not say WHICH function it holds (two closures key
-         * alike), so a prior input's instance, typed by the closure ITS
-         * calls passed, is not reused for it: its committed body would
-         * read the other closure's result as that one's */
-        const bool open_sig = std::any_of(sig.begin(), sig.end(),
-            [&](StaticTypeRef t) { return has_unknown(t); });
+        /* (an open signature: a prior input's instance, typed by the
+         * closure ITS calls passed, is not reused for it - its committed
+         * body would read the other closure's result as that one's) */
         auto it = tmpl_cache.find(key);
         if (it != tmpl_cache.end()) {
             auto gs = global->syms.find(it->second);
@@ -1931,22 +1975,33 @@ bool Inferencer::instantiate_round(Block *rootBlock)
                 clone_name = it->second;
                 clone_sym = gs->second;
                 reused = true;
+                /* #78: an instance a re-key had left with no use is live
+                 * again (mark_orphan_instances set it aside); every cache
+                 * entry names an instance */
+                ML_CHECK(inst_of.count(gs->second->func));
+                gs->second->func->is_template = false;
             }
         }
 
         if (!clone_sym) {
             /* D4: a new signature past the cap runs dynamically, not as a clone
-             * - a backstop for pathological polymorphic recursion. */
-            if (tmpl_inst_count[tmpl] >= g_tmpl_max_instances) {
-                if (tmpl_cap_warned.insert(tmpl).second && tmpl->decl->id) {
-                    auto nm = tmpl->decl->id->get_str();
-                    fprintf(stderr,
-                            "warning: template '%.*s' exceeded %d "
-                            "instantiations; further calls run dynamically\n",
-                            static_cast<int>(nm.size()), nm.data(),
-                            g_tmpl_max_instances);
+             * - a backstop for pathological polymorphic recursion. A call
+             * moving to its new key (#78) is not new polymorphism: left
+             * on its old instance it would hold the wrong type. */
+            if (!rekey) {
+                if (tmpl_inst_count[tmpl] >= g_tmpl_max_instances) {
+                    if (tmpl_cap_warned.insert(tmpl).second
+                            && tmpl->decl->id) {
+                        auto nm = tmpl->decl->id->get_str();
+                        fprintf(stderr,
+                                "warning: template '%.*s' exceeded %d "
+                                "instantiations; further calls run "
+                                "dynamically\n",
+                                static_cast<int>(nm.size()), nm.data(),
+                                g_tmpl_max_instances);
+                    }
+                    continue;
                 }
-                continue;
             }
             FuncDeclStmt *clone = make_template_clone(tmpl, key, rootBlock);
             clone_name = clone->id->uid;
@@ -1957,6 +2012,8 @@ bool Inferencer::instantiate_round(Block *rootBlock)
                 clone_sym = (gs != global->syms.end()) ? gs->second : nullptr;
             }
             tmpl_inst_count[tmpl]++;
+            ML_CHECK(func_of_decl.count(clone));
+            inst_of[func_of_decl[clone]].open = open_sig;
         }
 
         if (!clone_sym)
@@ -2002,13 +2059,64 @@ bool Inferencer::instantiate_round(Block *rootBlock)
          * (mark_lambda_templates: var-bound, calls-only). */
         if (!tmpl->decl->id) {
             ML_CHECK(ctag(call->what.get()) == ConstructType::id);
-            what->bind_guard.reset(
-                static_cast<Identifier *>(call->what.release()));
+            auto *old = static_cast<Identifier *>(call->what.get());
+            /* a re-keyed call's callee is the old instance, which holds
+             * the variable read already */
+            if (rekey)
+                what->bind_guard = std::move(old->bind_guard);
+            else
+                what->bind_guard.reset(
+                    static_cast<Identifier *>(call->what.release()));
         }
         call->what = std::move(what);
         progress = true;
+        rekeyed = rekeyed || rekey;
     }
     return progress;
+}
+
+/*
+ * #78: an instance no live code reaches any more - every call that was
+ * redirected to it moved to another key - is set aside as an
+ * un-instantiated template is: not inferred, not checked, not compiled
+ * (the #149 closure marks it is_template_base), since a body that was
+ * written as a template does not type-check with unconstrained
+ * parameters. "Live" is a fixpoint: the program outside the instances,
+ * then the body of each instance it reaches (an Identifier bound to the
+ * instance - a call's callee or a value use). A call that moves back to
+ * the key revives it (instantiate_round). Only the instances in THIS
+ * root: a prior REPL input's are committed.
+ */
+void Inferencer::mark_orphan_instances(Block *root)
+{
+    std::unordered_set<FuncInfo *> here, live;
+    std::vector<Construct *> work;
+    for (auto &e : root->elems) {
+        FuncInfo *f = nullptr;
+        if (ctag(e.get()) == ConstructType::func_decl)
+            f = func_of_decl[static_cast<FuncDeclStmt *>(e.get())];
+        if (inst_of.count(f))
+            here.insert(f);
+        else
+            work.push_back(e.get());
+    }
+    const std::function<void(Construct *)> scan = [&](Construct *n) {
+        if (!n)
+            return;
+        if (ctag(n) == ConstructType::id) {
+            FuncInfo *f = callee_funcinfo(n);
+            if (here.count(f) && live.insert(f).second)
+                work.push_back(f->decl->body.get());
+        }
+        for_each_child(n, [&](Construct *c) { scan(c); });
+    };
+    while (!work.empty()) {
+        Construct *n = work.back();
+        work.pop_back();
+        scan(n);
+    }
+    for (FuncInfo *f : here)
+        f->is_template = !live.count(f);
 }
 
 
@@ -2721,6 +2829,9 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
             if (gs != global->syms.end() && gs->second && gs->second->func) {
                 clone_name = itc->second;
                 clone_sym = gs->second;
+                /* #78: live again if a re-key had set it aside */
+                ML_CHECK(inst_of.count(gs->second->func));
+                gs->second->func->is_template = false;
             }
         }
         if (!clone_sym) {
@@ -2901,6 +3012,7 @@ void Inferencer::infer_one(Block *rootBlock)
     closure_site_inst.clear();
     closure_site_barred.clear();
     base_dyn_lvals.clear();
+    rekeyed = false;                            /* #78 */
     closure_loop_done = false;
     mark_closure_templates(rootBlock);          /* rule 8.2 */
     run_fixpoint(rootBlock);
@@ -2934,6 +3046,9 @@ void Inferencer::infer_one(Block *rootBlock)
             }
             if (!p1 && !p2 && !p3)
                 break;
+            /* #78: a call that moved may have left an instance unused */
+            if (rekeyed)
+                mark_orphan_instances(rootBlock);
             run_fixpoint(rootBlock);
         }
     };
@@ -2989,6 +3104,35 @@ void Inferencer::infer_one(Block *rootBlock)
     if (has_closure_tmpls) {
         run_fixpoint(rootBlock);
         instantiate_to_fixpoint();
+    }
+
+    /*
+     * #78: an instance a re-key left with no live use leaves the program
+     * - it would still be bound, and listed by specializations() - and
+     * its cache entry with it, so the key makes a fresh instance should a
+     * later input ask for it. Retired, not freed: id_sym / func_of_decl
+     * still name its nodes.
+     */
+    if (rekeyed) {
+        auto &el = rootBlock->elems;
+        for (size_t i = 0; i < el.size();) {
+            FuncInfo *f = nullptr;
+            if (ctag(el[i].get()) == ConstructType::func_decl)
+                f = func_of_decl[static_cast<FuncDeclStmt *>(el[i].get())];
+            if (!inst_of.count(f) || !f->is_template) {
+                i++;
+                continue;
+            }
+            const UniqueId *nm = f->decl->id->uid;
+            for (auto c = tmpl_cache.begin(); c != tmpl_cache.end();)
+                c = c->second == nm ? tmpl_cache.erase(c) : std::next(c);
+            /* (an instance is declared in the global scope) */
+            auto gs = global->syms.find(nm);
+            ML_CHECK(gs != global->syms.end() && gs->second->func == f);
+            global->syms.erase(gs);
+            retired.push_back(std::move(el[i]));
+            el.erase(el.begin() + static_cast<std::ptrdiff_t>(i));
+        }
     }
 
     /*

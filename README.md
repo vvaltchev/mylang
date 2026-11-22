@@ -1492,7 +1492,10 @@ Key rules:
     instead it is **instantiated per call-site signature**, and each instance is
     type-checked + compiled separately. So `sq` above works for `int`, and would
     *independently* work for `float` — calling a template with two different
-    argument types is **not a conflict**, it makes two instances. A
+    argument types is **not a conflict**, it makes two instances. A call's
+    signature is its arguments' types as the whole program types them:
+    `f(gv)`, with a global `gv` some later statement assigns a `float`, calls
+    the `float` instance, and `f(3)` keeps the `int` one. A
     never-called template is not type-checked at all (so a generic helper you
     haven't used yet never errors). Consequently an un-annotated parameter
     **never requires `dyn`**: `func f(x){ var t = x + 1; return t; }` is fine
