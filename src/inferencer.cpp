@@ -704,6 +704,7 @@ private:
     bool compound_may_misfit(Op op, StaticTypeRef place, StaticTypeRef v);
     bool compound_store_checked(Expr14 *e);
     void stamp_fixed_numeric(Identifier *id, StaticTypeRef v);
+    void stamp_capture_decl_types();                    /* #86 */
     StaticTypeRef checked_type_of(Identifier *id);
     void check_builtin_store(CallExpr *call);
     std::vector<TypeSym *> *known_params(CallExpr *call);
@@ -3165,6 +3166,33 @@ void Inferencer::check_opt_struct_fields()
             "fields");
 }
 
+/*
+ * A CAPTURE stores into the closure's copy of the variable, and that copy
+ * has the variable's type: carry the declaration's decl_type to each
+ * capture-list name, which the resolver's capture scope hands to every
+ * use in the closure's body. A dyn stored there used to land unconverted
+ * - `var cnt = 0; func [cnt] (dyn x) { cnt = cnt + x; ... }` given 2.5
+ * left a float in an `int` slot: the JIT printed its bits as an int, the
+ * VM aborted, the tree-walker threw (RULE 1). (A top-level closure's body
+ * is resolved before its capture list, so the resolver cannot do this
+ * itself.) Name resolution only, so it runs under -nti too (#86: an
+ * `int a` captured and given 2.5 held the float there).
+ */
+void Inferencer::stamp_capture_decl_types()
+{
+    for (auto &up : all_funcs) {
+        FuncDeclStmt *fd = up->decl;
+        if (!fd || !fd->captures || up->pinned)
+            continue;
+        for (auto &cap : fd->captures->elems) {
+            auto it = id_sym.find(cap.get());
+            const TypeSym *o = it != id_sym.end() ? it->second : nullptr;
+            if (o && o->decl_id && cap->decl_type == DeclType::none)
+                cap->decl_type = o->decl_id->decl_type;
+        }
+    }
+}
+
 void Inferencer::infer_one(Block *rootBlock)
 {
     hoist_globals(rootBlock);
@@ -3199,6 +3227,9 @@ void Inferencer::infer_one(Block *rootBlock)
          * the program. */
         for (auto &e : rootBlock->elems)
             stamp_untyped_calls(e.get());
+        /* (a declared variable's capture converts as it does with types:
+         * the stamp is name resolution only, #86) */
+        stamp_capture_decl_types();
         apply_late_folds(rootBlock);
         return;
     }
@@ -3627,28 +3658,7 @@ void Inferencer::infer_one(Block *rootBlock)
                 s->decl_id->decl_type = DeclType::f;
         }
     }
-    /*
-     * A CAPTURE stores into the closure's copy of the variable, and that
-     * copy has the variable's type: carry the declaration's decl_type to
-     * each capture-list name, which the resolver's capture scope hands
-     * to every use in the closure's body. A dyn stored there used to
-     * land unconverted - `var cnt = 0; func [cnt] (dyn x) { cnt = cnt +
-     * x; ... }` given 2.5 left a float in an `int` slot: the JIT printed
-     * its bits as an int, the VM aborted, the tree-walker threw (RULE 1).
-     * (A top-level closure's body is resolved before its capture list,
-     * so the resolver cannot do this itself.)
-     */
-    for (auto &up : all_funcs) {
-        FuncDeclStmt *fd = up->decl;
-        if (!fd || !fd->captures || up->pinned)
-            continue;
-        for (auto &cap : fd->captures->elems) {
-            auto it = id_sym.find(cap.get());
-            const TypeSym *o = it != id_sym.end() ? it->second : nullptr;
-            if (o && o->decl_id && cap->decl_type == DeclType::none)
-                cap->decl_type = o->decl_id->decl_type;
-        }
-    }
+    stamp_capture_decl_types();     /* (after the coerces_dyn stamp) */
     for (auto &up : all_funcs) {
         /*
          * An Unknown return means the function has return statement(s) whose

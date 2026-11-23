@@ -33,6 +33,16 @@ try { g(runtime(0.5)); } catch (TypeErrorEx) { refused2 = true; }
 if (typed)
     want("at the top level", refused2, true);
 
+# ---- a DECLARED int captured refuses a float with no types too (#86:
+# under -nti only the inferencer's stamp gave the capture its type, and
+# that stamp did not run)
+int di = 1;
+var dg = func [di] (dyn x) { di = x; return di; };
+var refused3 = false;
+try { dg(runtime(2.5)); } catch (TypeErrorEx) { refused3 = true; }
+want("a float into a captured declared int", refused3, true);
+want("an int into it", dg(runtime(4)), 4);
+
 # ---- a captured float converts an int
 var t = 0.5;
 var h = func [t] (dyn x) { t = x; return t; };
