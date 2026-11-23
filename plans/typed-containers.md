@@ -270,3 +270,24 @@ Not done here - the static half: `array<int> a = q` with `q` an
 carries `array<dyn>`). Refusing it at compile time changes
 `static_type_elem_compat`, which every assignability question asks; its
 blast radius is to be measured first.
+
+## 10. A type known in part (#80, 2026-11-23)
+
+Decided by the maintainer: "if the dict type is known, `d` should have a
+fixed type and `e["k"] = "s"` should fail at run time with a type error"
+(`var d = dict(0); var dyn e = d;`). Until then section 6's rule made
+any container with an unfilled component untyped, so `dict(0)` - a
+`dict<dyn,int>` whose key nothing decided - took a string among its int
+values through `dyn`, and only the next typed read failed.
+
+Now the container carries the part that is known: the unfilled
+component is marked (`DeclType::none` in its ctype, `annot_unfilled`),
+the known part is checked as any container's is, and the unknown part
+takes anything until the container first enters a typed place, where
+what it holds is checked and the part takes the place's type
+(`annot_merge`). A container whose own components are ALL unfilled is
+still untyped - nothing would be checked - and so is one whose type
+nests deeper than an image can store (`ANNOT_MAX_DEPTH`, the loader's
+limit: a recursive `a = [a]` is typed about a thousand levels deep). `.myv` v48 (the encoding is
+unchanged; a v47 binary would read the marker as a check refusing
+`none`).

@@ -2991,12 +2991,18 @@ static void const_values_widen(EvalValue *vals, size_t n, size_t stride,
  * its static type names - one under a `dyn` element stays untyped, as a
  * literal nested there is in -nc's tree, stamp_literal_coerce: only `dyn`
  * reaches it, and it keeps the storage its own values gave it).
+ * A container whose type has an unfilled part (#80) is typed too: it
+ * takes `t` where that part is (annot_merge) - a stamp refines it.
  */
 bool ctype_names(const TypeAnnot *t) noexcept
 {
+    /* (#80: a type whose own components are all unfilled names nothing -
+     * such a container stays untyped) */
     return t && (t->kind == DeclType::arr
-                 ? t->elem != nullptr
-                 : t->kind == DeclType::dict && t->key != nullptr);
+                 ? t->elem != nullptr && !annot_unfilled(t->elem.get())
+                 : t->kind == DeclType::dict && t->key != nullptr
+                   && !(annot_unfilled(t->key.get())
+                        && annot_unfilled(t->val.get())));
 }
 
 static void stamp_ctype_rec(const EvalValue &v, const TypeAnnot *t,
@@ -3010,9 +3016,12 @@ static void stamp_ctype_rec(const EvalValue &v, const TypeAnnot *t,
     };
     if (v.is<SharedArrayObj>()) {
         const SharedArrayObj &a = v.get_ref<SharedArrayObj>();
-        if (a.ctype() || a.is_readonly() || a.slice
+        const TypeAnnot *cur = a.ctype();
+        if ((cur && !annot_partial(cur)) || a.is_readonly() || a.slice
                 || t->kind != DeclType::arr)
             return;
+        if (cur)
+            t = annot_merge(cur, t);
         const_cast<SharedArrayObj &>(a).set_ctype(t);
         /* only general storage can hold a container */
         if (mode == 0 || a.skind() != SharedArrayObj::Storage::general)
@@ -3024,8 +3033,12 @@ static void stamp_ctype_rec(const EvalValue &v, const TypeAnnot *t,
     }
     if (v.is<intrusive_ptr<DictObject>>()) {
         DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
-        if (d.ctype() || d.is_readonly() || t->kind != DeclType::dict)
+        const TypeAnnot *cur = d.ctype();
+        if ((cur && !annot_partial(cur)) || d.is_readonly()
+                || t->kind != DeclType::dict)
             return;
+        if (cur)
+            t = annot_merge(cur, t);
         d.set_ctype(t);
         if (mode == 0)
             return;

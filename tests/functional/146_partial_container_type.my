@@ -1,0 +1,82 @@
+# #80 (maintainer, 2026-11-23): a container whose type is known only IN
+# PART carries the part that is known. `dict(0)` - a default dict nothing
+# stores into by key - is a dict<dyn,int> whose key type nothing decided;
+# it used to carry NO type at all, so a store through a `dyn` name put a
+# string among its int values unchecked, and the next typed read of it
+# failed far from the store. The known part is checked now; the unknown
+# part takes anything until the container first enters a typed place,
+# which checks what it holds there and fixes that part from then on.
+# A refusal leaves the container as it was. Under -nti no store is
+# checked (README), so those halves are gated on `typed`.
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+func refused(dyn f) {
+    try { f(); } catch (TypeErrorEx) { return true; }
+    return false;
+}
+
+# ---- the known part (the int values) is checked
+var d = dict(0);
+var dyn e = d;
+if (typed) {
+    want("a str value", refused(func [e] () { e["k"] = "s"; }), true);
+    want("a float value", refused(func [e] () { e["k"] = 2.5; }), true);
+    want("the dict is unchanged", len(d), 0);
+}
+# ---- the unknown part (the keys) takes anything, and so does a key read
+e[1] = 5;
+e["k"] = 7;
+want("both keys stored", len(d), 2);
+want("an int value reads as an int", d["k"] + 1, 8);
+want("the default", d["nope"] + 0, 0);
+
+# ---- entering a typed place checks what the unknown part holds...
+func takes(dict<str, int> m) => len(m);
+var d2 = dict(0);
+var dyn e2 = d2;
+e2["a"] = 1;
+want("a fitting dict enters", takes(e2), 1);
+# ...and fixes it from then on
+if (typed)
+    want("an int key after entry",
+         refused(func [e2] () { e2[5] = 2; }), true);
+var d3 = dict(0);
+var dyn e3 = d3;
+e3[3] = 1;
+if (typed)
+    want("an int key does not enter",
+         refused(func [e3] () { takes(e3); }), true);
+
+# ---- nested: an array whose elements are arrays nothing filled
+var rows = [[]];
+var dyn r = rows;
+if (typed)
+    want("a non-array element", refused(func [r] () { r[0] = 5; }), true);
+r[0] = ["s"];
+want("any array goes in", len(rows[0]), 1);
+func sizes(array<array<int>> m) => len(m);
+if (typed)
+    want("a str row does not enter",
+         refused(func [r] () { sizes(r); }), true);
+r[0] = [7];
+want("an int row enters", sizes(r), 1);
+if (typed)
+    want("a str row after entry",
+         refused(func [r] () { r[0] = ["t"]; }), true);
+
+# ---- array(n) of arrays fills with fresh empty arrays (README, array()):
+# the element type is known even though nothing filled ITS element (with
+# inference off, -nti, nothing decides it: none)
+var z = array(3);
+z[0] = [];
+if (typed)
+    want("a zero element", len(z[1]), 0);
+
+assert(bad == 0);

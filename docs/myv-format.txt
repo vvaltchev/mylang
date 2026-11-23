@@ -2,8 +2,13 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 47.  This document describes the on-disk image exhaustively:
+Format version 48.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v48 changes no encoding: a container's own type (2.3) may now carry a
+component of kind `none` - a part of its static type nothing filled (#80:
+`dict(0)`'s key) - which a v47 binary would read as a check refusing
+`none` instead of a part that takes anything; see 2.3.)
 
 (v47 changes no encoding: one opcode was APPENDED - InstanceSelectV, the
 callee of a call site a closure template's instance serves (rule 8.2,
@@ -502,7 +507,13 @@ array's, a MakeArrayV's, a MapFilterV's) or `dict` (a dict's, a MakeDictV's)
 - either for a builtin call's, which may build one or the other - and its
 top-level `opt` must be false; the reader refuses anything else ("corrupt
 .myv (container type)" / "(ctype)").  The loader interns it, so two equal
-types are one object.
+types are one object.  (v48: a component of kind `none` is UNFILLED - a
+part of the container's static type nothing decided, such as the key of
+`dict(0)`.  It takes any value, `none` included, until the container first
+enters a typed place, where what that part holds is checked and the part
+takes the place's type.  The compiler never writes a ctype whose own
+components - an array's element, a dict's key AND value - are all
+unfilled: such a container is written untyped.)
 
 --------------------------------------------------------------------------------
 3.  TOP-LEVEL LAYOUT

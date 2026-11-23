@@ -670,7 +670,7 @@ static void write_annot(Writer &w, const TypeAnnot *a)
     }
 }
 
-static constexpr int MYV_ANNOT_MAX_DEPTH = 256;
+static constexpr int MYV_ANNOT_MAX_DEPTH = ANNOT_MAX_DEPTH;
 
 static std::shared_ptr<TypeAnnot> read_annot(Reader &r, int depth)
 {

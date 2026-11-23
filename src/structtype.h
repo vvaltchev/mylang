@@ -57,6 +57,11 @@ enum class DeclType : unsigned char;
      shared
  * (a clone shares the same node).
  */
+/* the deepest annotation an image stores (serialize.cpp's reader refuses
+ * a deeper one) - and so the deepest type a container carries as its own
+ * (ctype_of: #80) */
+constexpr int ANNOT_MAX_DEPTH = 256;
+
 struct TypeAnnot {
     DeclType kind;
     bool opt = false;
@@ -89,6 +94,14 @@ const TypeAnnot *annot_array_of_dyn();
 const TypeAnnot *annot_array_of_struct(const StructTypeDef *d);
 /* the interned array<str> (argv's) */
 const TypeAnnot *annot_str_array();
+/* #80: a part of a container's own type that nothing filled (kind
+ * `none`: question 9's unfilled component) - it takes anything until the
+ * container enters a typed place, which fills it (types/fit.cpp.h) */
+bool annot_unfilled(const TypeAnnot *t) noexcept;
+/* ...has `t` such a part anywhere? */
+bool annot_partial(const TypeAnnot *t) noexcept;
+/* `c` with its unfilled parts taken from `p` (and `p`'s left `c`'s) */
+const TypeAnnot *annot_merge(const TypeAnnot *c, const TypeAnnot *p);
 /* how a type reads in a message ("array<int>"); "untyped" for null */
 std::string annot_text(const TypeAnnot *a);
 /* ...written as a TYPE (`int?`, `array<int>?`), where annot_text writes

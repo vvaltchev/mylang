@@ -1894,7 +1894,15 @@ slot = "now a string";           # ok, because it's dyn
     neither does one whose type nothing gave it (`[]` that nothing
     filled, or one written where only a `dyn` was known - a literal
     written inside a dynamic one: in `var dyn d = [[1, none]];` the row
-    takes a string too). A COPY has its source's type, wherever it is
+    takes a string too). A container whose type is known only IN PART
+    carries the part that is known: `dict(0)`, a default dict nothing
+    stores into by key, is a `dict<dyn,int>` whose key type nothing
+    decided, so through `var dyn e = dict(0);` the store `e["k"] = "s"`
+    is refused (its values are `int`) while `e[1] = 5` and `e["k"] = 7`
+    are both stored; likewise an `[[]]` that nothing fills refuses a
+    `5` (its elements are arrays) and takes any array. The unknown part
+    takes its type where the container first enters a typed place
+    (below). A COPY has its source's type, wherever it is
     written: `clone()`, `reverse()`, `sort()` and `rev_sort()` give an
     array of their argument's type, so `var dyn c = clone([1, none]);`
     (an `array<int?>`) refuses a string. Its STORAGE
@@ -1926,7 +1934,9 @@ slot = "now a string";           # ok, because it's dyn
     carries no type - one only a `dyn` reaches, such as an element of an
     `array<dyn>` - is checked by what it holds and then TAKES the
     place's type, so the place's type stays true however the container
-    is reached afterwards. A constant's container cannot change: it is
+    is reached afterwards; so is the unknown part of one whose type is
+    known in part (`dict(0)` above entering a `dict<str,int>` parameter
+    is checked key by key, and refuses an `int` key from then on). A constant's container cannot change: it is
     checked by what it holds, and takes no type. A container the runtime
     builds carries its type too: `argv` is an `array<str>` and
     `layout(S).fields` an `array<StructField>`, so a store of an `int`

@@ -7698,6 +7698,26 @@ per level of a deep value - a separate open item.
   `dyn` alias then writes past the place's type. `fit_needed` counts an
   UNFILLED component (`[]` nothing wrote) for the same reason: that
   container is untyped, and the check is where it takes its type.
+  **⛔ #80: A TYPE KNOWN IN PART IS CARRIED IN PART (maintainer,
+  2026-11-23).** A container with ANY unfilled component used to be made
+  untyped, so `var d = dict(0); var dyn e = d; e["k"] = "s";` put a
+  string among the int values of a `dict<dyn,int>` unchecked (RULE 1).
+  `ctype_of` now marks each unfilled component with the `none` kind
+  (`fit_annot_of(t, marks)`; `annot_unfilled`, `annot_partial`) and
+  returns null only when the container's OWN components are all
+  unfilled (`ctype_names` agrees, so no stamp makes such a type), or
+  when the type nests deeper than an image can store (`ANNOT_MAX_DEPTH`:
+  `var a = []; ... a = [a];` is typed ~1000 levels deep, an unfilled
+  part at the bottom - driver_checks' image round trip refused it). An
+  unfilled part takes anything (`fits`, `fits_elems`, `ct_exact` treat
+  it as a wildcard, on either side); a container with one enters a typed
+  place by its filled parts AND by what it holds (`fits` walks it like
+  an untyped one), and `fit_adopt` / `stamp_ctype_rec` MERGE the place's
+  type into it (`annot_merge`, which keeps the parts the place leaves
+  unfilled) - a stamp refines a partial type, never replaces a full one.
+  A side effect the README already promised: `array(n)` of an
+  `array<array<none>>` fills with `[]`, where it filled with `none`.
+  `.myv` v48. `tests/functional/146_partial_container_type.my`.
   `tests/functional/126_container_entry.my`.
   **⛔ RULE 1 (strict-container-types.md increment 3): THE STATIC SIDE IS
   EXACT TOO.** `static_type_elem_compat` (statictype.cpp) matches a

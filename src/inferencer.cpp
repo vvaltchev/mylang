@@ -4833,12 +4833,36 @@ static bool fit_needed(StaticTypeRef v, StaticTypeRef p, bool top = true)
     }
 }
 
+/* Q2, #80: is a component of a container's static type unfilled (`none`,
+ * question 9) or not yet known? */
+static bool comp_unfilled(StaticTypeRef t)
+{
+    t = static_type_resolve(t);
+    return t->kind == StaticTypeKind::None
+           || t->kind == StaticTypeKind::Unknown;
+}
+
+/* #80: how many levels a static type nests (a scalar is one) */
+static int static_type_depth(StaticTypeRef t)
+{
+    t = static_type_resolve(t);
+    if (t->kind == StaticTypeKind::Array || t->kind == StaticTypeKind::Box)
+        return 1 + static_type_depth(t->elem);
+    if (t->kind == StaticTypeKind::Dict)
+        return 1 + std::max(static_type_depth(t->key),
+                            static_type_depth(t->val));
+    return 1;
+}
+
 /*
  * #49: a static type as the run-time annotation value_fits checks a value
  * against. `dyn` (and anything value_fits has no rule for - a function,
  * an exception) checks nothing; so does a box's unknown element (null).
+ * `marks` (a container's own type, ctype_of): an unfilled component is
+ * the `none` kind (#80, annot_unfilled), not a `dyn`.
  */
-static std::shared_ptr<TypeAnnot> fit_annot_of(StaticTypeRef t)
+static std::shared_ptr<TypeAnnot> fit_annot_of(StaticTypeRef t,
+                                               bool marks = false)
 {
     auto a = std::make_shared<TypeAnnot>();
     a->kind = DeclType::dyn;
@@ -4855,12 +4879,12 @@ static std::shared_ptr<TypeAnnot> fit_annot_of(StaticTypeRef t)
     case StaticTypeKind::Str:   a->kind = DeclType::s; break;
     case StaticTypeKind::Array:
         a->kind = DeclType::arr;
-        a->elem = fit_annot_of(t->elem);
+        a->elem = fit_annot_of(t->elem, marks);
         break;
     case StaticTypeKind::Dict:
         a->kind = DeclType::dict;
-        a->key = fit_annot_of(t->key);
-        a->val = fit_annot_of(t->val);
+        a->key = fit_annot_of(t->key, marks);
+        a->val = fit_annot_of(t->val, marks);
         break;
     case StaticTypeKind::Struct:
         a->kind = DeclType::strct;
@@ -4876,6 +4900,8 @@ static std::shared_ptr<TypeAnnot> fit_annot_of(StaticTypeRef t)
         break;          /* dyn? takes anything, dyn all but none (rule 3) */
     default:
         a->opt = false;                 /* no check */
+        if (marks && comp_unfilled(t))
+            a->kind = DeclType::none;
         break;
     }
     return a;
@@ -5739,27 +5765,15 @@ static StaticTypeRef elem_place_of(StaticTypeRef c)
     return nullptr;
 }
 
-/* Q2: is a component of `t` unfilled (`none`) or not yet known? Such a
- * container is made UNTYPED: its first typed place gives it its type. */
-static bool ctype_unfilled(StaticTypeRef t)
-{
-    t = static_type_resolve(t);
-    if (t->kind == StaticTypeKind::None
-           || t->kind == StaticTypeKind::Unknown)
-        return true;
-    if (t->kind == StaticTypeKind::Array || t->kind == StaticTypeKind::Box)
-        return ctype_unfilled(t->elem);
-    if (t->kind == StaticTypeKind::Dict)
-        return ctype_unfilled(t->key) || ctype_unfilled(t->val);
-    return false;
-}
-
 /*
  * Q2 (plans/typed-containers.md): the type a container is MADE with, when
  * it is built for the static type `t` - an interned array<T> / dict<K,
  * V>, its top-level opt cleared; array<dyn> / dict<dyn, dyn> (DYNAMIC) for
- * a `dyn` place; null (untyped) when `t` is no such container or has a
- * component nothing filled.
+ * a `dyn` place; null (untyped) when `t` is no such container or its own
+ * components are all unfilled (question 9: its first typed place gives it
+ * its type). A part nothing filled is marked (#80, annot_unfilled): the
+ * parts the program typed are checked - `dict(0)`'s int values - and the
+ * rest takes its type where the container first lands in a typed place.
  */
 const TypeAnnot *Inferencer::ctype_of(StaticTypeRef t, bool dict)
 {
@@ -5768,10 +5782,19 @@ const TypeAnnot *Inferencer::ctype_of(StaticTypeRef t, bool dict)
     ML_CHECK(t);
     if (t->kind == StaticTypeKind::Dyn)
         return dict ? annot_dyn_dict() : annot_dyn_array();
-    if (t->kind != (dict ? StaticTypeKind::Dict : StaticTypeKind::Array)
-            || ctype_unfilled(t))
+    if (t->kind != (dict ? StaticTypeKind::Dict : StaticTypeKind::Array))
         return nullptr;
-    std::shared_ptr<TypeAnnot> a = fit_annot_of(t);
+    if (dict ? comp_unfilled(t->key) && comp_unfilled(t->val)
+             : comp_unfilled(t->elem))
+        return nullptr;
+    /* a type deeper than an image can store is no container's own: the
+     * recursive `var a = []; ... a = [a];` is typed some thousand levels
+     * deep, cut off with an unfilled part at the bottom - it was untyped
+     * before #80 marked that part, and it stays so (a check that deep
+     * buys nothing, and the image's reader would refuse it) */
+    if (static_type_depth(t) > ANNOT_MAX_DEPTH)
+        return nullptr;
+    std::shared_ptr<TypeAnnot> a = fit_annot_of(t, true);
     a->opt = false;
     return annot_intern(*a);
 }

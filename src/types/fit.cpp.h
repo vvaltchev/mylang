@@ -167,6 +167,42 @@ const TypeAnnot *annot_str_array()
                                      nullptr, nullptr});
 }
 
+/*
+ * #80: an UNFILLED part of a container's own type - a part of its static
+ * type nothing filled (question 9: `dict(0)`'s key), kind `none`. The
+ * rest of the type is checked as any container's is; this part takes
+ * whatever a store through `dyn` puts there, and is filled when the
+ * container first enters a typed place (fits: what it holds is checked;
+ * fit_adopt: it takes the place's type there, annot_merge). A container
+ * whose own components are ALL unfilled carries no type (ctype_names).
+ */
+bool annot_unfilled(const TypeAnnot *t) noexcept
+{
+    return t && t->kind == DeclType::none;
+}
+
+bool annot_partial(const TypeAnnot *t) noexcept
+{
+    return t && (t->kind == DeclType::none || annot_partial(t->elem.get())
+                 || annot_partial(t->key.get())
+                 || annot_partial(t->val.get()));
+}
+
+/* `c` (a container's type) with each unfilled part taken from `p` (the
+ * place it enters), and `p`'s unfilled parts left `c`'s: the place
+ * passed ct_enters, so every part both fill is the same */
+const TypeAnnot *annot_merge(const TypeAnnot *c, const TypeAnnot *p)
+{
+    if (!c || annot_unfilled(c))
+        return p;
+    if (!p || annot_unfilled(p))
+        return c;
+    return annot_intern_key(AnnotKey{
+        c->kind, c->opt, c->strct, annot_merge(c->elem.get(), p->elem.get()),
+        annot_merge(c->key.get(), p->key.get()),
+        annot_merge(c->val.get(), p->val.get())});
+}
+
 const TypeAnnot *annot_array_of_struct(const StructTypeDef *d)
 {
     const TypeAnnot *e = annot_intern_key(AnnotKey{DeclType::strct, false, d,
@@ -264,6 +300,11 @@ bool ct_exact(const TypeAnnot *c, const TypeAnnot *p)
     };
     if (c == p || (is_dyn(c) && is_dyn(p)))
         return true;
+    /* #80: an unfilled part - of the container's type (what it holds is
+     * checked instead: fits), or of a store's place inside such a type
+     * (it takes what is put there) */
+    if (annot_unfilled(c) || annot_unfilled(p))
+        return true;
     /* (a ctype the compiler makes names every component - a cast needs
      * a complete type - so only an image's can lack one) */
     if (!c)                             /* INT-COV-EXEMPT: an image */
@@ -307,7 +348,8 @@ bool fits_elems(const SharedArrayObj &arr, const TypeAnnot *ea, FitWalk &w,
 {
     using St = SharedArrayObj::Storage;
     const size_type n = arr.size();
-    if (!ea || n == 0)
+    /* (an unfilled element, #80, takes anything) */
+    if (!ea || n == 0 || annot_unfilled(ea))
         return true;
     /* a `dyn` element takes anything but none (rule 3): only a general
      * or a class array can hold one */
@@ -409,9 +451,10 @@ bool fits_dict(const DictObject &d, const TypeAnnot *ka,
 bool fits(const EvalValue &v, const TypeAnnot *a, FitWalk &w,
           FitMisfit &why)
 {
-    /* a `dyn` takes anything but none, unless it is a `dyn?` (rule 3) */
+    /* a `dyn` takes anything but none, unless it is a `dyn?` (rule 3);
+     * an unfilled part (#80) takes anything */
     if (v.is<NoneVal>()) {
-        if (a->opt)
+        if (a->opt || annot_unfilled(a))
             return true;
         return fit_miss(v, why);
     }
@@ -450,9 +493,12 @@ bool fits(const EvalValue &v, const TypeAnnot *a, FitWalk &w,
         const SharedArrayObj &arr = v.get_ref<SharedArrayObj>();
         const TypeAnnot *ct = arr.ctype();
         if (ct && !arr.is_readonly()) {
-            if (ct_enters(ct, a))
+            if (!ct_enters(ct, a))
+                return ct_miss(ct, why);
+            /* #80: a type with an unfilled part enters by the parts it
+             * fills, and the rest by what it holds */
+            if (!annot_partial(ct))
                 return true;
-            return ct_miss(ct, why);
         }
         return fits_elems(arr, a->elem.get(), w, why);
     }
@@ -462,13 +508,14 @@ bool fits(const EvalValue &v, const TypeAnnot *a, FitWalk &w,
         const DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
         const TypeAnnot *ct = d.ctype();
         if (ct && !d.is_readonly()) {
-            if (ct_enters(ct, a))
+            if (!ct_enters(ct, a))
+                return ct_miss(ct, why);
+            if (!annot_partial(ct))     /* (#80, as an array's) */
                 return true;
-            return ct_miss(ct, why);
         }
         return fits_dict(d, a->key.get(), a->val.get(), w, why);
     }
-    default:                /* `none`: an image's annotation, no check */
+    default:        /* `none`: unfilled (#80), or an image's: no check */
         return true;
     }
     if (ok)
@@ -532,7 +579,8 @@ bool value_fits(const EvalValue &v, const TypeAnnot &a, FitMisfit &why)
  * Q2 increment 3: an UNTYPED mutable container that fits a place takes
  * the place's type, along the annotation (stamp_ctype: a container under
  * a `dyn` component stays untyped, a typed one keeps its own - it fit, so
- * it is the same). From then on a store through a `dyn` name is checked
+ * it is the same; one whose type has an unfilled part, #80, takes the
+ * place's there - annot_merge). From then on a store through `dyn` is checked
  * against it, so the place's type stays true however the container is
  * reached. A read-only one (a constant's) takes none: no store changes it.
  * Under -nti nothing takes a type (g_ctype_adopt).
@@ -549,13 +597,20 @@ bool g_ctype_adopt = true;
  * The value fits `t` (fit_adopt runs after the fit), so its kind is the
  * type's.
  */
+/* #80: may a container whose type is `ct` still take one - it has none,
+ * or a part of it is unfilled? */
+static bool ct_open(const TypeAnnot *ct)
+{
+    return !ct || annot_partial(ct);
+}
+
 void adopt_detach(const EvalValue &v, const TypeAnnot *t)
 {
     if (!ctype_names(t))
         return;
     if (v.is<SharedArrayObj>()) {
         auto &a = const_cast<SharedArrayObj &>(v.get_ref<SharedArrayObj>());
-        if (a.ctype() || a.is_readonly())
+        if (!ct_open(a.ctype()) || a.is_readonly())
             return;
         a.materialize_slice();
         a.clone_all_slices();
@@ -568,7 +623,7 @@ void adopt_detach(const EvalValue &v, const TypeAnnot *t)
     }
     if (v.is<intrusive_ptr<DictObject>>()) {
         const DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
-        if (d.ctype() || d.is_readonly())
+        if (!ct_open(d.ctype()) || d.is_readonly())
             return;
         for (const auto &kv : d.get_ref())
             adopt_detach(kv.second.get(), t->val.get());
@@ -583,11 +638,11 @@ void fit_adopt(const EvalValue &v, const TypeAnnot &a)
         return;
     if (v.is<SharedArrayObj>()) {
         const SharedArrayObj &arr = v.get_ref<SharedArrayObj>();
-        if (arr.ctype() || arr.is_readonly())
+        if (!ct_open(arr.ctype()) || arr.is_readonly())
             return;
     } else if (v.is<intrusive_ptr<DictObject>>()) {
         const DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
-        if (d.ctype() || d.is_readonly())
+        if (!ct_open(d.ctype()) || d.is_readonly())
             return;
     } else {
         return;                 /* none, into an `opt` place */
@@ -756,7 +811,8 @@ bool annot_zero_value(const TypeAnnot *a, EvalValue *out, int depth)
         const StructTypeDef *sd = nullptr;
         const ArrHint h = annot_arr_hint(a, sd);
         EvalValue v = build_array_from_values(nullptr, 0, h, sd, false);
-        if (a->elem)
+        /* (a type whose components are all unfilled names none, #80) */
+        if (ctype_names(a))
             const_cast<SharedArrayObj &>(v.get_ref<SharedArrayObj>())
                 .set_ctype(annot_nonopt(annot_intern(*a)));
         *out = std::move(v);
@@ -767,7 +823,7 @@ bool annot_zero_value(const TypeAnnot *a, EvalValue *out, int depth)
             return true;
         auto d = make_intrusive<DictObject>();
         /* (a dict annotation has both a key and a value, or neither) */
-        if (a->key)
+        if (ctype_names(a))
             d->set_ctype(annot_nonopt(annot_intern(*a)));
         *out = EvalValue(std::move(d));
         return true;
