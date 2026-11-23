@@ -10256,6 +10256,28 @@ static bool jit_slot_ref_listed(const Chunk &ck, int slot)
 }
 
 /*
+ * #82 (myv_fuzz fat-286): A LOADED IMAGE KEEPS NO REF-LISTED SLOT IN A
+ * REGISTER. A pinned value is written back raw - a scalar tag and a
+ * payload (flush_cache) - so whatever the slot's memory held is
+ * overwritten unreleased. Our own bytecode never meets that: inference
+ * proves a pinned slot holds its scalar wherever it is pinned, which is
+ * why 64 corpus programs pin a ref-listed slot (ref_slots is
+ * conservative) at no risk. An image's proofs are input: one mutated
+ * byte made a dict loop write its string key into a float accumulator
+ * the scan pinned from a later definition, and the write-back leaked
+ * the string. ref_slots is DERIVED at load, so a slot no op can put a
+ * reference in is not listed and may still be pinned; a listed one
+ * stays in memory, where every store releases what it replaces. The
+ * cost is an image's pins on such slots, never a compiled program's -
+ * which is also why an image's -vdj may differ from its source's.
+ * Asked while the IMAGE's tier is built (g_jit_image_pass, vm.h).
+ */
+static bool jit_pin_refused(const Chunk &ck, int slot)
+{
+    return g_jit_image_pass && jit_slot_ref_listed(ck, slot);
+}
+
+/*
  * ⛔ IT WRITES THE PAIR EVEN WHEN THIS SITE HAS NO INLINE CHAIN (-1 and a
  * null pool) - 2026-09-23. It used to return early, leaving whatever the
  * LAST writer stored, on the reasoning that every consumer claims (reads
@@ -19156,6 +19178,24 @@ pick_cached_slots(const Chunk &ck, size_t begin,
         }
     }
 
+    /* #82: a loaded image keeps no ref-listed slot in a register
+     * (jit_pin_refused) - the pins, the spill homes taken from `out`,
+     * and the type-elided slots, whose exits stamp a scalar tag too */
+    if (g_jit_image_pass) {
+        const auto drop = [&](std::vector<int> *v) {
+            if (v)
+                v->erase(std::remove_if(v->begin(), v->end(),
+                                        [&](int sl) {
+                                            return jit_pin_refused(ck, sl);
+                                        }),
+                         v->end());
+        };
+        drop(&out);
+        drop(fhot);
+        drop(typed_extra);
+        drop(typed_extra_f);
+    }
+
     /* AUDIT: a slot LOST to disqualification is one that is a resolved
      * local and used often enough to have cleared the threshold - i.e. it
      * would have been a candidate, and only bad() stopped it. Attribute it
@@ -20097,6 +20137,7 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                     && !ret_read && !spans_call
                     && !jit_slot_ref_listed(ck, l.slot);
             const bool cand = !forced && !fl && evid
+                    && !jit_pin_refused(ck, l.slot)        /* #82 */
                     && !(locals_only && temp && !temp_ok)
                     && slot_wint[l.slot] >= (temp_ok ? 2 : 3)
                     && nu(s, l.slot) < static_cast<int>(e2 - s);

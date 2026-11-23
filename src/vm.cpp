@@ -2789,8 +2789,15 @@ void vm_install_func_chunk(const FuncDescriptor *fdesc, Chunk &&ck)
  * recomputed rather than stored - no drift surface). Pass B jits every body
  * with a JitCtx rebuilt from the image (global slot -> descriptor by NAME,
  * plus the stored reassigned flags), then main. */
+bool g_jit_image_pass = false;
+
 void vm_jit_loaded_image(VmProgram &prog)
 {
+    struct ImagePass {
+        bool saved = g_jit_image_pass;
+        ImagePass() { g_jit_image_pass = true; }
+        ~ImagePass() { g_jit_image_pass = saved; }
+    } image_pass;                                   /* #82 */
     /*
      * Over THIS PROGRAM's chunks, not over `g_func_chunks`.
      *
@@ -2831,7 +2838,8 @@ void vm_jit_loaded_image(VmProgram &prog)
     /* the ONE driver (vm.h): a loaded image's main must emit the native
      * code a fresh compile's does - that is the whole point of re-running
      * the tier here, and it holds by construction only while both run
-     * the same function. */
+     * the same function. The one deliberate difference: an image keeps
+     * no ref-listed slot in a register (#82, g_jit_image_pass). */
     vm_jit_program(&prog.root, bodies, slot_desc,
                    prog.global_slot_reassigned);
 }

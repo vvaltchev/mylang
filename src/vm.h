@@ -434,6 +434,13 @@ struct VmProgram {
  * then jit each body with a JitCtx rebuilt from the image), so a loaded
  * program gets the IDENTICAL native tier a fresh compile does. */
 void vm_jit_loaded_image(VmProgram &prog);
+/* #82: true while vm_jit_loaded_image runs - the native tier is being
+ * built for bytecode read off a disk, whose type proofs are input. The
+ * one difference that makes (jit.cpp, jit_pin_refused): no ref-listed
+ * slot is kept in a register. Scoped to the pass, not to the process
+ * (g_untrusted_bytecode is never cleared): a program compiled after an
+ * image is loaded - the -rt harness does that - pins as it always did. */
+extern bool g_jit_image_pass;
 /* a loaded image's global slot -> descriptor map, by name: the one the
  * load's JIT builds and the image's -vd dump reads */
 std::vector<const FuncDescriptor *> vm_image_slot_desc(const VmProgram &prog);

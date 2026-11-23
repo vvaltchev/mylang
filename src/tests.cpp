@@ -40693,6 +40693,123 @@ static bool myv_wrong_typed_base()
  * so the test cannot pass on the interpreted twin: the loop is JIT'd from
  * the retargeted ops and the helper must have RUN.
  */
+/*
+ * #82 (myv_fuzz fat-286, CI seed 45084619030): ONE mutated byte made a
+ * dict loop write its string key into the slot of a float accumulator
+ * the JIT kept in a register from a later definition, and the register's
+ * write-back (a scalar tag and a payload, flush_cache) overwrote the
+ * string unreleased - LeakSanitizer at exit. A loaded image now keeps no
+ * ref-listed slot in a register (jit_pin_refused): the slot stays in
+ * memory, and the accumulator's next store releases the string.
+ *
+ * The same mutation, made in-process: the loop's key operand retargeted
+ * to `fs` BEFORE the image is written, so the loader derives ref_slots
+ * from the mutated code as it did for the finding. `refcount(key)` after
+ * the run tells a released key from a leaked one: the mutated image must
+ * print what the unmutated one prints. Watched failing with
+ * jit_pin_refused returning false (refcount 3 for 2).
+ */
+static bool myv_refpin_release()
+{
+#if !ML_JIT_SUPPORTED
+    return true;                     /* no register to keep a slot in */
+#else
+    if (!g_jit_enabled)
+        return true;
+    const char *lines_arr[] = {
+        "var key = str(runtime(7)) + \"q\";",     /* a string of its own */
+        "var d = {};",
+        "d[key] = 1;",
+        "var before = refcount(key);",
+        "var t = 0;",
+        "foreach (var k, v in d) { t = t + v; }",
+        /* the finding's shape: the accumulator's register life starts at
+         * its definition, AFTER the loop's (mutated) key write */
+        "var fl = [1.0, 2.0, 3.0];",
+        "var fs = 0.0;",
+        "foreach (var f in fl) { fs += sqrt(f); }",
+        "print(fs > 0.0, t, refcount(key) - before);" };
+    std::string src;
+    for (const char *l : lines_arr) {
+        if (!src.empty()) src += '\n';
+        src += l;
+    }
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-refpin.myv";
+
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    std::string out[2];
+    for (int mutate = 0; mutate < 2 && ok; mutate++) {
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::vector<Tok> toks;
+            lexer(src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+            if (mutate) {
+                int32_t fs = -1;
+                for (size_t i = 0; i < prog.root.slot_names.size(); i++)
+                    if (prog.root.slot_names[i] == "fs")
+                        fs = static_cast<int32_t>(i);
+                int patched = 0;
+                for (Instr &in : prog.root.code)
+                    if (in.op == OpCode::DictIterNext) {
+                        in.pa = fs;          /* the key <- `fs`'s slot */
+                        patched++;
+                    }
+                if (fs < 0 || patched != 1) {
+                    cout.rdbuf(old);
+                    fprintf(stderr, "myv-refpin: expected one dict loop "
+                                    "and a slot named fs (%d, %d) - the "
+                                    "shape changed\n", patched, fs);
+                    ok = false;
+                    break;
+                }
+            }
+            myv_write(prog, path, MyvSourceRef());
+            MyvSource ms;
+            VmProgram loaded = myv_read(path, ms);      /* jits it too */
+            vm_run(loaded);
+        } catch (Exception &e) {
+            cap << "threw " << e.name;
+        }
+        cout.rdbuf(old);
+        out[mutate] = cap.str();
+        remove(path.c_str());
+    }
+    /* the unmutated image must run (a program that stops compiling
+     * would "agree" with any expectation); the mutated one must leave
+     * the key's count where it found it - its key went to `fs`, whose
+     * next store released it, and `k` never held it */
+    if (ok && out[0].find("threw") != std::string::npos) {
+        fprintf(stderr, "myv-refpin: the unmutated image did not run: "
+                        "%s\n", out[0].c_str());
+        ok = false;
+    }
+    if (ok && out[1] != "true 1 0 \n") {
+        fprintf(stderr, "myv-refpin: the mutated image printed '%s', "
+                        "expected 'true 1 0' - the key leaked\n",
+                out[1].c_str());
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+#endif
+}
+
 static bool myv_struct_elem_base()
 {
 #if !ML_UNTRUSTED_CHECKS
@@ -63151,6 +63268,9 @@ static const std::vector<extra_check> extra_checks =
     { "myv: a whole-p struct bind on a corrupt BASE renders, never "
       "terminates (#142, fat-676)",
       myv_struct_elem_base },
+    { "myv: a loaded image keeps no ref-listed slot in a register - a "
+      "mutated key store is released, not overwritten (#82, fat-286)",
+      myv_refpin_release },
     { "myv: a codegen-PROVEN arm on an image takes its defined fallback in "
       "every build (fat-845 float operand, fat-260 unpack base)",
       myv_untrusted_proven_arms },

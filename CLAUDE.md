@@ -10022,6 +10022,18 @@ cache-aware `read_slot` before the call (as `jit_elem_int_value` gets
 the stepped counter), or the op flushes first. Before handing a helper
 a slot index, ask whether `pick_visit_op` lets that slot live in a
 register at this pc.
+**⛔ AND A SEVENTH (#82, 2026-11-23, myv_fuzz fat-286): A PIN IS WRITTEN
+BACK RAW, SO AN IMAGE KEEPS NO REF-LISTED SLOT IN A REGISTER.** A pinned
+value's write-back is a scalar tag and a payload (`flush_cache`), never a
+release - sound only while inference proves the slot holds that scalar,
+which an image's bytecode does not prove. One mutated byte stored a
+dict loop's string key into a float accumulator pinned from a later
+definition, and the write-back leaked the string. While
+`vm_jit_loaded_image` runs (`g_jit_image_pass`, vm.h) `jit_pin_refused`
+keeps every ref-listed slot in memory (the scan's admission, the pick's
+outputs); compiled programs - 64 of 369 corpus programs pin such a slot
+- are untouched. **A new way to keep a slot in a register must ask
+`jit_pin_refused`.** Record: docs/jit-optimizations.md, *#82*.
 
 Two producer-side rules fell out: **only PRE-JIT bytecode is storable**
 (`myv_write` ML_CHECKs it - the JIT rewrites code in place and fragments

@@ -18392,3 +18392,53 @@ Pinned by
 binary, `[1] drive() at line 6` where `-ni -tw` has `use(k)`).
 **A new call site whose helper reaches `jit_call_sync_core` writes the
 pair**, or the core reads someone else's.
+
+## #82 - A loaded image keeps no ref-listed slot in a register (2026-11-23)
+
+myv_fuzz fat-286 (Nets, CI seed 45084619030): ONE mutated byte retargeted
+a dict loop's key operand (`dict.iter.n ... k=6` -> `k=18`) into the slot
+of `fs`, a float accumulator. The loader derives `ref_slots` from the
+mutated code, so slot 18 was listed - but the float linear scan still
+gave `fs` a register from its later definition (`load fs, 0.0`, a `trf`
+install), and every write-back of a pinned value is raw: a scalar tag
+and a payload (`flush_cache`). The string the loop had stored there was
+overwritten unreleased; LeakSanitizer at exit.
+
+The premise every pin rests on - inference proves the slot holds its
+scalar wherever it is register-resident - holds for our own bytecode,
+and is INPUT for an image. Measured with a probe over 369 corpus
+programs: 64 of them, benchmarks included (09_fib, 46_matrix_mult,
+06_if_branch), pin a ref-listed slot, because `ref_slots` is
+conservative. So refusing such pins everywhere would cost compiled
+programs real registers, and a release check at each pin's start (the
+first design proposed) would add a compare and branch on hot paths in
+those same programs.
+
+The fix is scoped to the image: `jit_pin_refused(ck, slot)` - true while
+`vm_jit_loaded_image` runs (`g_jit_image_pass`, set by an RAII guard
+there) for a ref-listed slot - is asked at the linear scan's piece
+admission (`cand`) and filters the pick's outputs (the GP pins and their
+spill homes, the float pins, the type-elided slots, whose exits stamp a
+scalar tag too). Such a slot stays in memory, where every store's
+ref-listed arm releases what it replaces. A slot the derivation does not
+list cannot hold a reference, so it may still be pinned. Not
+`g_untrusted_bytecode`: that flag is never cleared, so in `-rt` every
+program compiled after the first image test would have lost these pins.
+
+Cost: none for a compiled program (emitted code byte-identical by
+construction - the flag is false outside the image pass); an image may
+keep fewer registers than its source's compile, so its `-vdj` can
+differ from the source's - the one deliberate difference from "the
+loader re-runs the tier a fresh compile runs" (vm.cpp).
+
+Net: `myv_refpin_release` (`-rt`) writes the same mutation in-process -
+the loop's key retargeted to `fs` BEFORE the image is written, so the
+loader derives ref_slots from it - on the finding's shape (the
+accumulator's register life starts at a definition after the key
+write), and requires `refcount(key)` to end where it began. Watched
+failing with `jit_pin_refused` returning false (`true 1 1`, plus the
+LeakSanitizer report); a first version of the test was VACUOUS twice -
+its program did not compile (a `dyn` needing `var dyn`, which made both
+runs print the same exception), and then the mutated write kept `fs` in
+memory for the whole run even when sabotaged. It now refuses an
+unmutated image that does not run, and asserts the exact output.
