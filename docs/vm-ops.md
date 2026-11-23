@@ -1672,6 +1672,15 @@ location whatsoever** (a backtrace rendering "line 0"). Produced by
 remaps and the bytecode splice's rebuild like `locs`, and is serialized right
 after it (myv **v13**).
 
+**A compound or inc-dec on a GLOBAL records one too (#85, 2026-11-23):**
+`StoreGlobalV` with an `aop` and `IncDecCheckedV` on a global. A global not
+bound yet when `b += 1` / `b++` runs carets `b`, as the tree-walker's read
+of it does; the operation's own error (a div0, a type error) keeps the
+whole statement's `locs` span. The JIT's `jit_store_global_compound` reads
+it from its `boxed_ops` entry (`BoxedOp::bstart/bend`, derived by
+`build_boxed_ops` from `base_locs`, the statement's span when there is
+none). The VM used to mark the whole statement.
+
 **It is the user CALL ops' second caret too (RULE 2, 2026-09-20).**
 `CallV`/`CachedCallV`/`CallValueV` record the ARGUMENT LIST's span there
 (`try_native_call` / the CallValueV emit), because a loc-less exception out

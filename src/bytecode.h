@@ -2703,6 +2703,10 @@ struct Chunk {
          * requirement (a deleted run collapses every pc onto its
          * EnterNative, where a table lookup would be wrong). */
         Loc start, end;
+        /* ...and a compound GLOBAL store's base caret (#85, from
+         * base_locs): a global not bound yet marks its NAME, as the
+         * tree-walker's read of it does; start/end when there is none */
+        Loc bstart, bend;
     };
     std::vector<BoxedOp> boxed_ops;
 

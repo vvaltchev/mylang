@@ -6759,7 +6759,7 @@ extern "C" int jit_store_global_compound(const void *bop) noexcept
          * on the defined path. */
         g_vm_jit_exc = std::make_unique<UnboundSymbolEx>(
             intern_msg("'" + std::string(g->names[bo->target]->val)
-                       + "' is not bound yet"), bo->start, bo->end);
+                       + "' is not bound yet"), bo->bstart, bo->bend);
         return 1;
     }
     LValue &lv = g->slots[bo->target];
@@ -12197,23 +12197,11 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             /* A dyn/general scalar `--d`/`d++` - the shared body (also
              * jit_incdec_checked's). Slot kind: 0 local / 1 global
              * (defined-guarded) / 2 capture. */
-            LValue *lvp;
-            if (in->target2 == 1) {
-                if (!ctx.gfuncs->defined[in->target]) {
-                    Loc s, en;
-                    chunk->loc_at(pc, s, en);
-                    throw UnboundSymbolEx(
-                        intern_msg("'"
-                                   + std::string(ctx.gfuncs->names[in->target]
-                                                 ->val)
-                                   + "' is not bound yet"), s, en);
-                }
-                lvp = &ctx.gfuncs->slots[in->target];
-            } else if (in->target2 == 2) {
-                lvp = &(*ctx.captures)[in->target];
-            } else {
-                lvp = &ctx.frame->at(in->target);
-            }
+            /* (a global not bound yet carets its name - base_locs, #85 -
+             * as vm_store_base does for every store) */
+            LValue *lvp = vm_store_base(ctx, in->target2,
+                                        static_cast<int>(in->target),
+                                        *chunk, pc, nullptr);
             vm_incdec_scalar_body(*lvp, in->a_lit() != 0, chunk, pc);
             pc++;
         }
@@ -14453,18 +14441,12 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                     in->target, RValue(ctx.frame->at(in->a_slot()).get()));
             } else {
                 /* g OP= rhs / g++ (aop = the base op, rhs in `a`): a compound
-                 * requires the slot already DEFINED (else UndefinedVariableEx,
-                 * like the tree-walker falling through its defined guard), then
-                 * copy-modify-store via num_bin_op - identical to CompoundV. */
-                if (!ctx.gfuncs->defined[in->target]) {
-                    Loc s, en;
-                    chunk->loc_at(pc, s, en);
-                    throw UnboundSymbolEx(
-                        intern_msg("'"
-                                   + std::string(ctx.gfuncs->names[in->target]
-                                                 ->val)
-                                   + "' is not bound yet"), s, en);
-                }
+                 * requires the slot already BOUND (else UnboundSymbolEx at the
+                 * name - base_locs, #85 - as the tree-walker's read of it
+                 * raises it), then copy-modify-store via num_bin_op -
+                 * identical to CompoundV. */
+                vm_store_base(ctx, 1, static_cast<int>(in->target), *chunk,
+                              pc, nullptr);
                 EvalValue sb;
                 EvalValue nv = lv.get();
                 try {

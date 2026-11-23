@@ -1304,6 +1304,26 @@ static const std::vector<test> tests =
         "if (runtime(true)) { print(use(2)); }",
         "var lf = func(x) => x * 3;" },
       &typeid(UnboundSymbolEx), 26, 1, 29, 1 },
+    /* #85: a compound or an inc-dec on a global not bound yet marks its
+     * NAME in every engine, as the tree-walker's read of it does (the VM
+     * marked the whole statement) */
+    { "err loc: a compound on a global not bound yet marks its name",
+      { "func f() {", "    b   +=   1;", "}",
+        "if (runtime(true)) f();", "var b = 2;" },
+      &typeid(UnboundSymbolEx), 5, 2, 7, 2 },
+    { "err loc: an inc-dec on a global not bound yet marks its name",
+      { "func f() {", "    b++;", "}",
+        "if (runtime(true)) f();", "var b = 2;" },
+      &typeid(UnboundSymbolEx), 5, 2, 7, 2 },
+    { "err loc: a dyn global's inc-dec before its binding marks its name",
+      { "func f() {", "    b--;", "}",
+        "if (runtime(true)) f();", "var dyn b = runtime(2);" },
+      &typeid(UnboundSymbolEx), 5, 2, 7, 2 },
+    { "err loc: a multi-target compound before a global's binding marks "
+      "its name",
+      { "func f() {", "    b, c  +=  [1, 2];", "}",
+        "if (runtime(true)) f();", "var b = 2; var c = 3;" },
+      &typeid(UnboundSymbolEx), 5, 2, 7, 2 },
     /* ...in TAIL position too: a block-bodied lambda's body replaced the
      * `return lf(k);`, and the read went with the call (the tail-call
      * inliner finds its call through the ReturnStmt) */

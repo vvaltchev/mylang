@@ -3248,6 +3248,8 @@ struct Codegen {
             st.set_a(slot_op(v));
             if (compound_op != Op::invalid) {
                 st.node_idx = add_ast_node(e);   /* the operation's caret */
+                st.base_node_idx = add_base_node(          /* #85 */
+                    st.op == OpCode::StoreGlobalV ? 1 : 0, t);
                 st.aop = compound_op;
             }
             ops.push_back(st);
@@ -3422,6 +3424,8 @@ struct Codegen {
                     in.op = id->sym.kind == SymKind::global
                                 ? OpCode::StoreGlobalV : OpCode::StoreCaptureV;
                     in.node_idx = add_ast_node(s);
+                    in.base_node_idx = add_base_node(   /* #85 */
+                        in.op == OpCode::StoreGlobalV ? 1 : 0, id);
                     in.target = id->sym.slot;
                     in.set_a(int_lit(1));
                     in.aop = inc->is_inc ? Op::plus : Op::minus;
@@ -3449,6 +3453,8 @@ struct Codegen {
                     CgInstr in;
                     in.op = OpCode::IncDecCheckedV;
                     in.node_idx = add_ast_node(s);   /* TypeError caret */
+                    /* #85: a global not bound yet marks its name */
+                    in.base_node_idx = add_base_node(kind, id);
                     in.target = id->sym.slot;
                     in.target2 = kind;
                     in.set_a(int_lit(inc->is_inc ? 1 : 0));
@@ -3745,6 +3751,9 @@ struct Codegen {
             CgInstr in;
             in.op = store_op;
             in.node_idx = add_ast_node(s);               /* loc: compound may throw (div/undef) */
+            /* #85: a global not bound yet marks its name */
+            in.base_node_idx = add_base_node(
+                store_op == OpCode::StoreGlobalV ? 1 : 0, lv);
             in.target = lv->sym.slot;
             in.set_a(rhs_op);
             in.aop = cbase;
@@ -13659,10 +13668,14 @@ void build_boxed_ops(Chunk &chunk)
             /* the op's own caret, from the (already-extracted) loc table -
              * the jit helpers stamp a conveyed throw with it, making these
              * ops' carets pc-independent (re-raise deletability). */
-            Loc s, en;
+            Loc s, en, bs, be;
             chunk.loc_at(pc, s, en);
+            if (!chunk.base_loc_at(pc, bs, be)) {
+                bs = s;
+                be = en;
+            }
             chunk.boxed_ops.push_back(
-                { in.target, in.aop, in.a(), in.b(), s, en });
+                { in.target, in.aop, in.a(), in.b(), s, en, bs, be });
         }
     }
 }
