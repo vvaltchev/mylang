@@ -1515,6 +1515,25 @@ Key rules:
     is a `dyn?` - so `func f(opt x)` called as `f(2)`, `f(2.5)` and `f()` gets
     three instances, and `f(2)` stays an `int`. (A `none` given to an `opt`
     parameter adds nothing to its type: its declaration already allows `none`.)
+    A call that no instance serves - through a `dyn`, through a value that
+    may be one of several functions, or out of a constant container - runs
+    the template's **untyped body** (its *base*), where every un-annotated
+    parameter is `dyn` and the base's own variables hold whatever they are
+    given. What the base stores into a variable it does not own (a global,
+    an element or a field of one, `append` to one) is **checked when it
+    runs**, against the type the rest of the program gives that variable: a
+    number converts as a `dyn` does, anything else that does not fit raises
+    `TypeErrorEx` and the variable keeps its value:
+
+    ```C#
+    var g = 0;
+    func setg(x) { g = x; return 0; }
+    func nop(x) { return 1; }
+    var fs = [setg, nop];
+    var dyn h = fs[runtime(0)];
+    h(2);          # g is 2
+    h("s");        # TypeErrorEx: g is an int - g is still 2
+    ```
   * A **concrete** function's (typed or `dyn` params) parameter and return
     types are the **join** of how it is called and what it returns, across the
     whole program. A typed parameter called with an incompatible type is an
@@ -2435,7 +2454,10 @@ func pick(int k) {
 
 Such a call's result has no type the compiler can know - the two closures
 may return different things - so it is `dyn`: a variable it initializes needs
-no `var dyn`, and what is done with the value is checked when it runs.
+no `var dyn`, and what is done with the value is checked when it runs. So is
+the result of a call to one closure's untyped body when a return of it
+depends on its parameters: `func [b] (x) { if (x == 1) return 1; return x;
+}` may return anything, whatever its other return is.
 
 The untyped body may not store into a variable it captured (or a global)
 anything that variable's type does not allow: such a store is checked when it

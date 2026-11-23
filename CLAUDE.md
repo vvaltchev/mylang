@@ -6270,7 +6270,8 @@ Rules it already earned:
 - A REPL input's earlier closure is `pinned`: its later sites call the base
   (maintainer's decision 3). **And an earlier input's TEMPLATE instance is
   not reused for a signature holding a function whose return is still
-  unknown** (`instantiate_round`'s `ret_open`): a withheld return makes two
+  unknown** (`instantiate_round`: a key with an unsettled part): a withheld
+  return makes two
   closures key alike, and the pinned instance's committed body would read
   the other closure's result as its own (`r : str` holding 2).
 - **A MAPPING IS WITHDRAWN WHEN ITS SITE'S CALLEE SET GROWS** (each
@@ -6295,6 +6296,51 @@ Rules it already earned:
   (`splice_block_call`): a copied lambda is another function, with a
   fresh descriptor the instance stamps of the inlined sites do not name, so
   the inlined run called the base where `-ni` called the instance.
+- **A BASE'S RETURN ITS PARAMETERS DECIDE IS NOT A TYPE (#84,
+  2026-11-23)**: `contribute_ret` marks the round's `FuncInfo::ret_open`
+  when a closure base returns a type with an Unknown in it, and the commit
+  keeps the return Unknown (so `runs_unsettled_base` holds). The join had
+  DROPPED the unknown one: `func [b] (x) { if (x == 1) return 1; return
+  x; }` was typed `int`, and given "s" the JIT printed the string's
+  address as an int, `-nj` aborted, the tree-walker threw.
+- **A NAMED TEMPLATE'S BASE THAT MAY RUN IS ACCUMULATED TOO (#84,
+  maintainer-set 2026-11-23: "since x is dyn in the base instance, the
+  g = x assignment must require a runtime type check").**
+  `mark_named_bases` (before the fixpoint) sets `FuncInfo::named_base`
+  for the templates whose base can run - value-used, rebound, held by a
+  baked constant, or named in another running base's body (the #149
+  closure, as far as the tree tells it before any instance exists) - and,
+  once the instantiation loops are done (`late`), every template a live
+  call is still left on (its argument never settled - a closure base's
+  call passing its parameter or its result - or past the instance cap),
+  re-running the fixpoint for what that marks. **A name is resolved
+  through its BINDING (`id_sym`), never matched by name**: a parameter
+  shadowing a template's name made a never-called template run its
+  checks, and two nested templates sharing a name kept only one - the
+  #149 closure (`kept_bases`) had the same by-name match and left the
+  other base uncompiled, so the VM aborted (chunk-less function); and
+  `accumulate` walks such a body at `accum_base_depth > 0`, so
+  `base_shared_dyn` turns its untyped stores into variables it does not
+  own into run-time checks, exactly as for a closure base. Unlike a
+  closure base, a named base RUNS UNTYPED (question 5's rule - a
+  template reached through a value): its own variables are
+  `TypeSym::in_named_base`, take no contribution (contribute,
+  contribute_elem), finalize as untyped `dyn` (so a store of one into an
+  outer variable is checked too - finalized `none`, it read as settled),
+  and its return keeps the template's fallback. Not seen: a REPL
+  template first used as a value in a later input. A single-target
+  COMPOUND into a variable a base does not own is checked too
+  (`base_dyn_lvals` feeds `res_fit`), and a local that received an
+  Unknown and nothing settled but `none` / `dyn` finalizes as untyped
+  `dyn` / `dyn?` (it was typed `none`, and `var r = <a base's result>; r =
+  d;` was a DynRequiredEx).
+  `tests/functional/144_base_dyn_store.my`.
+- **A LOCAL GIVEN A VALUE OF NO TYPE IS CHECKED AT ITS STORE (#84):**
+  `checked_type_of` - a declared type, else, for a local whose converged
+  round received an Unknown (`got_unknown`, what a base's parameters
+  give), the type its other values settled - stamps `rv_fit` / `res_fit` /
+  `IdList::fits` (a numeric one converts instead, `coerces_dyn`): a closure
+  base's `var s = "a"; s = x;` held the int it was given.
 
 ### THE CALLEE-SET ANALYSIS (#116, `calleeset.cpp.h`)
 

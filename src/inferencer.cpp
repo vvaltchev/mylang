@@ -187,6 +187,12 @@ struct TypeSym {
      * converts at the store (coerces_dyn), any other is checked there
      * (rv_fit). */
     bool base_dyn_store = false;
+    /* #84: a variable of a NAMED template's base (or of a function nested
+     * in one). The base runs untyped - its own variables take what they
+     * are given (question 5) - so it contributes nothing to them, and
+     * their types stay the template's fallbacks; only a store into a
+     * variable it does not own is checked (base_shared_dyn). */
+    bool in_named_base = false;
     Loc decl_loc;
     Loc decl_end;              /* its name's end (an error's caret span) */
     FuncInfo *func = nullptr;  /* non-null when this name is a function */
@@ -260,6 +266,17 @@ struct FuncInfo {
      * closure object's own captures (one object, one capture vector).
      */
     bool closure_tmpl = false;
+    /* #84: a NAMED template whose base may run - it is used as a value
+     * (or its name is rebound), or a running base names it
+     * (mark_named_bases). Its body is accumulated as a closure base's
+     * is: a `dyn` it stores into a variable it does not own is checked
+     * at run time (base_shared_dyn). */
+    bool named_base = false;
+    /* rule 8.2: a closure base returned, this round, a value its template
+     * parameters decide (unknown for good): its return type is not
+     * settled (runs_unsettled_base) - the join with its other returns
+     * typed `func [b] (x) { if (x == 1) return 1; return x; }` an int */
+    bool ret_open = false;
     FuncInfo *closure_base = nullptr;    /* an instance: its base */
     std::map<std::string, FuncInfo *> closure_insts;
     /* the function whose body declares this one (null at the top level) */
@@ -669,6 +686,7 @@ private:
     bool compound_may_misfit(Op op, StaticTypeRef place, StaticTypeRef v);
     bool compound_store_checked(Expr14 *e);
     void stamp_fixed_numeric(Identifier *id, StaticTypeRef v);
+    StaticTypeRef checked_type_of(Identifier *id);
     void check_builtin_store(CallExpr *call);
     std::vector<TypeSym *> *known_params(CallExpr *call);
     StaticTypeRef arg_type(Construct *arg, TypeSym *param);
@@ -695,6 +713,7 @@ private:
     bool closure_site_current(const CallExpr *call, const FuncInfo *base);
     void value_funcs(const EvalValue &v, CycStack &path,
                      const std::function<void(const FuncDescriptor *)> &fn);
+    bool mark_named_bases(Block *rootBlock, bool late);   /* #84 */
     void tree_baked_funcs(Construct *n, CycStack &path,
                           const std::function<void(const FuncDescriptor *)>
                               &fn);
@@ -2489,6 +2508,104 @@ void Inferencer::tree_baked_funcs(
     for_each_child(n, [&](Construct *c) { tree_baked_funcs(c, path, fn); });
 }
 
+/*
+ * #84: the NAMED templates whose base may run (FuncInfo::named_base) - the
+ * #149 closure, as far as the tree tells it before any instance is made:
+ * one used as a value (a call through the value that no instance serves
+ * runs the base) or whose name is rebound, one a baked constant holds,
+ * and every template a running base's body names. Each is accumulated as
+ * a closure base is (rule 8.2), so a `dyn` it stores into a variable it
+ * does not own is checked at run time: `func setg(x) { g = x; }` called
+ * through a `dyn` with "s" stored the string into the int `g`. (A direct
+ * call instantiation leaves unredirected - past the instance cap - runs
+ * a base this does not see.)
+ */
+bool Inferencer::mark_named_bases(Block *rootBlock, bool late)
+{
+    std::map<const FuncDescriptor *, FuncInfo *> by_desc;
+    std::vector<FuncInfo *> work;
+    bool added = false;
+    const auto keep = [&](FuncInfo *f) {
+        if (!f->named_base) {
+            f->named_base = true;
+            work.push_back(f);
+            added = true;
+        }
+    };
+    bool any = false;
+    for (auto &up : all_syms) {
+        TypeSym *ts = up.get();
+        FuncInfo *f = ts->func;
+        if (!f || !f->is_template || !f->decl || f->pinned)
+            continue;
+        any = true;
+        by_desc.emplace(f->decl->desc, f);
+        if (ts->value_used || func_name_rebound(ts))
+            keep(f);
+    }
+    if (!any)
+        return false;
+    CycStack path;
+    const auto keep_desc = [&](const FuncDescriptor *d) {
+        auto it = by_desc.find(d);
+        if (it != by_desc.end())
+            keep(it->second);
+    };
+    /* the template a name is BOUND to - never matched by name: a
+     * parameter may shadow it, and two nested templates may share one */
+    const auto tmpl_of = [&](Identifier *id) -> FuncInfo * {
+        auto it = id_sym.find(id);
+        FuncInfo *f = it != id_sym.end() && it->second ? it->second->func
+                                                       : nullptr;
+        return f && f->is_template && f->decl && !f->pinned ? f : nullptr;
+    };
+    const std::function<void(Construct *)> scan = [&](Construct *n) {
+        if (!n)
+            return;
+        if (ctag(n) == ConstructType::id) {
+            if (FuncInfo *f = tmpl_of(static_cast<Identifier *>(n)))
+                keep(f);
+            return;
+        }
+        if (ctag(n) == ConstructType::func_decl) {
+            scan(static_cast<FuncDeclStmt *>(n)->body.get());
+            return;
+        }
+        for_each_child(n, scan);
+    };
+    for (auto &e : rootBlock->elems)
+        tree_baked_funcs(e.get(), path, keep_desc);
+    /* once the loops are done, a call they left on a template - its
+     * arguments never settled (a closure base's call passing its
+     * parameter, or its result), or past the instance cap */
+    if (late) {
+        std::vector<std::pair<CallExpr *, bool>> live;
+        for (auto &e : rootBlock->elems)
+            collect_calls(e.get(), live, false, true);
+        for (const auto &cp : live)
+            if (ctag(cp.first->what.get()) == ConstructType::id)
+                if (FuncInfo *f = tmpl_of(
+                        static_cast<Identifier *>(cp.first->what.get())))
+                    keep(f);
+    }
+    while (!work.empty()) {
+        FuncInfo *f = work.back();
+        work.pop_back();
+        scan(f->decl->body.get());
+        tree_baked_funcs(f->decl->body.get(), path, keep_desc);
+    }
+    /* a running base's own variables are its own (base_shared_dyn), and
+     * untyped (TypeSym::in_named_base) */
+    for (auto &up : all_syms)
+        for (FuncInfo *f = up->owner; f; f = f->lex_parent)
+            if (f->named_base) {
+                up->in_base = true;
+                up->in_named_base = true;
+                break;
+            }
+    return added;
+}
+
 void Inferencer::stamp_closure_templates(Block *rootBlock)
 {
     std::vector<std::pair<CallExpr *, bool>> calls;
@@ -3015,6 +3132,7 @@ void Inferencer::infer_one(Block *rootBlock)
     rekeyed = false;                            /* #78 */
     closure_loop_done = false;
     mark_closure_templates(rootBlock);          /* rule 8.2 */
+    mark_named_bases(rootBlock, false);         /* #84 */
     run_fixpoint(rootBlock);
 
     /*
@@ -3107,6 +3225,17 @@ void Inferencer::infer_one(Block *rootBlock)
     }
 
     /*
+     * #84: a base the loops leave running that the first marking could
+     * not see - a call whose argument never settled (a closure base's
+     * result) stays on the template. Mark it, and type its stores again.
+     * (Bounded: each round marks at least one more template.)
+     */
+    for (int k = 0; k < 16 && mark_named_bases(rootBlock, true); k++) {
+        run_fixpoint(rootBlock);
+        instantiate_to_fixpoint();
+    }
+
+    /*
      * #78: an instance a re-key left with no live use leaves the program
      * - it would still be bound, and listed by specializations() - and
      * its cache entry with it, so the key makes a fresh instance should a
@@ -3176,11 +3305,26 @@ void Inferencer::infer_one(Block *rootBlock)
                  * anything. A plain unconstrained local is `none` - but one
                  * ASSIGNED only values of an unknowable type is `dyn` too,
                  * untyped (see TypeSym::got_unknown). */
-                const bool untyped =
-                    !s->is_param && !s->is_loopvar && s->got_unknown;
+                /* (a named base's own variable is untyped too, #84: the
+                 * base contributes nothing to it, and it holds what the
+                 * base's `dyn` parameters give it) */
+                const bool untyped = !s->is_param && !s->is_loopvar
+                    && (s->got_unknown || s->in_named_base);
                 s->type = (s->is_param || s->is_loopvar || untyped)
                               ? A.dyn_ty() : A.none_ty();
                 s->untyped_dyn = untyped;
+            } else if (s->got_unknown && !s->is_param && !s->is_loopvar
+                       && (static_type_resolve(s->type)->kind
+                               == StaticTypeKind::None
+                           || static_type_resolve(s->type)->kind
+                               == StaticTypeKind::Dyn)) {
+                /* ...and one whose other values settled nothing but a
+                 * `none` or a `dyn` is untyped too (#84: `var r = <a
+                 * base's result>; r = none;` was typed `none`) */
+                s->type = A.with_opt(A.dyn_ty(),
+                                     static_type_resolve(s->type)->opt
+                                     || is_none(s->type));
+                s->untyped_dyn = true;
             } else if (s->got_unknown && !s->is_param && !s->is_loopvar) {
                 /* A NUMERIC local that also received an untyped value -
                  * `var y = x; if (c) y = 1;` with `x` a parameter no call
@@ -3242,13 +3386,11 @@ void Inferencer::infer_one(Block *rootBlock)
      * compiled chunk, never correctness.
      */
     std::map<const FuncInfo *, TypeSym *> tmpls;
-    std::map<const UniqueId *, TypeSym *> tmpl_by_uid;
     std::map<const FuncDescriptor *, TypeSym *> tmpl_by_desc;
     for (auto &up : all_syms) {
         TypeSym *s = up.get();
         if (s->func && s->func->is_template && s->func->decl) {
             tmpls.emplace(s->func, s);
-            tmpl_by_uid.emplace(s->name, s);
             tmpl_by_desc.emplace(s->func->decl->desc, s);
         }
     }
@@ -3293,10 +3435,16 @@ void Inferencer::infer_one(Block *rootBlock)
             if (!n)
                 return;
             if (ctag(n) == ConstructType::id) {
+                /* the template the name is BOUND to: by name, a nested
+                 * template sharing another's name was never kept, and its
+                 * base, reached, aborted the VM (chunk-less function) */
                 auto *id = static_cast<Identifier *>(n);
-                auto it = tmpl_by_uid.find(id->uid);
-                if (it != tmpl_by_uid.end())
-                    keep(it->second);
+                auto is = id_sym.find(id);
+                if (is != id_sym.end() && is->second && is->second->func) {
+                    auto it = tmpls.find(is->second->func);
+                    if (it != tmpls.end())
+                        keep(it->second);
+                }
                 return;
             }
             if (ctag(n) == ConstructType::lit_obj
@@ -4656,6 +4804,22 @@ store_fit(StaticTypeRef p, StaticTypeRef v, FitSpec::Place where,
     return f;
 }
 
+/* #83: is a value checked against a place of static type `t` at run time
+ * (fit_annot_of has a rule for it)? A function type is not: a `dyn` into a
+ * variable holding a function stays a compile error. */
+static bool fit_checkable(StaticTypeRef t)
+{
+    switch (static_type_resolve(t)->kind) {
+    case StaticTypeKind::Bool: case StaticTypeKind::Int:
+    case StaticTypeKind::Float: case StaticTypeKind::Str:
+    case StaticTypeKind::Array: case StaticTypeKind::Dict:
+    case StaticTypeKind::Struct: case StaticTypeKind::Box:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* #49: a dyn or unsettled type anywhere in `t` */
 static bool fit_has_dyn(StaticTypeRef t)
 {
@@ -4872,7 +5036,12 @@ void Inferencer::annotate_hints(Construct *n)
              * operation, before the store (an int one converts, #77) */
             e->res_fit = nullptr;
             if (e->op != Op::assign) {
-                if (StaticTypeRef d = declared_type_of(id))
+                StaticTypeRef d = checked_type_of(id);
+                /* (a base's compound into a variable it does not own -
+                 * rule 8.2's base_shared_dyn, recorded for compounds too) */
+                if (!d && base_dyn_lvals.count(id))
+                    d = static_type_resolve(user_sym(id)->type);
+                if (d)
                     e->res_fit = store_fit(
                         d, binop_result(compound_binop(e->op), d,
                                         type_of(e->rvalue.get())),
@@ -4895,6 +5064,10 @@ void Inferencer::annotate_hints(Construct *n)
                 e->rv_fit = store_fit(bs->type, type_of(e->rvalue.get()),
                                       FitSpec::Place::var, id->uid);
             }
+            /* #84: a base's own variable given its `dyn` parameter */
+            else if (StaticTypeRef c = checked_type_of(id))
+                e->rv_fit = store_fit(c, type_of(e->rvalue.get()),
+                                      FitSpec::Place::var, id->uid);
         }
         /* ... and each declared target of a multi-assignment, given what
          * it receives (idlist_elem_types) */
@@ -4912,7 +5085,7 @@ void Inferencer::annotate_hints(Construct *n)
                     continue;
                 stamp_fixed_numeric(t, els[i]);
                 /* (a compound's: its RESULT, as a single target's res_fit) */
-                if (StaticTypeRef d = declared_type_of(t))
+                if (StaticTypeRef d = checked_type_of(t))
                     fits[i] = store_fit(
                         d, e->op == Op::assign
                                ? els[i]
@@ -7648,8 +7821,10 @@ void Inferencer::reset_round()
             s->acc = s->dyn_decl ? A.dyn_ty() : bottom;
     }
     for (auto &up : all_funcs)
-        if (!up->pinned)
+        if (!up->pinned) {
             up->ret_acc = bottom;
+            up->ret_open = false;
+        }
 }
 
 void Inferencer::commit_round()
@@ -7735,16 +7910,18 @@ void Inferencer::commit_round()
     for (auto &up : all_funcs) {
         if (up->pinned)
             continue;
-        if (!static_type_equal(up->ret_acc, up->ret)) {
+        /* (a base's return its parameters decide: rule 8.2's ret_open) */
+        const StaticTypeRef r = up->ret_open ? bottom : up->ret_acc;
+        if (!static_type_equal(r, up->ret)) {
             changed = true;
             if (up->decl && up->decl->id)
                 TRACE(infer, 1, "func " +
                                 std::string(up->decl->id->get_str()) +
                                 " returns " + static_type_to_string(up->ret) +
                                     " -> " +
-                                static_type_to_string(up->ret_acc));
+                                static_type_to_string(r));
         }
-        up->ret = up->ret_acc;
+        up->ret = r;
     }
 }
 
@@ -7758,7 +7935,7 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
      * the opt bit, so `var dyn d = 5; d = none;` infers `opt dyn`. (A dyn param
      * is skipped in contribute_arg - its opt is declared, not inferred.)
      */
-    if (!s || s->func)
+    if (!s || s->func || s->in_named_base)
         return;
 
     /* rule 8.1: a `none` given to an `opt` parameter adds nothing to its
@@ -7821,7 +7998,7 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
             /* (a `dyn` is checked at run time, as for an annotated
              * variable below) */
             const bool dyn_checked = rt->kind == StaticTypeKind::Dyn
-                && (!rt->opt || pt->opt);
+                && (!rt->opt || pt->opt) && fit_checkable(pt);
             if (!has_unknown(rt) && !is_none(rt) && !dyn_checked
                     && !static_type_assignable(rt, pt))
                 conflict("'" + std::string(s->name->val) + "' " +
@@ -7854,7 +8031,7 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
              * res_fit). A `dyn?` into a non-opt one stays a nullability
              * error here. */
             const bool dyn_checked = rt->kind == StaticTypeKind::Dyn
-                && (!rt->opt || d->opt);
+                && (!rt->opt || d->opt) && fit_checkable(d);
             if (!has_unknown(rt) && !is_none(rt) && !dyn_checked
                     && !static_type_assignable(rt, d))
                 conflict("'" + std::string(s->name->val) +
@@ -7915,6 +8092,16 @@ void Inferencer::contribute_ret(StaticTypeRef t)
 {
     if (!cur_func)
         return;
+    /* #84: a named base's return type stays the template's fallback (a
+     * call to a template defers; its value's type is the dyn one), and
+     * so does a function's nested in it, which runs untyped with it */
+    for (FuncInfo *f = cur_func; f; f = f->lex_parent)
+        if (f->named_base)
+            return;
+    /* rule 8.2: a closure base returning what its template parameters
+     * decide - unknown for good, which a join would drop */
+    if (cur_func->closure_tmpl && has_unknown(t))
+        cur_func->ret_open = true;
     StaticTypeRef nw = A.join(cur_func->ret_acc, t);
     cur_func->ret_acc = nw ? nw : A.dyn_ty();   /* return conflict -> dyn */
 }
@@ -7927,11 +8114,14 @@ void Inferencer::accumulate(Construct *n)
     if (ctag(n) == ConstructType::func_decl) {
         auto *fd = static_cast<FuncDeclStmt *>(n);
         FuncInfo *fi = func_of_decl[fd];
-        if (fi && fi->is_template)
-            return;   /* a template: inferred per instantiation, not here */
+        /* a template: inferred per instantiation, not here - but a base
+         * that may run is accumulated as a closure base is (#84) */
+        if (fi && fi->is_template && !fi->named_base)
+            return;
         FuncInfo *prev = cur_func;
         cur_func = fi;
-        const bool base = fi && fi->closure_tmpl;   /* rule 8.2 */
+        /* rule 8.2, #84 */
+        const bool base = fi && (fi->closure_tmpl || fi->named_base);
         if (base)
             accum_base_depth++;
         if (fd->body && !fd->body->is_block()) {
@@ -8344,6 +8534,26 @@ void Inferencer::stamp_fixed_numeric(Identifier *id, StaticTypeRef v)
 }
 
 /*
+ * #84: the type a store into variable `id` is checked against at run time
+ * (rv_fit, res_fit, IdList::fits): a declared one's (declared_type_of),
+ * else - for a local that received a value of no type, which is a `dyn`
+ * at run time (TypeSym::got_unknown: what a template BASE's parameters
+ * give it, rule 8.2 and #84) - the type its other values settled. A
+ * numeric one converts instead (coerces_dyn), so store_fit asks no check
+ * of it. Null: no check.
+ */
+StaticTypeRef Inferencer::checked_type_of(Identifier *id)
+{
+    if (StaticTypeRef d = declared_type_of(id))
+        return d;
+    TypeSym *s = user_sym(id);
+    if (!s || !s->got_unknown || s->is_param || s->is_loopvar
+            || s->untyped_dyn || s->dyn_decl)
+        return nullptr;
+    return static_type_resolve(s->type);
+}
+
+/*
  * An ELEMENT contribution to a container symbol - an element or dict
  * store, an append / push / insert - given as the container type it
  * implies (`array<V>`, `dict<K, V>`). To a FIXED container type it is
@@ -8359,8 +8569,9 @@ void Inferencer::contribute_elem(TypeSym *s, StaticTypeRef cont, Loc loc,
 {
     /* rule 8.2: a closure base's `dyn` element into a container it does
      * not own - checked at the store (annotate_hints' rv_fit / arg_fit,
-     * from the container's final type), never joined into it */
-    if (base_shared_dyn(s, cont))
+     * from the container's final type), never joined into it; and a
+     * named base's own variable takes nothing (#84) */
+    if (base_shared_dyn(s, cont) || (s && s->in_named_base))
         return;
     const StaticTypeRef d = fixed_type(s);
     const StaticTypeRef c = static_type_resolve(cont);

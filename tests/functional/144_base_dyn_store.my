@@ -1,0 +1,149 @@
+# A template BASE runs where a call cannot name an instance - through a
+# `dyn`, or a value two templates may be - with its parameters `dyn`
+# (#84). What it stores into a variable it does not own is checked at run
+# time against the type the rest of the program gives that variable, as a
+# `dyn` entering a typed place is: until 2026-11-23 `func setg(x) { g =
+# x; }` called that way stored "s" into the int `g` (the tree-walker
+# threw at the next read, the VM printed 3.5 for `g + 1`). And a closure
+# base whose return its parameter decides (`if (x == 1) return 1; return
+# x;`) was typed by its other return - an int holding "s", the JIT printed
+# the string's address (rule 8.2).
+# (Every declaration first: a call through an unknown callee above a
+# global some function reads is a warning.)
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+func refused(dyn f, dyn v) {
+    try { f(v); } catch (TypeErrorEx) { return true; }
+    return false;
+}
+struct P { int x; }
+var gi = 0;
+var gs = "a";
+var ga = [1];
+var gd = {"k": 1};
+var gp = P(1);
+var gt = 0;
+var gm1 = 0; var gm2 = 0;
+var gb = true;
+var g2 = 0; var g3 = 0; var g4 = 0; var g5 = 0;
+var cb = 0;
+func s1(v) { gi = v; return 0; }
+func s2(v) { gs = v; return 0; }
+func s3(v) { ga[0] = v; return 0; }
+func s4(v) { append(ga, v); return 0; }
+func s5(v) { gd.k = v; return 0; }
+func s6(v) { gp.x = v; return 0; }
+func s7(v) { gt += v; return 0; }
+func s8(v) { gm1, gm2 = v; return 0; }
+func s9(v) { var t = v; gs = t; return 0; }
+func s10(v) { gb += v; return 0; }
+# (one array of them all: no call names one of them alone, so each runs
+# its base)
+var fs = [s1, s2, s3, s4, s5, s6, s7, s8, s9];
+var fits = [2, "b", 3, 4, 5, 6, 7, [8, 9], "c"];
+var misfits = [2.5, 9, "x", "x", "x", 2.5, 2.5, ["x", 1], 9];
+var fbs = [s10, func (q) { return 1; }];
+
+# a closure base whose return its parameter decides
+var g = func [cb] (x) { if (x == 1) return 1; return x; };
+var gsel = [g, func [cb] (y) { return 5; }];
+
+# a base's own variables take what its parameters give them (question 5:
+# a template reached through a value runs untyped)
+func show(v) { var w = v; var s = str(w); w = 0.5; return s; }
+var shows = [show, func (q) { return "?"; }];
+
+# a template is named by its BINDING: a parameter shadowing a never-called
+# template's name does not make that template run (its body would refuse
+# `g2 = "s"` against the int g2)
+func helper(x) { g2 = "s"; return x; }
+func run(helper) { return helper(1); }
+var rs = [run, func (q) { return 0; }];
+
+# ...and two nested templates sharing a name are two templates (the second
+# one's base, reached, used to be left uncompiled: the VM aborted)
+func a1(z) {
+    func inner(x) { return 0; }
+    return inner(z);
+}
+func b1(z) {
+    func inner(x) { g3 = x; return 0; }
+    return inner(z);
+}
+var bs = [b1, func (q) { return 1; }];
+
+# a template a closure base calls runs its own base
+func helper4(v) { g4 = v; return 0; }
+var c4 = func [cb] (x) { return helper4(x); };
+var cs4 = [c4, func [cb] (y) { return 1; }];
+
+# a call whose argument never settles (a closure base's result) runs the
+# template's base
+func k5(n) { g5 = n; return 0; }
+func through(dyn v) { return k5(gsel[runtime(0)](v)); }
+
+# ---- the stores that fit are stored; each misfit is refused
+for (var i = 0; i < len(fs); i++) {
+    var dyn f = fs[runtime(i)];
+    f(fits[i]);
+    if (typed)
+        want("base " + str(i + 1) + " refuses a misfit",
+             refused(f, misfits[i]), true);
+}
+want("the stores that fit", str([gi, gs, ga, gd, gp, gt, gm1, gm2]),
+     "[2, \"c\", [3, 4], {\"k\": 5}, P(x: 6), 7, 8, 9]");
+if (typed) {
+    want("a base's bool compound", refused(fbs[runtime(0)], 5), true);
+    want("the bool kept", gb, true);
+}
+
+# ---- the closure base's result is untyped
+var r = gsel[runtime(0)]("s");
+want("the closure base's result", r, "s");
+if (typed)
+    want("its type", typestr(r), "dyn");
+var t = r + "!";
+want("a sum with it", t, "s!");
+var r1 = gsel[runtime(0)](1);
+want("its other return", r1 + 1, 2);
+# (a local given it and nothing but none is untyped too)
+var r6 = gsel[runtime(0)](1);
+if (r6 != none)
+    want("r6 + 1", r6 + 1, 2);
+if (typed)
+    want("r6's type", typestr(r6), "dyn?");
+r6 = none;
+
+# ---- the base's own variables
+var dyn sh = shows[runtime(0)];
+want("an untyped base local", sh(4), "4");
+
+# ---- names are bindings
+var dyn rn = rs[runtime(0)];
+want("a shadowing parameter", rn(func (y) { return y + 1; }), 2);
+want("g2 untouched", g2, 0);
+want("the first nested template", a1(1), 0);
+if (typed)
+    want("the second one's store, checked", refused(bs[runtime(0)], "s"),
+         true);
+want("g3's int", g3 + 1, 1);
+
+# ---- bases reached through a closure base, and through a call whose
+# argument never settles
+want("a direct call", helper4(5), 0);
+if (typed) {
+    want("through a closure base", refused(cs4[runtime(0)], "s"), true);
+    want("an unsettled argument", refused(through, "s"), true);
+}
+want("g4's int", g4 + 1, 6);
+want("g5's int", g5 + 1, 1);
+
+assert(bad == 0);
+print("ok");
