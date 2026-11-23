@@ -2802,7 +2802,9 @@ Some types are decided by joining every place in the program: an
 un-annotated `opt` parameter takes all its call sites, a lambda's parameter
 does the same (unless the lambda is written as a builtin's argument, whose
 call is its only one), and a template called through a value gets an instance
-only if every call through that value agrees on the argument types. A constant
+only if every call through that value agrees on the argument types - the
+types the whole program gives the arguments, so a call whose argument a
+later statement widens can make them disagree. A constant
 call inside an expression takes part in those joins as any call does: the
 compiler computes it while parsing, but replaces it by its value only once the
 whole program is typed, and only when that value already has the type the

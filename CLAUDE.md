@@ -6192,6 +6192,20 @@ moved - a template body does not type-check with unconstrained
 parameters), then retired from the tree with its cache entry and global
 binding, so `specializations()` does not list it.
 `tests/functional/142_template_rekey.my`.
+**A VALUE instance is re-checked too (#81, 2026-11-23):** its signature is
+the agreement of the calls through the value, and `value_instantiate_round`
+asks it again every round (`Inferencer::value_insts` keeps each instance's
+template, signature and the uses it redirected, with their old names). A
+signature that moved re-instantiates for the new one; calls that stopped
+agreeing (or a value that escaped) give the uses back to the template,
+whose base then runs - as it does when the calls disagree from the start -
+and `value_inst_barred` keeps it there, so the rounds cannot flip. The old
+instance is left with no live use and retired the #78 way (`rekeyed`). It
+used to stay, its parameter joining the widened argument, so another
+call's int sat unconverted in a float parameter (`str(x + 1)` printed 4
+under `--no-opt all`, 4.000000 by default). Note the early return: a
+round with no template value use left still re-checks the instances.
+`tests/functional/145_value_template_rekey.my`.
 **The `(template, signature)` cache (`tmpl_cache`) is SESSION-persistent, NOT
 cleared per input** — a signature already instantiated by a prior input
 **reuses** that instance instead of building a duplicate (`f(2,3)` then `f(2,3)`

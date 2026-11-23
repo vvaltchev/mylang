@@ -545,8 +545,26 @@ private:
     /* Value-instantiated clones' uniform signatures - seeded into the
      * clone's params each fixpoint round (no direct call feeds them). */
     std::map<FuncInfo *, std::vector<StaticTypeRef>> value_inst_sigs;
-    /* Templates already value-instantiated (their uses redirected). */
-    std::set<FuncInfo *> value_inst_done;
+    /* Templates already value-instantiated (their uses redirected): the
+     * instance, the signature it was made for, and each use with the
+     * name and symbol it had - #81: a signature can go stale when an
+     * argument widens later, and the uses then go back to the template
+     * (value_instantiate_round). */
+    struct ValueInst {
+        FuncInfo *clone = nullptr;
+        std::vector<StaticTypeRef> sig;
+        struct OrigUse {
+            Identifier *id;
+            const UniqueId *uid;
+            TypeSym *sym;
+        };
+        std::vector<OrigUse> uses;
+    };
+    std::map<FuncInfo *, ValueInst> value_insts;
+    /* ...and the templates whose calls through a value stopped agreeing:
+     * their base runs from then on (never instantiated again, so the
+     * rounds cannot flip back and forth) */
+    std::set<FuncInfo *> value_inst_barred;
     std::unordered_set<FuncInfo *> tmpl_cap_warned;
     /*
      * #115 (fixed 2026-08-27): the INDIRECT call sites whose callee is
@@ -2685,6 +2703,17 @@ void Inferencer::stamp_closure_templates(Block *rootBlock)
  * calls run its typed body. Escapes (a set-dropping join, an arg-position
  * use, a capture) disable it - the base keeps running, as before.
  */
+/* two signatures alike, part by part */
+static bool same_sig(const std::vector<StaticTypeRef> &a,
+                     const std::vector<StaticTypeRef> &b)
+{
+    return a.size() == b.size()
+        && std::equal(a.begin(), a.end(), b.begin(),
+                      [](StaticTypeRef x, StaticTypeRef y) {
+                          return static_type_equal(x, y);
+                      });
+}
+
 bool Inferencer::value_instantiate_round(Block *rootBlock)
 {
     /*
@@ -2816,7 +2845,8 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
     for (auto &e : rootBlock->elems)
         walk(e.get(), false);
 
-    if (uses.empty())
+    /* (an instance's uses name the instance: #81 re-checks those) */
+    if (uses.empty() && value_insts.empty())
         return false;
 
     /* 2) Every INDIRECT call (no direct FuncInfo) whose callee type carries
@@ -2841,7 +2871,81 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
             sites[f].push_back({ cp.first, cp.second });
     }
 
+    /* the one signature every site gives `tmpl`'s template parameters
+     * (settled, arity-legal), or false */
+    const auto uniform_sig = [&](FuncInfo *tmpl, const std::vector<Site> &ss,
+                                 std::vector<StaticTypeRef> &sig) -> bool {
+        const size_t nparams = tmpl->params.size();
+        size_t min_args = 0;
+        for (size_t i = 0; i < nparams; i++)
+            if (!tmpl->params[i]->opt_decl)
+                min_args = i + 1;
+        bool first = true;
+        for (const Site &site : ss) {
+            const size_t nargs = site.call->args->elems.size();
+            if (nargs < min_args || nargs > nparams)
+                return false;
+            std::vector<StaticTypeRef> s1;
+            for (size_t i = 0; i < nparams; i++) {
+                TypeSym *p = tmpl->params[i];
+                if (!template_param(p))
+                    continue;              /* not a template param */
+                StaticTypeRef t = template_arg_key(site.call, p, i);
+                if (is_unknown(t))
+                    return false;
+                s1.push_back(t);
+            }
+            if (first) {
+                sig = std::move(s1);
+                first = false;
+            } else if (!same_sig(sig, s1)) {
+                return false;
+            }
+        }
+        return !first;
+    };
+
     bool progress = false;
+
+    /*
+     * #81: an instance's signature was the sites' when it was made, and
+     * an argument may widen afterwards (a global a later statement
+     * assigns a float). Each round asks again, of the sites the instance
+     * now has: one whose signature moved, or whose sites stopped agreeing,
+     * or whose value escaped, gives its uses back to the template - the
+     * instance is then left with no live use and set aside
+     * (mark_orphan_instances, through `rekeyed`). A signature that
+     * merely moved is instantiated again for the new one; sites that
+     * disagree run the base from then on, as they would have had they
+     * disagreed from the start. It used to stay: the instance's parameter
+     * joined the widened argument, and an int argument of another site
+     * sat unconverted in a float parameter.
+     */
+    for (auto it = value_insts.begin(); it != value_insts.end();) {
+        ValueInst &vi = it->second;
+        auto cs = sites.find(vi.clone);
+        if (vi.clone->pinned || cs == sites.end() || cs->second.empty()) {
+            ++it;
+            continue;
+        }
+        std::vector<StaticTypeRef> now;
+        const bool agree = !callee_escaped(vi.clone)
+            && uniform_sig(it->first, cs->second, now);
+        if (agree && same_sig(now, vi.sig)) {
+            ++it;
+            continue;
+        }
+        for (const ValueInst::OrigUse &u : vi.uses) {
+            u.id->uid = u.uid;
+            id_sym[u.id] = u.sym;
+        }
+        value_inst_sigs.erase(vi.clone);
+        if (!agree)
+            value_inst_barred.insert(it->first);
+        it = value_insts.erase(it);
+        rekeyed = true;
+        progress = true;
+    }
 
     for (auto &kv : uses) {
         FuncInfo *tmpl = kv.first;
@@ -2865,7 +2969,7 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
             continue;
         if (callee_escaped(tmpl))
             continue;
-        if (value_inst_done.count(tmpl))
+        if (value_insts.count(tmpl) || value_inst_barred.count(tmpl))
             continue;
         auto st = sites.find(tmpl);
         if (st == sites.end() || st->second.empty())
@@ -2873,43 +2977,9 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
 
         /* 3) UNIFORMITY: every attributed call must have the same settled,
          * arity-legal signature over the TEMPLATE params. */
-        const size_t nparams = tmpl->params.size();
-        size_t min_args = 0;
-        for (size_t i = 0; i < nparams; i++)
-            if (!tmpl->params[i]->opt_decl)
-                min_args = i + 1;
-
         std::vector<StaticTypeRef> sig;
-        bool ok = true, first = true;
-        for (const Site &site : st->second) {
-            const size_t nargs = site.call->args->elems.size();
-            if (nargs < min_args || nargs > nparams) { ok = false; break; }
-            std::vector<StaticTypeRef> s1;
-            for (size_t i = 0; i < nparams; i++) {
-                TypeSym *p = tmpl->params[i];
-                if (!template_param(p))
-                    continue;              /* not a template param */
-                StaticTypeRef t = template_arg_key(site.call, p, i);
-                if (is_unknown(t)) { ok = false; break; }
-                s1.push_back(t);
-            }
-            if (!ok)
-                break;
-            if (first) {
-                sig = std::move(s1);
-                first = false;
-            } else if (sig.size() != s1.size()
-                       || !std::equal(sig.begin(), sig.end(), s1.begin(),
-                                      [](StaticTypeRef a, StaticTypeRef b) {
-                                          return static_type_equal(a, b);
-                                      })) {
-                ok = false;
-                break;
-            }
-        }
-        if (!ok)
+        if (!uniform_sig(tmpl, st->second, sig))
             continue;
-        ML_CHECK(!first);          /* the site list is not empty */
 
         /*
          * A signature that cannot improve on the base - leave the base
@@ -2968,7 +3038,10 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
             continue;
 
         value_inst_sigs[clone_sym->func] = sig;
-        value_inst_done.insert(tmpl);
+        ValueInst &vi = value_insts[tmpl];
+        vi.clone = clone_sym->func;
+        vi.sig = sig;
+        vi.uses.clear();
 
         if (trace_enabled(TraceCat::templ)) {
             std::string ss;
@@ -2992,6 +3065,7 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
          * therefore callable with unchecked args - C3's proven-param
          * stamp must never fire on it. */
         for (const Use &u : kv.second) {
+            vi.uses.push_back({ u.id, u.id->uid, u.sym });
             u.id->uid = clone_name;
             id_sym[u.id] = clone_sym;
             clone_sym->value_used = true;

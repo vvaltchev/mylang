@@ -1,0 +1,44 @@
+# A template called through a VALUE gets an instance only if every call
+# through that value agrees on the argument types (README) - the types the
+# whole program gives the arguments, not the ones they had when the
+# instance was made (#81). An argument may widen afterwards (a global a
+# later statement assigns a float): until 2026-11-23 the instance stayed,
+# its parameter joined the widened argument, and another call's int sat
+# unconverted in a float parameter - `typestr` said "float" while
+# `str(x + 1)` printed 4 (--no-opt all) or 4.000000 (the default).
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (typed && got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+
+# ---- two calls through one value, one argument widens later: they
+# disagree, and the template's untyped body runs (as when they disagree
+# from the start)
+var gv = 1;
+var hv = 1;
+func setg(y) { gv = y; return 0; }
+func seth(y) { hv = y; return 0; }
+func f(x) { return typestr(x) + " " + str(x + 1); }
+func g(x) { return typestr(x) + " " + str(x + 1); }
+var w = [f];
+var wg = [g];
+want("the widened global's call", w[0](gv), "float 2.000000");
+want("the int literal's call", w[0](3), "int 4");
+func h(x) { return typestr(x) + " " + str(x + 1); }
+var w2 = [h];
+want("disagreeing from the start", w2[0](2.5) + " / " + w2[0](3),
+     "float 3.500000 / int 4");
+
+# ---- one call whose argument widens: the instance for its new type
+want("the only call", wg[0](hv), "float 2.000000");
+setg(2.5);
+seth(0.5);
+want("the only call again", wg[0](hv), "float 1.500000");
+
+assert(bad == 0);
+print("ok");
