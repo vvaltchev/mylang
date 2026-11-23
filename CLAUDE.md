@@ -4192,6 +4192,16 @@ purity is decided before the walk reaches a later reassignment) and
 AutoConst and the Inliner). An explicit `pure func` is the exception: its
 name is a compile-time binding, and rebinding it is CannotRebindConstEx in
 every engine (the tree-walker used to rebind it silently).
+**Two more holes in the same rule (#87, 2026-11-23):** a store into such
+a name - a named function, a `var` bound to a lambda - was never checked
+(`contribute` returned early for a function symbol), so `sq = 5`
+compiled and `typestr(sq)` said `func(dyn)->dyn`; it now takes only a
+function of a fitting signature (option B). And value instantiation
+walked the ASSIGNMENT TARGET as a value use of the template: `sq = ng`
+renamed the target to `sq$0`, the store wrote the instance's slot, every
+guard above (all keyed by name) read `sq` as never written, and `sq(3)`
+after it folded with the old body - 9 where `-nti` printed -3. A store's
+target is never a value use.
 
 **Auto-pure & const/pure introspection.** `func_body_is_pure` (`resolver.cpp`),
 run after a function body is resolved, promotes a non-pure, capture-free func to

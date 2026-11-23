@@ -20052,6 +20052,34 @@ static const std::vector<test> tests =
      * through the fixpoint's join (these cases), an ANNOTATED decl / an
      * argument goes through assignable.
      */
+    /* #87: a function's NAME - a named function, a `var` bound to a
+     * lambda - keeps a function too: a store of anything else was
+     * unchecked (typestr said `func(dyn)->dyn` of a name holding 5) */
+    { "ti: a function's name is not assigned a number (#87)",
+      { "func sq(x) { return x * x; }", "print(sq(3));", "sq = 5;" },
+      &typeid(TypeMismatchEx), 1, 3, 4, 3 },
+    { "ti: a var bound to a lambda is not assigned a number (#87)",
+      { "var f = func (x) { return x + 1; };", "print(f(1));",
+        "f = 5;" },
+      &typeid(TypeMismatchEx), 1, 3, 3, 3 },
+    { "ti: ...nor none, nor a dyn (#87)",
+      { "func sq(x) { return x * x; }", "print(sq(3));",
+        "var dyn d = runtime(sq);", "sq = d;" },
+      &typeid(TypeMismatchEx), 1, 4, 4, 4 },
+    { "ti: ...nor none (#87)",
+      { "var f = func (x) { return x + 1; };", "f = none;" },
+      &typeid(TypeMismatchEx) },
+    /* ...and the name stored into is not a VALUE use of the template:
+     * it was renamed to its instance, the store wrote the instance's
+     * slot and `sq(3)` folded with the old body */
+    { "ti: a function's name rebound at the top level is rebound (#87)",
+      { "func sq(x) { return x * x; }", "func ng(x) { return 0 - x; }",
+        "assert(sq(3) == 9);", "sq = ng;", "assert(sq(3) == -3);" } },
+    { "ti: a function's name still takes another function (#87)",
+      { "func sq(x) { return x * x; }", "func ng(x) { return 0 - x; }",
+        "var f = func (x) { return x + 1; };",
+        "assert(sq(3) == 9); sq = ng; assert(sq(3) == -3);",
+        "f = func (y) { return y * 10; }; assert(f(2) == 20);" } },
     { "ti: func subtyping - a wrong RETURN type is refused (->float)",
       { "func a(int k) { return k; }",
         "func b(int k) { return 2.5; }",
@@ -24118,6 +24146,10 @@ static const std::vector<repl_test> repl_tests =
           "" },
         { "var h83 = mk83()", "" },
         { "h83 = runtime(5)", "TypeMismatchEx" },
+        /* #87: a lambda template's variable keeps a function */
+        { "var lt87 = func (x) { return x + 1; }", "" },
+        { "lt87 = runtime(5)", "holds a function" },
+        { "lt87(1)", "=> 2" },
         { "h83(1)", "=> 2" },
         /* #84: an earlier input's template named in a running base is
          * committed - its body is not marked again */

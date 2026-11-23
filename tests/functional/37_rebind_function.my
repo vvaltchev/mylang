@@ -55,3 +55,14 @@ func drive(int n) { var r = ia(n); return r; }
 var d1 = drive(runtime(1));
 ia = ib;
 print("inlined ", d1, drive(runtime(1)));
+
+# a name rebound at the top level and called with constant arguments: the
+# store's target is not a value use of the template - it was renamed to
+# the template's instance, so the store went to the instance's slot and
+# `cs(3)` after it folded with the old body (9 where -nti printed -3, #87)
+func cs(x) { return x * x; }
+func cn(x) { return 0 - x; }
+print("const   ", cs(3));
+cs = cn;
+print("const   ", cs(3));
+assert(cs(3) == -3);

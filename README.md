@@ -2363,6 +2363,12 @@ sq = ng;
 print(sq(3), use(2));      # -3 -1
 ```
 
+Anything that is not a function - a number, `none`, a `dyn` value - is a
+compile-time `TypeMismatchEx`, as it is for any variable holding a function;
+so is a `var` bound to a lambda (`var f = func (x) { ... }; f = 5;`). (Both
+used to be accepted, and the name then held a number its type said was a
+function.)
+
 The exception is a `pure func` (see [Pure functions](#pure-functions)): its name
 is a compile-time binding, like a `const`, so reassigning it is a compile-time
 `CannotRebindConstEx` (and so is reassigning a struct's name).

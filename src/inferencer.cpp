@@ -2835,11 +2835,14 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
          * through a baked const (`const OPS = [tw];`, folded at parse
          * time, so no identifier names it) found the declaration's own
          * `tw` here, renamed it to the instance - whose name was then
-         * declared twice (AlreadyDefinedEx, 2026-11-14) */
+         * declared twice (AlreadyDefinedEx, 2026-11-14). Nor is the name
+         * an assignment STORES into: `sq = ng` renamed `sq` to sq's
+         * instance, so the store wrote the instance's slot, the rebound
+         * name read as never written, and `sq(3)` after it folded with
+         * the old body - 9 where -nti printed -3 (#87) */
         if (ctag(n) == ConstructType::expr14) {
             auto *e14 = static_cast<Expr14 *>(n);
-            if ((e14->fl & pFlags::pInDecl)
-                    && ctag(e14->lvalue.get()) == ConstructType::id) {
+            if (ctag(e14->lvalue.get()) == ConstructType::id) {
                 walk(e14->rvalue.get(), in_func);
                 return;
             }
@@ -8025,8 +8028,32 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
      * the opt bit, so `var dyn d = 5; d = none;` infers `opt dyn`. (A dyn param
      * is skipped in contribute_arg - its opt is declared, not inferred.)
      */
-    if (!s || s->func || s->in_named_base)
+    if (!s || s->in_named_base)
         return;
+    if (s->func) {
+        /* #87: a name bound to a function - a named function, a `var`
+         * bound to a lambda - keeps that function's type, so a store
+         * into it must be a function of a fitting signature (option B:
+         * another one rebinds it, #38 D). Anything else was stored
+         * unchecked: typestr said `func(dyn)->dyn` of a name holding 5,
+         * and a call through it raised NotCallableEx. A `dyn` is refused
+         * as for any variable holding a function (fit_checkable). A
+         * const binding - a `const`, an explicit pure function's name -
+         * is the resolver's CannotRebindConstEx instead (check_rebind). */
+        const FuncDeclStmt *fd = s->func->decl;
+        ML_CHECK(fd);       /* (declare_funcdecl is the one creator) */
+        if (strict_dyn && !s->const_decl
+                && !(fd->id && fd->desc->explicit_pure)) {
+            const StaticTypeRef rt = static_type_resolve(t);
+            const StaticTypeRef ft = func_static_type(s->func);
+            if (!has_unknown(rt) && !static_type_assignable(rt, ft))
+                conflict("'" + std::string(s->name->val)
+                             + "' holds a function but is assigned '"
+                             + static_type_to_string(t) + "'",
+                         loc, loc_end);
+        }
+        return;
+    }
 
     /* rule 8.1: a `none` given to an `opt` parameter adds nothing to its
      * type - the declaration already lets it be none. One only `none`
