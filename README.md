@@ -692,7 +692,11 @@ compile errors. (A plain `var x;` is implicitly nullable — equivalent to
     an incompatible value is an error (`int x = "hi"`, `int x = 3.5`, or a later
     `x = 2.5`). The numeric chain still applies: `float f = 3;` is fine and
     **coerces** the value to `3.0` (so `f` really holds a float, including after
-    `f = 5;`), and `int x = true;` stores `1`.
+    `f = 5;`), and `int x = true;` stores `1`. A `dyn` value is not an error:
+    its type is known when it is stored, so it is **checked there** - `int x =
+    d` converts it as above (a `TypeError` for a `float` or a `str`), `str s =
+    d` and `Point p = d` check it (see *A `dyn` value entering a typed
+    place*).
   * **`array`/`dict`** are *generic*: they only require the value to be an array
     / dict, while its element/key/value types are inferred as usual — so
     `array nums = [1,2,3]` is still a fast flat `array<int>`. A bare `array` /
@@ -1790,13 +1794,16 @@ slot = "now a string";           # ok, because it's dyn
         (`s.v = d` for an `array<int> v` field);
       * a value given to `append`, `push` or `insert`, which store it
         into the array or dict;
-      * a value assigned to a variable declared with a type, when the
-        value's type has a `dyn` inside (an `array<dyn>` into an
-        `array<int> v`) - a value whose type is `dyn` itself is refused
-        at compile time there. A multi-assignment checks what each
-        declared target receives, just before that target is stored:
-        `a, b = rows` with `rows[1]` not fitting `b` stores `a` and
-        leaves `b` as it was, as a failing conversion does.
+      * a value assigned to a variable declared with a type (`int`,
+        `bool`, `str`, `P`, `array<int>` ...), when the value is a
+        `dyn` or has a `dyn` inside (an `array<dyn>` into an
+        `array<int> v`) - so is one assigned to a top-level REPL
+        variable an earlier input fixed the type of. An `int` or `float`
+        variable converts it, as described above; any other one checks
+        it. A multi-assignment checks what each declared target
+        receives, just before that target is stored: `a, b = rows` with
+        `rows[1]` not fitting `b` stores `a` and leaves `b` as it was,
+        as a failing conversion does.
 
     The check goes as deep as the declared type does: an `array<int>`
     checks each element of the array, a `dict<str, array<int>>` each
@@ -1822,10 +1829,20 @@ slot = "now a string";           # ok, because it's dyn
 
     A compound assignment into an element, a field or a variable
     declared with a type (`a[i] += d`, `v += r`, `a, b += rows`) is
-    refused at compile time when its result may not fit the place:
-    the operation's result cannot be checked before the store, so the
-    compiler asks for the plain form, `a[i] = a[i] + d`, which is
-    checked.
+    `x = x OP v`, so when its result may not fit the place it is
+    checked after the operation and before the store, the caret on the
+    whole compound, and a refusal leaves the place as it was: `b += d`
+    into a `bool b` refuses the `int` it computes, `n *= d` into an
+    `int n` refuses a `float`. An array's `+=` grows the array every
+    name holding it shares, checking each new element against the type
+    the array carries before it adds any:
+
+    ```
+    array<int> a = [1];
+    var dyn xs = runtime(["x"]);
+    a += xs;      # TypeErrorEx: the array's elements are 'int' but the
+                  # value is a 'str' - `a` is still [1]
+    ```
 
     **A container keeps its type.** An array or a dict carries the type
     it was made with - the type of the place its literal or the call

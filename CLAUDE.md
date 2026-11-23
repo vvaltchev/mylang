@@ -5036,10 +5036,11 @@ decisions behind it: `plans/archived/type-inference.md`,
   float until then - for a local, a global and a capture alike. A float
   variable's compound result is a float whatever it is given. A
   compound into a DICT's `int` value (#79) is a Q2 checked store
-  instead: `compound_into_int_value` sets `ct_store` on its lvalue, so
+  instead: `compound_store_checked` sets `ct_store` on its lvalue, so
   every engine checks the result against the type the dict carries
-  (`ct_rmw`), as a store through `dyn` is - an element of an array<int>
-  is flat storage and a struct field's store refuses a float itself.
+  (`ct_rmw`), as a store through `dyn` is - and so does one into an
+  array element (#83) - while a struct field's store refuses a float
+  itself.
   `tests/functional/141_compound_dyn_store.my`.
 - **⛔ A `dyn` VALUE ENTERING A TYPED PLACE IS CHECKED AT RUN TIME, BY
   ONE FUNCTION (#49, 2026-10-12; README *A `dyn` value entering a typed
@@ -5060,9 +5061,9 @@ decisions behind it: `plans/archived/type-inference.md`,
   CheckNoneArgsV mask - so a fit failure is a BIND fault like the none
   one), a struct constructor's field (`BoxedCtor.fit`), an element /
   field / dict-value store and a store into a variable whose type is
-  declared (`Expr14::rv_fit` - a variable's only for a value with a
-  `dyn` INSIDE, `Place::var`: a `dyn` itself is refused statically),
-  each declared target of a multi-assignment (`IdList::fits`, checked
+  declared (`Expr14::rv_fit`, `Place::var`; a `dyn` itself as much as
+  one with a `dyn` inside - #83, below), each declared target of a
+  multi-assignment (`IdList::fits`, checked
   just before that target's store - the VM unpacks such a statement
   into temps, `emit_multi_via_temps`), a
   dict key (`Subscript::key_fit`) and an in-place builtin's stored
@@ -5073,11 +5074,34 @@ decisions behind it: `plans/archived/type-inference.md`,
   builtins/arr.cpp.h too - it evaluates its own argument); the VM emits
   **`CheckFitV`** on the value's slot (`emit_fit`, its spec in
   `Chunk::fit_specs`, `.myv` v37), whose native form is
-  `jit_check_fit`, conveying and exc-stamped. A COMPOUND store whose
-  result may misfit is refused at compile time
-  (`refuse_compound_misfit`, for an element, a field, a declared
-  variable and each declared multi-assignment target): the result is
-  computed in the store, past any point a check could stand. **A new
+  `jit_check_fit`, conveying and exc-stamped. **⛔ A `dyn` IS CHECKED,
+  NEVER REFUSED (#83, maintainer-set 2026-11-23: "we must always check
+  the type of dyn before using it with an int/float or any other fixed
+  type variable").** `int v = d` / `P p = d` used to be compile errors
+  (`contribute` refused a `dyn` into an annotated or a committed REPL
+  symbol), and so was a COMPOUND whose result may misfit. Now a `dyn`
+  into such a variable converts (int/float - its `decl_type`;
+  `stamp_fixed_numeric` gives a committed REPL global's use one, since
+  its declaration is in an earlier input) or is checked (`rv_fit`), and
+  a compound's RESULT is checked after the operation, before the store,
+  the whole compound's caret: a declared variable through
+  `Expr14::res_fit` (the tree-walker's `compound_checked_store`, the
+  VM's `emit_checked_compound` - MoveV + CompoundV on a COPY of the
+  handle, then CheckFitV and a plain store: a BinOpV would build `a +
+  v`, a new array, where `+=` grows the storage every alias shares), a
+  multi-assignment target through `IdList::fits` (for a compound, the
+  result's check), an element / dict value through the type its
+  container carries (`compound_store_checked` sets `ct_store`), a
+  struct field by its own store (`coerce_struct_field`). An array's
+  `+=` checks each new element against the type the array carries
+  before it adds any (`TypeArr::add`), so a refusal changes nothing.
+  The VM's multi-target compound into an INT target also lowers
+  through temps now (`emit_checked_compound`'s CoerceNumV) - the #77
+  fix had missed it, and `a, b += d` stored a float in an int slot. A
+  `dyn?` into a non-opt place stays a nullability error, and an
+  INFERRED non-numeric variable given a `dyn` still widens to `dyn`
+  and asks for the declaration (mandatory `dyn`).
+  `tests/functional/143_dyn_checked_store.my`. **A new
   place a value can enter - a new store form, a new in-place builtin, a
   new bind path - takes a FitSpec and a check through `value_fits`**,
   or a `dyn` launders a wrong value into it. The bytecode inliner does

@@ -7022,6 +7022,39 @@ handle_single_expr14(EvalContext *ctx,
     return rval;
 }
 
+/*
+ * #83: `t OP= v` whose RESULT may misfit the target's declared type
+ * (Expr14::res_fit, a compound's IdList::fits): it is `t = t OP v`, so the
+ * operation runs on the current value, the result is checked - the whole
+ * compound's caret, as the VM's CheckFitV after its BinOpV - and stored
+ * as a plain `=` stores it.
+ */
+static EvalValue compound_checked_store(EvalContext *ctx, bool inDecl, Op op,
+                                        Construct *t, const EvalValue &v,
+                                        const FitSpec &f, Loc s, Loc e)
+{
+    EvalValue acc = RValue(t->eval(ctx));
+    apply_compound_op(acc, v, op);
+    check_fit_loc(acc, f, s, e);
+    return handle_single_expr14(ctx, inDecl, Op::assign, t, acc);
+}
+
+/* one target of `a, b = v` / `a, b OP= v`: what it receives checked
+ * before its store (#49), or a compound's result after its operation */
+static void store_idlist_target(EvalContext *ctx, bool inDecl, Op op,
+                                Identifier *t, const EvalValue &v,
+                                const FitSpec *f, const Expr14 *e14)
+{
+    if (f && op != Op::assign) {
+        compound_checked_store(ctx, inDecl, op, t, v, *f, e14->start,
+                               e14->end);
+        return;
+    }
+    if (f)
+        check_fit_loc(v, *f, e14->rvalue->start, e14->rvalue->end);
+    handle_single_expr14(ctx, inDecl, op, t, v);
+}
+
 EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 {
     const bool inDecl = fl & pFlags::pInDecl;
@@ -7110,10 +7143,10 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
                 if (t->is_underscore())
                     continue;   /* `_` placeholder: skip */
                 /* #49: what the target receives, checked before its
-                 * store - the value's caret, as the VM's CheckFitV */
-                if (const auto &f = idlist->fit_of(i))
-                    check_fit_loc(rval, *f, rvalue->start, rvalue->end);
-                handle_single_expr14(ctx, inDecl, op, t, rval);
+                 * store - the value's caret, as the VM's CheckFitV (a
+                 * compound's RESULT, after its operation: #83) */
+                store_idlist_target(ctx, inDecl, op, t, rval,
+                                    idlist->fit_of(i).get(), this);
             }
 
         } else {
@@ -7142,10 +7175,9 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
                     continue;   /* `_` placeholder: skip this array slot */
 
                 const EvalValue elem = arr_elem_boxed(arr, i);
-                if (const auto &f = idlist->fit_of(i))
-                    check_fit_loc(elem, *f, rvalue->start, rvalue->end);
-                handle_single_expr14(ctx, inDecl, op,
-                                     idlist->elems[i].get(), elem);
+                store_idlist_target(ctx, inDecl, op,
+                                    idlist->elems[i].get(), elem,
+                                    idlist->fit_of(i).get(), this);
             }
         }
 
@@ -7153,6 +7185,9 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
     } else {
 
+        if (res_fit)
+            return compound_checked_store(ctx, inDecl, op, lvalue.get(),
+                                          rval, *res_fit, start, end);
         EvalValue r = handle_single_expr14(ctx, inDecl, op, lvalue.get(),
                                            rval);
         /* A plain store's VALUE into an element or a field is the rvalue

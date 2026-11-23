@@ -2629,24 +2629,41 @@ static const std::vector<test> tests =
         "if (i == 1) { d = runtime([2.5]); } }",
         "print(n);" },
       &typeid(TypeErrorEx), 50, 3, 52, 3 },
-    /* a compound store computes its value inside the store, where no
-     * fit check can stand: one whose result may misfit is refused */
-    { "check: a compound store whose result may misfit is refused (#49)",
+    /* a compound store whose result may misfit is checked at run time
+     * (#83: a `dyn` is checked, never refused): `aa[0] += d` grows the
+     * element array, each new element checked against the type it
+     * carries - the whole compound's caret */
+    { "check: a compound store whose result fits is stored (#83)",
       { "array<array<int>> aa = [[1]];",
         "var dyn d = runtime([2]);",
         "aa[0] += d;",
+        "assert(str(aa) == \"[[1, 2]]\");" } },
+    { "check: a compound store whose result misfits is a run-time "
+      "TypeErrorEx (#83)",
+      { "array<array<int>> aa = [[1]];",
+        "var dyn d = runtime([\"x\"]);",
+        "aa[0] += d;",
         "print(aa);" },
-      &typeid(TypeMismatchEx), 1, 3, 12, 3 },
-    /* (rule 1: a result that may misfit a declared variable is a `dyn`
-     * - an array<dyn> no longer enters an array<array<int>> - and a
-     * declared variable refuses a `dyn` at the target, #49) */
+      &typeid(TypeErrorEx), 1, 3, 12, 3 },
     { "check: a compound store into a declared variable whose result "
-      "may misfit is refused (#49)",
+      "fits is stored (#83)",
       { "array<array<int>> v = [[1]];",
         "var dyn r = [runtime([2])];",
         "v += r;",
+        "assert(str(v) == \"[[1], [2]]\");" } },
+    { "check: a compound store into a declared variable whose result "
+      "misfits is a run-time TypeErrorEx (#83)",
+      { "array<array<int>> v = [[1]];",
+        "var dyn r = [runtime([\"x\"])];",
+        "v += r;",
         "print(v);" },
-      &typeid(TypeMismatchEx), 1, 3, 3, 3 },
+      &typeid(TypeErrorEx), 1, 3, 8, 3 },
+    { "check: a bool variable's compound given a dyn is a run-time "
+      "TypeErrorEx, the variable kept (#83)",
+      { "bool b = true; var dyn d = runtime(2);",
+        "try { b += d; } catch (TypeErrorEx) { assert(b == true); }",
+        "b += d;" },
+      &typeid(TypeErrorEx), 1, 3, 8, 3 },
     /* rule 1 (plans/strict-container-types.md): a container a name may
      * hold keeps its type wherever it flows - into a variable, out of a
      * function, through a ternary - and a place of another type is a
@@ -2784,13 +2801,24 @@ static const std::vector<test> tests =
       { "func f(array<dyn> a) => len(a);", "var a = [1];",
         "print(f(a));" },
       &typeid(TypeMismatchEx), 9, 3, 11, 3 },
-    { "check: a compound multi-assignment whose result may misfit a "
-      "declared target is refused (#49)",
+    { "check: a compound multi-assignment whose result fits its "
+      "declared targets is stored (#83)",
       { "array<array<int>> a = [[1]]; array<array<int>> b = [[2]];",
         "var dyn src = [[runtime([3])], [[4]]];",
         "a, b += src;",
+        "assert(str([a, b]) == \"[[[1], [3]], [[2], [4]]]\");" } },
+    { "check: a compound multi-assignment whose result misfits a "
+      "declared target is a run-time TypeErrorEx (#83)",
+      { "array<array<int>> a = [[1]]; array<array<int>> b = [[2]];",
+        "var dyn src = [[[1]], [runtime([\"x\"])]];",
+        "a, b += src;",
         "print(a, b);" },
-      &typeid(TypeMismatchEx), 1, 3, 3, 3 },
+      &typeid(TypeErrorEx), 1, 3, 13, 3 },
+    { "check: a compound multi-assignment into bool targets given a dyn "
+      "is a run-time TypeErrorEx (#83)",
+      { "bool c = false; bool e = true; var dyn d = runtime(1);",
+        "c, e += [d, d];" },
+      &typeid(TypeErrorEx), 1, 2, 16, 2 },
     { "err loc: a DYN value that misfits a multi-assignment target "
       "marks the value (#49)",
       { "array<int> v = [1]; array<int> w = [2]; var dyn d = runtime(1);",
@@ -6971,9 +6999,14 @@ static const std::vector<test> tests =
         "var j = big(runtime(4)); j = 1; assert(j == 1);",
         "array<int> a = map(big, [1, 2]); assert(a == [2, 4]);",
         "array<int> b = [big(runtime(5))]; assert(b == [10]);" } },
-    { "infer: a dyn result into a declared int is the dyn refusal",
+    /* (a `dyn` into a declared int is converted, CHECKED, at run time -
+     * #83; it was refused at compile time) */
+    { "infer: a dyn result into a declared int converts at run time",
       { "func big(dyn v) { if (v < 100) return v * 2; return \"big\"; }",
-        "int k = big(runtime(3));" }, &typeid(TypeMismatchEx) },
+        "int k = big(runtime(3)); assert(k == 6);" } },
+    { "infer: a dyn result that misfits a declared int raises at run time",
+      { "func big(dyn v) { if (v < 100) return v * 2; return \"big\"; }",
+        "int k = big(runtime(300));" }, &typeid(TypeErrorEx) },
     { "infer: a conflict the fixpoint keeps is still refused",
       { "func big(dyn v) { if (v < 100) return v * 2; return \"big\"; }",
         "func s(int n) { return str(n); }",
@@ -24017,6 +24050,33 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* #83: a committed global of a fixed type given a `dyn` (or a
+     * narrower number) in a later input converts or checks it at run
+     * time, as an annotated variable does: its declaration is in an
+     * earlier input, so the use carries the conversion itself
+     * (stamp_fixed_numeric). `x83 = 3` used to leave the int 3 in a
+     * float global, and a `dyn` was refused at compile time. */
+    { "a committed global converts or checks a dyn at run time",
+      { { "var x83 = 1.5", "=> 1.500000" },
+        { "x83 = 3", "=> 3.000000" },
+        { "x83 += true", "=> 4.000000" },
+        { "var y83 = 1", "=> 1" },
+        { "var dyn d83 = runtime(2.5)", "" },
+        { "y83 = d83", "cannot store a non-int value" },
+        { "y83 += d83", "cannot store a non-int value" },
+        { "y83", "=> 1" },
+        { "y83 = runtime(4)", "=> 4" },
+        { "y83 += runtime(1)", "=> 5" },
+        { "bool b83 = true", "=> true" },
+        { "b83 = runtime(1)", "'b83' is declared 'bool' but the value" },
+        { "b83 += runtime(1)", "'b83' is declared 'bool' but the value" },
+        { "b83", "=> true" },
+        { "var s83 = \"a\"", "" },
+        { "s83 = runtime(\"b\")", "=> \"b\"" },
+        { "s83 = runtime(1)", "'s83' is declared 'str' but the value" },
+        { "var p83 = 1.5; var q83 = 2.5", "" },
+        { "p83, q83 = [runtime(1), 2]", "" },
+        { "typestr(p83) + str(p83)", "=> \"float1.000000\"" } } },
     /* rule 8.2, decision 3: a closure made in one input and called in a
      * later one runs its untyped body; sites in its own input get
      * instances */

@@ -666,9 +666,9 @@ private:
     void check_alias_exact(Construct *rv, Identifier *to);
     void check_flow_exact(Construct *rv, StaticTypeRef dest,
                           const std::string &what);
-    void refuse_compound_misfit(Op op, StaticTypeRef place,
-                                StaticTypeRef v, Construct *at);
-    bool compound_into_int_value(Expr14 *e);
+    bool compound_may_misfit(Op op, StaticTypeRef place, StaticTypeRef v);
+    bool compound_store_checked(Expr14 *e);
+    void stamp_fixed_numeric(Identifier *id, StaticTypeRef v);
     void check_builtin_store(CallExpr *call);
     std::vector<TypeSym *> *known_params(CallExpr *call);
     StaticTypeRef arg_type(Construct *arg, TypeSym *param);
@@ -4859,8 +4859,26 @@ void Inferencer::annotate_hints(Construct *n)
          * the declaration has a type - an array<dyn> into an array<int>:
          * the check pass accepts it (a dyn element fits any element
          * type), so it is checked at run time, as a parameter is at its
-         * bind. A value that is a `dyn` itself is refused at compile
-         * time there, and an int / float variable converts its value. */
+         * bind. A value that is a `dyn` itself is checked the same way
+         * (#83), and an int / float variable converts its value. */
+        if (lv && ctag(lv) == ConstructType::id) {
+            auto *id = static_cast<Identifier *>(const_cast<Construct *>(lv));
+            /* a committed REPL global's later use carries no declaration
+             * the resolver could copy a decl_type from: an int / float one
+             * given a `dyn` converts it as an annotated one does (#83) */
+            stamp_fixed_numeric(id, type_of(e->rvalue.get()));
+            /* #83: a COMPOUND into a declared variable whose RESULT may
+             * misfit it (`b += d`, `b` a bool) is checked after the
+             * operation, before the store (an int one converts, #77) */
+            e->res_fit = nullptr;
+            if (e->op != Op::assign) {
+                if (StaticTypeRef d = declared_type_of(id))
+                    e->res_fit = store_fit(
+                        d, binop_result(compound_binop(e->op), d,
+                                        type_of(e->rvalue.get())),
+                        FitSpec::Place::var, id->uid);
+            }
+        }
         if (e->op == Op::assign && lv && ctag(lv) == ConstructType::id) {
             auto *id = static_cast<Identifier *>(const_cast<Construct *>(lv));
             e->rv_fit = nullptr;
@@ -4880,11 +4898,11 @@ void Inferencer::annotate_hints(Construct *n)
         }
         /* ... and each declared target of a multi-assignment, given what
          * it receives (idlist_elem_types) */
-        if (e->op == Op::assign && lv && ctag(lv) == ConstructType::idlist) {
+        if (lv && ctag(lv) == ConstructType::idlist) {
             auto *idl = static_cast<IdList *>(const_cast<Construct *>(lv));
             idl->fits.clear();
             const std::vector<StaticTypeRef> els =
-                idlist_elem_types(idl, e->rvalue.get(), true);
+                idlist_elem_types(idl, e->rvalue.get(), e->op == Op::assign);
             std::vector<std::shared_ptr<const FitSpec>> fits(
                 idl->elems.size());
             bool any = false;
@@ -4892,13 +4910,22 @@ void Inferencer::annotate_hints(Construct *n)
                 Identifier *t = idl->elems[i].get();
                 if (t->is_underscore())
                     continue;
+                stamp_fixed_numeric(t, els[i]);
+                /* (a compound's: its RESULT, as a single target's res_fit) */
                 if (StaticTypeRef d = declared_type_of(t))
-                    fits[i] = store_fit(d, els[i], FitSpec::Place::var,
-                                        t->uid);
+                    fits[i] = store_fit(
+                        d, e->op == Op::assign
+                               ? els[i]
+                               : binop_result(compound_binop(e->op), d,
+                                              els[i]),
+                        FitSpec::Place::var, t->uid);
                 any = any || fits[i];
             }
             if (any)
                 idl->fits = std::move(fits);
+        }
+        if (e->op == Op::assign && lv && ctag(lv) == ConstructType::idlist) {
+            auto *idl = static_cast<IdList *>(const_cast<Construct *>(lv));
             /* (an element literal that took its target's type is built
              * for it - idlist_elem_types' `into`) */
             auto *la = node_cast<LiteralArray>(e->rvalue.get());
@@ -5396,13 +5423,14 @@ static bool ct_unsettled(StaticTypeRef t)
         || t->kind == StaticTypeKind::Unknown;
 }
 
-/* #79: is `e` a compound into a DICT's `int` value whose result may be a
- * float (`d.k += v`, `v` a dyn)? `d.k = d.k + v` refuses the float at the
+/* #79 / #83: is `e` a compound into an element or a dict value whose
+ * RESULT may misfit it - a `dyn` into an `int` value (`d.k += v`), or into
+ * a bool or container element? `x = x OP v` refuses such a value at the
  * store; the compound computes its result inside the store, so it is
- * checked there, against the type the dict carries (ct_rmw), as a store
- * through `dyn` is. (An element of an array<int> is flat storage, which
- * refuses a float itself; a struct field's store refuses it too.) */
-bool Inferencer::compound_into_int_value(Expr14 *e)
+ * checked there, against the type the container carries (ct_rmw), as a
+ * store through `dyn` is. (A struct field's store refuses a misfit
+ * itself, coerce_struct_field.) */
+bool Inferencer::compound_store_checked(Expr14 *e)
 {
     if (e->op == Op::assign)
         return false;
@@ -5410,13 +5438,16 @@ bool Inferencer::compound_into_int_value(Expr14 *e)
     Construct *base = ctag(lv) == ConstructType::subscript
         ? static_cast<Subscript *>(lv)->what.get()
         : static_cast<MemberExpr *>(lv)->what.get();
-    if (static_type_resolve(type_of(base))->kind != StaticTypeKind::Dict
-            || static_type_resolve(type_of(lv))->kind != StaticTypeKind::Int)
+    const StaticTypeKind bk = static_type_resolve(type_of(base))->kind;
+    if (bk != StaticTypeKind::Dict && bk != StaticTypeKind::Array)
         return false;
+    const StaticTypeRef place = type_of(lv);
+    const StaticTypeRef v = type_of(e->rvalue.get());
+    const StaticTypeRef res = binop_result(compound_binop(e->op), place, v);
     /* (an int OP anything is an int, a float or a dyn - never a bool) */
-    return static_type_resolve(binop_result(
-        compound_binop(e->op), type_of(lv), type_of(e->rvalue.get())))->kind
-        != StaticTypeKind::Int;
+    if (static_type_resolve(place)->kind == StaticTypeKind::Int)
+        return static_type_resolve(res)->kind != StaticTypeKind::Int;
+    return compound_may_misfit(e->op, place, v);
 }
 
 /* the builtins that store a value into the container they are given */
@@ -5663,11 +5694,11 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
          * member whose type the compiler does not know - through a `dyn`
          * name, into an array<dyn> - checks the value against the
          * container's own type at run time; so does a compound whose
-         * result may not fit a dict's `int` value (#79) */
+         * result may misfit its element or value (#79, #83) */
         if (ctag(e->lvalue.get()) == ConstructType::subscript
                 || ctag(e->lvalue.get()) == ConstructType::member)
             e->lvalue->ct_store = ct_unsettled(type_of(e->lvalue.get()))
-                || compound_into_int_value(e);
+                || compound_store_checked(e);
         if (e->op == Op::assign) {
             /* checked where it lands; or stored through a `dyn` container,
              * whose element type is unknown here */
@@ -7787,8 +7818,12 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
         if (strict_dyn && !s->is_param) {
             StaticTypeRef rt = static_type_resolve(t);
             StaticTypeRef pt = static_type_resolve(s->type);
-            if (!has_unknown(rt) && !is_none(rt) && !static_type_assignable(rt,
-                pt))
+            /* (a `dyn` is checked at run time, as for an annotated
+             * variable below) */
+            const bool dyn_checked = rt->kind == StaticTypeKind::Dyn
+                && (!rt->opt || pt->opt);
+            if (!has_unknown(rt) && !is_none(rt) && !dyn_checked
+                    && !static_type_assignable(rt, pt))
                 conflict("'" + std::string(s->name->val) + "' " +
                              (s->ann != DeclType::none ? "is declared '"
                                                        : "has type '") +
@@ -7813,8 +7848,15 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
     if (StaticTypeRef d = ann_scalar_static_type(s)) {
         if (strict_dyn && !s->is_param) {
             StaticTypeRef rt = static_type_resolve(t);
-            if (!has_unknown(rt) && !is_none(rt) && !static_type_assignable(rt,
-                d))
+            /* a `dyn` is checked where it is stored, at run time
+             * (maintainer, 2026-11-23): a numeric variable converts it
+             * (its decl_type, CHECKED), any other one checks it (rv_fit,
+             * res_fit). A `dyn?` into a non-opt one stays a nullability
+             * error here. */
+            const bool dyn_checked = rt->kind == StaticTypeKind::Dyn
+                && (!rt->opt || d->opt);
+            if (!has_unknown(rt) && !is_none(rt) && !dyn_checked
+                    && !static_type_assignable(rt, d))
                 conflict("'" + std::string(s->name->val) +
                              "' is declared '" + static_type_to_string(d) +
                              "' but is assigned '" + static_type_to_string(t)
@@ -8273,6 +8315,32 @@ StaticTypeRef Inferencer::fixed_type(const TypeSym *s)
     if (StaticTypeRef d = ann_scalar_static_type(s))
         return static_type_resolve(d);
     return nullptr;
+}
+
+/*
+ * #83: a store into a COMMITTED REPL global whose type is int / float
+ * converts what it is given, as an annotated variable's store does - a
+ * `dyn` CHECKED, a narrower number widened - through the target's
+ * decl_type. An annotated variable's uses get theirs from the resolver;
+ * a committed global was declared in an earlier input, which the
+ * resolver of this one cannot see, so its use here is stamped. (It held
+ * the int an `x = 3` gave a float global, and refused a `dyn`.)
+ */
+void Inferencer::stamp_fixed_numeric(Identifier *id, StaticTypeRef v)
+{
+    if (id->decl_type != DeclType::none)
+        return;
+    auto it = id_sym.find(id);
+    if (it == id_sym.end() || !it->second || !it->second->pinned)
+        return;
+    const StaticTypeRef d = fixed_type(it->second);
+    const StaticTypeKind vk = static_type_resolve(v)->kind;
+    if (!d || vk == StaticTypeKind::Unknown)
+        return;
+    if (d->kind == StaticTypeKind::Float && vk != StaticTypeKind::Float)
+        id->decl_type = DeclType::f;
+    else if (d->kind == StaticTypeKind::Int && vk != StaticTypeKind::Int)
+        id->decl_type = DeclType::i;
 }
 
 /*
@@ -9062,24 +9130,22 @@ void Inferencer::check_value_into(StaticTypeRef dest, StaticTypeRef vt,
                  at->start, at->end);
 }
 
-/* #49: `place OP= v` whose result may misfit the place's type (null: no
- * declared type) - the value is computed inside the store, past any
- * point a run-time check could stand, so it is refused */
-void Inferencer::refuse_compound_misfit(Op op, StaticTypeRef place,
-                                        StaticTypeRef v, Construct *at)
+/* #49: may `place OP= v`'s RESULT misfit the place's type (null: no
+ * declared type)? Then it is checked at run time, where it is stored
+ * (maintainer, 2026-11-23: a `dyn` is checked, never refused): an
+ * element / dict value through the type its container carries
+ * (compound_store_checked), a struct field by its own store
+ * (boxed_field_rmw), a declared variable through Expr14::res_fit - it
+ * used to be refused here, as a value computed inside the store. */
+bool Inferencer::compound_may_misfit(Op op, StaticTypeRef place,
+                                     StaticTypeRef v)
 {
     /* only a dyn makes the result's type unknown here: with none in
      * either operand, a dyn result means the operator does not apply,
      * which the operator check reports in its own words */
     if (!place || (!fit_has_dyn(place) && !fit_has_dyn(v)))
-        return;
-    const StaticTypeRef res = binop_result(compound_binop(op), place, v);
-    if (fit_needed(res, place))
-        mismatch("a compound assignment's value may not fit '" +
-                     static_type_to_string(place) +
-                     "' and cannot be checked: write it as a plain "
-                     "'=' (x = x OP v), which is checked",
-                 at->start, at->end);
+        return false;
+    return fit_needed(binop_result(compound_binop(op), place, v), place);
 }
 
 /*
@@ -9093,20 +9159,8 @@ void Inferencer::check_declared_store(Expr14 *e)
 {
     Construct *lv = e->lvalue.get();
     std::string field;
-    /* #49: a COMPOUND store computes its value inside the store, where no
-     * fit check (CheckFitV) can stand - a value that may misfit the
-     * place's type (`a[0] += d`, `d` a dyn, into an array<array<int>>; a
-     * declared variable's `v += r`) is refused here. A plain `=` is
-     * checked at run time. */
-    if (e->op != Op::assign) {
-        if (ctag(lv) == ConstructType::subscript
-                || ctag(lv) == ConstructType::member)
-            refuse_compound_misfit(e->op, type_of(lv),
-                                   type_of(e->rvalue.get()), e);
-        else if (ctag(lv) == ConstructType::id)
-            refuse_compound_misfit(e->op, declared_type_of(lv),
-                                   type_of(e->rvalue.get()), e);
-    }
+    /* (a COMPOUND store whose result may misfit the place's type is
+     * checked at run time where it is stored: compound_may_misfit) */
     if (ctag(lv) == ConstructType::deref) {
         /* `*b = v` / `*b OP= v`: v must fit the box's element type */
         const StaticTypeRef dest = declared_type_of(lv);
@@ -10092,14 +10146,12 @@ void Inferencer::check(Construct *n)
                 const std::vector<StaticTypeRef> els =
                     idlist_elem_types(idl, e14->rvalue.get());
                 for (size_t i = 0; i < idl->elems.size(); i++) {
+                    /* (a result that may misfit a declared target is
+                     * checked at run time: annotate_hints' IdList::fits) */
                     check_compound_op(e14->op,
                                       type_of(idl->elems[i].get()), els[i],
                                       idl->elems[i].get(),
                                       e14->rvalue.get(), e14);
-                    if (!idl->elems[i]->is_underscore())
-                        refuse_compound_misfit(
-                            e14->op, declared_type_of(idl->elems[i].get()),
-                            els[i], e14);
                 }
             } else {
                 check_compound_op(e14->op, type_of(e14->lvalue.get()),

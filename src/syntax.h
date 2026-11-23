@@ -1035,8 +1035,10 @@ public:
      * an array<int> variable. Checked (value_fits) just before that
      * target's store, so a refusal leaves it and the targets after it
      * unwritten, as a failing coercion does: the tree-walker's
-     * handle_single_expr14, the VM's CheckFitV on the unpack temp.
-     * Stamped by annotate_hints (Inferencer::store_fit). */
+     * store_idlist_target, the VM's CheckFitV on the unpack temp. Of a
+     * COMPOUND (`a, b OP= v`), the check is of the target's RESULT, after
+     * its operation (#83, as Expr14::res_fit). Stamped by annotate_hints
+     * (Inferencer::store_fit). */
     std::vector<std::shared_ptr<const FitSpec>> fits;
     const std::shared_ptr<const FitSpec> &fit_of(size_t i) const
     {
@@ -1863,6 +1865,14 @@ public:
      * caret: the tree-walker's handle_single_expr14, the VM's CheckFitV.
      * Stamped by annotate_hints (Inferencer::store_fit); null: no check. */
     std::shared_ptr<const FitSpec> rv_fit;
+    /* A COMPOUND into a declared variable whose RESULT may misfit its
+     * type (`array<int> a; a += d`, `d` a dyn - maintainer, 2026-11-23:
+     * a `dyn` is checked at run time, never refused): checked after the
+     * operation and before the store, with the whole compound's caret -
+     * the tree-walker's Expr14::do_eval, the VM's CheckFitV
+     * (compile_compound_coerced). An int variable converts its result
+     * instead (#77). Null: no check. */
+    std::shared_ptr<const FitSpec> res_fit;
 
     Expr14()
         : Construct("Expr14", false, ConstructType::expr14)
@@ -1882,6 +1892,7 @@ public:
         c->rv_coerce = rv_coerce;
         c->val_widen = val_widen;
         c->rv_fit = rv_fit;
+        c->res_fit = res_fit;
         return c;
     }
 };

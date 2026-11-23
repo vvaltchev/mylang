@@ -2794,46 +2794,92 @@ struct Codegen {
      * other expression compiles to a slot. Returns false if a non-literal can't
      * lower.
      */
-    /* #77: `lv OP= rvalue` for an int variable given a value that may be
-     * a float - see the caller */
-    void compile_compound_coerced(const Construct *s, const Expr14 *e,
-                                  const Identifier *lv, Op cbase,
-                                  std::vector<CgInstr> &ops)
+    /* #77 / #83: `lv OP= v` whose RESULT may not fit `lv` - an int
+     * variable given a value that may be a float, a declared variable
+     * given a `dyn` (`fit`, Expr14::res_fit or a compound's
+     * IdList::fits) - lowers as `lv = lv OP v`: the operation into a temp
+     * (a boxed BinOpV, its caret the whole compound `s`, as CompoundV's
+     * op error carets it), then CoerceNumV (an int) or CheckFitV, then a
+     * plain store - the tree-walker's handle_single_expr14 /
+     * compound_checked_store. `rhs` is the value's operand. */
+    void emit_checked_compound(const Construct *s, const Identifier *lv,
+                               Operand rhs, Op cbase,
+                               const std::shared_ptr<const FitSpec> &fit,
+                               std::vector<CgInstr> &ops)
     {
-        /* the read of a name always lowers; the rvalue is an operand of
-         * `x OP v`, which lowers it with the same compile_boxed_expr */
-        Operand cur, rhs_op;
+        /* (the read of a name always lowers) */
+        Operand cur;
         const bool ok_lv = boxed_operand(lv, cur, ops);
-        const bool ok_rv = boxed_operand(e->rvalue.get(), rhs_op, ops);
-        ML_CHECK(ok_lv && ok_rv);
+        ML_CHECK(ok_lv);
         (void)ok_lv;
-        (void)ok_rv;
         const int t = alloc_temp();
         CgInstr in;
-        in.op = OpCode::BinOpV;
-        in.node_idx = add_ast_node(s);
-        in.loc_node_idx = add_ast_node(s);      /* the whole compound */
-        in.target = t;
-        in.set_a(cur);
-        in.set_b(rhs_op);
+        if (fit) {
+            /* the COMPOUND itself on a copy of the handle - an array's
+             * `+=` grows the storage every alias shares, checking each
+             * element against the type the array carries, where a BinOpV
+             * would build `a + v`, a new array */
+            CgInstr mv;
+            mv.op = OpCode::MoveV;
+            mv.target = t;
+            ML_CHECK(!cur.is_lit);
+            mv.target2 = cur.slot;
+            ops.push_back(mv);
+            in.op = OpCode::CompoundV;
+            in.node_idx = add_ast_node(s);      /* the whole compound */
+            in.target = t;
+            in.set_b(rhs);
+        } else {
+            in.op = OpCode::BinOpV;
+            in.node_idx = add_ast_node(s);
+            in.loc_node_idx = add_ast_node(s);  /* the whole compound */
+            in.target = t;
+            in.set_a(cur);
+            in.set_b(rhs);
+        }
         in.aop = cbase;
         ops.push_back(in);
         const bool local = lv->sym.kind == SymKind::local;
-        CgInstr co;
-        co.op = OpCode::CoerceNumV;
-        co.node_idx = add_ast_node(s);           /* the Expr14 caret */
-        co.target = local ? lv->sym.slot : alloc_temp();
-        co.target2 = 0;                          /* to an int */
-        co.set_a(slot_op(t));
-        ops.push_back(co);
+        int v = t;
+        if (fit) {
+            emit_fit(fit, t, s, ops);
+            if (local) {
+                CgInstr mv;
+                mv.op = OpCode::MoveV;
+                mv.target = lv->sym.slot;
+                mv.target2 = t;
+                ops.push_back(mv);
+            }
+        } else {
+            CgInstr co;
+            co.op = OpCode::CoerceNumV;
+            co.node_idx = add_ast_node(s);       /* the Expr14 caret */
+            co.target = local ? lv->sym.slot : alloc_temp();
+            co.target2 = 0;                      /* to an int */
+            co.set_a(slot_op(t));
+            ops.push_back(co);
+            v = co.target;
+        }
         if (!local) {
             CgInstr st;
             st.op = lv->sym.kind == SymKind::global ? OpCode::StoreGlobalV
                                                     : OpCode::StoreCaptureV;
             st.target = lv->sym.slot;
-            st.set_a(slot_op(co.target));        /* a plain store */
+            st.set_a(slot_op(v));                /* a plain store */
             ops.push_back(st);
         }
+    }
+    void compile_compound_coerced(const Construct *s, const Expr14 *e,
+                                  const Identifier *lv, Op cbase,
+                                  std::vector<CgInstr> &ops)
+    {
+        /* the rvalue is an operand of `x OP v`, which lowers it with the
+         * same compile_boxed_expr */
+        Operand rhs_op;
+        const bool ok_rv = boxed_operand(e->rvalue.get(), rhs_op, ops);
+        ML_CHECK(ok_rv);
+        (void)ok_rv;
+        emit_checked_compound(s, lv, rhs_op, cbase, e->res_fit, ops);
     }
 
     bool boxed_operand(const Construct *e, Operand &out,
@@ -3154,6 +3200,15 @@ struct Codegen {
             const bool coerce = compound_op == Op::invalid
                                 && (t->decl_type == DeclType::i
                                     || t->decl_type == DeclType::f);
+            /* #77 / #83: a compound whose RESULT may misfit the target -
+             * an int one given a value that may be a float, a declared one
+             * given a `dyn` - lowers as `t = t OP elem` */
+            if (compound_op != Op::invalid
+                    && (il->fit_of(i) || t->decl_type == DeclType::i)) {
+                emit_checked_compound(e, t, slot_op(src), compound_op,
+                                      il->fit_of(i), ops);
+                continue;
+            }
             /* #49: what the target receives may misfit its declared type
              * - checked before its store, the targets before it written */
             emit_fit(il->fit_of(i), src, e->rvalue.get(), ops);
@@ -3219,12 +3274,14 @@ struct Codegen {
             }
             /* A typed int/float target coerces per stored value on a PLAIN
              * assign (R5); every other declared type is a no-op coerce. A
-             * COMPOUND doesn't coerce (op==assign only - measured), so its
-             * typed targets lower as-is. */
+             * COMPOUND into an int one converts its result (#77): through
+             * temps, emit_multi_via_temps. */
             if (compound_op == Op::invalid
                 && (t->decl_type == DeclType::i
                     || t->decl_type == DeclType::f))
                 any_coerce = true;
+            if (compound_op != Op::invalid && t->decl_type == DeclType::i)
+                via_temps = true;
         }
 
         const size_t omark = ops.size();
@@ -3550,11 +3607,12 @@ struct Codegen {
          * doesn't fit): CoerceNumV, below. The live producer is the
          * inferencer's coerces_dyn accumulator stamp (`var s = 0; s = s + d`
          * with a dyn `d` - the proven-scalar case went to
-         * compile_int/float_stmt already, and an EXPLICIT `int x = <dyn>` is
-         * compile-rejected). A COMPOUND lowers below as a plain CompoundV /
+         * compile_int/float_stmt already) and an EXPLICIT `int x = <dyn>`
+         * (#83). A COMPOUND lowers below as a plain CompoundV /
          * StoreGlobalV compound - its result already has the variable's
          * type - except an int variable's given a value that may be a float
-         * (#77, compile_compound_coerced). Every OTHER declared
+         * (#77) and a declared variable's whose result may misfit (#83,
+         * Expr14::res_fit): compile_compound_coerced. Every OTHER declared
          * type (bool/str/array/dict/struct/typed-container) coerces to a
          * NO-OP, so a plain boxed store is byte-identical. */
         const bool coerce_num = is_assign
@@ -3568,8 +3626,9 @@ struct Codegen {
          * carets it) and the store through CoerceNumV, which refuses a
          * float (handle_single_expr14 refuses it the same way). A float
          * variable's compound result is a float whatever it is given. */
-        if (!is_assign && lv->decl_type == DeclType::i
-                && e->rvalue->th != TypeHint::i) {
+        if (!is_assign && ((lv->decl_type == DeclType::i
+                            && e->rvalue->th != TypeHint::i)
+                           || e->res_fit)) {
             /* a const scalar has no variable (it is inlined), and a store
              * into a const binding is refused at compile time */
             ML_CHECK(!lv->is_const);

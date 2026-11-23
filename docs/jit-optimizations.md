@@ -18050,6 +18050,13 @@ says to write `x = x OP v`, which is checked. The variable and
 multi-assignment forms were missed at first: `v += r` with `v` an
 `array<array<int>>` and `r` an `array<dyn>` stored `["x"]` into `v` in
 every engine.
+**SUPERSEDED (#83, 2026-11-23, maintainer):** a `dyn` is checked,
+never refused, so such a compound is checked at run time after its
+operation and before its store (`Expr14::res_fit`, a compound's
+`IdList::fits`, `compound_store_checked`); `refuse_compound_misfit` is
+gone. The "past any point a check can stand" premise was wrong: the
+store lowers as `x = x OP v`, and an array's `+=` checks each new
+element against the type the array carries before adding any.
 
 **The gap left on purpose:** a container reached through a `dyn` NAME
 is not a typed place, so `var dyn d = rows; d[0] = v` stores unchecked

@@ -1506,10 +1506,17 @@ widen / pass-none / dyn-narrowing-throw, the exact function the tree-walker
 runs; for a LOCAL lvalue the op IS the store, a global/capture store coerces
 into a temp first; the Expr14-span caret rides the loc side table). Its live
 producer is the inferencer's `coerces_dyn` accumulator stamp — `var s = 0;
-s = s + d` was the last `EvalStmt` in a plain accumulator body (an EXPLICIT
-`int x = <dyn>` is compile-rejected, so it never reaches codegen). A COMPOUND
+s = s + d` was the last `EvalStmt` in a plain accumulator body; an EXPLICIT
+`int x = <dyn>` is another since #83 (it was compile-rejected). A COMPOUND
 (`s += d`) does NOT coerce (`handle_single_expr14` coerces `op == assign`
-only) and lowers as a plain `CompoundV`/`StoreGlobalV` compound.
+only) and lowers as a plain `CompoundV`/`StoreGlobalV` compound - except
+one whose RESULT may not fit (#77 an int variable given a value that may be
+a float, #83 a declared variable given a `dyn`, `Expr14::res_fit`), which
+`emit_checked_compound` lowers as `x = x OP v`: the operation into a temp
+(a BinOpV for #77; for #83 MoveV + CompoundV on a copy of the handle, so
+an array's `+=` still grows the storage every alias shares), then
+CoerceNumV or CheckFitV, then a plain store. A multi-target compound into
+such a target lowers through temps (`emit_multi_via_temps`) the same way.
 A typed array/dict keeps its FLAT
 storage (the `ArrHint` rides on the rvalue node, honored by `MakeArrayV`/
 `LoadLiteralObjV` regardless of the decl), and an uninitialized `array<int> a;`

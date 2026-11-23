@@ -1,0 +1,99 @@
+# A `dyn` value entering a variable of a FIXED type - an annotated one, or
+# the result of a compound into one - is checked at run time (maintainer,
+# 2026-11-23: the type of a `dyn` is known when it is stored). Until then
+# `int v = d` and `bool b = d` were compile errors, and so was a compound
+# whose result could misfit (`a += d`, `m[0] += d` into an array<int>);
+# the VM also stored the float of `a, b += d` into an int target (#77).
+# A refusal leaves the variable as it was.
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+func refused(dyn f) {
+    try { f(); } catch (TypeErrorEx) { return true; }
+    return false;
+}
+struct P { int x; }
+struct S { array<int> a; }
+var dyn d = runtime(2);
+var dyn df = runtime(2.5);
+var dyn ys = runtime([5]);
+var dyn xs = runtime(["x"]);
+
+# ---- a dyn that fits is stored
+int v = d;
+want("an int", v, 2);
+float f = d;
+want("a float widens it", str(f), "2.000000");
+str s = runtime("s");
+want("a str", s, "s");
+P p = runtime(P(3));
+want("a struct", p.x, 3);
+array<int> a = ys;
+want("an array", str(a), "[5]");
+
+# ---- a compound's result that fits is stored; an array's += grows the
+# array every name shares
+v += d;
+want("an int compound", v, 4);
+var alias = a;
+a += ys;
+want("an array compound", str(alias), "[5, 5]");
+want("the array the dyn held, too", str(ys), "[5, 5]");
+array<array<int>> m = [[1]];
+m[0] += runtime([5]);
+want("an element compound", str(m), "[[1, 5]]");
+S st = S([1]);
+st.a += runtime([5]);
+want("a field compound", str(st.a), "[1, 5]");
+int w = 1; int u = 2;
+w, u += [d, d];
+want("a multi-target compound", [w, u], [3, 4]);
+
+# ---- a misfit is refused, the variable kept
+want("an int given a float", refused(func () { v = df; }), true);
+want("the int kept", v, 4);
+want("an int compound given a float", refused(func () { v *= df; }), true);
+want("a multi-target int compound",
+     refused(func () { w, u += [df, df]; }), true);
+want("the targets kept", [w, u], [3, 4]);
+func locals_add(dyn x) {
+    int i = 1; int j = 2;
+    try { i, j += x; } catch (TypeErrorEx) { return [i, j, 0]; }
+    return [i, j];
+}
+want("a multi-target compound into locals", locals_add(runtime([1, 2])),
+     [2, 4]);
+want("locals refuse a float", locals_add(runtime([2.5, 1])), [1, 2, 0]);
+want("an array compound's misfit", refused(func () { a += xs; }), true);
+want("the array kept", str(a), "[5, 5]");
+want("an element compound's misfit",
+     refused(func () { m[0] += xs; }), true);
+want("a field compound's misfit", refused(func () { st.a += xs; }), true);
+# (-nti checks no store: the rest is the inferencer's)
+bool b = true;
+bool c = false; bool e = true;
+dict<str, bool> bd = {"k": true};
+if (typed) {
+    want("a bool given an int", refused(func () { b = d; }), true);
+    want("a bool compound", refused(func () { b += d; }), true);
+    want("the bool kept", b, true);
+    want("a multi-target bool compound",
+         refused(func () { c, e += [d, d]; }), true);
+    want("the bool targets kept", [c, e], [false, true]);
+    want("a str given an int", refused(func () { s = d; }), true);
+    want("a struct given an int", refused(func () { p = d; }), true);
+    want("an array given an array<str>", refused(func () { a = xs; }),
+         true);
+    want("a dict's bool value compound",
+         refused(func () { bd.k += d; }), true);
+    want("the dict kept", bd.k, true);
+}
+
+assert(bad == 0);
+print("ok");
