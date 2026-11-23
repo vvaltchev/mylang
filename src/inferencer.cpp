@@ -2554,8 +2554,9 @@ bool Inferencer::mark_named_bases(Block *rootBlock, bool late)
     for (auto &up : all_syms) {
         TypeSym *ts = up.get();
         FuncInfo *f = ts->func;
-        if (!f || !f->is_template || !f->decl || f->pinned)
+        if (!f || !f->is_template || f->pinned)
             continue;
+        ML_CHECK(f->decl);  /* (declare_funcdecl is the one creator) */
         any = true;
         by_desc.emplace(f->decl->desc, f);
         if (ts->value_used || func_name_rebound(ts))
@@ -2572,10 +2573,11 @@ bool Inferencer::mark_named_bases(Block *rootBlock, bool late)
     /* the template a name is BOUND to - never matched by name: a
      * parameter may shadow it, and two nested templates may share one */
     const auto tmpl_of = [&](Identifier *id) -> FuncInfo * {
-        auto it = id_sym.find(id);
-        FuncInfo *f = it != id_sym.end() && it->second ? it->second->func
-                                                       : nullptr;
-        return f && f->is_template && f->decl && !f->pinned ? f : nullptr;
+        TypeSym *ts = user_sym(id);
+        FuncInfo *f = ts ? ts->func : nullptr;
+        if (!f || !f->is_template || f->pinned)
+            return nullptr;
+        return f;
     };
     const std::function<void(Construct *)> scan = [&](Construct *n) {
         if (!n)
@@ -2703,12 +2705,13 @@ void Inferencer::stamp_closure_templates(Block *rootBlock)
  * calls run its typed body. Escapes (a set-dropping join, an arg-position
  * use, a capture) disable it - the base keeps running, as before.
  */
-/* two signatures alike, part by part */
+/* two signatures of one template alike, part by part (one part per
+ * template parameter) */
 static bool same_sig(const std::vector<StaticTypeRef> &a,
                      const std::vector<StaticTypeRef> &b)
 {
-    return a.size() == b.size()
-        && std::equal(a.begin(), a.end(), b.begin(),
+    ML_CHECK(a.size() == b.size());
+    return std::equal(a.begin(), a.end(), b.begin(),
                       [](StaticTypeRef x, StaticTypeRef y) {
                           return static_type_equal(x, y);
                       });
@@ -2924,7 +2927,8 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
     for (auto it = value_insts.begin(); it != value_insts.end();) {
         ValueInst &vi = it->second;
         auto cs = sites.find(vi.clone);
-        if (vi.clone->pinned || cs == sites.end() || cs->second.empty()) {
+        /* (a template's sites are pushed, never empty) */
+        if (vi.clone->pinned || cs == sites.end()) {
             ++it;
             continue;
         }
@@ -3302,9 +3306,10 @@ void Inferencer::infer_one(Block *rootBlock)
      * #84: a base the loops leave running that the first marking could
      * not see - a call whose argument never settled (a closure base's
      * result) stays on the template. Mark it, and type its stores again.
-     * (Bounded: each round marks at least one more template.)
+     * (It ends: each round marks at least one more template, and the
+     * loops make no new one - an instance is never a template.)
      */
-    for (int k = 0; k < 16 && mark_named_bases(rootBlock, true); k++) {
+    while (mark_named_bases(rootBlock, true)) {
         run_fixpoint(rootBlock);
         instantiate_to_fixpoint();
     }
@@ -5024,8 +5029,9 @@ void Inferencer::annotate_hints(Construct *n)
     }
     if (ctag(n) == ConstructType::expr14) {
         auto *e = static_cast<Expr14 *>(n);
+        /* (ctag is null-safe) */
         const Construct *lv = e->lvalue.get();
-        if (e->op == Op::assign && lv
+        if (e->op == Op::assign
             && (ctag(lv) == ConstructType::subscript
                 || ctag(lv) == ConstructType::member)) {
             const Construct *base =
@@ -5099,7 +5105,7 @@ void Inferencer::annotate_hints(Construct *n)
          * type), so it is checked at run time, as a parameter is at its
          * bind. A value that is a `dyn` itself is checked the same way
          * (#83), and an int / float variable converts its value. */
-        if (lv && ctag(lv) == ConstructType::id) {
+        if (ctag(lv) == ConstructType::id) {
             auto *id = static_cast<Identifier *>(const_cast<Construct *>(lv));
             /* a committed REPL global's later use carries no declaration
              * the resolver could copy a decl_type from: an int / float one
@@ -5122,7 +5128,7 @@ void Inferencer::annotate_hints(Construct *n)
                         FitSpec::Place::var, id->uid);
             }
         }
-        if (e->op == Op::assign && lv && ctag(lv) == ConstructType::id) {
+        if (e->op == Op::assign && ctag(lv) == ConstructType::id) {
             auto *id = static_cast<Identifier *>(const_cast<Construct *>(lv));
             e->rv_fit = nullptr;
             if (StaticTypeRef d = declared_type_of(id))
@@ -5145,7 +5151,7 @@ void Inferencer::annotate_hints(Construct *n)
         }
         /* ... and each declared target of a multi-assignment, given what
          * it receives (idlist_elem_types) */
-        if (lv && ctag(lv) == ConstructType::idlist) {
+        if (ctag(lv) == ConstructType::idlist) {
             auto *idl = static_cast<IdList *>(const_cast<Construct *>(lv));
             idl->fits.clear();
             const std::vector<StaticTypeRef> els =
@@ -5171,7 +5177,7 @@ void Inferencer::annotate_hints(Construct *n)
             if (any)
                 idl->fits = std::move(fits);
         }
-        if (e->op == Op::assign && lv && ctag(lv) == ConstructType::idlist) {
+        if (e->op == Op::assign && ctag(lv) == ConstructType::idlist) {
             auto *idl = static_cast<IdList *>(const_cast<Construct *>(lv));
             /* (an element literal that took its target's type is built
              * for it - idlist_elem_types' `into`) */
@@ -8104,8 +8110,10 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
              * (its decl_type, CHECKED), any other one checks it (rv_fit,
              * res_fit). A `dyn?` into a non-opt one stays a nullability
              * error here. */
+            /* (an annotation always names a type a run-time check has a
+             * rule for - fit_checkable) */
             const bool dyn_checked = rt->kind == StaticTypeKind::Dyn
-                && (!rt->opt || d->opt) && fit_checkable(d);
+                && (!rt->opt || d->opt);
             if (!has_unknown(rt) && !is_none(rt) && !dyn_checked
                     && !static_type_assignable(rt, d))
                 conflict("'" + std::string(s->name->val) +
@@ -8592,18 +8600,16 @@ StaticTypeRef Inferencer::fixed_type(const TypeSym *s)
  */
 void Inferencer::stamp_fixed_numeric(Identifier *id, StaticTypeRef v)
 {
-    if (id->decl_type != DeclType::none)
+    /* (a committed global's use carries no decl_type: nothing in this
+     * input declared it - and a function name is never a numeric one) */
+    TypeSym *s = user_sym(id);
+    if (!s || !s->pinned || s->func)
         return;
-    auto it = id_sym.find(id);
-    if (it == id_sym.end() || !it->second || !it->second->pinned)
-        return;
-    const StaticTypeRef d = fixed_type(it->second);
+    const StaticTypeKind dk = static_type_resolve(s->type)->kind;
     const StaticTypeKind vk = static_type_resolve(v)->kind;
-    if (!d || vk == StaticTypeKind::Unknown)
-        return;
-    if (d->kind == StaticTypeKind::Float && vk != StaticTypeKind::Float)
+    if (dk == StaticTypeKind::Float && vk != StaticTypeKind::Float)
         id->decl_type = DeclType::f;
-    else if (d->kind == StaticTypeKind::Int && vk != StaticTypeKind::Int)
+    else if (dk == StaticTypeKind::Int && vk != StaticTypeKind::Int)
         id->decl_type = DeclType::i;
 }
 
@@ -8645,7 +8651,8 @@ void Inferencer::contribute_elem(TypeSym *s, StaticTypeRef cont, Loc loc,
      * not own - checked at the store (annotate_hints' rv_fit / arg_fit,
      * from the container's final type), never joined into it; and a
      * named base's own variable takes nothing (#84) */
-    if (base_shared_dyn(s, cont) || (s && s->in_named_base))
+    ML_CHECK(s);            /* (every caller has the container's) */
+    if (base_shared_dyn(s, cont) || s->in_named_base)
         return;
     const StaticTypeRef d = fixed_type(s);
     const StaticTypeRef c = static_type_resolve(cont);
@@ -9428,7 +9435,8 @@ bool Inferencer::compound_may_misfit(Op op, StaticTypeRef place,
     /* only a dyn makes the result's type unknown here: with none in
      * either operand, a dyn result means the operator does not apply,
      * which the operator check reports in its own words */
-    if (!place || (!fit_has_dyn(place) && !fit_has_dyn(v)))
+    ML_CHECK(place);        /* (type_of's answer: bottom, never null) */
+    if (!fit_has_dyn(place) && !fit_has_dyn(v))
         return false;
     return fit_needed(binop_result(compound_binop(op), place, v), place);
 }

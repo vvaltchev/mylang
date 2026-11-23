@@ -2658,6 +2658,17 @@ static const std::vector<test> tests =
         "v += r;",
         "print(v);" },
       &typeid(TypeErrorEx), 1, 3, 8, 3 },
+    /* #83: a `dyn?` into an `opt` declared variable is checked like a
+     * `dyn`; into a non-opt one it stays the nullability error */
+    { "check: a dyn? into a declared opt variable is checked at run time",
+      { "var dyn? dn = runtime(none);",
+        "int? v = dn; assert(v == none);",
+        "dn = runtime(3); v = dn; assert(v == 3);",
+        "str? s = dn;" },
+      &typeid(TypeErrorEx), 10, 4, 13, 4 },
+    { "check: a dyn? into a declared non-opt variable is a compile error",
+      { "var dyn? dn = runtime(1);", "int v = 1;", "v = dn;" },
+      &typeid(NullabilityEx) },
     { "check: a bool variable's compound given a dyn is a run-time "
       "TypeErrorEx, the variable kept (#83)",
       { "bool b = true; var dyn d = runtime(2);",
@@ -24060,6 +24071,7 @@ static const std::vector<repl_test> repl_tests =
       { { "var x83 = 1.5", "=> 1.500000" },
         { "x83 = 3", "=> 3.000000" },
         { "x83 += true", "=> 4.000000" },
+        { "x83 = 2.5", "=> 2.500000" },
         { "var y83 = 1", "=> 1" },
         { "var dyn d83 = runtime(2.5)", "" },
         { "y83 = d83", "cannot store a non-int value" },
@@ -24076,7 +24088,22 @@ static const std::vector<repl_test> repl_tests =
         { "s83 = runtime(1)", "'s83' is declared 'str' but the value" },
         { "var p83 = 1.5; var q83 = 2.5", "" },
         { "p83, q83 = [runtime(1), 2]", "" },
-        { "typestr(p83) + str(p83)", "=> \"float1.000000\"" } } },
+        { "typestr(p83) + str(p83)", "=> \"float1.000000\"" },
+        { "y83 = true", "=> 1" },
+        { "var o83 = 1; o83 = none", "" },
+        { "var dyn? n83 = runtime(none)", "" },
+        { "o83 = n83", "" },
+        { "y83 = n83", "TypeMismatchEx" },
+        { "func mk83() { var k = 1; return func [k] (x) { return x + k; }; }",
+          "" },
+        { "var h83 = mk83()", "" },
+        { "h83 = runtime(5)", "TypeMismatchEx" },
+        { "h83(1)", "=> 2" },
+        /* #84: an earlier input's template named in a running base is
+         * committed - its body is not marked again */
+        { "func pt84(x) { return x; }", "" },
+        { "func nt84(y) { var dyn q = pt84; return q(y); } "
+          "var dyn h84 = nt84; h84(3)", "=> 3" } } },
     /* rule 8.2, decision 3: a closure made in one input and called in a
      * later one runs its untyped body; sites in its own input get
      * instances */

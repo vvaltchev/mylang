@@ -89,6 +89,39 @@ var cs4 = [c4, func [cb] (y) { return 1; }];
 func k5(n) { g5 = n; return 0; }
 func through(dyn v) { return k5(gsel[runtime(0)](v)); }
 
+# a closure base's own variables given its parameter: its parameter
+# itself, a loop variable, a `dyn` one and one given nothing else are
+# untyped; one its other values type is checked at its store
+var c7 = func [cb] (x) {
+    x = x;
+    var dyn dv = 1;
+    dv = x;
+    var u = x;
+    u = x;
+    foreach (e in [1, 2]) { e = x; }
+    var t = "a";
+    t = x;
+    return typestr(u);
+};
+var cs7 = [c7, func [cb] (y) { return "?"; }];
+
+# a named base's nested function returns with it, untyped; and a template
+# whose name is rebound runs its base
+var g6 = 0;
+func nb(x) { var f = func [x] () { return x; }; g6 = f(); return 0; }
+var nbs = [nb, func (q) { return 1; }];
+var g8 = 0;
+func rb(x) { g8 = x; return 0; }
+func rb2(x) { return 1; }
+var rb0 = rb(2);
+var rb_refused = false;
+try { rb("s"); } catch (TypeErrorEx) { rb_refused = true; }
+rb = rb2;
+
+# a named base's own container takes what its parameter gives it
+func own(x) { var a = []; append(a, x); return typestr(a[0]); }
+var owns = [own, func (q) { return "?"; }];
+
 # ---- the stores that fit are stored; each misfit is refused
 for (var i = 0; i < len(fs); i++) {
     var dyn f = fs[runtime(i)];
@@ -120,6 +153,18 @@ if (r6 != none)
 if (typed)
     want("r6's type", typestr(r6), "dyn?");
 r6 = none;
+# (...and so is one given it and a `dyn`, or a `dyn?`)
+var r7 = gsel[runtime(0)](1);
+r7 = runtime(2);
+want("r7", r7 + 1, 3);
+var r8 = gsel[runtime(0)](1);
+var dyn? n8 = runtime(none);
+r8 = n8;
+want("r8", r8, none);
+if (typed) {
+    want("r7's type", typestr(r7), "dyn");
+    want("r8's type", typestr(r8), "dyn?");
+}
 
 # ---- the base's own variables
 var dyn sh = shows[runtime(0)];
@@ -144,6 +189,26 @@ if (typed) {
 }
 want("g4's int", g4 + 1, 6);
 want("g5's int", g5 + 1, 1);
+
+# ---- a closure base's variables
+if (typed) {
+    want("a closure base local checked", refused(cs7[runtime(0)], 5),
+         true);
+    want("its own type", cs7[runtime(0)]("s"), "dyn");
+}
+# ---- a nested function in a named base, and a rebound template name
+want("a named base's nested return", nbs[runtime(0)](3), 0);
+want("g6 from it", g6, 3);
+if (typed)
+    want("its store checked", refused(nbs[runtime(0)], "s"), true);
+want("a rebound template", rb(5), 1);
+want("its base ran first", rb0, 0);
+if (typed) {
+    want("its store checked", rb_refused, true);
+    want("g8 kept", g8, 2);
+}
+# (a base is not type-checked, so its typestr runs: the value's type)
+want("a named base's own array", owns[runtime(0)]("s"), "str");
 
 assert(bad == 0);
 print("ok");

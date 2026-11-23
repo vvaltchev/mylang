@@ -55,6 +55,26 @@ int w = 1; int u = 2;
 w, u += [d, d];
 want("a multi-target compound", [w, u], [3, 4]);
 
+# ---- a captured int's compound converts its result too (#77)
+func mkc() {
+    var c = 10;
+    return func [c] (dyn v) { c -= v; return c; };
+}
+var cl = mkc();
+want("a capture's compound", cl(runtime(4)), 6);
+if (typed)
+    want("a capture's float refused",
+         refused(func () { cl(runtime(0.5)); }), true);
+# ---- a compound into a place with a `dyn` inside
+dict<str, array<dyn>> qd = {"k": [1]};
+qd.k += runtime([2]);
+want("a dyn element array's compound", str(qd), "{\"k\": [1, 2]}");
+# (...and into a `dyn` element itself: nothing to check)
+array<dyn> ae = [1, "s"];
+ae[0] += runtime(2);
+ae[1] += runtime("t");
+want("a dyn element's compound", str(ae), "[3, \"st\"]");
+
 # ---- a misfit is refused, the variable kept
 want("an int given a float", refused(func () { v = df; }), true);
 want("the int kept", v, 4);
