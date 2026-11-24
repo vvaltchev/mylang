@@ -2858,9 +2858,9 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
      * call the declared body - 9 where -nti printed -3 - so such a
      * template takes no value instance at all */
     for (auto it = uses.begin(); it != uses.end();) {
-        bool rebound = false;
-        for (const Use &u : it->second)
-            rebound = rebound || func_name_rebound(u.sym);
+        const bool rebound = std::any_of(
+            it->second.begin(), it->second.end(),
+            [&](const Use &u) { return func_name_rebound(u.sym); });
         it = rebound ? uses.erase(it) : std::next(it);
     }
 
@@ -3195,14 +3195,18 @@ void Inferencer::check_opt_struct_fields()
  */
 void Inferencer::stamp_capture_decl_types()
 {
+    /* (every FuncInfo has its declaration - declare_funcdecl, the one
+     * place one is made, sets it - and a capture takes its outer
+     * declaration's type whatever it held: the same value, the second
+     * time this runs) */
     for (auto &up : all_funcs) {
         FuncDeclStmt *fd = up->decl;
-        if (!fd || !fd->captures || up->pinned)
+        if (up->pinned || !fd->captures)
             continue;
         for (auto &cap : fd->captures->elems) {
             auto it = id_sym.find(cap.get());
             const TypeSym *o = it != id_sym.end() ? it->second : nullptr;
-            if (o && o->decl_id && cap->decl_type == DeclType::none)
+            if (o && o->decl_id)
                 cap->decl_type = o->decl_id->decl_type;
         }
     }

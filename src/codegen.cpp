@@ -3249,7 +3249,7 @@ struct Codegen {
             if (compound_op != Op::invalid) {
                 st.node_idx = add_ast_node(e);   /* the operation's caret */
                 st.base_node_idx = add_base_node(          /* #85 */
-                    st.op == OpCode::StoreGlobalV ? 1 : 0, t);
+                    st.op == OpCode::StoreGlobalV, t);
                 st.aop = compound_op;
             }
             ops.push_back(st);
@@ -3425,7 +3425,7 @@ struct Codegen {
                                 ? OpCode::StoreGlobalV : OpCode::StoreCaptureV;
                     in.node_idx = add_ast_node(s);
                     in.base_node_idx = add_base_node(   /* #85 */
-                        in.op == OpCode::StoreGlobalV ? 1 : 0, id);
+                        in.op == OpCode::StoreGlobalV, id);
                     in.target = id->sym.slot;
                     in.set_a(int_lit(1));
                     in.aop = inc->is_inc ? Op::plus : Op::minus;
@@ -3753,7 +3753,7 @@ struct Codegen {
             in.node_idx = add_ast_node(s);               /* loc: compound may throw (div/undef) */
             /* #85: a global not bound yet marks its name */
             in.base_node_idx = add_base_node(
-                store_op == OpCode::StoreGlobalV ? 1 : 0, lv);
+                store_op == OpCode::StoreGlobalV, lv);
             in.target = lv->sym.slot;
             in.set_a(rhs_op);
             in.aop = cbase;

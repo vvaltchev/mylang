@@ -1,0 +1,110 @@
+# INT-ENGINES: tw default nj noopt nc
+#
+# INT unit (#80, plans/typed-containers.md): the edges of a container whose
+# type is known only in part that tests/functional/146 does not reach - a
+# dict(0) or an empty dict NESTED in a typed container, a dict that names
+# its keys and leaves its values open, a builtin's result stamped with such
+# a type (clone), a typed container stored into an open part, a partial
+# dict stored where the place names its keys, and a `none` key into a
+# dict whose keys nothing decided. Plus #85's capture stores: a compound,
+# an inc-dec and a multi-target compound on a captured variable. Under
+# -nti no store is checked (README), so the refusals are gated on `typed`.
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+func refused(dyn f) {
+    try { f(); } catch (TypeErrorEx) { return true; }
+    return false;
+}
+
+# ---- a dict whose VALUE is a dict(0): its values are ints, its keys open
+var m = {"a": dict(0)};
+var dyn em = m;
+em["a"]["k"] = 4;
+em["a"][7] = 5;
+want("int values stored", m["a"]["k"] + m["a"][7], 9);
+if (typed)
+    want("a str value", refused(func [em] () { em["a"]["z"] = "s"; }), true);
+
+# ---- a dict whose value is an empty dict: both parts open
+var m2 = {"a": {}};
+var dyn em2 = m2;
+em2["a"]["q"] = "anything";
+em2["a"][3] = 2.5;
+want("anything goes in", len(m2["a"]), 2);
+
+# ---- a dict that names its keys and leaves its values open
+var d4 = {"k": []};
+var dyn e4 = d4;
+e4["k"] = [1];
+want("an array value", len(d4["k"]), 1);
+
+# ---- an array of dict(0)
+var ad = [dict(0)];
+var dyn ead = ad;
+ead[0]["x"] = 1;
+want("an element's int value", ad[0]["x"], 1);
+
+# ---- a TYPED container into an open part takes the part, and the part
+# stays open (the container's own type does not change)
+var r3 = [[]];
+var dyn er3 = r3;
+var s1 = ["s"];
+er3[0] = s1;
+er3[0] = [1];
+want("the part stays open", r3[0][0], 1);
+var md = [dict(0)];
+var dyn emd = md;
+var d1 = dict(0);
+emd[0] = d1;
+want("a dict(0) into a dict(0) place", len(md), 1);
+
+# ---- a partial dict where the place names its keys: an inline dict(0)
+# has no type of its own, so it enters by what it holds (nothing) and
+# takes the place's type
+var mm = [{"a": none}];
+var dyn emm = mm;
+emm[0] = dict(0);
+emm[0]["k"] = 3;
+emm[0]["s"] = "x";
+want("the place's value type", emm[0]["s"], "x");
+if (typed)
+    want("an int key", refused(func [emm] () { emm[0][4] = 1; }), true);
+
+# ---- a builtin's result is stamped with a partial type (clone)
+var m5 = clone(m2);
+var dyn em5 = m5;
+em5["b"] = {};
+want("a dict value", len(m5), 2);
+var a5 = clone([[]]);
+var dyn ea5 = a5;
+ea5[0] = ["t"];
+want("an array element", a5[0][0], "t");
+
+# ---- a `none` key into a dict whose keys nothing decided
+var dn = dict(0);
+var dyn edn = dn;
+edn[none] = 3;
+want("a none key", dn[none], 3);
+
+# ---- an array of functions carries its type
+var fs = [func(int a) => a];
+var dyn efs = fs;
+efs[0] = func(int a) => a + 1;
+want("a function element", fs[0](1), 2);
+
+# ---- #85: a captured variable's compound, inc-dec and multi-target
+# compound
+var c = 1;
+var x = 2;
+var f = func [c, x] () { c++; c += 2; c, x += [1, 1]; return c + x; };
+want("capture stores", f(), 8);
+want("a second call", f(), 13);
+
+assert(bad == 0);

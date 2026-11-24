@@ -1440,6 +1440,12 @@ static const std::vector<test> tests =
     { "err loc: a check through a program's own defined() guards nothing",
       { "func defined(v) { return 42; } if (defined(zork)) print(zork);" },
       &typeid(UndefinedVariableEx), 44, 1, 49, 1 },
+    /* a capture list naming nothing is the same compile error; inference
+     * runs first and finds no symbol for it (#86's capture stamp skips
+     * it) */
+    { "err loc: a closure capturing a name declared nowhere",
+      { "var f = func [zork] () { return 1; }; print(f());" },
+      &typeid(UndefinedVariableEx) },
     /* abs() takes an int or a float: any other type the compiler can see,
      * a bool included, is a compile error marking the argument (decided
      * 2026-11-13; the call was typed as its argument and the run time
@@ -40784,9 +40790,24 @@ static bool myv_refpin_release()
             MyvSource ms;
             VmProgram loaded = myv_read(path, ms);      /* jits it too */
             vm_run(loaded);
+            /* the pick itself, asked during an image pass with none of
+             * its optional outputs: no slot it returns is ref-listed */
+            const Chunk &ck = loaded.root;
+            g_jit_image_pass = true;
+            const std::vector<int> pins = jit_test_pick_cached_slots(
+                ck, 0, ck.code.size(), ck.slot_count, 8, nullptr, nullptr);
+            g_jit_image_pass = false;
+            for (int sl : pins)
+                if (std::find(ck.ref_slots.begin(), ck.ref_slots.end(), sl)
+                        != ck.ref_slots.end()) {
+                    fprintf(stderr, "myv-refpin: the image pick kept "
+                                    "ref-listed slot %d\n", sl);
+                    ok = false;
+                }
         } catch (Exception &e) {
             cap << "threw " << e.name;
         }
+        g_jit_image_pass = false;
         cout.rdbuf(old);
         out[mutate] = cap.str();
         remove(path.c_str());
