@@ -868,7 +868,20 @@ def reproduce(st, failed_cases):
     return lines
 
 
-def run_steps(steps, jobs, caps, out, timeout, mon, show_output):
+def run_steps(steps, *args):
+    """Run the steps; on an interrupt (Ctrl-C, or SIGTERM / SIGHUP -
+    see main) kill every step still running, then let it propagate.
+    Each step is a session of its own, so nothing else would."""
+    try:
+        return run_steps_body(steps, *args)
+    except KeyboardInterrupt:
+        for s in steps:
+            if s.status == "RUN":
+                kill_tree(s.proc)
+        raise
+
+
+def run_steps_body(steps, jobs, caps, out, timeout, mon, show_output):
     by = {s.name: s for s in steps}
     any_tests = any(s.test for s in steps)
     used, inuse, running = 0, {}, []
@@ -1356,6 +1369,14 @@ def main():
             stream.reconfigure(errors="replace")
         except (AttributeError, ValueError):
             pass
+    # SIGTERM / SIGHUP stop the run the way Ctrl-C does: every test runs
+    # in a session of its own, so without this a killed tests/run left
+    # its tests running, orphaned, for as long as they took
+    def stop_like_ctrl_c(signum, frame):
+        raise KeyboardInterrupt
+    if os.name == "posix":
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, stop_like_ctrl_c)
     cat = catalog()
     args = parse_args(cat)
     if args.classes:
@@ -1470,9 +1491,14 @@ def main():
     if args.case or args.sample or args.build_only:
         # the cases exist only once the builds do: build first
         if steps:
-            run_steps(steps, jobs, caps, out, args.timeout,
-                      Monitor("run", total=len(steps), phase="builds",
-                              heartbeat=60).__enter__(), False)
+            try:
+                run_steps(steps, jobs, caps, out, args.timeout,
+                          Monitor("run", total=len(steps), phase="builds",
+                                  heartbeat=60).__enter__(), False)
+            except KeyboardInterrupt:
+                out.clear()
+                print("\ntests/run: interrupted; logs in %s" % logdir)
+                return INTERRUPTED
             if any(s.status != "PASS" for s in steps):
                 return BUILD_FAILED
             steps = []
@@ -1533,11 +1559,8 @@ def main():
         with mon:
             wall = run_steps(steps, jobs, caps, out, args.timeout, mon,
                              args.show_output)
-    except KeyboardInterrupt:
+    except KeyboardInterrupt:              # run_steps killed the steps
         out.clear()
-        for s in steps:
-            if s.status == "RUN":
-                kill_tree(s.proc)
         print("\ntests/run: interrupted; logs in %s" % logdir)
         return INTERRUPTED
 
