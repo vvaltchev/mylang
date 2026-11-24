@@ -5763,7 +5763,7 @@ extern "C" int jit_load_elem_value(int_type dst, int_type base,
 static ML_ALWAYS_INLINE int
 vm_bool_elem(const SharedArrayObj &arr, int_type idx, bool &out)
 {
-    if (idx < 0 || static_cast<size_type>(idx) >= arr.size())
+    if (idx < 0 || static_cast<uint64_t>(idx) >= arr.size())
         return 1;
     if (arr.skind() == SharedArrayObj::Storage::bools) {
         out = arr.flat_bools()[arr.offset() + idx] != 0;
@@ -6050,12 +6050,14 @@ vm_unpack_elem_body(EvalContext &ctx, const EvalValue &base_v, int_type idx,
             ? static_cast<std::ptrdiff_t>(outer.size() * sizeof(LValue))
             : reinterpret_cast<const char *>(ov.data() + ov.size())
                   - reinterpret_cast<const char *>(base);
-        if (idx < 0 || static_cast<std::ptrdiff_t>(idx * sizeof(LValue))
-                           >= avail)
+        /* (the count, not idx * 48: a huge idx WRAPS the product
+         * below `avail` - #88) */
+        if (idx < 0 || static_cast<uint64_t>(idx)
+                           >= static_cast<uint64_t>(avail) / sizeof(LValue))
             vm_throw_unpack_gone(chunk, pc);
         elem_p = &base[idx].get();
     } else {
-        if (idx < 0 || static_cast<size_type>(idx) >= outer.size())
+        if (idx < 0 || static_cast<uint64_t>(idx) >= outer.size())
             vm_throw_unpack_gone(chunk, pc);
         elem_copy = vm_arr_elem(outer, static_cast<size_type>(idx));
         elem_p = &elem_copy;

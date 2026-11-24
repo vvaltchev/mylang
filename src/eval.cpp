@@ -6524,7 +6524,7 @@ int_type vm_struct_field_int(const EvalValue &arrv, int_type idx,
     if (!arrv.is<SharedArrayObj>())
         return 0;
     const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
-    if (idx < 0 || static_cast<size_type>(idx) >= arr.size())
+    if (idx < 0 || static_cast<uint64_t>(idx) >= arr.size())
         return 0;
     if (arr.skind() == SharedArrayObj::Storage::general)
         return general_struct_field<int_type>(
@@ -6562,7 +6562,7 @@ float_type vm_struct_field_float(const EvalValue &arrv, int_type idx,
     if (!arrv.is<SharedArrayObj>())
         return 0.0;
     const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
-    if (idx < 0 || static_cast<size_type>(idx) >= arr.size())
+    if (idx < 0 || static_cast<uint64_t>(idx) >= arr.size())
         return 0.0;
     if (arr.skind() == SharedArrayObj::Storage::general)   /* see above */
         return general_struct_field<float_type>(
@@ -6675,7 +6675,7 @@ EvalValue vm_struct_elem(const EvalValue &arrv, int_type idx)
      * loc-less - the op's caret is stamped by the raise) or PROMOTED it to
      * general storage (a cold op on a struct array; the element is then
      * read the general way, as the tree-walker does). */
-    if (idx < 0 || static_cast<size_type>(idx) >= arr.size())
+    if (idx < 0 || static_cast<uint64_t>(idx) >= arr.size())
         throw OutOfBoundsEx();
     if (arr.skind() == SharedArrayObj::Storage::general)
         return arr_elem_boxed(arr, static_cast<size_type>(idx));
@@ -6698,7 +6698,7 @@ EvalValue vm_struct_elem(const EvalValue &arrv, int_type idx)
 void vm_struct_elem_into(LValue &dst, const EvalValue &arrv, int_type idx)
 {
     const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
-    if (idx >= 0 && static_cast<size_type>(idx) < arr.size()
+    if (idx >= 0 && static_cast<uint64_t>(idx) < arr.size()
         && arr.skind() == SharedArrayObj::Storage::structs
         && dst.get().is<intrusive_ptr<StructObject>>()) {
         const auto &sv = arr.flat_structs();

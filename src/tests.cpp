@@ -40811,6 +40811,119 @@ static bool myv_refpin_release()
 #endif
 }
 
+/*
+ * #88, myv_fuzz seed 992390900 fat-115: a mutated image retargeted a
+ * struct-foreach field read's INDEX operand to a float slot. The JIT
+ * materializes the index as the slot's raw payload (the codegen proved it
+ * an int counter), so the C++ helper got a float's BITS - and its bounds
+ * test cast the index to the 32-bit size_type, so 2.5's bits
+ * (0x4004000000000000, low half zero) passed for 0 and the read went to
+ * `buf + idx * stride`, far out of the buffer (UBSan pointer-overflow; a
+ * SIGSEGV with no sanitizer). The bounds tests compare the full 64 bits
+ * now and the out-of-range read takes the helper's defined 0.
+ *
+ * The same mutation, made in-process before the image is written (so the
+ * loader JITs the mutated op as it did for the finding): every
+ * struct-foreach field read's index becomes `fz`'s slot. The run must
+ * finish and print its marker, and the helper must have RUN - the
+ * interpreter reads a float slot as the int 0, which never overflowed.
+ * Watched failing with the size_type cast restored (ASan SEGV).
+ */
+static bool myv_struct_field_float_index()
+{
+#if !ML_JIT_SUPPORTED
+    return true;          /* the interpreter reads the slot as the int 0 */
+#else
+    if (!g_jit_enabled)
+        return true;
+    const char *lines_arr[] = {
+        "struct P { int x; float y; }",
+        "var pts = [];",
+        "for (var i = 0; i < 4; i++) { append(pts, P(i + 10, 1.5)); }",
+        "var fz = float(runtime(2)) + 0.5;",       /* 2.5, in a slot */
+        "var s = 0;",
+        "foreach (var p in pts) { s += p.x; }",
+        "print(\"done\", fz);" };
+    std::string src;
+    for (const char *l : lines_arr) {
+        if (!src.empty()) src += '\n';
+        src += l;
+    }
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-sfield-index.myv";
+
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    std::ostringstream cap;
+    std::streambuf *old = cout.rdbuf(cap.rdbuf());
+    unsigned long ran = 0;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        int32_t fz = -1;
+        for (size_t i = 0; i < prog.root.slot_names.size(); i++)
+            if (prog.root.slot_names[i] == "fz")
+                fz = static_cast<int32_t>(i);
+        int patched = 0;
+        for (Instr &in : prog.root.code)
+            if ((in.op == OpCode::StructFieldAddInt
+                 || (in.op == OpCode::LoadStructFieldInt
+                     && !in.struct_checked()))
+                && !in.a().is_lit) {
+                in.pa = fz;               /* the index <- `fz`'s slot */
+                patched++;
+            }
+        if (fz < 0 || patched != 1) {
+            cout.rdbuf(old);
+            fprintf(stderr, "myv-sfield-index: expected one struct-foreach "
+                            "field read and a slot named fz (%d, %d) - the "
+                            "shape changed\n", patched, fz);
+            g_exec_engine = saved;
+            return false;
+        }
+        myv_write(prog, path, MyvSourceRef());
+        MyvSource ms;
+        VmProgram loaded = myv_read(path, ms);          /* jits it too */
+        const unsigned long before =
+            g_jit_op_run[static_cast<size_t>(OpCode::StructFieldAddInt)]
+            + g_jit_op_run[static_cast<size_t>(OpCode::LoadStructFieldInt)];
+        vm_run(loaded);
+        ran = g_jit_op_run[static_cast<size_t>(OpCode::StructFieldAddInt)]
+            + g_jit_op_run[static_cast<size_t>(OpCode::LoadStructFieldInt)]
+            - before;
+    } catch (Exception &e) {
+        cap << "threw " << e.name;
+    }
+    cout.rdbuf(old);
+    remove(path.c_str());
+    if (cap.str() != "done 2.500000 \n") {
+        fprintf(stderr, "myv-sfield-index: the mutated image printed '%s', "
+                        "expected 'done 2.500000'\n", cap.str().c_str());
+        ok = false;
+    }
+    if (ok && ran == 0) {
+        fprintf(stderr, "myv-sfield-index: no JIT field-read helper ran - "
+                        "the index never reached it raw (vacuous)\n");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+#endif
+}
+
 static bool myv_struct_elem_base()
 {
 #if !ML_UNTRUSTED_CHECKS
@@ -63272,6 +63385,9 @@ static const std::vector<extra_check> extra_checks =
     { "myv: a loaded image keeps no ref-listed slot in a register - a "
       "mutated key store is released, not overwritten (#82, fat-286)",
       myv_refpin_release },
+    { "myv: a field read whose index operand names a FLOAT slot reads in "
+      "bounds or takes the defined 0, never past the array (#88, fat-115)",
+      myv_struct_field_float_index },
     { "myv: a codegen-PROVEN arm on an image takes its defined fallback in "
       "every build (fat-845 float operand, fat-260 unpack base)",
       myv_untrusted_proven_arms },

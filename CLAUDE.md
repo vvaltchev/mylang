@@ -10053,6 +10053,15 @@ keeps every ref-listed slot in memory (the scan's admission, the pick's
 outputs); compiled programs - 64 of 369 corpus programs pin such a slot
 - are untouched. **A new way to keep a slot in a register must ask
 `jit_pin_refused`.** Record: docs/jit-optimizations.md, *#82*.
+**⛔ AND AN EIGHTH (#88, 2026-11-24, myv_fuzz fat-115): A BOUNDS TEST
+ON A SIGNED INDEX COMPARES ALL 64 BITS.** `static_cast<size_type>(idx)
+>= arr.size()` truncates to 32 bits, so a huge index whose low half is
+small passes - and the JIT hands a struct-foreach field read its index
+as the slot's RAW payload, so an image whose index operand names a
+float slot passed 2.5's bits (low half zero) for 0, and the read went
+`idx * stride` past the buffer. Compare `static_cast<uint64_t>(idx)`
+(or `size_t`, 64 bits on every platform we build); and bound a
+product by the COUNT, never `idx * sizeof(T)`, which wraps.
 
 Two producer-side rules fell out: **only PRE-JIT bytecode is storable**
 (`myv_write` ML_CHECKs it - the JIT rewrites code in place and fragments
