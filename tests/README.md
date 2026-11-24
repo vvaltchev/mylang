@@ -109,8 +109,10 @@ Choosing what runs:
 | -j N         | use N cores                                           |
 | --seed N     | the fuzzers' seed, to repeat a run exactly            |
 | --no-build   | build nothing; skip tests whose build is missing      |
+| --build-only | make and check the builds, run no test                |
 | --bin B=PATH | use this binary as build B instead of making it       |
 | --shard I/N  | run part I (from 0) of N of a test that can split     |
+| --sample PCT | run a random PCT% of each test's cases or runs        |
 | -- ARGS      | pass ARGS to the one selected test's tool             |
 
 Some tests have cases: each -rt entry, each corpus program, each tests/int
@@ -120,6 +122,21 @@ but its cases can be listed and run on their own:
     $ tests/run -l -d rt --case elem2
 
     $ tests/run rt --case '^elem2: '
+
+A sampled run (--sample 50) runs a random half of every test's work: a
+test with cases runs that share of its cases, a fuzzer that share of its
+programs, a tool over a corpus (int_enum, norec_sweep, disasmcheck) that
+share of the corpus, norec_enum that share of its shapes. The sample is
+drawn from --seed and the test's name, so the seed printed at the start
+gives back the same cases, and two builds of one test (rt, rt@clang)
+draw different ones. Two kinds of test run whole: the coverage gates (a
+floor counts what EVERY unit reaches, so a part of them cannot check it)
+and the small checks that are one property of the whole (driver_checks,
+vdjcmp, the .myv spec check). A whole -rt run's last check, that every
+emitted-code counter fired, is never in a sample: it is about the whole
+suite.
+
+    $ tests/run -t long --sample 50
 
 When a test fails, the runner prints the end of its output, the log file,
 and the command that reruns exactly what failed - the failing cases, or a

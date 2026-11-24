@@ -328,7 +328,8 @@ void help()
          << endl;
 
 #ifdef TESTS
-    cout << "  -rt      Run unit tests  (then: --list, --only REGEX, -s)"
+    cout << "  -rt      Run unit tests  (then: --list, --only REGEX, "
+            "--only-file FILE, -s)"
          << endl;
 #endif
 }
@@ -417,8 +418,9 @@ parse_args(int argc, char **argv)
 
             /*
              * The arguments AFTER -rt are the test harness's own options
-             * (--list, --only REGEX, -s): tests.cpp parses them, so they
-             * add no branch to the product code the coverage gate counts.
+             * (--list, --only REGEX, --only-file FILE, -s): tests.cpp
+             * parses them, so they add no branch to the product code the
+             * coverage gate counts.
              */
             run_tests(opt_show_syntax_tree, argc - 1, argv + 1); exit(0);
 

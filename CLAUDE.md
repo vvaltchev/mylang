@@ -94,14 +94,25 @@ the word in anything new.
 
 **A change to anything that is built, run or read by a test** -
 `src/`, `tests/`, `samples/`, `bench/`, `scripts/`, `Makefile`,
-`CMakeLists.txt`, `.github/` - is pushed only after the FULL catalog is
-green on that exact commit:
+`CMakeLists.txt`, `.github/` - is pushed only after a **50% SAMPLE of
+the long catalog** is green on that exact commit (maintainer,
+2026-11-24 - it was the full catalog until then):
 
     cmake -S . -B build-claude/ci-int -DINT_TESTS=ON -DGCOV=ON \
           -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug     # once
     cmake --build build-claude/ci-int -j8
-    tests/run --build-root build-claude -t long \
+    tests/run --build-root build-claude -t long --sample 50 \
               --bin int-gcov=build-claude/ci-int/mylang
+
+Why a sample: the whole catalog takes about 3h45m on this machine, past
+the 2-hour limit one command has here, and running only the fast tests
+let CI break too often. CI runs everything on every push, so the goal is
+that CI fails RARELY, not never; a CI failure is fixed forward. Each run
+draws a fresh seed (printed first), so successive pushes test different
+halves; the coverage gates and the small whole-run checks run whole
+(tests/README.md, *A sampled run*). Run the whole catalog (no
+`--sample`) when the maintainer asks for it, e.g. before a merge to
+master - in two invocations if it would pass two hours.
 
 **A DOCS-ONLY change needs no test run and is pushed directly**: every
 file it touches is prose that nothing compiles, executes or reads -
@@ -2363,7 +2374,10 @@ lanes compile - int-rel, int-gcov, cmake-gcov); `-a` the manual ones.
 binary check and test command line and runs nothing, `-T` / `-f` / names
 select, `NAME@BUILD` runs a test on another build (`rt@clang`),
 `--case REGEX` runs some cases of a test (`mylang -rt --only`,
-`corpus_diff` / `int_run` / `bt_oracle --only`). **CI runs the same
+`corpus_diff` / `int_run` / `bt_oracle --only`), and `--sample PCT` a
+random PCT% of every selected test's cases, programs or runs, drawn from
+`--seed` (`mylang -rt --only-file` takes -rt's; the push rule above
+uses 50; tests/CLAUDE.md has how a tool takes part). **CI runs the same
 catalog** (2026-10-04): each workflow job builds its binary itself
 (CMake mostly, the only place that build system is exercised) and
 runs `tests/run --bin LANE=PATH NAME@LANE ...`, so a check CI needs is a

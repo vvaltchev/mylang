@@ -108,6 +108,21 @@ the INT_TESTS section); read those first.
   Python, POSIX ERE for corpus_diff's grep -E).
 - The runner never tests a binary it did not check: every build gets a
   `check:` step (in-process `check_build`) before its tests.
+- `--sample PCT` (maintainer, 2026-11-24) runs a random PCT% of each
+  test's work, drawn from `--seed` and the test's name (`sample_rng`). A
+  test with `cases=` gets a sample of its listed cases (as `--only`, or
+  as a FILE for a kind in `CASE_FILE` - -rt's half is past the 128 KB one
+  argument may hold); a tool whose work is a count or a program list
+  reads its share in its `cmd` through the TestCtx: `c.scale(n)` (a
+  fuzzer's count), `c.pick(list)`, `c.only_files(dirs)` (disasmcheck),
+  `c.sample_opts()` (a tool that draws for itself: norec_enum). Each is
+  the identity without --sample, so the full run's command is unchanged
+  - and each marks the step sampled, which its label says. A coverage
+  gate runs whole (`sample_whole`), and so does a test with no knob.
+  **A new tool that can run part of its work reads `c.pct` the same
+  way; a check that is about a WHOLE case list goes in `SAMPLE_NEVER`**
+  (-rt's jit_counter_coverage), or a sample fails it for nothing. A
+  sampled run records no times (test-times.json holds whole runs).
 
 ## The progress API (tests/lib/testrun.py)
 

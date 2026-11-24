@@ -1222,7 +1222,7 @@ for s in shopping phonebook; do
 done
 [ $eof_ok = 1 ] && pass "readln: none at end of input, every engine + image"
 
-# ---- -rt's own options (2026-10-05): --list, --only REGEX, -s -------- #
+# ---- -rt's own options (2026-10-05): --list, --only, --only-file, -s - #
 # tests/run reproduces one failing -rt case with --only, so the selection
 # must run exactly what --list says it selects, refuse a regex matching
 # nothing (a misspelt reproduction must not pass by running nothing) and
@@ -1241,6 +1241,25 @@ if "$BIN" -v 2>/dev/null | grep -q '^  tests  *1'; then
         rt_ok=0; fail "-rt: an unknown option was accepted"
     fi
     [ $rt_ok = 1 ] && pass "-rt: --list and --only select the same cases"
+    # --only-file (2026-11-24): exactly the cases a file names, one per
+    # line - tests/run --sample hands -rt its sample this way. A name that
+    # is no case, and a file that cannot be read, are refused.
+    rt_ok=1
+    "$BIN" -rt --only '^elem2: ' --list | sed -n '1p;3p' > "$TMP/rt.names"
+    out=$("$BIN" -rt --only-file "$TMP/rt.names" 2>&1)
+    printf '%s\n' "$out" | grep -q '^Tests passed: 2/2 ' \
+        || { rt_ok=0; fail "-rt --only-file: did not run the 2 named cases"; }
+    first=$(head -n 1 "$TMP/rt.names")
+    printf '%s\n' "$out" | grep -qF "[ RUN  ] $first" \
+        || { rt_ok=0; fail "-rt --only-file: '$first' did not run"; }
+    printf 'no such case at all\n' >> "$TMP/rt.names"
+    if "$BIN" -rt --only-file "$TMP/rt.names" >/dev/null 2>&1; then
+        rt_ok=0; fail "-rt --only-file: a name that is no case passed"
+    fi
+    if "$BIN" -rt --only-file "$TMP/no-such-file" >/dev/null 2>&1; then
+        rt_ok=0; fail "-rt --only-file: a missing file passed"
+    fi
+    [ $rt_ok = 1 ] && pass "-rt: --only-file runs the cases it names"
 fi
 
 # ---- out of memory (2026-10-05) ------------------------------------- #

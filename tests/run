@@ -188,6 +188,28 @@ def enum_corpus():
         "fib", "gcd", "loop", "primes", "primes2", "strloop")]
 
 
+def program_files(dirs):
+    """The files of `dirs` ((directory, extension) pairs, an empty
+    extension: every file not starting with a dot), sorted per directory
+    - the default corpora of the tools --sample hands a list to."""
+    out = []
+    for d, ext in dirs:
+        p = os.path.join(ROOT, d)
+        if os.path.isdir(p):
+            out += sorted(os.path.join(p, f) for f in os.listdir(p)
+                          if (f.endswith(ext) if ext
+                              else not f.startswith("."))
+                          and os.path.isfile(os.path.join(p, f)))
+    return out
+
+
+# the corpora the tools default to - norec_sweep's and disasmcheck's own
+# lists (keep them in step: a sample is drawn from these)
+SWEEP_DIRS = [("tests/functional", ".my"), ("samples", "")]
+DISASM_DIRS = [("bench/my", ".my"), ("samples", ""),
+               ("tests/functional", ".my")]
+
+
 def myv_doc(c):
     progs = [os.path.join(ROOT, "samples", f)
              for f in sorted(os.listdir(os.path.join(ROOT, "samples")))]
@@ -340,27 +362,31 @@ def catalog():
         desc="inlining never changes a backtrace")
     add("norec_enum", "diff", "med", "dbg", 90,
         lambda c: [T("norec_enum"), c.b, "--depth", "3", "--reach", "0",
-                   "--jobs", str(c.share)], wide=True,
+                   "--jobs", str(c.share)] + c.sample_opts(), wide=True,
         desc="every small call-stack shape, 4 engines")
     add("norec_sweep", "diff", "med", "dbg", 150,
         lambda c: [T("norec_sweep"), c.b, "--max-events", "25",
-                   "--jobs", str(c.share)], wide=True,
+                   "--jobs", str(c.share)] +
+        (c.pick(program_files(SWEEP_DIRS)) if c.pct < 100 else []),
+        wide=True,
         desc="a forced frame rebuild at each call changes nothing")
 
     # fuzz: a fresh seed every run, printed in the reproduce line; a
     # finding is saved beside the logs (a .myv one replays from its seed
     # only here, on a build of the same commit: the temp paths' lengths)
     add("nested_fuzz", "fuzz", "med", "dbg", 90,
-        lambda c: [T("nested_fuzz"), "--mylang", c.b, "--count", "250",
+        lambda c: [T("nested_fuzz"), "--mylang", c.b, "--count",
+                   str(c.scale(250)),
                    "--seed", str(c.seed), "--jobs", str(c.share)],
         wide=True, desc="random nested programs vs CPython")
     t = add("myv_fuzz", "fuzz", "med", "dbg", 60,
-            lambda c: [T("myv_fuzz"), c.b, "-n", "400", "--seed",
+            lambda c: [T("myv_fuzz"), c.b, "-n", str(c.scale(400)), "--seed",
                        str(c.seed), "--save", c.out("-bad")],
             desc="damaged .myv images never crash the loader")
     on(t, "rna", 10)
     t = add("repl_fuzz", "fuzz", "med", "dbg", 40,
-            lambda c: [T("repl_fuzz"), c.b, "-n", "400", "--seed",
+            lambda c: [T("repl_fuzz"), c.b, "-n", str(c.scale(400)),
+                       "--seed",
                        str(c.seed), "--save", c.out("-bad")],
             desc="random REPL sessions never crash it")
     on(t, "recycle", 40)
@@ -378,7 +404,7 @@ def catalog():
             (lambda n: lambda c: [T("int_enum"), c.b, "--tier", str(n),
                                   "--heartbeat", "60", "--failures-out",
                                   c.out("-failures.txt")] +
-             enum_corpus())(tier),
+             c.pick(enum_corpus()))(tier),
             wide=True, desc="every legal compiler decision, tier %d" % tier)
 
     # cli: the driver, a shipping build, the .myv spec
@@ -410,19 +436,22 @@ def catalog():
     # the corpus, 2026-11-15)
     add("disasmcheck", "jit", "med", "dbg", 120,
         lambda c: [S("disasmcheck"), c.b, "--env", "MYLANG_NO_LOWMEM=1",
-                   "--jobs", str(c.share)], wide=True,
+                   "--jobs", str(c.share)] + c.only_files(DISASM_DIRS),
+        wide=True,
         desc="-vdj decodes like objdump, both arenas")
     add("disasmcheck-matrix", "jit", "long", "rel-hard", 300,
         lambda c: [S("disasmcheck"), c.b, "--matrix",
-                   "--jobs", str(c.share)], wide=True,
+                   "--jobs", str(c.share)] + c.only_files(DISASM_DIRS),
+        wide=True,
         shard=lambda spec: ["--shard", spec],
         desc="the same over 23 configurations")
     rex = []
     for p in REX_PICKS:
         rex += ["--env", "MYLANG_INT_CHOOSE=" + p]
     add("disasmcheck-rex", "jit", "long", "int-rel", 60,
-        lambda c: [S("disasmcheck"), c.b, "--only", "tests/functional",
-                   "--jobs", str(c.share)] + rex, wide=True,
+        lambda c: [S("disasmcheck"), c.b, "--jobs", str(c.share)] +
+        (c.only_files([("tests/functional", ".my")]) if c.pct < 100
+         else ["--only", "tests/functional"]) + rex, wide=True,
         guards=[guard_rex],
         desc="the same with forced picks in r8-r15 and xmm8-15")
 
@@ -511,6 +540,54 @@ def rx_exact(names):
     return "^(" + "|".join(esc) + ")$"
 
 
+# --sample: the cases a sample never takes - a check that is about the
+# WHOLE suite it belongs to, and fails on any part of it. -rt's
+# jit_counter_coverage asserts every emitted-code counter fired over
+# every test above it (tests.cpp names this table at its entry).
+SAMPLE_NEVER = {
+    "rt": re.compile(r"^jit: every emitted-code counter fired"),
+}
+
+# --sample: the kinds whose sample goes to the tool as a FILE of names -
+# -rt's half is ~1400 names, past the 128 KB one argument may hold as a
+# regex (and a recursive regex compiler's stack)
+CASE_FILE = {
+    "rt": lambda path: ["--only-file", path],
+}
+
+
+def sample_rng(args, test):
+    """The sample's random source for one test: from --seed and the
+    test's name, so a printed seed gives back the same cases, and two
+    builds of one test (rt, rt@clang) draw different ones."""
+    return random.Random("%d:%s" % (args.seed, test.name))
+
+
+def sample_list(items, pct, rng):
+    """A random `pct`% of `items`, one at least, kept in their order."""
+    items = list(items)
+    if pct >= 100 or not items:
+        return items
+    k = max(1, (len(items) * pct + 50) // 100)
+    keep = sorted(rng.sample(range(len(items)), k))
+    return [items[i] for i in keep]
+
+
+def sample_cases(test, cases, pct, rng):
+    """The sampled cases of a test with a case list; SAMPLE_NEVER's
+    are never among them."""
+    never = SAMPLE_NEVER.get(test.cases)
+    pool = [c for c in cases if not (never and never.search(c))]
+    return sample_list(pool, pct, rng)
+
+
+def sample_whole(test):
+    """True when --sample runs `test` whole: a coverage gate measures a
+    floor over EVERYTHING its units reach, so no part of it can check
+    the floor - and it is the check a local run most needs."""
+    return test.type == "coverage"
+
+
 def list_cases(test, binary):
     """The test's cases, or None when they cannot be listed yet."""
     if not test.cases:
@@ -545,15 +622,51 @@ class Ctx:
 class TestCtx:
     """What a test's `cmd` sees: its binary `b`, the other builds, the
     seed, its share of the cores, and a path for its own output files
-    beside the logs."""
+    beside the logs. Under --sample, `scale` and `pick` give a tool that
+    takes a count or a list of programs its share of the work; `sampled`
+    records that the command asked."""
 
     def __init__(self, ctx, test):
         self.ctx, self.test = ctx, test
         self.b = ctx.bin(test.lane) if test.lane else None
         self.seed, self.share = ctx.seed, ctx.share
+        self.pct = ctx.args.sample or 100
+        self.sampled = False
 
     def bin(self, lane):
         return self.ctx.bin(lane)
+
+    def scale(self, n):
+        """`n` (a fuzzer's program count, ...) scaled to the sample."""
+        if self.pct >= 100:
+            return n
+        self.sampled = True
+        return max(1, (n * self.pct + 99) // 100)
+
+    def pick(self, items):
+        """A random `pct`% of `items` (one at least), in their order."""
+        if self.pct >= 100:
+            return list(items)
+        self.sampled = True
+        return sample_list(items, self.pct, sample_rng(self.ctx.args,
+                                                       self.test))
+
+    def only_files(self, dirs):
+        """disasmcheck's `--only FILE` for each program of a sample of
+        its corpus; nothing (its whole corpus) without --sample."""
+        out = []
+        for f in self.pick(program_files(dirs)) if self.pct < 100 else []:
+            out += ["--only", f]
+        return out
+
+    def sample_opts(self):
+        """A tool's own `--sample PCT --sample-seed N` (norec_enum draws
+        its shapes itself); nothing without --sample."""
+        if self.pct >= 100:
+            return []
+        self.sampled = True
+        return ["--sample", str(self.pct), "--sample-seed",
+                str(sample_rng(self.ctx.args, self.test).randrange(10 ** 9))]
 
     def out(self, suffix):
         return os.path.join(self.ctx.logdir, self.test.name + suffix)
@@ -738,9 +851,10 @@ def reproduce(st, failed_cases):
         rx = rx_exact(failed_cases[:20])
         lines.append("tests/run %s --case %s" % (t.name, shlex.quote(rx)))
         base = Step(st.name, [a for a in st.cmd], env=st.env)
-        if "--only" in base.cmd:        # already a --case run
-            i = base.cmd.index("--only")
-            del base.cmd[i:i + 2]
+        for opt in ("--only", "--only-file"):   # a --case or --sample run
+            if opt in base.cmd:
+                i = base.cmd.index(opt)
+                del base.cmd[i:i + 2]
         base.cmd += CASES[t.cases][1](rx)
         lines.append(quote_cmd(base))
     elif t.name.startswith("nested_fuzz"):
@@ -1109,6 +1223,11 @@ def parse_args(cat):
                    help="the fuzzers' seed (default: a fresh one)")
     g.add_argument("--timeout", type=int, default=3 * 3600,
                    help="per-test timeout in seconds (default 3 hours)")
+    g.add_argument("--sample", type=int, default=None, metavar="PCT",
+                   help="run a random PCT%% of each selected test's work, "
+                        "drawn from --seed: a sample of its cases, programs "
+                        "or runs (the coverage gates and the small whole-run "
+                        "checks run whole)")
     g.add_argument("--shard", default=None, metavar="I/N",
                    help="run part I (from 0) of N of each selected test "
                         "(those that can split: %s)" % ", ".join(
@@ -1122,6 +1241,10 @@ def parse_args(cat):
                         "$MYLANG_TEST_BUILD_ROOT)")
     g.add_argument("--no-build", action="store_true",
                    help="build nothing; skip tests whose build is missing")
+    g.add_argument("--build-only", action="store_true",
+                   help="make and check the builds the selected tests "
+                        "need, and run no test (a long run's builds can "
+                        "then go first, on their own)")
     g.add_argument("--bin", action="append", default=[],
                    metavar="BUILD=PATH",
                    help="use this binary for a build instead of making it")
@@ -1138,6 +1261,13 @@ def parse_args(cat):
         argv, extra = argv[:i], argv[i + 1:]
     args = ap.parse_args(argv)
     args.extra = extra
+    if args.sample is not None and not 1 <= args.sample <= 100:
+        ap.error("--sample wants a percentage from 1 to 100")
+    if args.sample is not None and (args.case or args.shard):
+        ap.error("--sample picks the cases itself: not with --case or "
+                 "--shard")
+    if args.sample == 100:
+        args.sample = None
     if args.shard is not None:
         m = re.fullmatch(r"(\d+)/(\d+)", args.shard)
         if not m or not int(m.group(1)) < int(m.group(2)):
@@ -1317,8 +1447,9 @@ def main():
                        times)
 
     caps = {"rt": testjobs_cap("rtcap"), "build": testjobs_cap("buildcap")}
-    out.line("tests/run: %d test(s), %d build(s), %d cores, seed %d" % (
-        len(sel), len(build), jobs, args.seed))
+    out.line("tests/run: %d test(s), %d build(s), %d cores, seed %d%s" % (
+        len(sel), len(build), jobs, args.seed,
+        ", a %d%% sample" % args.sample if args.sample else ""))
     for l in need:
         if l in args.bins:
             out.line("build %s: %s (--bin)" % (l, rel(args.bins[l])))
@@ -1336,7 +1467,7 @@ def main():
     steps = build_steps(build, args.build_root, jobs)
     steps += check_steps(need, ctx, build)
     assign_logs(steps)
-    if args.case:
+    if args.case or args.sample or args.build_only:
         # the cases exist only once the builds do: build first
         if steps:
             run_steps(steps, jobs, caps, out, args.timeout,
@@ -1346,9 +1477,31 @@ def main():
                 return BUILD_FAILED
             steps = []
             need = []
+        if args.build_only:
+            out.line("tests/run: the builds are made and checked; no test "
+                     "run (--build-only)")
+            return OK
     for t in sel:
         st = test_step(t, ctx, args, share, need, times)
         cmd = st.cmd
+        if args.sample and t.cases and not sample_whole(t):
+            cases = list_cases(t, ctx.bin(t.lane))
+            if not cases:
+                out.line("%s %-26s cannot list its cases: runs whole" % (
+                    out.c("33", "[ WHOLE   ]"), st.label))
+            else:
+                hit = sample_cases(t, cases, args.sample,
+                                   sample_rng(args, t))
+                if t.cases in CASE_FILE:
+                    path = os.path.join(logdir, t.name.replace(":", "_")
+                                        + "-sample.txt")
+                    with open(path, "w") as f:
+                        f.write("".join(c + "\n" for c in hit))
+                    st.cmd = cmd + CASE_FILE[t.cases](path)
+                else:
+                    st.cmd = cmd + CASES[t.cases][1](rx_exact(hit))
+                st.label += " (%d of %d cases)" % (len(hit), len(cases))
+                st.est *= len(hit) / float(len(cases))
         if args.case:
             cases = list_cases(t, ctx.bin(t.lane))
             rx = re.compile(args.case)
@@ -1392,12 +1545,12 @@ def main():
     for s in tests_run:
         # only whole, unmodified runs say how long a test takes
         if s.status == "PASS" and not (args.case or args.shard
-                                       or args.extra):
+                                       or args.extra or args.sample):
             h = times.get(s.name, [])[-4:] + [round(s.secs, 1)]
             times[s.name] = h
     save_times(args.build_root, times)
 
-    return summary(steps, skipped, wall, logdir, out)
+    return summary(steps, skipped, wall, logdir, out, args)
 
 
 def test_step(t, ctx, args, share, need, times):
@@ -1408,6 +1561,13 @@ def test_step(t, ctx, args, share, need, times):
     if args.shard:
         cmd += t.shard(args.shard)
     cmd += args.extra
+    est = expected(t, times)
+    label = "%s: %s" % (t.type, t.name)
+    if tc.sampled:
+        label += " (%d%% of its runs)" % tc.pct
+        est = est * tc.pct / 100.0
+    elif args.sample and (not t.cases or sample_whole(t)):
+        label += " (whole)"
     env = dict(t.env)
     if t.wide:
         env["MYLANG_TEST_JOBS"] = str(share)
@@ -1417,8 +1577,7 @@ def test_step(t, ctx, args, share, need, times):
     return Step(t.name, cmd, deps=["check:" + l for l in t.lanes()
                                    if l in need],
                 cost=share if t.wide else 1, klass=t.klass,
-                env=env, est=expected(t, times), test=t,
-                label="%s: %s" % (t.type, t.name),
+                env=env, est=est, test=t, label=label,
                 prep=(lambda g, c: lambda: [f(c) for f in g])(
                     t.guards, tc) if t.guards else None)
 
@@ -1467,6 +1626,11 @@ def dry_run(sel, args, ctx, need, build, skipped, jobs, share, times):
                 g.__name__.replace("guard_", "") for g in t.guards))
         print("  %s  [%s]" % (st.label, "; ".join(notes)))
         cmd = quote_cmd(st)
+        if args.sample and t.cases and not sample_whole(t):
+            cases = list_cases(t, ctx.bin(t.lane))
+            cmd += "  # + a %d%% sample of its %s cases" % (
+                args.sample, len(cases) if cases else "(not yet listed)")
+            total -= st.est * (1 - args.sample / 100.0)
         if args.case:
             cases = list_cases(t, ctx.bin(t.lane))
             if cases is None:
@@ -1494,7 +1658,7 @@ def testjobs_cap(what):
         return 2
 
 
-def summary(steps, skipped, wall, logdir, out):
+def summary(steps, skipped, wall, logdir, out, args):
     tests = [s for s in steps if s.test]
     builds_bad = [s for s in steps if not s.test and s.status == "FAIL"]
     out.line("-" * 72)
@@ -1521,6 +1685,10 @@ def summary(steps, skipped, wall, logdir, out):
     out.line("%s: %d/%d tests passed in %s; logs in %s" % (
         verdict, sum(1 for s in tests if s.status == "PASS"), len(tests),
         human(wall), rel(logdir)))
+    if args.sample:
+        out.line("a %d%% sample, seed %d: the same sample again is "
+                 "--sample %d --seed %d" % (args.sample, args.seed,
+                                             args.sample, args.seed))
     if failed:
         out.line()
         out.line("to reproduce:")

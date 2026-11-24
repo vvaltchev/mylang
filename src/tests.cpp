@@ -9,6 +9,7 @@
 #include <fstream>
 #include <sstream>
 #include <regex>
+#include <set>
 
 /* mkdir(), for the .myv source-reference relocation test; dup2()/close(),
  * for the audit test's stderr capture (POSIX only - it self-skips on
@@ -63591,7 +63592,9 @@ static const std::vector<extra_check> extra_checks =
     { "static_type: unify & occurs-check", static_type_unify_vars },
     { "static_type: to_string", static_type_to_string_basic },
     /* LAST ON PURPOSE: it asserts every emitted-code counter fired, so
-     * every test above it must already have run. */
+     * every test above it must already have run - which is also why
+     * tests/run's --sample never picks it (SAMPLE_NEVER there: change its
+     * name, change that too). */
     { "jit: every emitted-code counter fired at least once",
       jit_counter_coverage },
 };
@@ -63609,17 +63612,21 @@ void run_tests(bool dump_syntax_tree, int argc, char **argv)
      * `-rt -s` silently ignored the -s its own help line documents.
      */
     const char *only = nullptr;
+    const char *only_file = nullptr;
     bool list = false;
     for (int i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--list")) {
             list = true;
         } else if (!strcmp(argv[i], "--only") && i + 1 < argc) {
             only = argv[++i];
+        } else if (!strcmp(argv[i], "--only-file") && i + 1 < argc) {
+            only_file = argv[++i];
         } else if (!strcmp(argv[i], "-s")) {
             dump_syntax_tree = true;
         } else {
             cout << "-rt: unknown option '" << argv[i]
-                 << "' (want --list, --only REGEX or -s)" << endl;
+                 << "' (want --list, --only REGEX, --only-file FILE or "
+                    "-s)" << endl;
             exit(1);
         }
     }
@@ -63643,8 +63650,42 @@ void run_tests(bool dump_syntax_tree, int argc, char **argv)
             exit(1);
         }
     }
+    /*
+     * --only-file FILE: the cases NAMED in FILE, one per line, exactly -
+     * tests/run's --sample hands -rt its random half this way: as a
+     * regex, the alternation of 1400 names is past the 128 KB a single
+     * argument may hold, and a recursive regex compiler's stack. A name
+     * that is no case is an error, so a stale list cannot pass by
+     * running less than it says.
+     */
+    std::set<std::string> only_names;
+    if (only_file) {
+        std::ifstream f(only_file);
+        if (!f) {
+            cout << "-rt --only-file: cannot read '" << only_file << "'"
+                 << endl;
+            exit(1);
+        }
+        std::string l;
+        while (std::getline(f, l))
+            if (!l.empty())
+                only_names.insert(l);
+        std::set<std::string> all;
+        for (const auto &t : tests)
+            all.insert(t.name);
+        for (const auto &ec : extra_checks)
+            all.insert(ec.name);
+        for (const auto &rt : repl_tests)
+            all.insert(std::string("repl: ") + rt.name);
+        for (const std::string &n : only_names)
+            if (!all.count(n)) {
+                cout << "-rt --only-file: '" << n << "' is no case" << endl;
+                exit(1);
+            }
+    }
     auto selected = [&](const std::string &name) {
-        return !only || std::regex_search(name, only_rx);
+        return (!only || std::regex_search(name, only_rx))
+               && (!only_file || only_names.count(name));
     };
 
     if (list) {
@@ -63734,8 +63775,10 @@ void run_tests(bool dump_syntax_tree, int argc, char **argv)
 
     const size_t total = n_tests + n_total;
 
-    if (only && total == 0) {
-        cout << "-rt --only '" << only << "': no test case matches" << endl;
+    if ((only || only_file) && total == 0) {
+        cout << "-rt --only" << (only ? " '" : "-file '")
+             << (only ? only : only_file) << "': no test case matches"
+             << endl;
         exit(1);
     }
 
@@ -63743,8 +63786,9 @@ void run_tests(bool dump_syntax_tree, int argc, char **argv)
     cout << "===========================================" << endl;
     cout << "Tests passed: " << pass_count << "/" << total << " ";
     cout << (pass_count == total ? "[ PASS ]" : "[ FAIL ]") << endl;
-    if (only)
-        cout << "  (--only '" << only << "': " << total << " of "
+    if (only || only_file)
+        cout << "  (--only" << (only ? " '" : "-file '")
+             << (only ? only : only_file) << "': " << total << " of "
              << tests.size() + extra_checks.size() + repl_tests.size()
              << " cases)" << endl;
 

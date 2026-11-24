@@ -51,6 +51,7 @@ Stdlib only.
 import argparse
 import itertools
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -243,6 +244,10 @@ def main():
                     help="write the generated programs here and keep them")
     ap.add_argument("--reach", type=int, default=25,
                     help="sample size for the tier-reach report (0 = off)")
+    ap.add_argument("--sample", type=int, default=100, metavar="PCT",
+                    help="run a random PCT%% of the shapes (tests/run "
+                         "--sample), drawn from --sample-seed")
+    ap.add_argument("--sample-seed", type=int, default=0)
     args = ap.parse_args()
     testjobs.ensure_idle()
     if args.jobs <= 0:
@@ -251,11 +256,22 @@ def main():
     shapes = list(enumerate_shapes(args.depth))
     if args.limit:
         shapes = shapes[:args.limit]
+    # (index, shape): a program's name keeps its shape's index, so a
+    # sampled run names each program as the whole run does
+    shapes = list(enumerate(shapes))
+    if args.sample < 100:
+        total = len(shapes)
+        rng = random.Random(args.sample_seed)
+        keep = set(rng.sample(range(total),
+                              max(1, (total * args.sample + 50) // 100)))
+        shapes = [x for x in shapes if x[0] in keep]
+        print("sample: %d of %d shapes (seed %d)"
+              % (len(shapes), total, args.sample_seed), flush=True)
 
     tmp = args.keep_dir or tempfile.mkdtemp(prefix="norec_enum_")
     os.makedirs(tmp, exist_ok=True)
     paths = []
-    for idx, (depth, kinds, terminal, catch_at) in enumerate(shapes):
+    for idx, (depth, kinds, terminal, catch_at) in shapes:
         name = "d%d_%s_%s_c%s_%04d.my" % (
             depth, "".join(k[0] for k in kinds), terminal,
             "x" if catch_at is None else catch_at, idx)
