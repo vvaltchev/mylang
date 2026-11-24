@@ -66,3 +66,18 @@ print("const   ", cs(3));
 cs = cn;
 print("const   ", cs(3));
 assert(cs(3) == -3);
+
+# ...and the rebound name handed to a higher-order call: its value use
+# must read the slot the store wrote. Value-template instantiation renamed
+# the argument `hsq` to hsq's typed copy while the store kept writing
+# `hsq` itself, so `hap(hsq, 3)` ran the declared body - 9 where -nti
+# printed -3 (CI int job, tests/int/101, 2026-11-23). Such a name takes
+# no instance.
+func hsq(x) => x * x;
+func hng(x) => 0 - x;
+func hap(f, v) => f(v);
+print("hof     ", hap(hng, int(runtime(3))));
+hsq = hng;
+var hv = hap(hsq, int(runtime(3)));
+print("hof     ", hv);
+assert(hv == -3);

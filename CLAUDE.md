@@ -4201,7 +4201,12 @@ walked the ASSIGNMENT TARGET as a value use of the template: `sq = ng`
 renamed the target to `sq$0`, the store wrote the instance's slot, every
 guard above (all keyed by name) read `sq` as never written, and `sq(3)`
 after it folded with the old body - 9 where `-nti` printed -3. A store's
-target is never a value use.
+target is never a value use. **And that fix alone split the name in two
+(2026-11-24, CI's int job):** the store now wrote `sq`'s slot while a READ
+of `sq` - `ap(sq, 3)` - was still renamed to `sq$0`, whose slot holds the
+declared body, so the call printed 9 again. A template whose name is
+rebound takes NO value instance (`value_instantiate_round` drops it): every
+use of a variable names the one slot its stores write.
 
 **Auto-pure & const/pure introspection.** `func_body_is_pure` (`resolver.cpp`),
 run after a function body is resolved, promotes a non-pure, capture-free func to

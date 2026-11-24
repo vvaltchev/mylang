@@ -2851,6 +2851,18 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
     };
     for (auto &e : rootBlock->elems)
         walk(e.get(), false);
+    /* a template whose NAME is rebound is a variable (CLAUDE.md, A
+     * REBOUND FUNCTION NAME IS A VARIABLE): every use of it must name
+     * the one slot its stores write. Redirecting its reads to an
+     * instance's slot while `sq = ng` writes sq's own made `ap(sq, 3)`
+     * call the declared body - 9 where -nti printed -3 - so such a
+     * template takes no value instance at all */
+    for (auto it = uses.begin(); it != uses.end();) {
+        bool rebound = false;
+        for (const Use &u : it->second)
+            rebound = rebound || func_name_rebound(u.sym);
+        it = rebound ? uses.erase(it) : std::next(it);
+    }
 
     /* (an instance's uses name the instance: #81 re-checks those) */
     if (uses.empty() && value_insts.empty())
