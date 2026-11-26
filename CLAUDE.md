@@ -2686,9 +2686,11 @@ value - that is what a const scalar is, and a pure function body relies
 on it), registering a struct descriptor and a pure function, discarding a
 statically dead branch (`if`/`while`/`foreach`/`?:`/`??` on a constant -
 README *Const evaluation of conditional statements*: its contents are not
-checked, so keeping them would refuse programs), and EVALUATING each
+checked, so keeping them would refuse programs), EVALUATING each
 constant expression, so an error it raises is the same compile error
-(`nc_eval_const`). A folded node's absence is visible to exactly one rule,
+(`nc_eval_const`), and recording a fixed read's value for its TYPE
+(question 22, `Construct::fixed_val`: `K[0]` of `[1, none]` is an `int`
+either way). A folded node's absence is visible to exactly one rule,
 pExpr14's assignable shape (`K[0]` folds to a VALUE), which reads
 `Construct::nc_folds`. ONE exception, `ParseContext::folding()`: a `pure
 func` BODY folds either way - it is the const evaluator's own code, and a
