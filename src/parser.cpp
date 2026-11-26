@@ -1217,15 +1217,135 @@ detach_baked_funcs(ParseContext &c, unique_ptr<Construct> &slot,
  * so `const A = C(1);` got number 2 where the folding run gives it 1, and
  * `hash(A)` differed between the two (RULE 2, found 2026-11-15).
  */
+static void pNoteFixed(ParseContext &c, Construct *node,
+                       const EvalValue *known = nullptr);
+
 static void
 nc_eval_const(ParseContext &c, Construct *node,
               bool process_arrays, bool immutable)
 {
     const uint64_t ident = g_class_ident;
     unique_ptr<Construct> scratch;
-    node->nc_folds = MakeConstructFromConstVal(
-        RValue(node->eval(c.const_ctx)), scratch, process_arrays, immutable);
+    const EvalValue v = RValue(node->eval(c.const_ctx));
+    node->nc_folds = MakeConstructFromConstVal(v, scratch, process_arrays,
+                                               immutable);
+    pNoteFixed(c, node, &v);
     class_ident_reset(ident);
+}
+
+/* the node kinds pNoteFixed records a value on */
+static bool pFixedShape(const Construct *x)
+{
+    switch (ctag(x)) {
+    case ConstructType::subscript:
+    case ConstructType::slice:
+    case ConstructType::member:
+    case ConstructType::call:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * Question 22 (maintainer, 2026-11-26): whether a constant node's value is
+ * FIXED - computed from constants by no code of the program's own. Every
+ * call in it is to a builtin, and no FUNCTION is given to one as an
+ * argument - a callback is the program's code (pNoteFixed asks the node's
+ * own value too). A call to the program's own functions has a
+ * compile-time value that is right only once the whole program is typed
+ * (#96 checks that before it replaces the call), so a node holding one
+ * keeps the type the program gives it.
+ *
+ * Nothing below the node is evaluated again: a read or a call in it was
+ * parsed first, and its own site recorded its value when it is fixed
+ * (pNoteFixed runs at every such site, in both modes) - so a recorded
+ * one is fixed, and an unrecorded one is not (or fails). An argument's
+ * value is a function only when the argument is a function literal or a
+ * name bound to one, or a recorded read naming one: arithmetic and
+ * container literals make no function.
+ */
+static bool
+pValueFixed(ParseContext &c, Construct *n)
+{
+    const uint64_t ident = g_class_ident;
+    bool ok = true;
+    std::function<void(Construct *)> scan = [&](Construct *x) {
+        if (!ok || !x)
+            return;
+        if (ctag(x) == ConstructType::func_decl) {
+            ok = false;
+            return;
+        }
+        if (x != n && pFixedShape(x)) {
+            if (!x->fixed_val)
+                ok = false;
+            return;
+        }
+        /* (the callee and a name given as an argument are constants the
+         * node's own evaluation - done before, or after with its errors
+         * the fold's - reads anyway: evaluating them cannot fail) */
+        if (ctag(x) == ConstructType::call) {
+            auto *call = static_cast<CallExpr *>(x);
+            if (RValue(call->what->eval(c.const_ctx)).get_type()->t
+                    != Type::t_builtin) {
+                ok = false;
+                return;
+            }
+            for (auto &a : call->args->elems) {
+                if (ctag(a.get()) != ConstructType::id)
+                    continue;
+                const EvalValue av = RValue(a->eval(c.const_ctx));
+                if (av.get_type()->t == Type::t_func) {
+                    ok = false;
+                    return;
+                }
+            }
+        }
+        for_each_child_of(x, scan);
+    };
+    scan(n);
+    class_ident_reset(ident);
+    return ok;
+}
+
+/*
+ * Question 22: record the value of a constant read - a subscript, a slice,
+ * a member - or of a builtin call, on the node left in the tree, when that
+ * value is fixed (pValueFixed) and names no function (inference may name
+ * one from elsewhere, a callee set). The inferencer types the node by it
+ * (Construct::fixed_val) in both modes, so `K[0]` of `const K = [1,
+ * none]` is an `int` with and without -nc. `known` is the value when the
+ * caller computed it; else the node is evaluated here, and a node whose
+ * evaluation fails gets nothing (the error belongs to the fold that
+ * reports it, unchanged).
+ */
+static void
+pNoteFixed(ParseContext &c, Construct *node, const EvalValue *known)
+{
+    if (!node->is_const || node->fixed_val || !pFixedShape(node))
+        return;
+    if (!pValueFixed(c, node))
+        return;
+    EvalValue v;
+    if (known) {
+        v = *known;
+    } else {
+        const uint64_t ident = g_class_ident;
+        try {
+            v = RValue(node->eval(c.const_ctx));
+        } catch (const Exception &) {
+            class_ident_reset(ident);
+            return;
+        }
+        class_ident_reset(ident);
+    }
+    const Type::TypeE t = v.get_type()->t;
+    std::unordered_set<const FuncDescriptor *> descs;
+    collect_value_descs(v, descs);
+    if (t == Type::t_builtin || t == Type::t_func || !descs.empty())
+        return;
+    node->fixed_val = make_unique<LiteralObj>(std::move(v), true);
 }
 
 /*
@@ -1283,6 +1403,7 @@ pDeferFold(ParseContext &c, Construct *node,
     unique_ptr<Construct> lit;
     node->nc_folds = cse_materialize_core(c, node, lit, process_arrays,
                                           immutable, &v);
+    pNoteFixed(c, node, &v);                /* question 22 */
     std::unordered_set<const FuncDescriptor *> descs;
     collect_value_descs(v, descs);
     /* ...and one holding an instance of a struct declared in a function
@@ -1904,6 +2025,7 @@ pAcceptCallExpr(ParseContext &c,
             /* end spans through the closing ')': the caret convention is
              * loc_end = last-char-column + 2, and get_loc() is the ')' here. */
             expr->end = c.get_loc() + 2;
+            pNoteFixed(c, expr.get());          /* question 22 */
             ret = std::move(expr);
         }
 
@@ -1953,6 +2075,10 @@ pFoldSubscript(ParseContext &c, unique_ptr<Construct> &ret, bool in_slice,
             }
         }
     }
+    /* question 22: a read left in the tree - a slice outside a const
+     * declaration, a deferred or unbaked subscript, any of them under
+     * -nc - is typed by its value (a folded one is a literal now) */
+    pNoteFixed(c, ret.get());
 }
 
 /* ParseContext::pending_fold: a const subscript naming no element */
@@ -2121,6 +2247,10 @@ pAcceptMember(ParseContext &c,
 
     mem->memId = SharedStr(string(id->get_str()));
     mem->memUid = UniqueId::get(id->get_str());
+    /* question 22: a member read is folded only by the expression around
+     * it, so one inside an expression that is not constant (`CFG.n + r`)
+     * stays a read - typed by its value */
+    pNoteFixed(c, mem.get());
     ret = std::move(mem);
     return true;
 }

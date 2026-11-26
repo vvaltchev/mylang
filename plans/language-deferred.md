@@ -139,3 +139,16 @@ questions - above all whether the aliasing outlives the expression,
 which decides between "a fresh array of the stored values" and a new
 reference value kind with a lifetime rule - are in
 `plans/multi-assign-value.md`.
+
+## Tuple types: a constant's per-element types beyond the constant itself
+
+**Raised by the maintainer (2026-11-26, question 22), not designed.** A
+read of a constant at a constant index has the element's exact type
+(README *A read of a constant has the type of what it reads*), but the
+knowledge stops at the constant: `var a = K; a[0]`, a parameter `K` was
+passed to, and a `foreach` over it get the container's element type.
+Carrying the per-element types further needs a real tuple type
+(`tuple<int, str, ...>`) and templates keyed on it - C++'s variadic
+templates. The cost to weigh first: a 1M-element constant would be a
+1M-entry type key, and one instance per distinct tuple. A new language
+feature: it waits for step 4 of the work order.

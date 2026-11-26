@@ -594,6 +594,40 @@ const-fold of a constant-index access"); the README says nothing.
   but then the builtin fix should go the same way (`get` of a constant
   dict would be `int`, against the README).
 
+**DECIDED: B, as a rule of inference (maintainer, 2026-11-26) - done.**
+The maintainer turned A down (it loses compile-time information the
+optimizations live on) and stated the intuition: a constant's `dyn` is
+not a real `dyn` - each element of a constant has a known type, like a
+tuple's. The rule, in README *A read of a constant has the type of what
+it reads*: **an expression whose value is fixed at compile time has the
+exact type of that value** - an element, member or slice of a constant
+at constant indexes, keys or bounds, and a builtin call whose arguments
+are constants and not functions. Anything else - a run-time index, a read
+through a variable, a parameter or a `foreach` - has the container's
+element type (the join of the elements; `dyn` only when they share no
+type).
+
+- It is decided by inference, not by the fold, so `-nc` types every such
+  read as the folding run does - `-nc` stays, the oracle for "folding
+  changes nothing". Types are visible to a program (`typestr`, the
+  mandatory-`dyn` and the `none` checks), so letting `-nc` type them
+  otherwise would have broken RULE 2.
+- Decision 1: a builtin call on constant data follows the rule -
+  `get(D, "a")` is the `int` 1 and `dict([[1, "b"]])` a `dict<int, str>`,
+  which reverses the 2026-11-14 change above (README *Const builtins*).
+- Decision 2: a call to a user function keeps the type the program gives
+  it: its compile-time value is right only once the whole program is
+  typed (#96), and each argument type has its own template instance.
+- No tuple type: the value is the record, so a constant read is typed from
+  the element it reads, with no per-element type table. Carrying the
+  per-element types through variables, parameters and `foreach` would
+  need a real tuple type and templates keyed on it (C++'s variadic
+  templates) - a new language feature, not built.
+
+Implementation: `Construct::fixed_val` (the parser's `pNoteFixed`, at
+every read and call site, in `pDeferFold` and in `nc_eval_const`), read
+by `Inferencer::type_of`.
+
 ## 23. A typed container reached through a `dyn` name
 
 **DECIDED (maintainer, 2026-11-16).** A name not declared `dyn` is

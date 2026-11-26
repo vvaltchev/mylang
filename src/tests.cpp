@@ -31747,19 +31747,20 @@ static bool const_fold_equivalence()
             "const array<array<float>> C = [[1], g()];",
             "array<dict<str, float>> e = [dict(1.5), {\"k\": 2}];",
             "print(a, d, C, e, e[0][\"q\"]);" } },
-        /* a constant BUILTIN call is typed as the call, not as its value:
-         * folded while parsing, `get` (int?) read as its value's int, so
-         * `g + 1` compiled where -nc refused it, and `dict(pairs)` typed
-         * dict<str,int> against dict<dyn,dyn> */
-        { "a folded get() is opt", {
+        /* question 22 (2026-11-26): a constant BUILTIN call has its
+         * value's exact type, with folding on and off - `get` of
+         * constants is the int it finds, `dict(pairs)` the dict it
+         * makes. (The 2026-11-14 rule typed it as the call; folded while
+         * parsing it had been the value's type, and -nc the call's.) */
+        { "a folded get() has its value's type", {
             "const D = {\"a\": 1};",
             "var g = get(D, \"a\");",
             "print(g + 1);" } },
-        { "a folded find() is opt, and narrows", {
+        { "a folded find() has its value's type", {
             "var w = find([1, 2], 2);",
             "if (w != none) print(w + 10);",
             "print(typestr(w), typestr(find([1, 2], 2)));" } },
-        { "a folded dict(pairs) is typed as the call", {
+        { "a folded dict(pairs) has its value's type", {
             "var d1 = dict([[\"a\", 1]]);",
             "var k = keys(d1);",
             "print(typestr(d1), typestr(k), array_storage(k));",
@@ -31780,6 +31781,70 @@ static bool const_fold_equivalence()
             "var dyn r = range(3);",
             "r[0] = \"z\";",
             "print(r, array_storage(r));" } },
+        /* question 22: a read whose value is fixed at compile time - an
+         * element, member or slice of a constant at constant indexes -
+         * has that value's type in every mode. It was the FOLD's doing:
+         * -nc, a member inside an expression that is not constant and a
+         * slice outside a const declaration were typed by the
+         * container's element type */
+        { "a constant element read has its value's type", {
+            "const K = [1, none];",
+            "var e = K[0];",
+            "print(e + 1, typestr(K[0]), typestr(K[1]));" } },
+        { "a mixed constant reads like a tuple", {
+            "const M = [1, \"a\", 2.5];",
+            "var i = M[0];",
+            "var s = M[1] + \"!\";",
+            "print(i + 1, s, typestr(M[2]));" } },
+        { "a member read inside an expression that is not constant", {
+            "const CFG = {\"name\": \"x\", \"n\": 3};",
+            "var r = int(runtime(1));",
+            "var k = CFG.n + r;",
+            "print(k, typestr(k), typestr(CFG.name));" } },
+        { "a subscript inside an expression that is not constant", {
+            "const M = [1, \"a\"];",
+            "var r = int(runtime(1));",
+            "var j = M[0] + r;",
+            "print(j, typestr(j));" } },
+        { "a constant slice has its value's type", {
+            "const M = [1, 2, \"a\"];",
+            "func f(array<int> a) => len(a);",
+            "print(typestr(M[0:2]), f(M[0:2]), typestr(M[2:3]));" } },
+        { "a nested constant read", {
+            "const N = [[1, \"x\"], {\"k\": 2.5}];",
+            "print(typestr(N[0][1]), typestr(N[1][\"k\"]),"
+            " typestr(N[1].k), N[1].k + 1);" } },
+        { "a constant index a builtin computes", {
+            "const M = [1, \"a\", 2.5];",
+            "print(typestr(M[len(M) - 1]), M[len(M) - 1] + 1);" } },
+        { "a struct's constant member", {
+            "struct S { const T = [1, \"s\"]; }",
+            "print(typestr(S.T[0]), S.T[0] + 1, typestr(S.T[1]));" } },
+        /* ...and anything else has the element type: a run-time index, a
+         * read through a variable, a parameter, a foreach - and a call
+         * to a user function keeps the type the program gives it */
+        { "a run-time index has the element type", {
+            "const K = [1, none];",
+            "var r = int(runtime(0));",
+            "print(typestr(K[r]));" } },
+        { "a run-time read of a mixed constant needs dyn", {
+            "const M = [1, \"a\"];",
+            "var r = int(runtime(0));",
+            "var f = M[r];" } },
+        { "a read through a variable has the element type", {
+            "const M = [1, \"a\"];",
+            "var a = M;",
+            "func first(b) => b[0];",
+            "foreach (var e in M) print(typestr(e));",
+            "print(typestr(a[0]), typestr(first(M)));" } },
+        { "a user function's call keeps the program's type", {
+            "const K = [1, none];",
+            "pure func pick(int k) {",
+            "    if (k > 0) return K[0];",
+            "    return K[1];",
+            "}",
+            "var x = pick(5);",
+            "print(typestr(x), x);" } },
     };
 
     bool ok = true;

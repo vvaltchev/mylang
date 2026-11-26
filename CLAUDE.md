@@ -5435,8 +5435,22 @@ decisions behind it: `plans/archived/type-inference.md`,
 - **Const-container types are exact** (`static_type_from_value` recurses): a
   folded
   const array/dict is typed `array<T>`/`dict<K,V>` from its actual elements
-  (heterogeneous -> `array<dyn>`; individual elements stay exact via const-fold
-  of a constant-index access). Container element joins absorb `None`
+  (heterogeneous -> `array<dyn>`). **⛔ A READ WHOSE VALUE IS FIXED HAS
+  THAT VALUE'S TYPE, IN EVERY MODE (question 22, maintainer 2026-11-26)** -
+  an element, member or slice of a constant at constant indexes, and a
+  builtin call on constant data (no function argument, no user call
+  inside: `pValueFixed`). It used to be a by-product of the FOLD - the
+  literal a folded `K[0]` became was typed by its value, while `-nc`, a
+  member read inside a non-constant expression (`CFG.n + r`) and a slice
+  outside a const declaration were typed by the container's element type
+  (RULE 2). Now the PARSER records the value on every such node it
+  leaves in the tree (`Construct::fixed_val`, `pNoteFixed` - at the
+  member, subscript/slice and call sites, in `pDeferFold` and in
+  `nc_eval_const`) and `type_of` reads it, so folding decides nothing
+  about a type. A user function's call stays typed by the program
+  (decision 2: its compile-time value is right only once the program is
+  typed, #96). A NEW read-shaped node kind joins `pNoteFixed`'s switch.
+  Container element joins absorb `None`
   (`join_elem`) so `array(N)`-then-fill stays `array<int>`, not opt-element;
   an empty `[]` (`array<none>`) or a `dyn`-element container fits any
   `array<T>` (`static_type_elem_compat` — invariance relaxed at the bottom/top

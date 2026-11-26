@@ -238,6 +238,18 @@ public:
     std::unique_ptr<Construct> late_fold;
 
     /*
+     * Question 22 (maintainer, 2026-11-26): an expression whose value is
+     * FIXED at compile time has the exact type of that value - a read of a
+     * constant at a fixed index, key or bounds, a builtin call on fixed
+     * data (README *Const evaluation*). The parser sets this on such a
+     * node it leaves in the tree: a LiteralObj holding the value, set in
+     * BOTH modes, so `-nc` types the node as the folding run types the
+     * literal it folds to. type_of reads it; it is never swapped in and
+     * never run. A clone carries it.
+     */
+    std::unique_ptr<Construct> fixed_val;
+
+    /*
      * The parser PROVED this constant expression is not none: it is the
      * left side of a `??` the parser decided, which stands for the whole
      * `a ?? b` (README: the result is non-opt). Its own static type may
@@ -379,6 +391,7 @@ public:
         d.never_none = never_none;
         d.inline_call = inline_call;
         d.late_fold = late_fold ? late_fold->clone() : nullptr;
+        d.fixed_val = fixed_val ? fixed_val->clone() : nullptr;
     }
 };
 

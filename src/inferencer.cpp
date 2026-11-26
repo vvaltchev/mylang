@@ -7095,14 +7095,16 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v,
             const auto &m = dobj.get_ref();
             /* a DEFAULT dict's reads also yield its default: an empty one
              * is what `dict(v)` is typed unfolded (builtin_result:
-             * dict<dyn, T>), a non-empty one joins T into its values. It
-             * was typed by its entries alone, so a folded `dict(0)` was
-             * dict<none,none> and `d.a + 1` a NullabilityEx that -nc
-             * did not raise (RULE 2). */
+             * dict<?, T>, the key UNFILLED - #80: the first typed place
+             * or store fills it, so it is never a `dyn` of its own), a
+             * non-empty one joins T into its values. It was typed by its
+             * entries alone, so a folded `dict(0)` was dict<none,none>
+             * and `d.a + 1` a NullabilityEx that -nc did not raise (RULE
+             * 2). */
             StaticTypeRef dft = dobj.get_has_default()
                 ? static_type_from_value(dobj.get_default(), st) : nullptr;
             if (m.empty())
-                return dft ? A.dict_of(A.dyn_ty(), held(dft))
+                return dft ? A.dict_of(A.none_ty(), held(dft))
                            : A.dict_of(A.none_ty(), A.none_ty());
             StaticTypeRef kty = nullptr, val = nullptr;
             for (const auto &kv : m) {
@@ -7155,6 +7157,12 @@ StaticTypeRef Inferencer::type_of_node(const Construct *e)
 {
     if (!e)
         return A.none_ty();
+
+    /* question 22: a node whose value is fixed at compile time
+     * (Construct::fixed_val - a constant read, a builtin call on
+     * constants) has its value's exact type, with or without -nc */
+    if (e->fixed_val)
+        return type_of_node(e->fixed_val.get());
 
     if (ctag(e) == ConstructType::lit_bool)  return A.bool_ty();
     if (ctag(e) == ConstructType::lit_int)   return A.int_ty();

@@ -1,11 +1,11 @@
-# A constant call to a builtin is typed as the CALL, not as the value
-# the parser computes for it (the rule #96 set for a call to a user
-# function): `get` and `find` give an `opt` result, `dict(pairs)` a
-# `dict<dyn, dyn>` (README: dict, get, find). Folded while parsing, each
-# took its value's exact type, so `-nc` printed and refused differently.
-# The program checks the types the README gives and that the values
-# are the call's. With no types (-nti) typestr names a value's run-time
-# type, so the type checks are made in a typed run only.
+# A constant call to a builtin has the exact type of the value it
+# computes (question 22, maintainer 2026-11-26; README *Const builtins*):
+# `get` and `find` of constants are the value they find (an `int`, or
+# `none`), `dict(pairs)` of constant pairs the dict they make. It is the
+# rule a read of a constant follows, and it does not depend on folding:
+# corpus_diff runs this program under -nc too, where every call runs at
+# run time. With no types (-nti) typestr names a value's run-time type,
+# so the type checks are made in a typed run only.
 
 var typed = typestr(runtime(0)) == "dyn";
 
@@ -16,20 +16,26 @@ func want(what, opt dyn got, opt dyn exp) {
         bad++;
     }
 }
+func refused(dyn f) {
+    try { f(); } catch (TypeErrorEx) { return true; }
+    return false;
+}
 
 const D = {"a": 1};
 var g = get(D, "a");
 if (typed)
-    want("get's type", typestr(g), "int?");
-want("get's value", g ?? 0, 1);
+    want("get's type", typestr(g), "int");
+want("get's value", g + 1, 2);
 want("get of a missing key", get(D, "z"), none);
+var gz = get(D, "z");
+if (typed)
+    want("...is a none", typestr(gz), "none");
 want("get! is not opt", typestr(get!(D, "a")), "int");
 
 var w = find([1, 2], 2);
 if (typed)
-    want("find's type", typestr(w), "int?");
-if (w != none)
-    want("find narrowed", w + 10, 11);
+    want("find's type", typestr(w), "int");
+want("find's value", w + 10, 11);
 want("find of nothing", find([1, 2], 7), none);
 
 # `a ?? b` is never none, whatever its left side's own type says: the
@@ -46,13 +52,17 @@ want("a missing key takes the default", n3 + 1, 8);
 
 var d1 = dict([["a", 1]]);
 if (typed)
-    want("dict(pairs)'s type", typestr(d1), "dict<dyn,dyn>");
-d1["b"] = "s";
-want("dict(pairs) takes any value", d1["b"], "s");
+    want("dict(pairs)'s type", typestr(d1), "dict<str,int>");
+d1["b"] = 2;
+want("dict(pairs) takes an int value", d1["b"], 2);
+var dyn e1 = d1;
+if (typed)
+    want("...and refuses a str", refused(func [e1] () { e1["c"] = "s"; }),
+         true);
 var k = keys(dict([["x", 1], ["y", 2]]));
 if (typed) {
-    want("keys of it", typestr(k), "array<dyn>");
-    want("...stored general", array_storage(k), "general");
+    want("keys of it", typestr(k), "array<str>");
+    want("...stored as strings", array_storage(k), "str");
     want("a default dict is typed by its default", typestr(dict(2.5)),
          "dict<dyn,float>");
 }

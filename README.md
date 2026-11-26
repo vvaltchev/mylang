@@ -979,6 +979,30 @@ s[0] = 9;         # error: NotLValueEx
 s = [9, 9];       # OK: rebinding the name s is allowed
 ```
 
+**A read of a constant has the type of what it reads.** When the compiler
+knows a read's value - an element, a member or a slice of a constant, at an
+index, key or bounds that are constants themselves - the read has that
+value's exact type, as the constant itself does. So a constant whose
+elements are of different kinds is read like a tuple:
+
+```C#
+const M = [1, "a", 2.5];
+var i = M[0];             # an int
+var s = M[1] + "!";       # a str
+const CFG = {"name": "x", "n": 3};
+var k = CFG.n + 1;        # an int: 4
+const K = [1, none];
+print(K[0] + 1);          # 2: K[0] is an int, not an int?
+```
+
+A read whose index or key is known only at run time (`M[n]`) has the
+constant's element type - `dyn` here, the one type that holds an int, a str
+and a float - and so does a read through anything that is not the constant
+itself: a variable bound to it, a parameter it was passed to, a `foreach`
+over it. A builtin call on constants follows the same rule (see *Const
+builtins*). It does not depend on folding: with `-nc` the read runs at run
+time, and has the same type.
+
 **Rebinding a const or a builtin name is a compile error.** An assignment, a
 compound assignment or a `++`/`--` whose target is a `const` holding an
 array, a dict, a struct or a function - or a struct's name, or a `pure
@@ -3698,26 +3722,28 @@ The chain is part of the report only: a script cannot read it.
 The following built-in functions will be evaluated during *parse-time* when
 const arguments are passed to them.
 
-Such a call is still **typed as the call**, by the builtin's own rule, never
-as the value it computes: `get(D, "a")` is an `int?` and `dict([[1, "b"]])` a
-`dict<dyn, dyn>` (its pairs mix two kinds) even when every argument is a
-constant. The value replaces
-the call once the whole program is typed, as for a constant call to a user
-function (see *Calling functions during const-evaluation*), so turning
-folding off (`-nc`) changes nothing a program can see:
+Such a call has the **exact type of the value it computes** when every
+argument is a constant and none is a function - the rule a read of a
+constant follows (*A read of a constant has the type of what it reads*,
+under *Declaring constants*): `get(D, "a")` below is the `int` 1, not the
+`int?` a `get()` is in general, `get(D, "zz")` is `none`, and
+`dict([[1, "b"]])` is a `dict<int, str>`, not the `dict<dyn, dyn>` of pairs
+mixing two kinds. Turning folding off (`-nc`) changes nothing a program can
+see: the call then runs at run time, with the same type.
 
 ```
 const D = {"a": 1};
 var g = get(D, "a");
-print(g + 1);             # compile error: g is an int?, which may be none
-if (g != none)
-    print(g + 1);         # 2
+print(g + 1);             # 2: g is an int
 ```
 
-`??` gives a non-`opt` result here as everywhere (`var n = get(D, "a") ?? 0;`
-is an `int`). A `const` declaration binds the value itself, so `const c =
-get(D, "a");` is the int 1, and a `pure` function's body is evaluated the
-same way in both modes.
+A call given a FUNCTION (`map(f, K)`, `sort(K, cmp)`) runs code of the
+program's own, and is typed by the builtin's rule, as a call to a user
+function is typed by the program: its value replaces the call once the whole
+program is typed (see *Calling functions during const-evaluation*). A
+`const` declaration binds the value itself, so `const c = get(D, "a");` is
+the int 1, and a `pure` function's body is evaluated the same way in both
+modes.
 
 **A declaration wins over the builtin it shadows.** A `var`/`const` may not
 take a const builtin's name at all (`var len = 7;` is a compile-time
@@ -3996,7 +4022,9 @@ inserts) that default value instead of throwing, so accumulation works directly.
 The default's type is the value type; the key type is whatever the program
 stores (`dict(0)` used with string keys is a `dict<str, int>`). `dict(pairs)` is
 typed by its pairs: an array of `[k, v]` arrays of one element type `T` makes a
-`dict<T, T>`, mixed pairs a `dict<dyn, dyn>`:
+`dict<T, T>`, mixed pairs a `dict<dyn, dyn>` - and constant pairs the exact
+type of the dict they make (`dict([[1, "b"]])` is a `dict<int, str>`, see
+*Const builtins*):
 
 ```C#
 var counts = dict(0);
@@ -4019,8 +4047,9 @@ var squares = make_dict([1, 2, 3, 4], func(k) => k * k);  # {1:1, 2:4, 3:9, 4:16
 
 #### `get(dictionary, key)`
 Look up `key`, returning its value or `none` if the key is absent — the explicit
-*nullable* lookup (type `opt V`, so you narrow it before use). Contrast
-`d[key]`, which throws on a missing key.
+*nullable* lookup (type `opt V`, so you narrow it before use; on constant
+arguments the call has its value's exact type instead, see *Const
+builtins*). Contrast `d[key]`, which throws on a missing key.
 
 #### `get!(dictionary, key)`
 Look up `key`, returning its value or raising `KeyNotFoundEx` if the key is
