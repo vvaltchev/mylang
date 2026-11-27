@@ -209,26 +209,6 @@ std::string reflect_struct_ctor(const StructTypeDef *def)
 
 static std::string reflect_typeof_rec(const EvalValue &e, CycStack &st);
 
-/* Do two array elements have one type, as far as an array's element type
- * goes: the same value kind - and, for a struct, class or box<P>, the
- * same type and the same box-ness; for a box of a scalar or a string, the
- * same element kind (a box<int> and a box<float> are two types). */
-static bool reflect_same_kind(const EvalValue &a, const EvalValue &b)
-{
-    const int t = a.get_type()->t;
-    if (t != b.get_type()->t)
-        return false;
-    if (t == Type::t_struct) {
-        const StructObject &x = *a.get_ref<intrusive_ptr<StructObject>>();
-        const StructObject &y = *b.get_ref<intrusive_ptr<StructObject>>();
-        return x.def == y.def && x.boxed == y.boxed;
-    }
-    if (t == Type::t_box)
-        return a.get_ref<intrusive_ptr<BoxObj>>()->kind
-            == b.get_ref<intrusive_ptr<BoxObj>>()->kind;
-    return true;
-}
-
 /* The element type of a box of a scalar or a string, by its kind. */
 static const char *reflect_box_elem(char kind)
 {
@@ -261,22 +241,41 @@ static std::string reflect_array_type(const SharedArrayObj &a, CycStack &st)
     if (n == 0)
         return "array<dyn>";
 
-    const EvalValue e0 = arr_elem_at(a, 0);
+    /* each element described in full: a shallow kind compare took the
+     * first one's type for the whole array, so [[1], ["s"]] read as an
+     * array<array<int>> */
+    const std::string t0 = reflect_typeof_rec(arr_elem_at(a, 0), st);
     for (size_type i = 1; i < n; i++)
-        if (!reflect_same_kind(arr_elem_at(a, i), e0))
+        if (reflect_typeof_rec(arr_elem_at(a, i), st) != t0)
             return "array<dyn>";                      /* heterogeneous */
-    return std::string("array<") + reflect_typeof_rec(e0, st) + ">";
+    return "array<" + t0 + ">";
 }
 
-/* The structural type of a dict value, probing one entry for key/value. */
+/* The structural type of a dict value: the type its keys share and the
+ * one its values share, `dyn` where they differ (one entry used to
+ * stand for all, so {"b": [2.5], "c": 3} read as dict<str,array<float>>) */
 static std::string reflect_dict_type(const DictObject &d, CycStack &st)
 {
     const DictObject::inner_type &m = d.get_ref();
     if (m.empty())
         return "dict";
-    const auto &kv = *m.begin();
-    return std::string("dict<") + reflect_typeof_rec(kv.first, st) + "," +
-           reflect_typeof_rec(kv.second.get(), st) + ">";
+    std::string kt, vt;
+    bool first = true;
+    for (const auto &kv : m) {
+        const std::string k = reflect_typeof_rec(kv.first, st);
+        const std::string v = reflect_typeof_rec(kv.second.get(), st);
+        if (first) {
+            kt = k;
+            vt = v;
+            first = false;
+            continue;
+        }
+        if (k != kt)
+            kt = "dyn";
+        if (v != vt)
+            vt = "dyn";
+    }
+    return "dict<" + kt + "," + vt + ">";
 }
 
 std::string reflect_typeof(const EvalValue &e)

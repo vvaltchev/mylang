@@ -1,5 +1,5 @@
 MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
->> >> >> >> >> >> >> >> array<dyn>   (runtime type)
+>> >> >> >> >> >> >> >> >> >> >> array<dyn>   (runtime type)
 >> array<box<P>>   (runtime type)
 >> array<box<int>>   (runtime type)
 >> array<dyn>   (runtime type)
@@ -11,4 +11,8 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 >> dict<str,box<float>>   (runtime type)
 >> dict<box<int>,array<P>>   (runtime type)
 >> array<array<box<str>>>   (runtime type)
+>> array<dyn>   (runtime type)
+>> array<array<int>>   (runtime type)
+>> dict<str,dyn>   (runtime type)
+>> dict<dyn,int>   (runtime type)
 >> 

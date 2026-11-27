@@ -6,6 +6,8 @@
 # holding a named constant is not baked (#74): floats that read back as
 # the same double, arrays, dicts, POD and slot structs, class instances,
 # and cyclic constants, whose back edge renders as the print form does.
+# (Two constant dicts of different types go into two literals: in one,
+# the literal's element type would not be either's, rule 1.)
 struct P { int x; int y; }
 struct N { str n; int v; }
 class K { int v; }
@@ -65,8 +67,10 @@ func vals() {
     var k = keep([KK])
     var f = keep([FL])
     var x = keep([FX])
-    var d = keep([DD, D2])
-    return [len(r), len(e), len(s), len(n), len(k), len(f), len(d), len(x)]
+    var d = keep([DD])
+    var d2 = keep([D2])
+    return [len(r), len(e), len(s), len(n), len(k), len(f),
+            len(d) + len(d2), len(x)]
 }
 vals()
 :show vals

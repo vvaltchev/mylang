@@ -3,6 +3,9 @@
 # boxes of each element kind, a class array, a struct type value, a
 # caught exception, and the element of a dict of boxes. A struct and a
 # box of it are two types: such an array is array<dyn>, never array<P>.
+# Each element is described in full and each dict entry looked at, so
+# rows or values of two types make the component dyn (one element or one
+# entry used to stand for all).
 struct P { int x; int y; }
 class K { int v; }
 :type [P(1, 2), box(P(3, 4))]
@@ -19,3 +22,7 @@ try { var dyn z = 1 / runtime(0); } catch (DivisionByZeroEx as e) { ce = e; }
 :type ({"k": box(1.5)})
 :type ({box(1): [P(1, 2)]})
 :type [[box("a")], [box("b")]]
+:type [[1], ["s"]]
+:type [[1], [2]]
+:type ({"b": [2.5], "c": 3})
+:type ({"b": 1, 2: 1})
