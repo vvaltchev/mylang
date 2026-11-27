@@ -32,7 +32,7 @@ at run time (#49).
 | 20 | trace verbosity levels                          | open       |
 | 21 | a `const` container or function read before its | decided: A |
 |    | declaration has run                             |            |
-| 22 | the type of a folded read of a constant         | open       |
+| 22 | the type of a folded read of a constant         | decided: B |
 |    | container                                       |            |
 | 23 | a typed container reached through a `dyn` name  | decided    |
 | 24 | more than two variables in a dict `foreach`     | decided: A |
