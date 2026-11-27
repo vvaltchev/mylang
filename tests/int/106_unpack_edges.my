@@ -7,10 +7,10 @@
 #  - a body that removes rows under the loop raises OutOfBoundsEx at the
 #    row that is gone (README, *Modifying the container during the loop*);
 #  - a typed `array<array<int>>` / `array<array<float>>` whose row is
-#    stored GENERAL is unpacked from what it holds: an array only `dyn`
-#    reached, which took the row type as it entered (an inline keys()
-#    built one too, until rule 4 made a typed array's storage follow its
-#    type).
+#    stored GENERAL is unpacked from what it holds: a constant's row
+#    reached through `dyn` (read-only, it takes no type, so it keeps its
+#    storage); an array only `dyn` reached that takes the row type as it
+#    enters becomes FLAT (rule 4: the storage follows the type).
 # The tree-walker is the oracle; every engine must print the same.
 
 var bad = 0;
@@ -45,20 +45,28 @@ try {
 want("rows removed under the loop", r + str(s), "O12");
 
 func geni(array<int> a) => a;
-array<dyn> isrc = [[3, "x"]];
-var dyn ig = isrc[0];
-ig[1] = 4;
+const IROW = [3, 4, "x"][0:2];
+var dyn ig = IROW;
 array<array<int>> m = [[1, 2], geni(ig)];
 want("the int row's storage", array_storage(m[1]), "general");
 var t = 0;
 foreach (var a, b in m)
     t += a + b;
 want("an int row stored general", t, 10);
+array<dyn> isrc = [[3, "x"]];
+var dyn ag = isrc[0];
+ag[1] = 4;
+array<array<int>> am = [[1, 2], geni(ag)];
+want("an adopted int row's storage", array_storage(am[1]), "int");
+want("...seen through dyn", array_storage(ag), "int");
+t = 0;
+foreach (var a, b in am)
+    t += a + b;
+want("an adopted int row", t, 10);
 
 func genf(array<float> a) => a;
-array<dyn> fsrc = [[3.5, "x"]];
-var dyn fg = fsrc[0];
-fg[1] = 4.5;
+const FROW = [3.5, 4.5, "x"][0:2];
+var dyn fg = FROW;
 array<array<float>> fm = [[1.5, 2.5], genf(fg)];
 want("the float row's storage", array_storage(fm[1]), "general");
 var u = 0.0;

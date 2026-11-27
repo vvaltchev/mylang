@@ -147,6 +147,75 @@ void SharedArrayObjTempl<LValueT>::promote_objs_to_general()
     len = n;
 }
 
+/*
+ * Rule 4 (plans/strict-container-types.md): an array<int> / array<float>
+ * / array<bool> is FLAT. An untyped array - one only `dyn` reached - is
+ * general, and when it takes such a type (fit_adopt) it becomes flat
+ * here: in place, on the storage every handle shares, as a promotion is
+ * (#53b) in the other direction. The caller (adopt_detach) has made it an
+ * ordinary array no slice views, and it fit the type exactly (an element
+ * of another kind is refused there), so each element converts as it is;
+ * anything else leaves it general. Safe for the walks a `dyn` name can
+ * drive while it happens - each reads the kind per element (vm_arr_elem,
+ * arr_elem_at, the tree-walker's foreach), and sort's guard refuses a
+ * change of kind as a modification.
+ */
+template <class LValueT>
+void SharedArrayObjTempl<LValueT>::flatten_general(Storage to)
+{
+    if (slice || shobj->kind != Storage::general)
+        return;
+    vec_type &v = shobj->vec;
+    const size_type n = static_cast<size_type>(v.size());
+    switch (to) {
+    case Storage::ints: {
+        ivec_type nv;
+        nv.reserve(n);
+        for (size_type i = 0; i < n; i++) {
+            const EvalValue &x = v[i].get();
+            if (!x.is<int_type>())
+                return;
+            nv.push_back(x.get<int_type>());
+        }
+        v.~vec_type();
+        shobj->kind = Storage::ints;
+        new (&shobj->ivec) ivec_type(std::move(nv));
+        break;
+    }
+    case Storage::floats: {
+        fvec_type nv;
+        nv.reserve(n);
+        for (size_type i = 0; i < n; i++) {
+            const EvalValue &x = v[i].get();
+            if (!x.is<float_type>())
+                return;
+            nv.push_back(x.get<float_type>());
+        }
+        v.~vec_type();
+        shobj->kind = Storage::floats;
+        new (&shobj->fvec) fvec_type(std::move(nv));
+        break;
+    }
+    case Storage::bools: {
+        bvec_type nv;
+        nv.reserve(n);
+        for (size_type i = 0; i < n; i++) {
+            const EvalValue &x = v[i].get();
+            if (!x.is<bool>())
+                return;
+            nv.push_back(x.get<bool>() ? 1 : 0);
+        }
+        v.~vec_type();
+        shobj->kind = Storage::bools;
+        new (&shobj->bvec) bvec_type(std::move(nv));
+        break;
+    }
+    default:
+        return;
+    }
+    len = n;
+}
+
 /* Q2: a copy of an array is an array of the same type */
 template <class LValueT>
 void SharedArrayObjTempl<LValueT>::clone_internal_vec()

@@ -4460,7 +4460,15 @@ flat; an array you also store a string into is `array<dyn>` and is born general
 from the very first element — even if its initializer looked like all ints (so
 `var a = [1,2,3]; a[0] = "x";` makes `a` general from the start). Every
 operation (`append`/`pop`/`insert`/`erase`/`sort`/`map`/`filter`/slicing/…)
-preserves the representation.
+preserves the representation. The one change happens to an array no type
+has reached yet - one only `dyn` names have held: when it enters a place
+typed `array<int>`, `array<float>` or `array<bool>` (a parameter, a typed
+variable, an element) it takes that type, and with it the flat storage, in
+place, so every name for it sees the same array. A loop or a `map` over it
+through `dyn` that causes this midway goes on as before; a `sort`
+comparator that causes it raises `InvalidArgumentEx` (*Callbacks that
+change the container they run over*). A constant's array is read-only and
+takes no type, so it keeps its storage.
 
 A **`bool` value widens into numeric storage** like everywhere else in the
 language (the promotion chain `bool <= int <= float`, the same rule as

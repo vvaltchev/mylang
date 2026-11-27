@@ -616,6 +616,24 @@ void adopt_detach(const EvalValue &v, const TypeAnnot *t)
         a.clone_all_slices();
         if (a.skind() != SharedArrayObj::Storage::general)
             return;
+        /* rule 4: the storage follows the type it takes - an array of
+         * non-none ints, floats or bools is flat (flatten_general) */
+        const TypeAnnot *et = t->elem.get();
+        if (et && !et->opt) {
+            switch (et->kind) {
+            case DeclType::i:
+                a.flatten_general(SharedArrayObj::Storage::ints);
+                return;
+            case DeclType::f:
+                a.flatten_general(SharedArrayObj::Storage::floats);
+                return;
+            case DeclType::b:
+                a.flatten_general(SharedArrayObj::Storage::bools);
+                return;
+            default:
+                break;
+            }
+        }
         const ArrayConstView &view = a.get_view();
         for (size_type i = 0; i < view.size(); i++)
             adopt_detach(view[i].get(), t->elem.get());

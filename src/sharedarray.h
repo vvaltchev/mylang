@@ -182,7 +182,10 @@ public:
      * less memory: int/float are 8-byte slots, bool is a single byte (48x
      * denser than general, ideal for sieves/bitmaps). mylang never promotes a
      * flat array to general (representation is type-driven, fixed at creation);
-     * the hot ops branch on the kind and touch the flat vector directly.
+     * the hot ops branch on the kind and touch the flat vector directly. The
+     * one change of kind is the other way: an UNTYPED general array (one
+     * only `dyn` reached) that takes an array<int> / array<float> /
+     * array<bool> type becomes flat, in place (flatten_general, rule 4).
      */
     enum class Storage : unsigned char {
         general, ints, floats, bools, structs, strs, objs
@@ -602,6 +605,11 @@ public:
     void promote_structs_to_general();
     void promote_strs_to_general();     /* flat strings (top-10 #7) */
     void promote_objs_to_general();     /* flat class references */
+    /* The reverse, for an untyped GENERAL array taking an array<int> /
+     * array<float> / array<bool> type (rule 4: fit_adopt) - in place, on
+     * the shared storage; a no-op unless every element is of `to`'s kind.
+     * Defined in types/arr.cpp.h. */
+    void flatten_general(Storage to);
     /* A fresh general copy of this handle's elements; the shared storage is
      * untouched (for a read-only general walk - see types/arr.cpp.h). */
     SharedArrayObjTempl general_copy() const;

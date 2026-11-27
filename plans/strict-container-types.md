@@ -431,7 +431,15 @@ prints `0`. Choice 6 fixes it.
    order); a container only `dyn` reached that ADOPTS a typed place's
    type keeps its storage (a general array of ints entering an
    array<int> parameter is then a general array<int>: converting it in
-   place is the missing step, tests/int/106 builds one); and rule 5.
+   place is the missing step, tests/int/106 builds one) - DONE
+   2026-11-27 (flatten_general, called by adopt_detach: an array of
+   non-none ints, floats or bools becomes flat as it takes the type, in
+   place; a general array's kind can now change, so every walk a `dyn`
+   name drives reads the kind per element, and sort's guard refuses the
+   change as a modification - tests/functional/149, tests/int/138 and
+   106). What still holds general storage under a typed array<int> is a
+   CONSTANT's row (read-only, it takes no type), so the invariant is
+   not yet a check; and rule 5.
    Rule 5 DONE 2026-11-21 (top level): a bare `array` / `dict`
    parameter is a template parameter (`template_param`, inferencer.cpp)
    - `f([1])` and `f(["s"])` are two instances where they were a join

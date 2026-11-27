@@ -1,11 +1,13 @@
 # INT-ENGINES: tw default nj nbi
 #
-# INT unit (plans/strict-container-types.md, rule 4's open gap): a
-# container only `dyn` reached keeps its storage when it takes a typed
-# place's type, so a typed array can still be stored GENERAL. Every typed
-# read, store and loop over one must use what it holds, as a flat one's
-# would: a float read of an int or a bool, an int store, a float store,
-# a compound store, a foreach. And a multi-assignment whose targets are
+# INT unit (plans/strict-container-types.md, rule 4): a container only
+# `dyn` reached that takes an array<int> / array<float> / array<bool>
+# type as it enters a typed place becomes FLAT (flatten_general), and
+# every typed read, store and loop over it then works on the flat
+# storage. A CONSTANT's row is read-only and takes no type, so a typed
+# array can still hold general storage that way: its typed reads and
+# loops must use what it holds, as a flat one's would (a float read of
+# an int or a bool, a foreach). And a multi-assignment whose targets are
 # declared checks each value it unpacks from an array whose element type
 # is not filled yet (Expr14's IdList fit checks). The tree-walker is
 # the oracle; every engine must agree.
@@ -32,17 +34,36 @@ array<float> fa = asf(f0);
 array<int> ia = asi(i0);
 array<bool> ba = asb(b0);
 want("storages", array_storage(fa) + array_storage(ia) + array_storage(ba),
-     "generalgeneralgeneral");
+     "floatintbool");
 
-# typed reads
+# typed reads of a constant's general rows
+const ROWS = [1.5, 2.5, "x", 1, 2, "x", true, false, "x"];
+var dyn cf = ROWS[0:2];
+var dyn ci = ROWS[3:5];
+var dyn cb = ROWS[6:8];
+array<float> gfa = asf(cf);
+array<int> gia = asi(ci);
+array<bool> gba = asb(cb);
+want("a constant's rows", array_storage(gfa) + array_storage(gia)
+                              + array_storage(gba),
+     "generalgeneralgeneral");
 var fs = 0.0;
-for (var k = 0; k < len(fa); k++)
-    fs += fa[k];
+for (var k = 0; k < len(gfa); k++)
+    fs += gfa[k];
 want("float reads", fs, 4.0);
-float fb = 0.5 + ba[0];
+float fb = 0.5 + gba[0];
 want("a bool read as a float", fb, 1.5);
-float fi = 0.25 * ia[1];
+float fi = 0.25 * gia[1];
 want("an int read as a float", fi, 0.5);
+var gsum = 0;
+foreach (x in gia)
+    gsum += x;
+want("foreach a constant's ints", gsum, 3);
+var gbc = 0;
+foreach (b in gba)
+    if (b)
+        gbc++;
+want("foreach a constant's bools", gbc, 1);
 
 # typed stores, plain and compound
 ia[0] = 7;
@@ -72,8 +93,8 @@ var pairs = [[], []];
 p, q = pairs;
 append(p, 1);
 want("unpacked", str(p) + str(q), "[1][]");
-# (its storage stays its own, general: the gap this unit is about)
-want("storage as it landed", array_storage(p), "general");
+# (an empty untyped array takes the type too, and flat storage)
+want("storage as it landed", array_storage(p), "int");
 
 # a `dyn?` element of a literal fits an element that may be none
 array<int?> lq = [runtime(none), runtime(3)];

@@ -251,10 +251,11 @@ static const std::vector<test> tests =
       "converted or refused before the store", {
         "array<float?> ga = [none];",
         "dict<str, int> di = {};",
-        /* a general-storage array<int> whose values fit (#49 refuses
-         * the misfit a dyn element used to launder in) */
+        /* an untyped general array whose values fit (#49 refuses the
+         * misfit a dyn element used to launder in): it takes the type
+         * as it enters, and with it flat storage (rule 4) */
         "array<int> gl = keep(ug([1, 2]));",
-        "assert(array_storage(gl) == \"general\");",
+        "assert(array_storage(gl) == \"int\");",
         "var n = 0;",
         "try { ga[0] = runtime(\"s\"); } catch (TypeErrorEx) { n += 1; }",
         "try { di[\"k\"] = runtime(2.5); } catch (TypeErrorEx) { n += 1; }",

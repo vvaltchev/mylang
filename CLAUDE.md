@@ -7504,7 +7504,15 @@ per level of a deep value - a separate open item.
   member can't have non-trivial ctors/dtors, so `SharedObject` placement-news
   the live member per kind and the dtor switches on `kind`.
   **Representation is type-driven and fixed at creation — there is NO runtime
-  promotion** (`promote_to_general` was deleted). An array-producing node is
+  promotion** (`promote_to_general` was deleted). **The one change of kind
+  is the other way (rule 4, 2026-11-27): an UNTYPED general array - one
+  only `dyn` reached - that takes an `array<int>`/`array<float>`/
+  `array<bool>` type as it enters a typed place becomes flat in place
+  (`flatten_general`, called by `adopt_detach`).** So a GENERAL array's
+  kind is not stable: a walk over one that may run program code must read
+  the kind per element (`vm_arr_elem`, `arr_elem_at`), never hold its
+  `get_vec()` across the call (sort's guard checks the kind per
+  comparison). An array-producing node is
   built flat **iff** the inferencer proved its *destination* is
   `array<int>`/`array<float>`/`array<bool>`; a destination that is `array<dyn>`
   (or any other element type) is built **general from the start**. The

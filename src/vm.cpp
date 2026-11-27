@@ -1786,7 +1786,10 @@ struct DynIterState {
      * int/float/bool array can never change storage kind at runtime (no
      * promotion; a wrong-type mutation throws), and every fast body still
      * re-derefs the container per element, so growth/realloc during the
-     * loop behaves exactly as the generic body did. */
+     * loop behaves exactly as the generic body did. (A GENERAL array may
+     * become flat midway - an untyped one taking an array<int> type,
+     * flatten_general - which is why the generic body reads each element
+     * through vm_arr_elem, by the kind it has then.) */
     bool (*next)(DynIterState &, Frame &, const Chunk *, size_t) = nullptr;
     int32_t slot0 = -1, slot1 = -1;            /* baked target slots */
     /* #53: an ARRAY body found the element gone (the loop body shrank the

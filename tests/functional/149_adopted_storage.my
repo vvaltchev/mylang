@@ -1,0 +1,99 @@
+# Rule 4 (plans/strict-container-types.md; README *Storage follows the
+# type*): an untyped array - one only `dyn` names reached - that takes
+# an array<int> / array<float> / array<bool> type as it enters a typed
+# place becomes flat, in place, so every name for it sees the change. A
+# walk over it through `dyn` that makes the change midway (a foreach
+# body, a map callback) keeps going; a sort comparator that makes it is
+# "the array changed during the sort". An `array<int?>` stays general,
+# and a constant (read-only) takes no type. With no types (-nti) nothing
+# takes a type, so the storage checks are made in a typed run only.
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+func wants(str what, str got, str exp) {
+    if (typed)
+        want(what, got, exp);
+}
+
+func geni(array<int> a) => len(a);
+func genf(array<float> a) => len(a);
+func genb(array<bool> a) => len(a);
+func geno(array<int?> a) => len(a);
+
+/* an untyped general array of `vals`, reached only through dyn */
+func untyped(dyn x, dyn y) {
+    array<dyn> src = [[x, "pad"]];
+    var dyn g = src[0];
+    g[1] = y;
+    return g;
+}
+
+# ---- each scalar kind becomes flat; a dyn alias sees it
+var dyn gi = untyped(3, 4);
+wants("an untyped int array", array_storage(gi), "general");
+want("enters array<int>", geni(gi), 2);
+wants("...becomes flat", array_storage(gi), "int");
+var dyn gf = untyped(1.5, 2.5);
+genf(gf);
+wants("float", array_storage(gf), "float");
+var dyn gb = untyped(true, false);
+genb(gb);
+wants("bool", array_storage(gb), "bool");
+want("...keeps its values", str(gb), "[true, false]");
+
+# ---- the values and a store through the dyn alias after it
+want("values", gi[0] + gi[1], 7);
+var r = "";
+try {
+    gi[0] = "s";
+} catch (TypeErrorEx) {
+    r = "T";
+}
+want("a misfit store through dyn", r, typed ? "T" : "");
+
+# ---- an array<int?> place keeps general storage (it may hold none)
+var dyn go = untyped(1, 2);
+geno(go);
+wants("array<int?>", array_storage(go), "general");
+
+# ---- a foreach over it through dyn that converts it midway
+var dyn gl = untyped(5, 6);
+var total = 0;
+foreach (var v in gl) {
+    if (total == 0)
+        geni(gl);
+    total += v;
+}
+want("a foreach that converts its array", total, 11);
+wants("...converted", array_storage(gl), "int");
+
+# ---- a map callback that converts the array it walks
+var dyn gm = untyped(7, 8);
+var doubled = map(func(dyn v) { geni(gm); return v * 2; }, gm);
+want("a map that converts its array", doubled, [14, 16]);
+
+# ---- a sort comparator that converts the array: changed during sort
+var dyn gs = untyped(2, 1);
+r = "";
+try {
+    sort(gs, func(dyn a, dyn b) { geni(gs); return a < b; });
+    r = "sorted";
+} catch (InvalidArgumentEx) {
+    r = "changed";
+}
+want("a sort comparator that converts", r, typed ? "changed" : "sorted");
+
+# ---- a constant reached through dyn takes no type
+const ROW = [3, 4, "x"][0:2];
+var dyn gc = ROW;
+geni(gc);
+wants("a constant's row", array_storage(gc), "general");
+
+assert(bad == 0);
+print("ok");
