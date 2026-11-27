@@ -517,18 +517,18 @@ StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
 
         case StaticTypeKind::Array: {
             StaticTypeRef ej = join_elem(a->elem, b->elem);
-            if (!ej)
-                ej = g_dyn[0];               /* D1: mixed elements -> dyn */
+            if (!ej)                         /* D1: mixed elements -> dyn */
+                ej = mixed(a->elem, b->elem);
             return array_of(ej, anyopt);
         }
 
         case StaticTypeKind::Dict: {
             StaticTypeRef kj = join_elem(a->key, b->key);
             if (!kj)
-                kj = g_dyn[0];
+                kj = mixed(a->key, b->key);
             StaticTypeRef vj = join_elem(a->val, b->val);
             if (!vj)
-                vj = g_dyn[0];
+                vj = mixed(a->val, b->val);
             return dict_of(kj, vj, anyopt);
         }
 
@@ -605,6 +605,17 @@ StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
         default:
             return nullptr;
     }
+}
+
+StaticTypeRef StaticTypeArena::mixed(StaticTypeRef a, StaticTypeRef b) noexcept
+{
+    a = static_type_resolve(a);
+    b = static_type_resolve(b);
+    /* (never a bare `none`: a join with none does not fail - it makes
+     * the other side nullable) */
+    ML_CHECK(a->kind != StaticTypeKind::None
+             && b->kind != StaticTypeKind::None);
+    return g_dyn[a->opt || b->opt];
 }
 
 StaticTypeRef StaticTypeArena::join_elem(StaticTypeRef a, StaticTypeRef b)

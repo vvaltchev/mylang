@@ -18043,7 +18043,8 @@ static const std::vector<test> tests =
         "assert(typestr(a) == \"array<dyn>\");",
         "assert(typestr(d) == \"dict<dyn,dyn>\");",
         "assert(typestr([[]]) == \"array<array<dyn>>\");",
-        "assert(typestr(array(2)) == \"array<dyn>\");",
+        /* (strict item 1: an array(n) nothing types holds its nones) */
+        "assert(typestr(array(2)) == \"array<dyn?>\");",
         "var f = []; append(f, 1); assert(typestr(f) == \"array<int>\");",
         "var g = {}; g[\"k\"] = 2.5;",
         "assert(typestr(g) == \"dict<str,float>\");",
@@ -18052,6 +18053,65 @@ static const std::vector<test> tests =
         "assert(type({}).key?.kind == \"dyn\");",
         "assert(type({}).val?.kind == \"dyn\");",
         "assert(decltype(a).elem?.kind == \"dyn\");" } },
+    /* strict item 1 (maintainer, 2026-11-27): an array(n) its own
+     * function leaves undecided is an array<dyn?> - a caller's store
+     * cannot type it, and what it reads may be none */
+    { "strict item 1: an array(n) returned untyped is array<dyn?>",
+      { "func mk(n) => array(n);",
+        "var q = mk(2); q[0] = \"s\";",
+        "assert(typestr(q) == \"array<dyn?>\");",
+        "assert(q[0] == \"s\" && q[1] == none);",
+        "func mk2(n) { var a = array(n); return a; }",
+        "assert(typestr(mk2(1)) == \"array<dyn?>\");",
+        "func mk3(n) { var a = array(n); a[0] = 1; return a; }",
+        "assert(typestr(mk3(2)) == \"array<int>\" && mk3(2)[1] == 0);" } },
+    { "strict item 1: a declared place decides an array(n)",
+      { "func takes(array<int> a) => a[1] + 1;",
+        "assert(takes(array(3)) == 1);",
+        "struct B { array<str> items; }",
+        "B b; b.items = array(2);",
+        "assert(b.items == [\"\", \"\"]);",
+        "array<array<float>> m = [[1.5]];",
+        "m[0] = array(2); append(m, array(1));",
+        "assert(m == [[0.0, 0.0], [0.0]]);" } },
+    { "strict item 1: an element of an undecided array(n) may be none",
+      { "func mk(n) => array(n);",
+        "var q = mk(2); q[0] = \"s\";",
+        "var z = q[1] + \"x\";" },
+      &typeid(NullabilityEx) },
+    { "strict item 1: a variable reading it is a dyn?",
+      { "var a = array(3);",
+        "var x = a[0];" },
+      &typeid(DynRequiredEx) },
+    /* min / max of two kinds: the join fails, the result is a dyn, and
+     * comparing them is the run's error */
+    { "mixed join: max of an int and a str",
+      { "var dyn m = max(int(runtime(1)), str(runtime(\"s\")));" },
+      &typeid(TypeErrorEx) },
+    /* a mixed component keeps its nullability whatever the order */
+    { "mixed join: a none before the conflict keeps the element nullable",
+      { "var a = [none, 1, \"s\"];",
+        "var dyn y = a[runtime(0)];" },
+      &typeid(NullabilityEx) },
+    /* (an element only the run knows: a constant literal is baked at
+     * parse time and typed by its value - the row below) */
+    { "mixed join: a literal the run builds",
+      { "var a = [none, int(runtime(1)), \"s\"];",
+        "var dyn y = a[runtime(0)];" },
+      &typeid(NullabilityEx) },
+    { "mixed join: a dict value too",
+      { "var d = {\"a\": none, \"b\": 1, \"c\": \"s\"};",
+        "var dyn y = d[runtime(\"a\")];" },
+      &typeid(NullabilityEx) },
+    { "mixed join: conflicting returns, one of them none",
+      { "func f(int c) { if (c == 0) return none; if (c == 1) return 1;",
+        "                return \"s\"; }",
+        "var dyn y = f(runtime(0));" },
+      &typeid(NullabilityEx) },
+    { "mixed join: a baked constant reads the same",
+      { "const K = [none, 1, \"s\"];",
+        "var dyn y = K[runtime(0)];" },
+      &typeid(NullabilityEx) },
     { "ti: iterating an empty container compiles, in every caller",
       { "var out = \"\";",
         "func show(d) { foreach (k, v in d) out += k + \"=\" + str(v) + \";\"; }",
@@ -31511,6 +31571,58 @@ static bool exc_chain_report()
                 }
             }
     }
+    return ok;
+}
+
+/*
+ * Strict item 1 without types (-nti, infer_types(root, false)): nothing
+ * decides an array(n)'s element type and no ctype is stamped, so it holds
+ * nones in every engine, a declared variable's included (an -nti store is
+ * not checked) - the one way left to reach builtin_array with no ctype.
+ */
+static bool array_n_untyped()
+{
+    const char *src =
+        "var a = array(2);\n"
+        "array<int> b = array(1);\n"
+        "print(a, b, len(a) + len(b));\n";
+    const ExecEngine saved_engine = g_exec_engine;
+    const bool saved_jit = g_jit_enabled;
+    bool ok = true;
+    for (int mode = 0; mode < 3; mode++) {
+        static const char *const mode_name[] = { "tw", "vm", "jit" };
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        g_exec_engine = mode ? ExecEngine::Vm : ExecEngine::TreeWalk;
+        g_jit_enabled = mode == 2 && saved_jit;
+        std::ostringstream cap;
+        std::streambuf *old = std::cout.rdbuf(cap.rdbuf());
+        std::string got;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), false);
+            run_optimizers(root.get());
+            g_ctype_adopt = false;      /* -nti: the driver turns it off */
+            if (mode)
+                vm_execute(root.get());
+            else
+                root->eval(nullptr);
+        } catch (Exception &ex) {
+            got = std::string("EXCEPTION ") + ex.name;
+        }
+        std::cout.rdbuf(old);
+        g_ctype_adopt = true;
+        got += cap.str();
+        if (got != "[<none>, <none>] [<none>] 3 \n") {
+            fprintf(stderr, "array_n_untyped [%s]: got [%s]\n",
+                    mode_name[mode], got.c_str());
+            ok = false;
+        }
+    }
+    g_exec_engine = saved_engine;
+    g_jit_enabled = saved_jit;
     return ok;
 }
 
@@ -54077,6 +54189,18 @@ static bool callee_set_analysis()
         "var dyn h = max(fs);",
         "print(map(h, [\"ab\"]));" },
         { "dcs-esc\tsq" });
+    /* a store builtin at another arity (an error the run reports) is
+     * no store: opaque */
+    want("builtin: append / push / insert at another arity are opaque", {
+        "func sq(int x) => x * x;",
+        "func neg(int x) => 0 - x;",
+        "func one(int x) => x + 1;",
+        "var fs = [sq];",
+        "append(fs, neg, neg);",
+        "push(fs);",
+        "insert(fs, one);",
+        "print(fs[0](2));" },
+        { "dcs\t8\t7\t-\ttop\t-", "dcs-esc\tneg", "dcs-esc\tone" });
     /* ⛔ THE ARITY IS PART OF THE CLAIM: find's 3-argument form calls its
      * key on every element, so it stays opaque - the key and what it was
      * handed escape, and what the array holds is unknown from then on */
@@ -63981,6 +64105,8 @@ static const std::vector<extra_check> extra_checks =
       const_fold_equivalence },
     { "parse: a constant call is folded once the program is typed (#96)",
       late_fold_shape },
+    { "strict item 1: without types an array(n) holds nones (-nti)",
+      array_n_untyped },
     { "exceptions: the uncaught report names the exceptions it was raised "
       "while handling (question 12)",
       exc_chain_report },

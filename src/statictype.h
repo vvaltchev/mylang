@@ -111,6 +111,15 @@ public:
     StaticTypeRef join(StaticTypeRef a, StaticTypeRef b);
 
     /*
+     * What a MIXED component is - an element, a key, a value whose two
+     * types conflict (`[1, "s"]`): `dyn`, NULLABLE when either side is
+     * (`[none, 1, "s"]` is an array<dyn?>, as `[1, "s", none]` is -
+     * until 2026-11-27 the order decided, and a `dyn` element proven
+     * non-none held the none).
+     */
+    StaticTypeRef mixed(StaticTypeRef a, StaticTypeRef b) noexcept;
+
+    /*
      * `t` with every UNFILLED container component - an array's element,
      * a dict's key or value typed `none`, which is what `[]`, `{}` and
      * array(N) give and nothing typed ever replaced (join_elem absorbs

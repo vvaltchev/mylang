@@ -243,6 +243,23 @@ New open point found by the measurement:
 The maintainer was away and asked for reasonable choices, to be reviewed
 later. Each is marked with what it would take to reverse it.
 
+**Choices 1-3 CONFIRMED by the maintainer, 2026-11-27**, with one
+direction for 2: the compiler names the function being called every time
+it can - only a call whose callee depends on a run-time value (several
+candidates, which run their bases - rule 8.2's decision - and the JIT's
+guard chain makes fast) or that the program hides on purpose stays
+unnamed. Done the same day: the callee-set analysis models the builtins
+whose effect is known (the reads-only list, append / push / insert, and
+the builtins whose result comes out of their first argument), so
+`len(fs)` no longer makes `fs[i](x)` an unknown callee (CLAUDE.md, the
+callee-set section). What still has no name: `runtime(f)`, a caught
+payload, a `dyn` parameter fed by one of those, the result of any other
+builtin, a function a builtin calls back, a REPL closure from an earlier
+input, more than CS_MAX_SET candidates, a call through a builtin held in
+a variable. And a mixed component keeps its nullability (`[none, 1,
+"s"]` is an `array<dyn?>`, as `[1, "s", none]` was - the order used to
+decide, and a `dyn` element held the none).
+
 1. **Open point 1 (a join of two container types): the recommended
    answer, `dyn`.** The program writes `var dyn c` (mandatory dyn).
 2. **Open point 2 (an unnameable callee): the recommended answer, the
@@ -389,6 +406,21 @@ prints `0`. Choice 6 fixes it.
    not for `array(n)`'s none-filled one). The fix needs `array(n)` with
    no type of its own to be an `array<dyn?>` once it flows out untyped,
    while `var a = array(2); a[0] = "x"` keeps typing `a` by its stores.
+   **DONE 2026-11-27 (item 1, the maintainer chose `array<dyn?>` over
+   a compile error):** `decide_array_n`, after the program has
+   settled, marks every `array(n)` whose own function leaves its element
+   type open - no variable whose type has an element and no DECLARED
+   place (a declared parameter, a field, a declared container's element
+   or append, through `?:` / `??` arms) decides it: returned, passed to a
+   parameter nothing declares, an element of a new literal, a variable
+   nothing types - and the fixpoint runs again with those typed
+   `array<dyn?>`. A declared place gets its zero values (it got nones,
+   which the bind refused at run time). A callee's stores through an
+   undeclared parameter do not decide it (`var b = array(3); fill(b);`
+   is an `array<dyn?>`). Measured: 0 corpus programs change outcome; one
+   `-rt` row (`typestr(array(2))`) now says `array<dyn?>`. A read of such
+   an element into a plain `var` needs `var dyn?`. Tests:
+   tests/functional/150, the `strict item 1:` `-rt` rows.
    **Also open (found 2026-11-21) - DONE 2026-11-27, below:** the flow
    check covers a variable, a result and a ternary arm, not an ELEMENT: a container a name holds,
    put into an inferred container whose element type later widens -

@@ -5340,6 +5340,30 @@ decisions behind it: `plans/archived/type-inference.md`,
   and without the store's coercion an unattributed indirect call left a
   float in an `int` slot - the JIT printed its bits, the VM aborted, the
   tree-walker threw (RULE 1 and RULE 2 at once).
+- **`array(n)`'s element type is decided in its OWN function
+  (`decide_array_n`, strict item 1, 2026-11-27).** `array(n)` is typed
+  `array<none>` (unfilled) and filled by the variable it initializes;
+  but its value could leave the function first - returned, passed, an
+  element - and a CALLER's store then typed it, an `array<str>` holding
+  the nones it was made with. So once the program has settled (after the
+  instantiation loops), every one-argument `array(n)` whose PLACE does
+  not decide it is marked by `node_id` (`arrn_dyn`), types `array<dyn?>`,
+  and the fixpoint runs again. A place is the variable it is assigned to
+  (its type), or a DECLARED one - a declared parameter (through a
+  function value too: one every function the callee set names declares
+  alike), a struct field,
+  a declared container's element, an append / push / insert into one,
+  through `?:` / `??` arms - which `arrn_place` hands `stamp_ctypes` as
+  the `dest` to fill for (a declared place never got one, so the array
+  was none-filled and the bind refused it). An inferred parameter typed
+  by the callee's stores is NOT a place: the maintainer's rule is "in its
+  own function". Settled, not mid-fixpoint, because "nothing decides it"
+  is an answer only then. **A MIXED component is `A.mixed(a, b)`, never a bare
+  `dyn_ty()`**: `dyn`, nullable when either side may be none - the
+  fallback of every failed join (a literal's elements and keys, a baked
+  value's, `min`/`max`, a function's returns, the lattice's own
+  container join). A bare `dyn` there made the element order decide
+  (`[none, 1, "s"]` was an `array<dyn>` holding a none).
 - **Null narrowing** (`check_if`/`narrow_target`, check pass only): inside a
   proven branch a nullable var reads as non-opt — `if (x != none)` / `if (x)`
   (then), `if (x == none) ... else` (else), and the guard clause

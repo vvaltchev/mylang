@@ -1,0 +1,134 @@
+# Strict item 1 (maintainer, 2026-11-27; README *array(n)*): `array(n)`'s
+# element type is decided in the function that evaluates it - by the
+# variable it initializes and that variable's stores and places. An array
+# nothing there decides is an `array<dyn?>`: its elements are the nones it
+# was filled with, and a caller's stores cannot type it afterwards (they
+# typed `func mk(n) => array(n); var q = mk(2); q[0] = "s";` an array<str>
+# holding nones, read three ways by the three engines).
+#
+# And a MIXED component keeps its nullability whatever the order: `[none,
+# 1, "s"]` is an array<dyn?> like `[1, "s", none]` (it was an array<dyn>
+# holding a none). With no types (-nti) nothing is decided, so the type
+# checks are made in a typed run only.
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+func wants(str what, str got, str exp) {
+    if (typed)
+        want(what, got, exp);
+}
+/* a zero value needs a type: under -nti array(n) is filled with none */
+func wantz(str what, opt dyn got, opt dyn exp) {
+    if (typed)
+        want(what, got, exp);
+}
+
+# 1. returned with nothing to decide it: array<dyn?>, the caller's store
+#    fits, and the nones stay nones
+func mk(n) => array(n);
+var q = mk(2);
+wants("returned", typestr(q), "array<dyn?>");
+q[0] = "s";
+want("stored", q[0], "s");
+want("still none", q[1], none);
+
+# 2. a variable nothing types, returned
+func mk2(n) { var a = array(n); return a; }
+var r = mk2(2);
+r[0] = 5;
+wants("undecided variable", typestr(r), "array<dyn?>");
+want("its other element", r[1], none);
+
+# 3. ...but a store in its own function decides it: zero values
+func mk3(n) { var a = array(n); a[0] = 2.5; return a; }
+wants("decided by its store", typestr(mk3(2)), "array<float>");
+wantz("zero value", mk3(2)[1], 0.0);
+
+# 4. a declared variable decides it
+array<int> u = array(2);
+wantz("declared", u, [0, 0]);
+var s = array(3);
+s[1] = "x";
+wants("typed by its stores", typestr(s), "array<str>");
+wantz("zero string", s[0], "");
+
+# 4b. ...and so does any DECLARED place it enters: a parameter, a field,
+#     an element of a declared container (a store, an append), through a
+#     ternary's arms too
+#     (with no types, -nti, the array holds nones, which a declared
+#     parameter or field refuses as it is bound - so those run typed only)
+func takes(array<int> a) => a[1] + 1;
+if (typed)
+    want("a declared parameter", takes(array(3)), 1);
+struct Box { array<str> items; }
+Box bx;
+bx.items = array(2);
+wantz("a declared field", bx.items, ["", ""]);
+if (typed) {
+    var bx2 = Box(array(1));
+    want("a constructor's field", bx2.items, [""]);
+}
+array<array<int>> mm = [[1]];
+mm[0] = array(3);
+append(mm, array(2));
+wantz("a declared container's element", mm, [[0, 0, 0], [0, 0]]);
+var kk = int(runtime(1));
+var tw = kk > 0 ? array(2) : array(3);
+tw[0] = 5;
+wants("a ternary a store types", typestr(tw), "array<int>");
+wantz("its zero value", tw[1], 0);
+
+# 4c. ...but not a callee's stores through a parameter nothing declares:
+#     that is the other function's (the maintainer's rule, 2026-11-27)
+func fillp(p) { for (var i = 0; i < len(p); i++) p[i] = i * 2; }
+var viap = array(3);
+fillp(viap);
+wants("filled by a callee", typestr(viap), "array<dyn?>");
+want("...but filled", viap[1], 2);
+
+# 5. nothing at all decides it
+var t = array(3);
+wants("never typed", typestr(t), "array<dyn?>");
+want("len", len(t), 3);
+
+# 6. an argument, an element, a ternary's arm: no variable decides it
+func fill(p) { p[0] = "x"; return typestr(p); }
+wants("an argument", fill(array(2)), "array<dyn?>");
+var nest = [array(2)];
+wants("an element", typestr(nest), "array<array<dyn?>>");
+var k = int(runtime(1));
+var w = k > 0 ? array(2) : array(3);
+wants("a ternary", typestr(w), "array<dyn?>");
+
+# 7. the mixed join keeps none, in every order
+wants("none first", typestr([none, 1, "s"]), "array<dyn?>");
+wants("none middle", typestr([1, none, "s"]), "array<dyn?>");
+wants("none last", typestr([1, "s", none]), "array<dyn?>");
+wants("dict value", typestr({"a": none, "b": 1, "c": "s"}),
+      "dict<str,dyn?>");
+wants("dict key", typestr({none: 1, 2: 2, "s": 3}), "dict<dyn?,int>");
+var mixed = [none, 1, "s"];
+var dyn? m0 = mixed[0];
+want("the none read back", m0, none);
+
+# 8. ...and so does a function whose returns conflict
+func pick(int c) {
+    if (c == 0)
+        return none;
+    if (c == 1)
+        return 1;
+    return "s";
+}
+var dyn? p0 = pick(int(runtime(0)));
+want("a return that may be none", p0, none);
+var dyn? p2 = pick(int(runtime(2)));
+want("a return of another kind", p2, "s");
+
+assert(bad == 0);
+print("ok");

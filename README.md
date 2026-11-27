@@ -1565,7 +1565,12 @@ Key rules:
   * Arrays and dicts are typed by their contents (`[1,2,3]` is an array of int).
     A genuinely mixed container is allowed — its element type just becomes `dyn`
     (see below), so you don't get the speed/safety benefits but it still works.
-    An empty `[]` or `{}` (and `array(n)`) takes the type of what the program
+    It becomes `dyn?` when one of the elements may be `none`, wherever that
+    element is: `[none, 1, "s"]` and `[1, "s", none]` are both an
+    `array<dyn?>`, as a function that may return `none`, an `int` or a `str`
+    returns a `dyn?`.
+    An empty `[]` or `{}` (and `array(n)` - within its own function, see
+    `array()`) takes the type of what the program
     puts into it: `var a = []; append(a, 1);` is an `array<int>`. One nothing
     typed is ever put into is the most generic container, `array<dyn>` /
     `dict<dyn,dyn>`, so iterating or reading it always compiles:
@@ -3932,14 +3937,31 @@ no initializer gives (`T x;`, see *Explicit type annotations*): `0`, `0.0`,
 `false`, `""`, a fresh `[]` / `{}` of the element's own type, a struct
 zero-initialized field by field, a fresh class instance, a box of its
 value's zero - each element a value of its own (`append(m[0], 5)` grows
-one element of an `array<array<int>>`). The element type is the one type
-inference finds for the array - the variable it is assigned to, declared
-or inferred from what the program later stores: `var a = array(3); a[0] =
-5;` yields `[5, 0, 0]`, `var s = array(2); s[0] = "x";` yields `["x", ""]`.
-A nullable element type (`array<int?>`, `array<dyn?>`) is filled with
-`none`, and so is an array whose element type nothing decides (one nothing
-is stored into, one made where `dyn` is declared - `var dyn d =
-array(2)` - or any array with type inference disabled, `-nti`). An element
+one element of an `array<array<int>>`). The element type is decided in the
+function that evaluates `array(N)`: by the variable the array is assigned
+to - declared, or inferred from what that function stores into it: `var a =
+array(3); a[0] = 5;` yields `[5, 0, 0]`, `var s = array(2); s[0] = "x";`
+yields `["x", ""]` - or by a DECLARED place it enters: a parameter whose type
+is declared (`f(array(3))` with `func f(array<int> a)` passes `[0, 0, 0]`), a
+struct field, an element of a container whose type is declared (`m[0] =
+array(2)`, `append(m, array(2))`), through the arms of a `?:` or `??` too. A
+nullable element type (`array<int?>`) is filled with `none`. **An array whose
+element type nothing there decides is an `array<dyn?>`, filled with `none`**
+- one nothing is stored into, one returned or passed on as it is made, one a
+callee fills through a parameter nothing declares, or any array with type
+inference disabled, `-nti` - and what a caller or a callee later stores into
+it does not change that: its elements are the nones it was made with.
+
+```C#
+func mk(n) => array(n);         # nothing in mk decides the element type
+var q = mk(2);                  # an array<dyn?>
+q[0] = "s";                     # fine: a dyn? element takes any value
+var x = q[1];                   # refused: x would be a dyn? (write `var dyn?`)
+func mk2(n) { array<str> a = array(n); return a; }   # ["", ""] - typed
+```
+
+One made where `dyn` is declared (`var dyn d = array(2)`) is an
+`array<dyn?>` too. An element
 type with no zero value - a non-`opt` `dyn`, a struct with a non-`opt`
 `dyn` field, a struct field whose struct is declared further down - is a
 compile error: give a fill value, `array(n, v)`, or make the element type

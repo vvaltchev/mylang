@@ -738,6 +738,15 @@ private:
     void value_funcs(const EvalValue &v, CycStack &path,
                      const std::function<void(const FuncDescriptor *)> &fn);
     bool mark_named_bases(Block *rootBlock, bool late);   /* #84 */
+    /* strict item 1: the array(n) calls whose element type nothing in
+     * their own function decides - keyed by node_id, which is never
+     * reused (a clone's call is a call of its own) */
+    std::unordered_set<uint64_t> arrn_dyn;
+    /* ...and the ones a DECLARED place decides (a parameter, a field, an
+     * element of a declared container): the type stamp_ctypes fills
+     * them for - rewritten by each decide_array_n pass */
+    std::unordered_map<uint64_t, StaticTypeRef> arrn_place;
+    bool decide_array_n(Construct *n, StaticTypeRef place);
     void tree_baked_funcs(Construct *n, CycStack &path,
                           const std::function<void(const FuncDescriptor *)>
                               &fn);
@@ -3373,6 +3382,26 @@ void Inferencer::infer_one(Block *rootBlock)
     }
 
     /*
+     * Strict item 1 (maintainer, 2026-11-27): `array(n)`'s element type
+     * is decided in the function that evaluates it - by the variable it
+     * initializes and that variable's stores and places - and an array
+     * nothing there decides is an `array<dyn?>`: its elements are the
+     * nones it was filled with. Decided once the program has settled,
+     * because only then is "nothing decides it" an answer; the types it
+     * changes are worked out again. (It ends: a call is marked once, and
+     * the calls are a finite program's - instantiation inside the loop
+     * makes new ones only within its caps. The pass that marks nothing
+     * is the one whose arrn_place stamp_ctypes reads.)
+     */
+    for (;;) {
+        arrn_place.clear();
+        if (!decide_array_n(rootBlock, nullptr))
+            break;
+        run_fixpoint(rootBlock);
+        instantiate_to_fixpoint();
+    }
+
+    /*
      * #78: an instance a re-key left with no live use leaves the program
      * - it would still be bound, and listed by specializations() - and
      * its cache entry with it, so the key makes a fresh instance should a
@@ -4427,12 +4456,17 @@ void Inferencer::enforce_concrete_decls()
             continue;
 
         const std::string what = s->const_decl ? "const" : "variable";
+        /* a value that may be none needs `dyn?`: a `dyn` refuses none
+         * (the type is the dyn itself - strict_deep, a dyn anywhere in
+         * it, is off) */
+        const std::string kw =
+            static_type_resolve(s->type)->opt ? "dyn?" : "dyn";
         throw DynRequiredEx(
             intern_msg(
                 std::string(s->name->val) + ": " + what +
                 " has dynamic type '" + static_type_to_string(s->type) +
-                "'; declare it 'dyn' (e.g. '" +
-                (s->const_decl ? "const dyn " : "var dyn ") +
+                "'; declare it '" + kw + "' (e.g. '" +
+                (s->const_decl ? "const " : "var ") + kw + " " +
                 std::string(s->name->val) + " = ...')"),
             s->decl_loc, s->decl_end);
     }
@@ -5913,6 +5947,13 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
         auto *cid = node_cast<Identifier>(call->what.get());
         const bool builtin = cid && names_builtin(cid);
         ML_CHECK(call->args);      /* every call has a (maybe empty) list */
+        /* strict item 1: an array(n) a declared place decides is made
+         * for that place - its zero values, its storage */
+        if (!dest) {
+            auto ap = arrn_place.find(call->node_id);
+            if (ap != arrn_place.end())
+                dest = ap->second;
+        }
         ExprList *const args = call->args.get();
         if (builtin && builtin_builds_container(cid->uid->val)) {
             const StaticTypeRef own = static_type_resolve(type_of(call));
@@ -6063,6 +6104,140 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
         break;
     }
     for_each_child(n, [&](Construct *c) { stamp_ctypes(c, nullptr); });
+}
+
+/*
+ * Strict item 1: mark every `array(n)` (one argument - `array(n, v)` is
+ * typed by its value) whose element type its own function leaves
+ * undecided; true when it marked one. `place` is the type of the place the
+ * value of `n` lands in, or null for none that decides anything:
+ *  - a variable it is assigned to: that variable's type, which its own
+ *    stores and places fill (choice 6 then fills the array with that
+ *    type's zero value);
+ *  - a DECLARED place: a parameter whose type is declared, a struct
+ *    field, an element or value of a container whose type is declared
+ *    (a store, an append / push / insert) - recorded in arrn_place for
+ *    stamp_ctypes, which fills the array for it;
+ *  - a ternary's arm or a `??` side: the place the whole lands in.
+ * Anything else - returned, an argument of a parameter nothing declares,
+ * an element of a new literal - decides nothing: before this, whatever
+ * the CALLER (or a callee, through a parameter) stored into the result
+ * typed it, an `array<str>` holding the nones `array(n)` was filled with
+ * (`func mk(n) => array(n); var q = mk(2); q[0] = "s";` - the
+ * tree-walker raised TypeErrorEx at `len(q[1])`, -nj one with no caret,
+ * the JIT printed 0). A place whose type is not an array - a `dyn` -
+ * decides it as before (choice 8). A template BASE's body is not
+ * checked, so its calls are left to its instances.
+ */
+bool Inferencer::decide_array_n(Construct *n, StaticTypeRef place)
+{
+    if (!n)
+        return false;
+    if (ctag(n) == ConstructType::func_decl) {
+        /* (the structural pass gave every function its FuncInfo) */
+        auto it = func_of_decl.find(static_cast<FuncDeclStmt *>(n));
+        ML_CHECK(it != func_of_decl.end() && it->second);
+        if (it->second->is_template)
+            return false;
+    }
+    bool marked = false;
+    const auto down = [&](Construct *c, StaticTypeRef p) {
+        marked |= decide_array_n(c, p);
+    };
+
+    if (ctag(n) == ConstructType::call) {
+        auto *call = static_cast<CallExpr *>(n);
+        auto *cid = node_cast<Identifier>(call->what.get());
+        const bool builtin = cid && names_builtin(cid);
+        ML_CHECK(call->args);      /* every call has a (maybe empty) list */
+        ExprList *args = call->args.get();
+        if (builtin && cid->uid->val == std::string_view("array")
+                && args->elems.size() == 1
+                && !arrn_dyn.count(call->node_id)) {
+            const StaticTypeRef t =
+                place ? static_type_resolve(place) : nullptr;
+            if (!t || (t->kind == StaticTypeKind::Array
+                       && static_type_resolve(t->elem)->kind
+                              == StaticTypeKind::None)) {
+                arrn_dyn.insert(call->node_id);
+                marked = true;
+            } else if (t->kind == StaticTypeKind::Array) {
+                arrn_place[call->node_id] = t;
+            }
+        }
+        /* the places of the arguments */
+        std::vector<StaticTypeRef> ap(args->elems.size());
+        if (builtin) {
+            const std::string_view nm = cid->uid->val;
+            const size_t vi = nm == "insert" ? 2 : 1;
+            if (in_place_store(nm) && args->elems.size() > vi)
+                ap[vi] = fixed_elem_dest(args->elems[0].get(), false);
+        } else {
+            if (const StructTypeDef *def = cs_struct_callee(call->what.get())) {
+                for (size_t i = 0;
+                     i < ap.size() && i < def->fields.size(); i++)
+                    if (def->fields[i].kind != FieldKind::f_dyn)
+                        ap[i] = field_static_type(def->fields[i]);
+            } else if (std::vector<TypeSym *> *ps = known_params(call)) {
+                for (size_t i = 0; i < ap.size() && i < ps->size(); i++)
+                    ap[i] = fixed_type((*ps)[i]);
+            } else {
+                /* a call through a function value: a parameter every
+                 * function it can reach declares alike (the callee
+                 * sets; none for an unknown callee) */
+                const CsSet cs = callee_set(call->what.get());
+                for (size_t i = 0; i < ap.size() && !cs.top; i++) {
+                    StaticTypeRef d = nullptr;
+                    for (FuncInfo *f : cs.funcs) {
+                        StaticTypeRef t = i < f->params.size()
+                            ? fixed_type(f->params[i]) : nullptr;
+                        if (!t || (d && !static_type_equal(d, t))) {
+                            d = nullptr;
+                            break;
+                        }
+                        d = t;
+                    }
+                    ap[i] = d;
+                }
+            }
+        }
+        down(call->what.get(), nullptr);
+        for (size_t i = 0; i < ap.size(); i++)
+            down(args->elems[i].get(), ap[i]);
+        return marked;
+    }
+
+    if (ctag(n) == ConstructType::expr14) {
+        auto *e = static_cast<Expr14 *>(n);
+        StaticTypeRef rp = nullptr;
+        if (e->op == Op::assign) {
+            auto *id = node_cast<Identifier>(e->lvalue.get());
+            if (TypeSym *sym = id ? user_sym(id) : nullptr)
+                rp = sym->type;
+            else if (!id)
+                rp = declared_type_of(e->lvalue.get());
+        }
+        down(e->lvalue.get(), nullptr);
+        down(e->rvalue.get(), rp);
+        return marked;
+    }
+
+    if (ctag(n) == ConstructType::ternary) {
+        auto *t = static_cast<TernaryExpr *>(n);
+        down(t->condExpr.get(), nullptr);
+        down(t->thenExpr.get(), place);
+        down(t->elseExpr.get(), place);
+        return marked;
+    }
+    if (ctag(n) == ConstructType::coalesce) {
+        auto *c = static_cast<CoalesceExpr *>(n);
+        down(c->lhs.get(), place);
+        down(c->rhs.get(), place);
+        return marked;
+    }
+
+    for_each_child(n, [&](Construct *c) { down(c, nullptr); });
+    return marked;
 }
 
 /* Q2: make the container node `n` makes UNTYPED (stamp_ctypes) - through
@@ -7089,9 +7264,10 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v,
                 StaticTypeRef el = static_type_from_value(
                     obj_elem_value(ov[arr.offset()]));
                 for (size_type i = 1; i < n; i++) {
-                    StaticTypeRef j = A.join(el, static_type_from_value(
-                        obj_elem_value(ov[arr.offset() + i])));
-                    el = j ? j : A.dyn_ty();
+                    const StaticTypeRef t = static_type_from_value(
+                        obj_elem_value(ov[arr.offset() + i]));
+                    StaticTypeRef j = A.join(el, t);
+                    el = j ? j : A.mixed(el, t);
                 }
                 return A.array_of(held(el));
             }
@@ -7101,9 +7277,10 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v,
                 return A.array_of(A.none_ty());
             StaticTypeRef el = static_type_from_value(view[0].get(), st);
             for (size_type i = 1; i < view.size(); i++) {
-                StaticTypeRef j = A.join(el,
-                    static_type_from_value(view[i].get(), st));
-                el = j ? j : A.dyn_ty();
+                const StaticTypeRef t =
+                    static_type_from_value(view[i].get(), st);
+                StaticTypeRef j = A.join(el, t);
+                el = j ? j : A.mixed(el, t);
             }
             return A.array_of(held(el));
         }
@@ -7131,12 +7308,12 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v,
                 if (!kty) {
                     StaticTypeRef jv = dft ? A.join(dft, vt) : vt;
                     kty = kt;
-                    val = jv ? jv : A.dyn_ty();
+                    val = jv ? jv : A.mixed(dft, vt);
                 } else {
                     StaticTypeRef jk = A.join(kty, kt);
                     StaticTypeRef jv = A.join(val, vt);
-                    kty = jk ? jk : A.dyn_ty();
-                    val = jv ? jv : A.dyn_ty();
+                    kty = jk ? jk : A.mixed(kty, kt);
+                    val = jv ? jv : A.mixed(val, vt);
                 }
             }
             return A.dict_of(held(kty), held(val));
@@ -7204,7 +7381,7 @@ StaticTypeRef Inferencer::type_of_node(const Construct *e)
             if (is_unknown(static_type_resolve(t)))
                 return A.array_of(bottom);
             StaticTypeRef j = A.join(el, t);
-            el = j ? j : A.dyn_ty();
+            el = j ? j : A.mixed(el, t);
         }
         return A.array_of(held(el));
     }
@@ -7216,10 +7393,12 @@ StaticTypeRef Inferencer::type_of_node(const Construct *e)
         StaticTypeRef k = type_of(ld->elems[0]->key.get());
         StaticTypeRef val = type_of(ld->elems[0]->value.get());
         for (size_t i = 1; i < ld->elems.size(); i++) {
-            StaticTypeRef jk = A.join(k, type_of(ld->elems[i]->key.get()));
-            StaticTypeRef jv = A.join(val, type_of(ld->elems[i]->value.get()));
-            k = jk ? jk : A.dyn_ty();
-            val = jv ? jv : A.dyn_ty();
+            const StaticTypeRef ki = type_of(ld->elems[i]->key.get());
+            const StaticTypeRef vi = type_of(ld->elems[i]->value.get());
+            StaticTypeRef jk = A.join(k, ki);
+            StaticTypeRef jv = A.join(val, vi);
+            k = jk ? jk : A.mixed(k, ki);
+            val = jv ? jv : A.mixed(val, vi);
         }
         return A.dict_of(held(k), held(val));
     }
@@ -7407,8 +7586,12 @@ StaticTypeRef Inferencer::type_of_node(const Construct *e)
                 return bottom;          /* defer: callee not yet known */
             if (s && is_dyn(s->type))
                 return A.dyn_ty();
-            if (!s && is_builtin(cid->uid))
+            if (!s && is_builtin(cid->uid)) {
+                /* strict item 1 (decide_array_n) */
+                if (arrn_dyn.count(call->node_id))
+                    return A.array_of(A.with_opt(A.dyn_ty(), true));
                 return builtin_result(cid->uid, call->args.get());
+            }
             /* unresolved callee: defer (an UndefinedVariableEx at runtime), so
              * the enclosing var isn't forced to `dyn`, masking that error. */
             return bottom;
@@ -7863,8 +8046,9 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
             if (is_unknown(static_type_resolve(t)) ||
                 is_unknown(static_type_resolve(arg(i))))
                 return bottom;          /* defer */
-            StaticTypeRef j = A.join(t, arg(i));
-            t = j ? j : A.dyn_ty();
+            const StaticTypeRef ai = arg(i);
+            StaticTypeRef j = A.join(t, ai);
+            t = j ? j : A.mixed(t, ai);
         }
         return t;
     }
@@ -8287,7 +8471,8 @@ void Inferencer::contribute_ret(StaticTypeRef t)
     if (cur_func->closure_tmpl && has_unknown(t))
         cur_func->ret_open = true;
     StaticTypeRef nw = A.join(cur_func->ret_acc, t);
-    cur_func->ret_acc = nw ? nw : A.dyn_ty();   /* return conflict -> dyn */
+    /* a return conflict -> dyn, nullable when a return may be none */
+    cur_func->ret_acc = nw ? nw : A.mixed(cur_func->ret_acc, t);
 }
 
 void Inferencer::accumulate(Construct *n)

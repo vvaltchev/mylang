@@ -667,7 +667,13 @@ var cmix = C(4);
 var lm1 = [P(1, 1.0), 5];
 var lm2 = [cmix, 5];
 var lm3 = [cmix, none, P(2, 1.0)];
-want("mixed literals", [lm1[1], lm2[0].v, lm2[1], lm3[1] == none, lm3[2].x],
+# (lm3 holds a none, so it is an array<dyn?> and an element is read
+# through a `dyn?` name - not straight off the array)
+var dyn? lm3e = lm3[2];
+var lm3x = -1;
+if (lm3e != none)
+    lm3x = lm3e.x;
+want("mixed literals", [lm1[1], lm2[0].v, lm2[1], lm3[1] == none, lm3x],
      [5, 4, 5, true, 2]);
 want("mixed literal storages", [array_storage(lm1), array_storage(lm2),
      array_storage(lm3)], ["general", "general", "general"]);
