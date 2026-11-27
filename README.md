@@ -1611,7 +1611,24 @@ Key rules:
     `array<int?> a = [none];`, it is that place's type. `a + b` of two
     arrays is a new array of the two element types' join: `[1] + [1.5]`
     is an `array<float>` (the ints widened), `[1] + ["x"]` an
-    `array<dyn>`. To change a
+    `array<dyn>`. What a new container is MADE OF does not change, though:
+    a container another name holds, put into it - an element of a literal,
+    a key or value of a dict literal, an operand's element in an array sum,
+    an `append`, an element store - is the same container, shared, so it
+    must have exactly the new container's element type, as it must a
+    variable's. A row written fresh in place takes the element type, and a
+    container declared `dyn` takes anything:
+
+    ```C#
+    var cs = [1]; var ds = [2.5];
+    var r = [[2], ds];    # an array<array<float>>: [2] is built of floats
+    var e = [cs, ds];     # TypeMismatchEx: an element of 'e' has type
+                          # 'array<float>' but the container it is given
+                          # is an 'array<int>'
+    var dyn m = [cs, ds]; # fine: m's elements are each array's own
+    ```
+
+    To change a
     container's type, convert it: `cast<array<dyn>>(a)` is a new
     `array<dyn>` holding `a`'s elements (see *cast*).
   * **Null safety.** A plain value is *non-nullable*: passing `none` where a

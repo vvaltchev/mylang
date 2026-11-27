@@ -389,8 +389,8 @@ prints `0`. Choice 6 fixes it.
    not for `array(n)`'s none-filled one). The fix needs `array(n)` with
    no type of its own to be an `array<dyn?>` once it flows out untyped,
    while `var a = array(2); a[0] = "x"` keeps typing `a` by its stores.
-   **Also open (found 2026-11-21):** the flow check covers a variable, a
-   result and a ternary arm, not an ELEMENT: a container a name holds,
+   **Also open (found 2026-11-21) - DONE 2026-11-27, below:** the flow
+   check covers a variable, a result and a ternary arm, not an ELEMENT: a container a name holds,
    put into an inferred container whose element type later widens -
    `var r = [cs]; append(r, r);` with `cs` an array<C> - makes `r` an
    array<array<dyn>> holding `cs`. Nothing is unchecked (a store through
@@ -401,6 +401,22 @@ prints `0`. Choice 6 fixes it.
    `array` component (`array<array>`) is a `dyn` at run time as it is
    statically (it matched any array there - fixed the same day; only a
    place's top-level generic `array` is a hole).
+   **Done 2026-11-27 (check_flow_exact):** it was wider than the example
+   - a shared container joined into ANY new container's element type
+   unchecked, so `[cs, [2.5]]` with `cs` an array<int> was an
+   array<array<float>> holding `cs`, read back as an int by the
+   tree-walker and as a float by the VM (RULE 1 and RULE 2), and the
+   same through an array sum, a dict literal's key or value, an
+   `append`, an element store, a returned literal, a ternary or `??`.
+   The flow check now recurses into what a NEW container is made of
+   (literal elements, sum operands, a slice's base, a builtin's
+   container elements) at every place: a variable, a result, an arm, an
+   argument, a field, an element or dict store, an in-place builtin. Its
+   run-time half (check_lit_elems_exact, in stamp_ctypes) checks each
+   literal and array sum against the type it is MADE with, which covers
+   a literal written in an expression (`print([cs, ds][0][0])`, a
+   foreach's container). A container declared `dyn` takes anything.
+   Tests: the `rule 1: a shared ...` -rt rows, tests/functional/148.
 4. Rule 4 (storage follows the type), rule 5 (bare annotations are
    holes), rule 6 (`none` keys - already work, gets a test). Rules 4 and
    6 DONE 2026-11-21: a builtin's new container takes the storage of the

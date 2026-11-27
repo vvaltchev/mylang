@@ -701,6 +701,11 @@ private:
     void check_alias_exact(Construct *rv, Identifier *to);
     void check_flow_exact(Construct *rv, StaticTypeRef dest,
                           const std::string &what);
+    void check_elems_into(Construct *src, StaticTypeRef dest,
+                          const std::string &what);
+    void check_type_exact(StaticTypeRef r, StaticTypeRef dest,
+                          const std::string &what, Construct *at);
+    void check_lit_elems_exact(Construct *lit);
     bool compound_may_misfit(Op op, StaticTypeRef place, StaticTypeRef v);
     bool compound_store_checked(Expr14 *e);
     void stamp_fixed_numeric(Identifier *id, StaticTypeRef v);
@@ -5884,6 +5889,7 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
                     written(kv->value.get());
             }
         }
+        check_lit_elems_exact(n);
         break;
     case ConstructType::lit_obj: {
         auto *lo = static_cast<LiteralObj *>(n);
@@ -5987,10 +5993,19 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
          * starts untyped, ctype_sum_copy): it gets the type the place it
          * is written into has, else the sum's own (StampTypeV) */
         const StaticTypeRef own = static_type_resolve(type_of(n));
-        if (own->kind == StaticTypeKind::Array)
+        if (own->kind == StaticTypeKind::Array) {
             n->ctype = ctype_untyped.count(n) ? nullptr
                 : ctype_dyn_place.count(n) ? annot_dyn_array()
                 : ctype_of(dest ? dest : own, false);
+            /* the sum holds its operands' elements, shared (rule 1) */
+            if (strict_dyn && n->ctype && !ctype_dyn_place.count(n)) {
+                const StaticTypeRef t =
+                    strip(annot_to_static_type(n->ctype));
+                for (auto &op : static_cast<MultiOpConstruct *>(n)->elems)
+                    check_elems_into(op.second.get(), t,
+                                     "the array sum");
+            }
+        }
         break;
     }
     case ConstructType::expr14: {
@@ -9437,25 +9452,165 @@ void Inferencer::check_alias_exact(Construct *rv, Identifier *to)
     check_flow_exact(rv, type_of(to), "'" + std::string(to->uid->val) + "'");
 }
 
-/* The flow behind check_alias_exact: `rv` lands where the type is `dest`
+/* `what` names a place; the name of one of its components */
+static std::string component_place(const std::string &what,
+                                   const char *part)
+{
+    if (what.rfind("an element of ", 0) == 0
+            || what.rfind("a key of ", 0) == 0
+            || what.rfind("a value of ", 0) == 0)
+        return what;
+    return std::string(part) + what;
+}
+
+/*
+ * The flow behind check_alias_exact: `rv` lands where the type is `dest`
  * (`what` names the place) - a variable, a function's result (a return),
- * a ternary's value (an arm). */
+ * a ternary's value (an arm), an argument, a field, an element or a dict
+ * key or value. A container another name may hold must have exactly the
+ * place's type. A NEW container takes the place's type, but what it is
+ * made of does not change: the elements of a literal, of an array sum or
+ * of a slice are the values written there, and a container among them
+ * is SHARED, so it lands in the place's element in turn. `var cs = [1];
+ * var r = [cs, [2.5]];` made `r` an array<array<float>> holding `cs`'s
+ * ints, which the tree-walker read back as an int and the VM as a float.
+ */
 void Inferencer::check_flow_exact(Construct *rv, StaticTypeRef dest,
                                   const std::string &what)
 {
     /* (`return;` has no value; every caller has the destination) */
-    if (!rv || new_container_expr(rv))
+    if (!rv || !dest)
         return;
-    StaticTypeRef r = strip(static_type_resolve(type_of(rv)));
-    StaticTypeRef l = strip(static_type_resolve(dest));
+    const StaticTypeRef l = strip(static_type_resolve(dest));
+    /* a `dyn`, unfilled or scalar place takes what it is given */
+    if (l->kind != StaticTypeKind::Array && l->kind != StaticTypeKind::Dict)
+        return;
+    switch (ctag(rv)) {
+    case ConstructType::lit_arr:
+        if (l->kind == StaticTypeKind::Array)
+            for (auto &e : static_cast<LiteralArray *>(rv)->elems)
+                check_flow_exact(e.get(), l->elem,
+                                 component_place(what, "an element of "));
+        return;
+    case ConstructType::lit_dict:
+        if (l->kind == StaticTypeKind::Dict)
+            for (auto &kv : static_cast<LiteralDict *>(rv)->elems) {
+                check_flow_exact(kv->key.get(), l->key,
+                                 component_place(what, "a key of "));
+                check_flow_exact(kv->value.get(), l->val,
+                                 component_place(what, "a value of "));
+            }
+        return;
+    case ConstructType::ternary: {
+        auto *t = static_cast<TernaryExpr *>(rv);
+        check_flow_exact(t->thenExpr.get(), dest, what);
+        check_flow_exact(t->elseExpr.get(), dest, what);
+        return;
+    }
+    case ConstructType::coalesce: {
+        auto *c = static_cast<CoalesceExpr *>(rv);
+        check_flow_exact(c->lhs.get(), dest, what);
+        check_flow_exact(c->rhs.get(), dest, what);
+        return;
+    }
+    case ConstructType::expr04:
+    case ConstructType::slice:
+        /* a new array made of the operands' elements, or of a part of
+         * the sliced one's */
+        if (l->kind == StaticTypeKind::Array)
+            check_elems_into(rv, l, what);
+        return;
+    case ConstructType::cast:
+    case ConstructType::lit_obj:
+        /* a cast copies what it converts, and a baked value's
+         * containers are its own (rebuilt for the place) */
+        return;
+    case ConstructType::call:
+        if (new_container_expr(rv)) {
+            /* a builtin's new container is built for the place (its
+             * scalar elements are made at the place's type, rule 4), and
+             * a container among its elements is one it was given */
+            const StaticTypeRef o = strip(static_type_resolve(type_of(rv)));
+            if (o->kind == StaticTypeKind::Array
+                    && l->kind == StaticTypeKind::Array) {
+                check_type_exact(o->elem, l->elem,
+                                 component_place(what, "an element of "),
+                                 rv);
+            } else if (o->kind == StaticTypeKind::Dict
+                       && l->kind == StaticTypeKind::Dict) {
+                check_type_exact(o->key, l->key,
+                                 component_place(what, "a key of "), rv);
+                check_type_exact(o->val, l->val,
+                                 component_place(what, "a value of "), rv);
+            }
+            return;
+        }
+        break;
+    default:
+        break;
+    }
+    check_type_exact(type_of(rv), dest, what, rv);
+}
+
+/* A NEW array of type `dest` made of `src`'s elements: an array sum (each
+ * operand's), a slice (the sliced array's) - each element lands in
+ * `dest`'s */
+void Inferencer::check_elems_into(Construct *src, StaticTypeRef dest,
+                                  const std::string &what)
+{
+    const StaticTypeRef l = strip(static_type_resolve(dest));
+    switch (ctag(src)) {
+    case ConstructType::lit_arr:
+        check_flow_exact(src, l, what);
+        return;
+    case ConstructType::expr04: {
+        if (strip(static_type_resolve(type_of(src)))->kind
+                != StaticTypeKind::Array)
+            return;
+        for (auto &op : static_cast<MultiOpConstruct *>(src)->elems)
+            check_elems_into(op.second.get(), l, what);
+        return;
+    }
+    case ConstructType::slice:
+        check_elems_into(static_cast<Slice *>(src)->what.get(), l, what);
+        return;
+    case ConstructType::ternary: {
+        auto *t = static_cast<TernaryExpr *>(src);
+        check_elems_into(t->thenExpr.get(), l, what);
+        check_elems_into(t->elseExpr.get(), l, what);
+        return;
+    }
+    case ConstructType::coalesce: {
+        auto *c = static_cast<CoalesceExpr *>(src);
+        check_elems_into(c->lhs.get(), l, what);
+        check_elems_into(c->rhs.get(), l, what);
+        return;
+    }
+    default: {
+        const StaticTypeRef o = strip(static_type_resolve(type_of(src)));
+        if (o->kind == StaticTypeKind::Array)
+            check_type_exact(o->elem, l->elem,
+                             component_place(what, "an element of "), src);
+        return;
+    }
+    }
+}
+
+/* A container of static type `r` lands where the type is `dest`: exactly
+ * that type (two container types are assignable both ways or neither:
+ * they are exact, rule 1). The place's components may be unfilled (an
+ * empty literal's), and its top level may be `?`. */
+void Inferencer::check_type_exact(StaticTypeRef r, StaticTypeRef dest,
+                                  const std::string &what, Construct *at)
+{
+    r = strip(static_type_resolve(r));
+    const StaticTypeRef l = strip(static_type_resolve(dest));
     if ((r->kind != StaticTypeKind::Array && r->kind != StaticTypeKind::Dict)
             || r->kind != l->kind || has_unknown(r))
         return;
     /* (the place's type joins what flows into it, so it has no unsettled
      * component when the value has none) */
     ML_CHECK(!has_unknown(l));
-    /* (two container types are assignable both ways or neither: they
-     * are exact, rule 1) */
     if (static_type_assignable(r, l))
         return;
     mismatch(what + " has type '" + static_type_to_string(l)
@@ -9463,7 +9618,38 @@ void Inferencer::check_flow_exact(Construct *rv, StaticTypeRef dest,
                  + static_type_to_string(r) + "' - a container's type is "
                  "exact (write cast<" + static_type_to_string(l)
                  + ">(...) to convert it)",
-             rv->start, rv->end);
+             at->start, at->end);
+}
+
+/*
+ * The run-time half: a literal is MADE with a type (stamp_literal_coerce:
+ * its place's, else its own), and a container among its elements is
+ * shared, so it must have exactly that type's element type - wherever
+ * the literal is written: `print([cs, [2.5]][0][0])`, an argument, a
+ * foreach's container. One made where only `dyn` reaches it has no type.
+ * (A literal nested in it has a type of its own, checked on its own.)
+ */
+void Inferencer::check_lit_elems_exact(Construct *lit)
+{
+    if (!strict_dyn || !lit->ctype || ctype_untyped.count(lit)
+            || ctype_dyn_place.count(lit))
+        return;
+    const StaticTypeRef t = strip(annot_to_static_type(lit->ctype));
+    const auto el = [&](Construct *e, StaticTypeRef into, const char *w) {
+        if (ctag(e) != ConstructType::lit_arr
+                && ctag(e) != ConstructType::lit_dict)
+            check_flow_exact(e, into, std::string(w) + "the literal");
+    };
+    if (ctag(lit) == ConstructType::lit_arr) {
+        if (t->kind == StaticTypeKind::Array)
+            for (auto &e : static_cast<LiteralArray *>(lit)->elems)
+                el(e.get(), t->elem, "an element of ");
+    } else if (t->kind == StaticTypeKind::Dict) {
+        for (auto &kv : static_cast<LiteralDict *>(lit)->elems) {
+            el(kv->key.get(), t->key, "a key of ");
+            el(kv->value.get(), t->val, "a value of ");
+        }
+    }
 }
 
 StaticTypeRef Inferencer::literal_dest_type(Expr14 *e)
@@ -9563,10 +9749,23 @@ void Inferencer::check_declared_store(Expr14 *e)
     }
     if (ctag(lv) == ConstructType::member)
         field = static_cast<MemberExpr *>(lv)->memUid->val;
-    else if (ctag(lv) != ConstructType::subscript
-             || ctag(static_cast<Subscript *>(lv)->what.get())
-                    == ConstructType::id)
+    else if (ctag(lv) != ConstructType::subscript)
         return;
+    else if (auto *bid = node_cast<Identifier>(
+                 static_cast<Subscript *>(lv)->what.get())) {
+        /* a store into a plain variable's element joins into that
+         * variable's type - and a container shared with another name
+         * must have exactly the element type it joins into (rule 1) */
+        if (strict_dyn && e->op == Op::assign) {
+            const bool dict = strip(static_type_resolve(type_of(bid)))->kind
+                == StaticTypeKind::Dict;
+            check_flow_exact(e->rvalue.get(), type_of(lv),
+                             std::string(dict ? "a value of '"
+                                              : "an element of '")
+                                 + std::string(bid->uid->val) + "'");
+        }
+        return;
+    }
     StaticTypeRef dest = declared_type_of(lv);
     if (!dest) {
         /* an element reached through something whose type was INFERRED
@@ -9592,6 +9791,11 @@ void Inferencer::check_declared_store(Expr14 *e)
                           type_of(e->rvalue.get()));
     }
     check_value_into(dest, vt, field, e->rvalue.get());
+    /* (a new container's shared elements: check_flow_exact) */
+    if (strict_dyn && e->op == Op::assign)
+        check_flow_exact(e->rvalue.get(), dest,
+                         field.empty() ? std::string("the element")
+                                       : "field '" + field + "'");
 }
 
 /* check_declared_store's twin for append / push / insert into a container
@@ -9602,9 +9806,26 @@ void Inferencer::check_builtin_store(CallExpr *call)
     const std::string_view nm = cid->uid->val;
     ExprList *al = call->args.get();
     const size_t vi = nm == "insert" ? 2 : 1;
-    if (!in_place_store(nm) || !al || al->elems.size() <= vi
-        || ctag(al->elems[0].get()) == ConstructType::id)
+    if (!in_place_store(nm) || !al || al->elems.size() <= vi)
         return;
+    if (auto *bid = node_cast<Identifier>(al->elems[0].get())) {
+        /* a value appended to a plain variable joins into its element
+         * type - and a container shared with another name must have
+         * exactly the type it joins into (rule 1) */
+        if (!strict_dyn)
+            return;
+        const StaticTypeRef d = strip(static_type_resolve(type_of(bid)));
+        const std::string nm_q = "'" + std::string(bid->uid->val) + "'";
+        if (d->kind == StaticTypeKind::Array) {
+            check_flow_exact(al->elems[vi].get(), d->elem,
+                             "an element of " + nm_q);
+        } else if (d->kind == StaticTypeKind::Dict && vi == 2) {
+            check_flow_exact(al->elems[1].get(), d->key, "a key of " + nm_q);
+            check_flow_exact(al->elems[2].get(), d->val,
+                             "a value of " + nm_q);
+        }
+        return;
+    }
     StaticTypeRef d = declared_type_of(al->elems[0].get());
     if (!d) {
         /* a container reached through something whose type was INFERRED
@@ -9620,6 +9841,8 @@ void Inferencer::check_builtin_store(CallExpr *call)
         Construct *v = al->elems[i].get();
         StaticTypeRef vt = literal_into(v, into);
         check_value_into(into, vt ? vt : type_of(v), "", v);
+        if (strict_dyn)
+            check_flow_exact(v, into, "the element");
     };
     if (d->kind == StaticTypeKind::Array)
         value(vi, d->elem);
@@ -10223,6 +10446,11 @@ void Inferencer::check(Construct *n)
         check_flow_exact(te->thenExpr.get(), type_of(te), "the ternary");
         check_flow_exact(te->elseExpr.get(), type_of(te), "the ternary");
     }
+    if (strict_dyn && ctag(n) == ConstructType::coalesce) {
+        auto *ce = static_cast<CoalesceExpr *>(n);
+        check_flow_exact(ce->lhs.get(), type_of(ce), "the coalesce");
+        check_flow_exact(ce->rhs.get(), type_of(ce), "the coalesce");
+    }
 
     if (ctag(n) == ConstructType::block) {
         auto *b = static_cast<Block *>(n);
@@ -10621,6 +10849,10 @@ void Inferencer::check_struct_construction(CallExpr *call,
                          static_type_to_string(ft) + "' but got '" +
                          static_type_to_string(at) + "'",
                      args->elems[i]->start, args->elems[i]->end);
+        /* (a new container's shared elements: check_flow_exact) */
+        if (strict_dyn)
+            check_flow_exact(args->elems[i].get(), ft,
+                             "field '" + std::string(fd.name->val) + "'");
     }
 }
 
@@ -10788,6 +11020,10 @@ void Inferencer::check_call(CallExpr *call)
                          static_type_to_string(ptype) + "'" +
                          box_use_hint(at, anode, ptype),
                      anode->start, anode->end);
+        /* (a new container's shared elements: check_flow_exact) */
+        if (strict_dyn)
+            check_flow_exact(anode, ptype,
+                             "argument " + std::to_string(i + 1));
     }
 }
 

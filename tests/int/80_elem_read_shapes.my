@@ -156,7 +156,10 @@ func oob(dyn a, int i) {
     }
     return r;
 }
-foreach (a in [flat, ki, fb, [1.5, 2.5], ["x", "y"], keys(dict_bools())])
+# (arrays of several types in one literal: a `dyn` one, which keeps each
+# array's own type and storage)
+var dyn storages = [flat, ki, fb, [1.5, 2.5], ["x", "y"], keys(dict_bools())];
+foreach (a in storages)
     note("oob", oob(a, int(runtime(7))) + "/" + oob(a, int(runtime(-9)))
                 + "/" + oob(a, int(runtime(-1))));
 

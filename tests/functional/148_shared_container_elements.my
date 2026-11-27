@@ -1,0 +1,60 @@
+# Rule 1 (plans/strict-container-types.md; README *Container types are
+# exact*): a container another name holds, put into a NEW container - a
+# literal, an array sum, an append, an element store - is shared, so it
+# must have exactly the new container's element type. These are the
+# shapes that compile: a fresh row takes the container's type, a `dyn`
+# container keeps each array's own, a cast copies. (The refused shapes
+# are the `rule 1: a shared ...` -rt rows.) With no types (-nti) a fresh
+# row is built from its own values, so that check is made typed only.
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+
+var cs = [int(runtime(1))];
+var ds = [2.5];
+
+# ---- a fresh row is built for the outer array's element type
+var r = [[2], ds];
+if (typed) {
+    r[0][0] = 1.5;
+    want("a fresh row takes floats", r[0][0], 1.5);
+}
+want("...and the shared one is the same array", r[1] == ds, true);
+ds[0] = 3.5;
+want("...shared", r[1][0], 3.5);
+
+# ---- the same type: shared, in a literal, an append, a store, a sum
+var rows = [cs];
+append(rows, cs);
+rows[0][0] = 7;
+want("an appended row is the same array", cs[0], 7);
+want("...both of them", rows[1][0], 7);
+var more = rows + [[9]];
+more[0][0] = 8;
+want("a sum shares the rows", cs[0], 8);
+var d = {"a": cs};
+d["b"] = cs;
+d["b"][0] = 6;
+want("a dict value is the same array", cs[0], 6);
+
+# ---- a dyn container keeps each array's own type and storage
+var dyn mixed = [cs, ds, ["s"]];
+want("a dyn literal's int row", array_storage(mixed[0]), "int");
+want("...its float row", array_storage(mixed[1]), "float");
+mixed[1][0] = 4.5;
+want("...shared", ds[0], 4.5);
+
+# ---- a cast converts by copying
+var c = cast<array<array<float>>>([cs]);
+c[0][0] = 9.5;
+want("a cast's row is a copy", cs[0], 6);
+want("...converted", c[0][0], 9.5);
+
+assert(bad == 0);
+print("ok");

@@ -544,7 +544,8 @@ func local_calls(dyn ap2) {
     ap2(o.inner.xs, 3);
     ap2(o.ins[0].xs, 4);
     ap2(m[0], 5);
-    return [xs, o.inner.xs, o.ins[0].xs, m];
+    var dyn res = [xs, o.inner.xs, o.ins[0].xs, m];
+    return res;
 }
 want("dyn callee locals", local_calls(ap),
      [[1, 2], [1, 3], [4], [[1, 5], [2]]]);
