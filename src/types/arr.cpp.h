@@ -154,8 +154,8 @@ void SharedArrayObjTempl<LValueT>::promote_objs_to_general()
  * here: in place, on the storage every handle shares, as a promotion is
  * (#53b) in the other direction. The caller (adopt_detach) has made it an
  * ordinary array no slice views, and it fit the type exactly (an element
- * of another kind is refused there), so each element converts as it is;
- * anything else leaves it general. Safe for the walks a `dyn` name can
+ * of another kind is refused there), so each element converts as it is.
+ * Safe for the walks a `dyn` name can
  * drive while it happens - each reads the kind per element (vm_arr_elem,
  * arr_elem_at, the tree-walker's foreach), and sort's guard refuses a
  * change of kind as a modification.
@@ -163,55 +163,39 @@ void SharedArrayObjTempl<LValueT>::promote_objs_to_general()
 template <class LValueT>
 void SharedArrayObjTempl<LValueT>::flatten_general(Storage to)
 {
-    if (slice || shobj->kind != Storage::general)
-        return;
+    /* (adopt_detach made it an ordinary array no slice views, and the fit
+     * check refused an element of another kind) */
+    ML_CHECK(!slice && shobj->kind == Storage::general);
     vec_type &v = shobj->vec;
     const size_type n = static_cast<size_type>(v.size());
-    switch (to) {
-    case Storage::ints: {
-        ivec_type nv;
-        nv.reserve(n);
+    if (to == Storage::ints) {
+        ivec_type nv(n);
         for (size_type i = 0; i < n; i++) {
-            const EvalValue &x = v[i].get();
-            if (!x.is<int_type>())
-                return;
-            nv.push_back(x.get<int_type>());
+            ML_CHECK(v[i].get().template is<int_type>());
+            nv[i] = v[i].get().template get<int_type>();
         }
         v.~vec_type();
         shobj->kind = Storage::ints;
         new (&shobj->ivec) ivec_type(std::move(nv));
-        break;
-    }
-    case Storage::floats: {
-        fvec_type nv;
-        nv.reserve(n);
+    } else if (to == Storage::floats) {
+        fvec_type nv(n);
         for (size_type i = 0; i < n; i++) {
-            const EvalValue &x = v[i].get();
-            if (!x.is<float_type>())
-                return;
-            nv.push_back(x.get<float_type>());
+            ML_CHECK(v[i].get().template is<float_type>());
+            nv[i] = v[i].get().template get<float_type>();
         }
         v.~vec_type();
         shobj->kind = Storage::floats;
         new (&shobj->fvec) fvec_type(std::move(nv));
-        break;
-    }
-    case Storage::bools: {
-        bvec_type nv;
-        nv.reserve(n);
+    } else {
+        ML_CHECK(to == Storage::bools);
+        bvec_type nv(n);
         for (size_type i = 0; i < n; i++) {
-            const EvalValue &x = v[i].get();
-            if (!x.is<bool>())
-                return;
-            nv.push_back(x.get<bool>() ? 1 : 0);
+            ML_CHECK(v[i].get().template is<bool>());
+            nv[i] = v[i].get().template get<bool>() ? 1 : 0;
         }
         v.~vec_type();
         shobj->kind = Storage::bools;
         new (&shobj->bvec) bvec_type(std::move(nv));
-        break;
-    }
-    default:
-        return;
     }
     len = n;
 }

@@ -2852,6 +2852,13 @@ static const std::vector<test> tests =
       { "var cs = [1]; var ds = [\"s\"];", "var r = [cs];",
         "append(r, ds);" },
       &typeid(TypeMismatchEx), 10, 2, 13, 2 },
+    /* (a long name: the place's text takes the heap, not the short
+     * string buffer) */
+    { "rule 1: a shared element appended to a long-named array",
+      { "var cs = [1]; var ds = [\"s\"];",
+        "var a_rather_long_container_name = [cs];",
+        "append(a_rather_long_container_name, ds);" },
+      &typeid(TypeMismatchEx) },
     { "rule 1: a container appended to itself",
       { "var cs = [1];", "var r = [cs];", "append(r, r);" },
       &typeid(TypeMismatchEx), 10, 2, 13, 2 },
@@ -2899,6 +2906,49 @@ static const std::vector<test> tests =
       { "var cs = [1];",
         "var r = runtime(true) ? [cs] : [[2.5]];", "print(r);" },
       &typeid(TypeMismatchEx), 26, 2, 29, 2 },
+    { "rule 1: a ternary inside an array sum keeps its arms' rows",
+      { "var cs = [1];",
+        "var r = [[1.5]] + (runtime(true) ? [cs] : [cs]);",
+        "print(r);" },
+      &typeid(TypeMismatchEx) },
+    { "rule 1: a ?? inside an array sum keeps its sides' rows",
+      { "var cs = [1];",
+        "func mk(bool b) { if (b) return [cs]; return none; }",
+        "var r = [[1.5]] + (mk(runtime(true)) ?? [cs]);",
+        "print(r);" },
+      &typeid(TypeMismatchEx) },
+    { "rule 1: a builtin's new dict holding a shared container",
+      { "var cs = [1];", "var d = {\"a\": [1.5]};",
+        "d = make_dict([\"b\"], func(str k) => cs);", "print(d);" },
+      &typeid(TypeMismatchEx) },
+    { "rule 1: a sum stored into a nested element keeps its rows' types",
+      { "var m = [[[[1.5]]]]; var cs = [1];",
+        "m[0][0] = [cs] + [[2.5]];" },
+      &typeid(TypeMismatchEx) },
+    { "rule 1: a sum stored into a field keeps its rows' types",
+      { "struct T { array<array<float>> f; }",
+        "var t = T([[1.5]]); var cs = [1];",
+        "t.f = [cs] + [[2.5]];" },
+      &typeid(TypeMismatchEx) },
+    { "rule 1: a sum appended to a field keeps its rows' types",
+      { "struct S { array<array<array<float>>> f; }",
+        "var s = S([[[1.5]]]); var cs = [1];",
+        "append(s.f, [cs] + [[2.5]]);" },
+      &typeid(TypeMismatchEx) },
+    { "rule 1: a ?? or a ternary of new rows is assigned as it is",
+      { "var r = [[1.5]];",
+        "func mk(bool b) { if (b) return [[2.5]]; return none; }",
+        "r = mk(runtime(true)) ?? [[3.5]]; assert(r[0][0] == 2.5);",
+        "r = runtime(true) ? [[4.5]] : [[5.5]]; assert(r[0][0] == 4.5);" } },
+    { "rule 1: a dyn sum, slice or builtin result into a typed array is "
+      "checked where it lands",
+      { "array<array<float>> r = [[1.5]];",
+        "var dyn q = runtime([[2.5]]);",
+        "r = q + [[3.5]]; assert(len(r) == 2);",
+        "r = q[0:1]; assert(r[0][0] == 2.5);",
+        "r = clone(q); assert(r[0][0] == 2.5);",
+        "var cs = [1]; var ds = [2.5];",
+        "var dyn m = [cs] + [ds]; assert(len(m) == 2);" } },
     { "rule 1: a new container's shared elements are accepted where "
       "they fit",
       { "var cs = [1]; var ds = [2.5];",
@@ -53531,6 +53581,18 @@ static bool callee_set_analysis()
     };
 
     /* ------------------- the constraint forms ------------------- */
+    /* a non-strict run (-dti, -dcs, -a) reports and refuses nothing: the
+     * rule 1 checks of what a new container is made of stay quiet (this
+     * program is refused by a strict run, at `[cs, ds]`) */
+    want("a non-strict run passes rule 1's element checks", {
+        "func sq(int x) => x * x;",
+        "var cs = [1]; var ds = [2.5];",
+        "var r = [cs, ds];",
+        "var s = [cs] + [ds];",
+        "var g = sq;",
+        "print(g(2), len(r), len(s));" },
+        { "dcs\t6\t7\t-\tone\tsq" });
+
 
     /* pts(g) ⊇ pts(f) - a copy chain, and the answer is the FUNCTION,
      * not the shape: `neg` has the identical type and must not be in

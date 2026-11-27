@@ -623,7 +623,12 @@ vm_store_elem_float_body(LValue &alv, int_type idx, float_type rhs, Op aop,
     Loc ls, le;
     if (chunk)
         chunk->loc_at(pc, ls, le);       /* JIT (null): loc-less -> stamped */
-    vm_subscript_store(&alv, EvalValue(idx), EvalValue(rhs),
+    /* (rule 4 made every writable array<float> flat - an array<float?>
+     * stores through StoreElemValue - so the general storage that
+     * reaches here is a constant's row, read-only: this store throws,
+     * and the temporaries' no-throw exit cannot be taken) */
+    vm_subscript_store(&alv, EvalValue(idx),       /* INT-COV-EXEMPT */
+                       EvalValue(rhs),                /* INT-COV-EXEMPT */
                        vm_base_to_expr14_op(aop), ls, le);
 }
 

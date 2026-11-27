@@ -64,6 +64,60 @@ foreach (b in gba)
     if (b)
         gbc++;
 want("foreach a constant's bools", gbc, 1);
+# the fused element ops on them: a branch on an element
+# (JumpUnlessElemInt) and a counted loop that reads one (ForStepElemInt)
+var nb = 0;
+for (var k = 0; k < len(gba); k++)
+    if (gba[k])
+        nb++;
+want("a branch on a constant's bool", nb, 1);
+var ni = 0;
+for (var k = 0; k < len(gia); k++)
+    if (gia[k])
+        ni++;
+want("a branch on a constant's int", ni, 2);
+var st = 0;
+for (var k = 0; k < len(gia); k++) {
+    var e = gia[k];
+    st += e * 10;
+}
+want("a counted loop over a constant's ints", st, 30);
+var bt = 0;
+for (var k = 0; k < len(gba); k++) {
+    var e = gba[k];
+    bt += e ? 1 : 0;
+}
+want("a counted loop over a constant's bools", bt, 1);
+# a loop whose body ends in a store keeps its plain step, which the
+# element read fuses into (ForStepElemInt) - an int read, a bool read as
+# an int
+var outi = [0, 0];
+for (var k = 0; k < len(gia); k++) {
+    var e = gia[k];
+    outi[k] = e * 10;
+}
+want("ForStepElemInt over a constant's ints", outi, [10, 20]);
+var outb = [0, 0];
+for (var k = 0; k < len(gba); k++)
+    outb[k] = gba[k] * 3;
+want("ForStepElemInt over a constant's bools", outb, [3, 0]);
+# a store into a constant's row is refused (it is read-only)
+var ro = "";
+try {
+    gfa[0] = 0.5;
+} catch (NotLValueEx) {
+    ro = "L";
+}
+want("a store into a constant's float row", ro, "L");
+
+# a row that is none takes no type as its array enters an
+# array<array<int>?>; the other row becomes flat
+func asno(array<array<int>?> a) => a;
+array<dyn> nsrc = [[none, [1]]];
+var dyn nr = nsrc[0];
+array<array<int>?> nra = asno(nr);
+want("a none row", nra[0] == none, true);
+want("...and the other row's storage", array_storage(nra[1]), "int");
 
 # typed stores, plain and compound
 ia[0] = 7;

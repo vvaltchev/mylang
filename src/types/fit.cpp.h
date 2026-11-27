@@ -619,7 +619,8 @@ void adopt_detach(const EvalValue &v, const TypeAnnot *t)
         /* rule 4: the storage follows the type it takes - an array of
          * non-none ints, floats or bools is flat (flatten_general) */
         const TypeAnnot *et = t->elem.get();
-        if (et && !et->opt) {
+        ML_CHECK(et);              /* (an array type names its element) */
+        if (!et->opt) {
             switch (et->kind) {
             case DeclType::i:
                 a.flatten_general(SharedArrayObj::Storage::ints);
