@@ -200,6 +200,8 @@ unsigned long g_jit_ret_truth_slow = 0; /* #84: boundary returns through
                                          * the C++ tier that reloaded rdx */
 unsigned long g_jit_temp_regs = 0; /* #86: temp pieces given a register
                                      * (emit-time) */
+unsigned long g_jit_image_home_refused = 0; /* #82 (fat-170): image
+                                             * spill homes dropped */
 unsigned long g_jit_xcall_lost = 0; /* #124(b): runs re-emitted with the
                                      * denial (a live pin in a loop) */
 unsigned long g_jit_xcall_brackets = 0; /* #124(b): call ops emitted
@@ -16426,6 +16428,7 @@ void jit_stats_report()
         { "xcall_brackets",   &g_jit_xcall_brackets },
         { "xcall_lost",       &g_jit_xcall_lost },
         { "temp_regs",        &g_jit_temp_regs },
+        { "image_home_refused", &g_jit_image_home_refused },
         { "ret_truth_slow",   &g_jit_ret_truth_slow },
         { "regcall_fpinned",  &g_jit_regcall_fpinned },
         { "call_align",       &g_jit_call_align },
@@ -33003,6 +33006,33 @@ retry_emission:
                                           * list, never over budget */
         if (jit_lever_off(JL_SCACHE))
             spill_hot.clear();
+        /*
+         * #82 again (myv_fuzz fat-170, CI seed 46023289682): a loaded
+         * image keeps no ref-listed slot in a SPILL HOME either. A home
+         * is written back raw like a pin - a scalar tag and a payload, at
+         * every exit and around every call bracket - so a reference an op
+         * put in the slot is overwritten unreleased. #82 filtered the
+         * pick's overflow and the scan's register pieces, and missed the
+         * scan's own home tier (lsra_homes): one mutated byte made a
+         * join() write its string into a loop counter homed on the native
+         * stack, and the counter's next store leaked it. Dropped HERE, at
+         * the one consumer, so every producer of homes is covered.
+         */
+        if (g_jit_image_pass) {
+#ifdef TESTS
+            const size_t n0 = spill_hot.size();
+#endif
+            spill_hot.erase(std::remove_if(spill_hot.begin(),
+                                           spill_hot.end(),
+                                           [&](int sl) {
+                                               return jit_pin_refused(
+                                                   chunk, sl);
+                                           }),
+                            spill_hot.end());
+#ifdef TESTS
+            g_jit_image_home_refused += n0 - spill_hot.size();
+#endif
+        }
         /* #96 COST MODEL: the home CAPACITY is applied AFTER the share
          * plan, not here - the overflow past it is exactly the set for
          * which a seam beats the nothing it would otherwise get (see

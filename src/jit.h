@@ -1675,6 +1675,7 @@ extern "C" unsigned long g_jit_regcall_fargs;   /* REGCALL 4 reach */
 extern "C" unsigned long g_jit_xcall_brackets;  /* #124(b) reach */
 extern "C" unsigned long g_jit_xcall_lost;      /* ...and lost bets */
 extern "C" unsigned long g_jit_temp_regs;       /* #86 reach */
+extern "C" unsigned long g_jit_image_home_refused; /* #82 fat-170 */
 extern "C" unsigned long g_jit_ret_truth_slow;  /* #84 slow-tier rdx */
 extern "C" unsigned long g_jit_regcall_fpinned; /* ...into a pin */
 extern "C" unsigned long g_jit_call_align;      /* SP3: self-aligned */

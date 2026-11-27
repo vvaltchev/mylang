@@ -18442,3 +18442,28 @@ its program did not compile (a `dyn` needing `var dyn`, which made both
 runs print the same exception), and then the mutated write kept `fs` in
 memory for the whole run even when sabotaged. It now refuses an
 unmutated image that does not run, and asserts the exact output.
+
+**THE PATH IT MISSED (myv_fuzz fat-170, Nets, CI seed 46023289682,
+2026-11-27).** One flipped bit moved a `join()` call's result into the
+second loop's counter `i` (`call.blt.v joined = ...` -> `i = ...`). The
+linear scan had given `i` no register but a SPILL HOME on the native
+stack - its trans-mode overflow tier, `lsra_homes`, which carries the
+clean slots that never won a register. A home is a pin by another name:
+the call bracket writes it back as a scalar tag and a payload, and
+reloads only the payload after the call, so the string the call stored
+was overwritten unreleased by `load i, 0`. #82 filtered the pick's
+overflow (`out`) and the scan's register pieces, not this tier.
+
+The filter now runs where homes are CONSUMED - `spill_hot`, after the
+pick or the scan chose them - so a future producer of homes is covered
+too; `g_jit_image_home_refused` (TESTS, in `MYLANG_JITSTATS`) counts
+what it drops. Net: `myv_refhome_release` (`-rt`) builds the finding's
+program with `top()` for `join()` (a string the program names, so
+`refcount()` sees it), makes the finding's mutation in-process, and
+requires the JIT's count to equal the INTERPRETER's on the same mutated
+image - an exact expected count was tried first and was a guess about
+which temps hold the key (a print's staging temp held one more handle
+in the unmutated run). It also requires the counter to move, so a
+change that stops the shape reaching the home tier fails instead of
+passing vacuously. Watched failing with the filter disabled (the JIT
+printed 0 where the interpreter printed -1).

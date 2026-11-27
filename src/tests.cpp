@@ -41018,6 +41018,177 @@ static bool myv_refpin_release()
 }
 
 /*
+ * #82 again, the path it missed (myv_fuzz fat-170, CI seed 46023289682):
+ * one flipped bit moved a builtin call's result - join()'s string - into
+ * the second loop's counter `i`, which the linear scan had not given a
+ * register but a SPILL HOME on the native stack (its home tier,
+ * lsra_homes). A home is written back raw like a pin, so the counter's
+ * next store left the string unreleased: LeakSanitizer at exit. A loaded
+ * image keeps no ref-listed slot in a home now either.
+ *
+ * The finding's program, with top() in place of join() so the value is a
+ * string the program names (`key`) and refcount() can count it; the
+ * mutation is the finding's, made in-process before the image is written.
+ * The ORACLE is the same mutated image run with the JIT off: the
+ * interpreter releases whatever a store replaces, so the JIT must print
+ * what it prints (an exact count would be a guess about which temps hold
+ * the key). g_jit_image_home_refused must move in the JIT run, or the
+ * shape no longer reaches the home tier and the test checks nothing.
+ * Watched failing with the filter removed (the JIT's count ended one
+ * higher than the interpreter's).
+ */
+static bool myv_refhome_release()
+{
+#if !ML_JIT_SUPPORTED
+    return true;                     /* no home to keep a slot in */
+#else
+    if (!g_jit_enabled)
+        return true;
+    const char *lines_arr[] = {
+        "struct P { int x; float y; }",
+        "struct Q { int a; }",
+        "func mk(int n) { return P(n, float(n) * 1.5); }",
+        "func dist(P p) { return p.x * p.x + int(p.y); }",
+        "var pts = [];",
+        "for (var i = 0; i < 6; i++) { append(pts, mk(i)); }",
+        "var s = 0;",
+        "foreach (var p in pts) { s += dist(p); }",
+        "var d = {\"a\": 1, \"b\": 2};",
+        "d[\"c\"] = 3;",
+        "foreach (var k, v in d) { s += v; }",
+        "var key = str(runtime(7)) + \"z\";",
+        "var names = [\"x\", \"y\", key];",
+        "var before = refcount(key);",
+        "var joined = top(names);",
+        "var nested = [[1, 2], [3, 4]];",
+        "for (var i = 0; i < 2; i++) { s += nested[i][1]; }",
+        "var cnt = 0;",
+        "var bump = func[cnt]() { cnt = cnt + 1; return cnt; };",
+        "s += bump() + bump();",
+        "try { throw Q(9); } catch (Q as e) { s += e.a; }",
+        "finally { s += 1; }",
+        "var t = 0;",
+        "try { var z = pts[99]; } catch (OutOfBoundsEx) { t = 1; }",
+        "var fl = [1.0, 2.0, 3.0];",
+        "var fs = 0.0;",
+        "foreach (var f in fl) { fs += sqrt(f); }",
+        "var bits = (s << 2) | 7;",
+        "pure func sq(x) => x * x;",
+        "const OPS = [sq];",
+        "var dyn ops = runtime(OPS);",
+        "bits += len(ops);",
+        "struct K { const F = pure func(a, b) => a < b; const T = [sq]; }",
+        "var dyn kf = runtime(K.F);",
+        "if (kf(1, 2)) { bits += len(K.T); }",
+        "print(s, joined, t, bits, fs > 0.0, refcount(key) - before);" };
+    std::string src;
+    for (const char *l : lines_arr) {
+        if (!src.empty()) src += '\n';
+        src += l;
+    }
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-refhome.myv";
+
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    /* run 0: the unmutated image; 1: the mutated one with the JIT off
+     * (the oracle); 2: the mutated one with the JIT on */
+    std::string out[3];
+    unsigned long refused[3] = { 0, 0, 0 };
+    for (int run = 0; run < 3 && ok; run++) {
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            std::vector<Tok> toks;
+            lexer(src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+            if (run > 0) {
+                /* the finding: `joined`'s call writes the LAST `i` */
+                int32_t joined = -1, i2 = -1;
+                for (size_t i = 0; i < prog.root.slot_names.size(); i++) {
+                    if (prog.root.slot_names[i] == "joined")
+                        joined = static_cast<int32_t>(i);
+                    if (prog.root.slot_names[i] == "i")
+                        i2 = static_cast<int32_t>(i);
+                }
+                int patched = 0;
+                for (Instr &in : prog.root.code)
+                    if (in.op == OpCode::CallBuiltinV && joined >= 0
+                            && in.target == joined) {
+                        in.target = i2;
+                        patched++;
+                    }
+                if (i2 < 0 || patched != 1) {
+                    cout.rdbuf(old);
+                    fprintf(stderr, "myv-refhome: expected one call "
+                                    "into `joined` and a slot named i "
+                                    "(%d, %d) - the shape changed\n",
+                            patched, i2);
+                    ok = false;
+                    break;
+                }
+            }
+            myv_write(prog, path, MyvSourceRef());
+            MyvSource ms;
+            const unsigned long r0 = g_jit_image_home_refused;
+            g_jit_enabled = run != 1;
+            VmProgram loaded = myv_read(path, ms);      /* jits it too */
+            refused[run] = g_jit_image_home_refused - r0;
+            vm_run(loaded);
+        } catch (Exception &e) {
+            cap << "threw " << e.name;
+        }
+        g_jit_enabled = true;
+        cout.rdbuf(old);
+        out[run] = cap.str();
+        remove(path.c_str());
+    }
+    /* the unmutated image must run and keep the key in `joined` (a
+     * program that stops compiling would "agree" with anything); the
+     * mutated one must count the key as the interpreter does - its
+     * reference went to `i`, whose next store released it */
+    if (ok && out[0].find("101 7z 1 409 true ") != 0) {
+        fprintf(stderr, "myv-refhome: the unmutated image printed '%s', "
+                        "expected '101 7z 1 409 true N'\n",
+                out[0].c_str());
+        ok = false;
+    }
+    if (ok && out[1].find("101 <none> 1 409 true ") != 0) {
+        fprintf(stderr, "myv-refhome: the mutated image, JIT off, printed "
+                        "'%s' - the mutation did not move the result\n",
+                out[1].c_str());
+        ok = false;
+    }
+    if (ok && out[2] != out[1]) {
+        fprintf(stderr, "myv-refhome: the mutated image printed '%s' under "
+                        "the JIT and '%s' without it - the key leaked\n",
+                out[2].c_str(), out[1].c_str());
+        ok = false;
+    }
+    if (ok && refused[2] == 0) {
+        fprintf(stderr, "myv-refhome: the mutated image refused no spill "
+                        "home - the shape no longer reaches the scan's "
+                        "home tier, so this checks nothing\n");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+#endif
+}
+
+/*
  * #88, myv_fuzz seed 992390900 fat-115: a mutated image retargeted a
  * struct-foreach field read's INDEX operand to a float slot. The JIT
  * materializes the index as the slot's raw payload (the codegen proved it
@@ -63603,6 +63774,10 @@ static const std::vector<extra_check> extra_checks =
     { "myv: a loaded image keeps no ref-listed slot in a register - a "
       "mutated key store is released, not overwritten (#82, fat-286)",
       myv_refpin_release },
+    { "myv: a loaded image keeps no ref-listed slot in a spill home - a "
+      "mutated builtin result is released, not overwritten (#82, "
+      "fat-170)",
+      myv_refhome_release },
     { "myv: a field read whose index operand names a FLOAT slot reads in "
       "bounds or takes the defined 0, never past the array (#88, fat-115)",
       myv_struct_field_float_index },

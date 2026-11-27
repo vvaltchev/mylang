@@ -10076,7 +10076,11 @@ definition, and the write-back leaked the string. While
 keeps every ref-listed slot in memory (the scan's admission, the pick's
 outputs); compiled programs - 64 of 369 corpus programs pin such a slot
 - are untouched. **A new way to keep a slot in a register must ask
-`jit_pin_refused`.** Record: docs/jit-optimizations.md, *#82*.
+`jit_pin_refused`.** A SPILL HOME counts (fat-170, 2026-11-27): it is
+written back raw too, and the scan's own home tier (`lsra_homes`) was
+missed, so a builtin's string written into a homed loop counter leaked.
+The homes are filtered where they are consumed (`spill_hot`), whatever
+produced them. Record: docs/jit-optimizations.md, *#82*.
 **⛔ AND AN EIGHTH (#88, 2026-11-24, myv_fuzz fat-115): A BOUNDS TEST
 ON A SIGNED INDEX COMPARES ALL 64 BITS.** `static_cast<size_type>(idx)
 >= arr.size()` truncates to 32 bits, so a huge index whose low half is
