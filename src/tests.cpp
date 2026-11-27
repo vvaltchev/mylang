@@ -53989,6 +53989,111 @@ static bool callee_set_analysis()
         "print(helper(3));" },
         "dcs-esc\thelper");
 
+    /*
+     * ⛔ A BUILTIN WHOSE EFFECT IS KNOWN DOES NOT HIDE A CALLEE
+     * (2026-11-27). Every builtin used to be opaque: `len(fs)` made what
+     * `fs` holds unknown, so the loop over an array of functions that
+     * reads its length called an unknown callee, and `append(fns, f)` -
+     * how such an array is built - escaped `f`. Each row below names
+     * the rule it pins; each was watched failing with that rule removed.
+     */
+    /* a reads-only builtin (esc_builtin_transparent) keeps the contents */
+    want("builtin: len() keeps what the container holds", {
+        "func sq(int x) => x * x;",
+        "func neg(int x) => 0 - x;",
+        "var fs = [sq, neg];",
+        "print(len(fs), typestr(sq));",
+        "print(fs[runtime(0)](2));" },
+        { "dcs\t5\t7\t-\tmany\tneg,sq" });
+    reject("builtin: ...and its function argument does not escape", {
+        "func sq(int x) => x * x;",
+        "func neg(int x) => 0 - x;",
+        "var fs = [sq, neg];",
+        "print(len(fs), typestr(sq));",
+        "print(fs[runtime(0)](2));" },
+        "dcs-esc\tsq");
+    /* append / push / insert store exactly, and escape nothing */
+    want("builtin: append stores into the container", {
+        "func sq(int x) => x * x;",
+        "var fs = [];",
+        "append(fs, sq);",
+        "print(fs[0](3));" },
+        { "dcs\t4\t7\t-\tone\tsq" });
+    reject("builtin: ...and the stored function does not escape", {
+        "func sq(int x) => x * x;",
+        "var fs = [];",
+        "append(fs, sq);",
+        "print(fs[0](3));" },
+        "dcs-esc\tsq");
+    /* (the dict holds another function first, so the inserted one is
+     * reachable ONLY through the insert - with `sq` in the literal too,
+     * dropping the insert's write passed this row) */
+    want("builtin: insert stores its value", {
+        "func sq(int x) => x * x;",
+        "func neg(int x) => 0 - x;",
+        "var d = {\"a\": neg};",
+        "insert(d, \"b\", sq);",
+        "foreach (k, v in d) print(k, v(2));" },
+        { "dcs\t5\t30\t-\tmany\tneg,sq" });
+    /* a result that comes out of the first argument (passthrough) */
+    want("builtin: find / pop return an element", {
+        "func sq(int x) => x * x;",
+        "var d = {\"a\": sq};",
+        "var g = find(d, \"a\");",
+        "print(g(2));",
+        "var fs = [sq];",
+        "var h = pop(fs);",
+        "print(h(3));" },
+        { "dcs\t4\t7\t-\tone\tsq", "dcs\t7\t7\t-\tone\tsq" });
+    want("builtin: clone / values return the same contents", {
+        "func sq(int x) => x * x;",
+        "var fs = [sq];",
+        "var c = clone(fs);",
+        "print(c[0](2));",
+        "var h = clone(sq);",
+        "print(h(3));",
+        "var vs = values({\"a\": sq});",
+        "print(vs[0](4));" },
+        { "dcs\t4\t7\t-\tone\tsq", "dcs\t6\t7\t-\tone\tsq",
+          "dcs\t8\t7\t-\tone\tsq" });
+    /* ⛔ A RESULT THAT CARRIES AN ARGUMENT IS MODELLED (review,
+     * 2026-11-27): max hands back an element, append its container. Left
+     * ⊤ with the arguments not escaped, the function went on unseen and
+     * map called `sq` with a string while it was typed from its int site
+     * (a garbage number under the JIT). */
+    want("builtin: max / append results carry the callee", {
+        "func sq(x) => x + x;",
+        "var fs = [sq];",
+        "var h = max(fs);",
+        "print(h(3));",
+        "var gs = [];",
+        "var r = append(gs, sq);",
+        "print(r[0](4));" },
+        { "dcs\t4\t7\t-\tone\tsq", "dcs\t7\t7\t-\tone\tsq" });
+    want("builtin: ...and what calls it through a callback escapes it", {
+        "func sq(x) => x + x;",
+        "var fs = [sq];",
+        "print(fs[0](3));",
+        "var dyn h = max(fs);",
+        "print(map(h, [\"ab\"]));" },
+        { "dcs-esc\tsq" });
+    /* ⛔ THE ARITY IS PART OF THE CLAIM: find's 3-argument form calls its
+     * key on every element, so it stays opaque - the key and what it was
+     * handed escape, and what the array holds is unknown from then on */
+    want("builtin: find with a key stays opaque", {
+        "func sq(int x) => x * x;",
+        "var fs = [sq];",
+        "print(find(fs, sq, func(e) => e));",
+        "print(fs[0](2));" },
+        { "dcs\t4\t7\t-\ttop\t-", "dcs-esc\tsq" });
+    /* and a builtin nobody modelled is still opaque */
+    want("builtin: an unmodelled builtin hides the contents", {
+        "func sq(int x) => x * x;",
+        "var fs = [sq, sq];",
+        "erase(fs, 0);",
+        "print(fs[0](2));" },
+        { "dcs\t4\t7\t-\ttop\t-", "dcs-esc\tsq" });
+
     /* ⛔ AND THE VACUITY GUARD. Every case above asserts a row is
      * PRESENT, so an analysis that emitted nothing at all - or a dump
      * that silently stopped running it - would fail loudly; but an

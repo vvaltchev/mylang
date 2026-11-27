@@ -3751,6 +3751,19 @@ static bool esc_writes_global(const Construct *c)
  *      code whatever its argument's static type is, and refusing it for a
  *      `dyn` argument would cost the single most common shape in the
  *      language for no reason.
+ *   4. it writes into no container it is handed - not an element, not a
+ *      field, not a dict key. The CALLEE-SET analysis (calleeset.cpp.h)
+ *      relies on this one together with 1-3: a function handed to a listed
+ *      builtin does not escape, and a container handed to one keeps the
+ *      callees the analysis knows it holds (`len(fs)` before `fs[i](x)`).
+ *      A false entry there is a MISSING member of a callee set - a wrong
+ *      MUST answer, read by #115's parameter typing and by this file's
+ *      escape analysis through `CallExpr::callee_fn`. And since nothing
+ *      escapes, what claim 2 allows - a result reached THROUGH an
+ *      argument, min / max's element or argument - must be modelled
+ *      there: cs_builtin_passthrough names min and max for that reason,
+ *      and a new entry whose result carries any part of an argument must
+ *      join it.
  *
  * ⛔ IT IS AN ALLOWLIST, SO IT FAILS CLOSED. An unlisted builtin - and any
  * builtin added later - captures every argument and is assumed to invoke,
@@ -3780,7 +3793,7 @@ static bool esc_writes_global(const Construct *c)
  *   reverse/pop/erase/  mutate or hand back pieces in ways worth reading
  *   top/get             one at a time before trusting; not needed yet
  */
-static bool esc_builtin_transparent(const UniqueId *name)
+static bool esc_transparent_list(const UniqueId *name)
 {
     static const char *const transparent[] = {
         "abs", "array_storage", "chr", "endswith", "float", "hash",
@@ -3939,7 +3952,7 @@ static bool esc_builtin_no_invoke(const UniqueId *name)
         "erase", "exit", "insert", "keys", "pop", "push", "reverse",
         "runtime", "top", "values",
     };
-    if (esc_builtin_transparent(name))
+    if (esc_transparent_list(name))
         return true;                     /* the stronger claim implies this */
     for (const char *q : quiet)
         if (name->val == q)
@@ -4036,7 +4049,7 @@ static void esc_scan_call(const CallExpr *call, EscCtx &ctx)
      * (LICM asks it for the same reason), and it defaults to ~0u, so an
      * unstamped call declines.
      */
-    const bool transparent = is_builtin && esc_builtin_transparent(cid->uid);
+    const bool transparent = is_builtin && esc_transparent_list(cid->uid);
     if (!is_builtin && !is_ctor && callee < 0)
         ESC_POISON(ctx.self, g_esc_p_callee);
     if (is_builtin && !transparent && call->args
@@ -4725,6 +4738,12 @@ Resolver::walk(Construct *c, FuncState *cur)
 }
 
 } // anonymous namespace
+
+/* the list's one entry point from outside this file (resolver.h) */
+bool esc_builtin_transparent(const UniqueId *name)
+{
+    return esc_transparent_list(name);
+}
 
 /* ----------------------- Function inlining ------------------------ */
 

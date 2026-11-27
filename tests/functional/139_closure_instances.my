@@ -77,8 +77,10 @@ var o = outer(1);
 want("nested", o(2.5) + " " + o(true), "floatfloat|floatstr boolbool|boolstr");
 # ...and one that calls itself through a container it captures. The
 # pop that breaks the cycle (README, *Values that contain themselves*)
-# hands the container to a builtin, after which the compiler cannot name
-# what box[0] holds: the call inside runs the untyped body.
+# hands the container to a builtin that only takes an element out of it,
+# so the compiler still names what box[0] holds, and the call inside runs
+# the typed instance. (Until 2026-11-27 any builtin made a container's
+# contents unknown, and this printed dyn.)
 var box = [];
 var rec = func [box] (n) {
     if (n == 0) return typestr(n);
@@ -86,7 +88,7 @@ var rec = func [box] (n) {
 };
 append(box, rec);
 if (typed)
-    want("recursive through a capture", rec(3), "dyn");
+    want("recursive through a capture", rec(3), "int");
 pop(box);
 
 # ---- a site inside a body the AST inliner pastes, and one through a

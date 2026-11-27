@@ -1,0 +1,30 @@
+# A builtin whose result carries one of its arguments hands the callee on
+# (review of 2026-11-27): `max` / `min` return an element or an argument,
+# `append` / `push` their container. The callee-set analysis lets the
+# arguments of such a builtin stay put, so it must follow the result; when
+# it did not, `sq` below was typed from its int call alone while `map`
+# called it with a string - the JIT printed a garbage number, -nj `[0]`,
+# and the tree-walker raised TypeErrorEx.
+func sq(x) => x + x;
+func f(a) => a[1] + 1;
+
+var fs = [sq];
+assert(fs[0](3) == 6);
+var dyn h = max(fs);
+assert(map(h, ["ab"]) == ["abab"]);
+var dyn h2 = min(fs);
+assert(map(h2, ["c"]) == ["cc"]);
+
+# (a function of its own: `sq` escapes through the map above, which would
+# hide a hole in the append case)
+func sq2(x) => x + x;
+var gs = [];
+var dyn r = append(gs, sq2);
+assert(gs[0](3) == 6);
+assert(map(r[0], ["ab"]) == ["abab"]);
+
+var ks = [f];
+assert(ks[0]([1, 2]) == 3);
+var dyn k = max(ks);
+assert(map(k, ["xyz"]) == ["y1"]);
+print("ok");

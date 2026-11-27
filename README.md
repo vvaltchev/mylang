@@ -2491,6 +2491,22 @@ var add = make_adder(3);
 print(add(4));            # 34 - `x` is typed `int` from this call site
 ```
 
+The compiler follows a function value through variables, parameters, returns,
+struct fields and container elements, and through the builtins that only read
+what they are given (`len`, `print`, `str`, `typestr`, ...), store it
+(`append`, `push`, `insert`) or hand back what a container holds (`pop`, `top`,
+`get`, `get!`, `find` without a key, `clone`, `deepclone`, `keys`, `values`,
+and `sort`, `rev_sort` and `reverse` without a comparator). It cannot follow
+one through `runtime()`, a caught exception, any other builtin, or a function
+a builtin calls back (`map`, `filter`, `sort` with a comparator, ...):
+
+```C#
+var ops = [make_adder(1), make_adder(2)];
+print(len(ops), ops[runtime(0)](4));   # 2 14 - `x` is `int`: one closure
+var dyn f = runtime(ops[0]);
+print(f(4));                           # 14 - `x` is `dyn` in this call
+```
+
 **A call that may reach more than one function runs the lambda's untyped
 body** (its *base*): every un-annotated parameter is `dyn` there. That is
 what happens when a value may hold one of several closures, when the compiler

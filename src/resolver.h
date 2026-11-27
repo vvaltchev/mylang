@@ -100,3 +100,13 @@ void run_optimizers(Construct *root,
  * array-storage colors (collect_array_analysis).
  */
 void collect_resolver_analysis(Construct *root, AnalysisInfo &out);
+
+/*
+ * A builtin that only READS its arguments: it stores none of them, returns
+ * none of them itself, invokes no callback and writes into no container it
+ * is handed. Two consumers lean on it for soundness - the #93 parameter
+ * escape analysis (a false entry is a use-after-free) and the callee-set
+ * analysis (a false entry is a missing callee). The list and its audit are
+ * in resolver.cpp.
+ */
+bool esc_builtin_transparent(const UniqueId *name);

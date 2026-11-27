@@ -6465,10 +6465,22 @@ dump on the corpus, and all three in the UNSOUND direction:**
  - **`append` IS A WRITE, not an opaque builtin.** Treating every
    builtin as a black box loses the STORE, so `var fns = []; append(fns,
    mk(i));` left the array EMPTY and `fn(1)` answered ⊥ for a site that
-   reaches five closures. Note the allowlist here is INVERTED from
-   `esc_builtin_transparent`'s: a builtin handed a container makes its
-   contents UNKNOWN unless the write is modelled exactly, so a missing
-   entry costs precision and can never cost soundness.
+   reaches five closures. A builtin handed a container makes its
+   contents UNKNOWN unless what it does is modelled exactly, so a
+   missing entry costs precision and can never cost soundness.
+   **THREE KINDS ARE MODELLED (2026-11-27), and a wrong entry in any of
+   them is a missing callee - the unsound direction:** a builtin on
+   `esc_builtin_transparent`'s list (resolver.cpp, exported through
+   resolver.h - its claim 4, "writes into no container it is handed",
+   exists for this consumer) escapes nothing and leaves its containers
+   alone; `append`/`push`/`insert` store exactly (`cs_builtin_store`);
+   and `cs_builtin_passthrough` names the builtins whose RESULT comes out
+   of their first argument, AT THE ARITY that calls nothing (`find`'s
+   key form, `sort`'s comparator form stay opaque). Until then
+   `len(fs)` made `fs[i](x)` an unknown callee - the commonest loop over
+   an array of functions - and that unknown escaped every function in
+   the program. Each rule has a `builtin:` row in the `-rt` callee-set
+   test, watched failing with it removed.
  - **`None` IS "NOT PINNED YET", NOT "EMPTY"** - the inferencer's own
    defer-on-Unknown/None invariant. `var fns = [];` types the LITERAL
    `array<none>`, so a `can this hold a function?` gate that answered

@@ -661,21 +661,22 @@ CsSet Inferencer::cs_eval(Construct *e)
         }
         if (cs_callee_is_builtin(c->what.get())) {
             /*
-             * EVERY builtin is opaque here - see cs_call for why this
-             * analysis refuses to inherit `esc_builtin_*`'s allowlist
-             * and its known map/filter/sort hole.
-             *
-             * ⛔ AND THIS BRANCH IS A PURE SHORT-CIRCUIT, PROVEN
-             * REDUNDANT. An unshadowed builtin name has no TypeSym, so
-             * the `id` case above already answers ⊤ and the generic
-             * path below would reach the same ⊤ - deleting it fails no
-             * test, which is exactly what the sabotage run found. It
-             * stays for legibility, with the redundancy ASSERTED, so
-             * the day a builtin acquires a symbol this fires instead
-             * of the branch quietly becoming load-bearing. (Same
-             * treatment as #93's reassignment guard.)
+             * A builtin's result is ⊤ - except for the ones whose
+             * result comes out of their first argument, which
+             * cs_builtin_passthrough names (see cs_call). `fs[i]` read
+             * back through `pop(fs)`, `find(cmds, name)` or a clone of
+             * `fs` is the same callee set `fs[i]` has.
              */
-            ML_CHECK(cs_eval(c->what.get()).top);
+            const CsPass pk = cs_builtin_passthrough(c);
+            if (pk == CsPass::same)
+                return cs_eval(c->args->elems[0].get());
+            if (pk == CsPass::elem)
+                return cs_read_elems(cs_eval(c->args->elems[0].get()));
+            if (pk == CsPass::args) {
+                for (auto &a : c->args->elems)
+                    out.merge(cs_eval(a.get()));
+                return out;
+            }
             out.set_top();
             return out;
         }
@@ -1171,18 +1172,38 @@ void Inferencer::cs_call(CallExpr *c)
         cal = cs_eval(c->what.get());
 
     /*
-     * ⛔ A BUILTIN IS A SINK, AND THE ENUMERATION IS THE TRAP.
-     * `esc_builtin_transparent` (the escape analysis) is an ALLOWLIST
-     * of builtins that neither store nor invoke their arguments, and
-     * its own note records that the grep it was derived from MISSES
-     * map/filter/sort - they reach their callback through a shared
-     * helper not named `builtin_*`. Rather than inherit that list and
-     * its known hole, this analysis treats EVERY builtin as opaque:
-     * any function-carrying argument escapes, and the result is ⊤.
-     * That is one enumeration fewer to keep correct, and its cost is
-     * precision on `print(f)`, which nothing consumes.
+     * ⛔ A BUILTIN IS A SINK, EXCEPT WHERE WHAT IT DOES IS KNOWN.
+     * Its RESULT is ⊤ (cs_eval), whatever it is. Its ARGUMENTS:
+     *  - a builtin on `esc_builtin_transparent`'s list only reads them
+     *    (that list's claims 1-4, resolver.cpp): nothing escapes and no
+     *    container changes. `len(fs)` used to make `fs`'s elements ⊤,
+     *    so every later `fs[i](x)` was an unknown callee - the commonest
+     *    loop over an array of functions - and `typestr(f)` escaped `f`;
+     *  - append / push / insert store a value into their container,
+     *    which cs_builtin_store models exactly, so that value does not
+     *    escape either: `append(fns, mk(i))`, how an array of closures
+     *    is BUILT, escaped every closure it stored;
+     *  - a builtin whose result is its first argument, or one of its
+     *    elements, and which calls and stores nothing (cs_builtin_
+     *    passthrough): what it returns is modelled by cs_eval, so its
+     *    argument does not escape and its container keeps its contents;
+     *  - EVERY OTHER builtin is opaque: any function-carrying argument
+     *    escapes, and a container handed to it holds ⊤ from then on.
+     * The allowlist is the one the #93 escape analysis audits for a
+     * stronger reason (a false entry there is a use-after-free), not a
+     * second copy: it was refused here once because the grep it is
+     * audited by misses map/filter/sort - which is why it lists only
+     * builtins that call nothing, and why an unlisted builtin, or one
+     * added later, stays opaque.
      */
     if (cs_callee_is_builtin(c->what.get())) {
+        const UniqueId *bn = static_cast<Identifier *>(c->what.get())->uid;
+        if (esc_builtin_transparent(bn))
+            return;
+        if (cs_builtin_store(c))
+            return;
+        if (cs_builtin_passthrough(c) != CsPass::none)
+            return;
         for (auto &a : c->args->elems)
             cs_escape_set(cs_eval(a.get()));
         cs_builtin_container_effect(c);
@@ -1254,28 +1275,92 @@ void Inferencer::cs_call(CallExpr *c)
  * analysis's allowlist, where a missing entry meant "transparent" and
  * a wrong entry was a use-after-free.
  */
-void Inferencer::cs_builtin_container_effect(CallExpr *c)
+/*
+ * MODELLED EXACTLY: arg0's container gains arg1 (append / push), or arg1
+ * AND arg2 (insert: an array's arg1 is an index, which holds no function,
+ * and a dict's is the KEY it stores, written into the one element location
+ * as a dict literal's key is - hash() refuses a function, so a key holds
+ * none today, and writing it costs nothing). The three call no callback
+ * and store nothing anywhere else, so their arguments do not escape: a
+ * value they store is reachable exactly through the container, which a
+ * later read sees. A container the analysis cannot name (⊤) escapes the
+ * value instead - cs_write_elems. Anything else is false: not modelled.
+ */
+bool Inferencer::cs_builtin_store(CallExpr *c)
 {
-    Construct *callee = c->what.get();
-    const std::string name =
-        callee->ct == ConstructType::id
-            ? std::string(static_cast<Identifier *>(callee)->uid->val)
-            : std::string();
-
-    /* MODELLED EXACTLY: arg0's container gains arg1 (append/push), or
-     * arg2 (insert, whose arg1 is the index). Everything else about
-     * them is already covered by the argument escape above. */
-    if ((name == "append" || name == "push") && c->args->elems.size() >= 2) {
+    const std::string_view name =
+        static_cast<Identifier *>(c->what.get())->uid->val;
+    const size_t na = c->args->elems.size();
+    if ((name == "append" || name == "push") && na == 2) {
         cs_write_elems(cs_eval(c->args->elems[0].get()),
                        cs_eval(c->args->elems[1].get()));
-        return;
+        return true;
     }
-    if (name == "insert" && c->args->elems.size() >= 3) {
-        cs_write_elems(cs_eval(c->args->elems[0].get()),
-                       cs_eval(c->args->elems[2].get()));
-        return;
+    if (name == "insert" && na == 3) {
+        const CsSet base = cs_eval(c->args->elems[0].get());
+        cs_write_elems(base, cs_eval(c->args->elems[1].get()));
+        cs_write_elems(base, cs_eval(c->args->elems[2].get()));
+        return true;
     }
+    return false;
+}
 
+/*
+ * A builtin whose RESULT comes out of its first argument and which calls
+ * nothing and stores nothing anywhere: cs_eval models the result and
+ * cs_call lets the argument stay put. Two shapes, by the arity that has
+ * them (a builtin's other arity may call a callback, so the count is part
+ * of the claim - `find(a, x, key)` and `sort(a, cmp)` stay opaque):
+ *  - SAME: the result is the argument itself, or a copy of it - sort /
+ *    rev_sort / reverse (an array sorted in place, or a sorted copy of a
+ *    constant), clone / deepclone (a copy - of a function too, which is a
+ *    closure of the SAME function), keys / values (an array of the dict's
+ *    keys or values). A copy is modelled as the SAME abstract object:
+ *    a write into one is then a write into both, which only adds members,
+ *    and a read of the copy sees everything the original may hold, which
+ *    includes everything the copy does;
+ *  - ELEM: the result is an element of it, or none - pop / top (an
+ *    array's last element), get / get! / find (a dict's value for a key;
+ *    find on an array is an int index, which holds no function), and
+ *    min / max of one array;
+ *  - ARGS: the result is one of the arguments - min / max of two or more.
+ * pop removes an element, which takes nothing out of a flow-insensitive
+ * set. Every entry is on `esc_builtin_no_invoke`'s quiet list or is one
+ * of its listed builtins at the arity that calls nothing.
+ *
+ * ⛔ A RESULT THAT CARRIES AN ARGUMENT MUST BE MODELLED HERE. cs_call lets
+ * the arguments of a reads-only builtin, a store and a passthrough stay
+ * put - they do not escape - so the result is the only way a function in
+ * them can travel on; left ⊤, it travels unseen. min / max (an element or
+ * an argument) and append / push (their container, which they return)
+ * did, until the review of 2026-11-27: `var dyn h = max(fs); map(h, xs)`
+ * called `sq` with a string while `sq` was typed from its `int` site -
+ * a garbage number under the JIT. A builtin whose result is none of its
+ * arguments' contents is ⊤ there harmlessly: nothing can be in it.
+ */
+Inferencer::CsPass Inferencer::cs_builtin_passthrough(CallExpr *c)
+{
+    const std::string_view name =
+        static_cast<Identifier *>(c->what.get())->uid->val;
+    const size_t na = c->args->elems.size();
+    if ((na == 1
+            && (name == "sort" || name == "rev_sort" || name == "reverse"
+                || name == "clone" || name == "deepclone"
+                || name == "keys" || name == "values"))
+            || (na == 2 && (name == "append" || name == "push")))
+        return CsPass::same;
+    if ((na == 1 && (name == "pop" || name == "top" || name == "min"
+                     || name == "max"))
+            || (na == 2 && (name == "get" || name == "get!"
+                            || name == "find")))
+        return CsPass::elem;
+    if (na >= 2 && (name == "min" || name == "max"))
+        return CsPass::args;
+    return CsPass::none;
+}
+
+void Inferencer::cs_builtin_container_effect(CallExpr *c)
+{
     /* NOT MODELLED: whatever it did to the container, we cannot say -
      * so what comes out of it later is unknown. */
     for (auto &a : c->args->elems) {

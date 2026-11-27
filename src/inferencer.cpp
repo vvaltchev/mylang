@@ -795,6 +795,9 @@ private:
     void cs_bind_target(Construct *lv, const CsSet &v);
     void cs_call(CallExpr *c);
     void cs_builtin_container_effect(CallExpr *c);
+    bool cs_builtin_store(CallExpr *c);
+    enum class CsPass { none, same, elem, args };
+    CsPass cs_builtin_passthrough(CallExpr *c);
     CsSet cs_eval(Construct *e);
     void cs_eval_value(const EvalValue &v, const Construct *site,
                        CsSet &out);
